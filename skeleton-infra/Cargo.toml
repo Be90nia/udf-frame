@@ -1,0 +1,69 @@
+[package]
+name = "skeleton-infra"
+version = "0.1.0"
+edition = "2021"
+description = "Standard-library adapters for the skeleton UDF core: tokio effect runtime, serde journal, bounded registry, testing harness"
+license = "MIT"
+
+# default = [] 显式落，零 feature = 零依赖（cargo tree 单行证明）。
+# 引用不存在的 optional dep 会 manifest error，故 feature 不预声明；
+# memgov 零外部依赖；journal 绑 serde/serde_json；tokio 绑 fx。
+[features]
+default = []
+memgov = []
+journal = ["dep:serde", "dep:serde_json"]
+tokio = ["dep:tokio"]
+# testing：测试替身需要 fx 底座。skeleton 走本 feature 门控而非全局依赖——
+# 守「零 feature = 零依赖」的 cargo tree 证明。
+testing = ["tokio", "dep:skeleton"]
+log = ["dep:log", "dep:tracing", "dep:tracing-subscriber", "dep:tracing-log"]
+# tracing：骨架审计事件流 → tracing 桥。tokio/log 先例形态——feature 门控依赖，
+# 核心 skeleton crate 零依赖不破（cargo tree -p skeleton 单行证明照常成立；
+# 桥在本层消费审计事件值面）。
+tracing = ["dep:tracing", "dep:tracing-subscriber", "dep:skeleton"]
+
+[dependencies]
+# testing 域绑核心 EffectRuntime/ActionSender/Effect；optional=true 由
+# testing feature 启用（守零依赖证明）。
+skeleton = { path = "../skeleton", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tokio = { workspace = true, optional = true }
+log = { version = "0.4", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, features = ["fmt", "env-filter"] }
+tracing-log = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# criterion dev-dep 只进开发依赖树，不影响消费方的零依赖证明；
+# tokio test-util 供 #[tokio::test(start_paused)]。
+criterion = "0.5"
+tokio = { workspace = true, features = ["test-util"] }
+
+# bench 三组跨 fx/journal/memgov/testing 四 feature，required-features 取并集——
+# 只开 tokio 会被整目标跳过（hollow gate），CI 闸与首跑一律 --all-features。
+[[bench]]
+name = "infra"
+harness = false
+required-features = ["tokio", "journal", "memgov", "testing"]
+
+[lints.clippy]
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+large_types_passed_by_value = "warn"
+# disallowed_methods 属 restriction 组（默认 allow），不显式启用则 clippy.toml
+# 的 tokio::spawn 禁令恒惰性——「效果只经 FxScope 唯一口」这一约束落地的必要
+# 一行；本 crate 现零裸 spawn 调用点，闸启用即净。
+disallowed_methods = "warn"
+
+# 端到端小例：五件套+combine+TestStore+fx/journal 解释器标准形
+#（--all-features 测试步顺带编译，feature 不全时跳过）。
+[[example]]
+name = "end_to_end"
+required-features = ["tokio", "journal", "testing"]
+
+# 多维实测数据采集器（评测基建非产品面，核心壳测量只需 memgov 计数分配器
+# + testing feature 的 skeleton 依赖）。
+[[example]]
+name = "multidim_eval"
+required-features = ["memgov", "testing"]

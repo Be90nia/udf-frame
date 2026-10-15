@@ -1,0 +1,15 @@
+[package]
+name = "skeleton"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal unidirectional data flow skeleton: Reducer/Effect/Store signatures with a zero-dependency pure-function core"
+license = "MIT"
+
+# 零依赖纪律：不设 [dependencies]——核心无 IO/运行时依赖，reducer「禁 IO」
+# 从评审约束升级为编译期不可能。serde/async 均为可选演进方向。
+
+# 默认 lints 集（与 skeleton-infra 同款，不含 disallowed——核心无 tokio）。
+[lints.clippy]
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+large_types_passed_by_value = "warn"

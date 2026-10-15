@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (all features)
+        run: cargo build --workspace --all-features
+      - name: Test (all features)
+        run: cargo test --workspace --all-features
+      - name: Clippy
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
