@@ -28,6 +28,7 @@ pub enum Eviction {
 /// 引入 thiserror 依赖时可换回派生。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundError {
+    /// 撞上的注册表容量上界。
     pub capacity: usize,
 }
 
@@ -85,22 +86,27 @@ impl<K: Ord, V> BoundedRegistry<K, V> {
         Ok(())
     }
 
+    /// 读侧（键不存在=`None`，不 panic）。
     pub fn get(&self, k: &K) -> Option<&V> {
         self.map.get(k)
     }
 
+    /// 摘除并返回值（登记面收缩的唯一口）。
     pub fn remove(&mut self, k: &K) -> Option<V> {
         self.map.remove(k)
     }
 
+    /// 当前登记数。
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
+    /// 空表判定（泄漏断言的便捷面）。
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
+    /// 容量上界（构造时定，不变）。
     pub fn capacity(&self) -> usize {
         self.max
     }
@@ -252,7 +258,9 @@ impl Drop for LeakGuard {
 /// 泄漏报告：相对基线的净增量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeakReport {
+    /// 分配次数净增量（相对基线）。
     pub allocs_delta: isize,
+    /// 分配字节净增量（相对基线）。
     pub bytes_delta: isize,
 }
 

@@ -69,11 +69,13 @@ pub struct CancelSource {
 }
 
 impl CancelSource {
+    /// 触发取消（幂等；观察面 `CancelToken` 恒见 `false→true` 恰一次）。
     pub fn cancel(&self) {
         // 幂等：重复 cancel 语义恒真；接收端全部丢弃时 send 失败可忽略（无观察者）。
         let _ = self.tx.send(true);
     }
 
+    /// 取消态读侧（非阻塞快照）。
     pub fn is_cancelled(&self) -> bool {
         *self.tx.borrow()
     }
@@ -86,6 +88,7 @@ pub struct CancelToken {
 }
 
 impl CancelToken {
+    /// 取消态读侧（非阻塞快照）。
     pub fn is_cancelled(&self) -> bool {
         *self.rx.borrow()
     }
@@ -202,6 +205,7 @@ pub struct FxScope {
 }
 
 impl FxScope {
+    /// 新建即 accepting（可 spawn）；并发闸与外接取消源经 builder 链显式加挂。
     pub fn new() -> Self {
         let (source, token) = cancel_pair();
         Self {
@@ -230,6 +234,7 @@ impl FxScope {
         self
     }
 
+    /// 取观察面令牌（Clone=同一取消态；任务内携带判停）。
     pub fn token(&self) -> CancelToken {
         self.token.clone()
     }
@@ -242,6 +247,7 @@ impl FxScope {
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire);
     }
 
+    /// accepting 闸读侧（true=可 spawn）。
     pub fn is_closed(&self) -> bool {
         !self.accepting.load(Ordering::Acquire)
     }
@@ -345,10 +351,12 @@ impl<T: Send + 'static> Spawned<T> {
         }
     }
 
+    /// 中止任务（幂等；join 侧见 `TaskError::Cancelled`）。
     pub fn abort(&self) {
         self.handle.abort();
     }
 
+    /// 任务是否已终局（完成/中止/panic 皆真；在途=false）。
     pub fn is_finished(&self) -> bool {
         self.handle.is_finished()
     }

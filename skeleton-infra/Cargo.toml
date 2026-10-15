@@ -12,7 +12,7 @@ license = "MIT"
 default = ["runtime"]
 runtime = ["dep:skeleton"]
 memgov = []
-journal = ["dep:serde", "dep:serde_json"]
+journal = ["dep:serde", "dep:serde_json", "dep:skeleton"]
 tokio = ["dep:tokio"]
 # testing：测试替身（TestStore 走 SyncStore + fx 底座）。runtime 连带启用
 # skeleton 依赖——「零三方依赖」cargo tree 证明不受影响。

@@ -168,6 +168,88 @@ fn combine_product_is_fragment_initial_panics() {
     let _ = fragment.initial();
 }
 
+// ── combine! 宏：六闭包生成（人体工学验收：变体短形态组合面一行）────────
+
+/// 宏显式形态（有 lift）：与 parent_child_fragment 逐参同义。
+fn macro_fragment() -> impl Reducer<State = ParentState, Action = ParentAction, Op = ParentOp> {
+    skeleton_infra::combine!(
+        ChildFeature,
+        ParentState.child,
+        wrap: ParentAction::Child,
+        unwrap: |pa: &ParentAction| match pa {
+            ParentAction::Child(ca) => Some(ca.clone()),
+            ParentAction::Finish => None,
+        },
+        lift: |fx, out: &mut EffectBuf<ParentAction, ParentOp>| match fx {
+            Effect::Run { id, op: ChildOp::Notify } => {
+                out.push(Effect::Run { id, op: ParentOp::ChildNotify });
+            }
+            Effect::Emit(_) => {}
+            Effect::Cancel { id } => out.push(Effect::Cancel { id }),
+        },
+    )
+}
+
+/// 宏产物与函数产物对拍：同输入恒同状态、同效果序列（路由命中/未路由两路）。
+#[test]
+fn combine_macro_fragment_matches_function_semantics() {
+    let s0 = ParentState { child: ChildState { count: 0 }, done: false };
+    let cases = [ParentAction::Child(ChildAction::Inc), ParentAction::Finish];
+    for a in cases {
+        let mut o_macro = EffectBuf::new();
+        let mut o_fn = EffectBuf::new();
+        let sm = macro_fragment().reduce(&s0, a.clone(), &mut o_macro);
+        let sf = parent_child_fragment().reduce(&s0, a.clone(), &mut o_fn);
+        assert_eq!(sm, sf, "{a:?}: 宏产物与函数产物状态同义");
+        let em: Vec<_> = std::iter::from_fn(|| o_macro.pop_front()).collect();
+        let ef: Vec<_> = std::iter::from_fn(|| o_fn.pop_front()).collect();
+        assert_eq!(format!("{em:?}"), format!("{ef:?}"), "{a:?}: 效果序列同形");
+    }
+}
+
+/// 变体短形态（lift 省略）：组合面一行——切片表达式 + 变体构造子即完装配
+///（零效果词表的正形；对齐 compose 文档的 counter_fragment 例）。
+#[test]
+fn combine_macro_short_form_one_line_assembly() {
+    #[derive(Clone, Debug, PartialEq)]
+    struct P {
+        total: u32,
+        child: u32,
+    }
+    #[derive(Clone, Debug, PartialEq)]
+    enum A {
+        Child(u32),
+        Touch,
+    }
+
+    struct Counter;
+    impl Reducer for Counter {
+        type State = u32;
+        type Action = u32;
+        type Op = Infallible;
+        fn initial(&self) -> u32 {
+            0
+        }
+        fn reduce(&self, s: &u32, a: u32, _out: &mut EffectBuf<u32, Infallible>) -> u32 {
+            s + a
+        }
+    }
+
+    fn short_fragment() -> impl Reducer<State = P, Action = A, Op = Infallible> {
+        skeleton_infra::combine!(Counter, P.child, A::Child)
+    }
+
+    let f = short_fragment();
+    let s0 = P { total: 10, child: 0 };
+    let mut out = EffectBuf::new();
+    let s1 = f.reduce(&s0, A::Child(7), &mut out);
+    assert_eq!(s1, P { total: 10, child: 7 }, "短形态：子迁移+切片写回");
+    let mut out2 = EffectBuf::new();
+    let s2 = f.reduce(&s1, A::Touch, &mut out2);
+    assert_eq!(s2, s1, "短形态：未路由零漂移");
+    assert!(out.is_empty() && out2.is_empty(), "零效果词表无效果可产");
+}
+
 // ── TestStore 验收形状 ───────────────────────────────────────────────────
 
 /// 验收纪律 1+2：逐动作断言 + 效果回填断言（原样流程）。

@@ -1,6 +1,6 @@
 //! 追加式真相源端口 + JSONL 默认实现（先落盘后 apply；schema 只加字段+default）。
 //!
-//! feature 门 `journal`（绑 serde+serde_json）。契约要点：
+//! feature 门 `journal`（绑 serde+serde_json+契约 crate skeleton——JournalPort 兑现面）。契约要点：
 //! - **先落盘后 apply**：`append` 契约 Err ⇒ 调用方禁 apply 该 Action；
 //! - **单写者**：本件无跨进程锁，双进程挂载同一账本=交错损坏——多进程场景上层编排；
 //! - **flush 点=持久点**：BufWriter 缓冲非逐行 flush；读侧可见性=已 flush 前缀；
@@ -28,23 +28,33 @@ use serde::Serialize;
 /// 写缓冲容量（64KiB，禁逐行 flush）。
 const WRITE_BUF: usize = 64 * 1024;
 
+/// 账本错误（fail-visible 面：Display 含路径/行号，`source` 链保源头）。
 #[derive(Debug)]
 pub enum JournalError {
     /// 底层 IO 失败（含 create 撞已存在文件：kind=AlreadyExists）。携带目标文件
     /// 路径（多账本进程里「哪个文件撞了」不靠猜）。
     Io {
+        /// 目标账本文件路径。
         path: PathBuf,
+        /// 底层 io 错误。
         source: std::io::Error,
     },
     /// 序列化失败（先序列化后写，失败不产生残行）。
     Serialize(serde_json::Error),
     /// 文件中部畸形行（行号从 1 起；尾部残行由 open 截断，不经此路径）。
     Corrupt {
+        /// 畸形行行号（从 1 起）。
         line: u64,
+        /// 反序列化失败源头。
         source: serde_json::Error,
     },
     /// 版本头与期望不符。
-    VersionMismatch { found: u32, expected: u32 },
+    VersionMismatch {
+        /// 文件头实际版本。
+        found: u32,
+        /// 调用方期望版本。
+        expected: u32,
+    },
 }
 
 impl fmt::Display for JournalError {
@@ -83,13 +93,16 @@ impl From<serde_json::Error> for JournalError {
     }
 }
 
+/// 回放迭代器错误（逐行懒解析的失败面）。
 #[derive(Debug)]
 pub enum ReplayError {
     /// 底层 IO 失败。
     Io(std::io::Error),
     /// 畸形 JSON 行（行号从 1 起，fail-closed 禁静默跳过）。
     Corrupt {
+        /// 畸形行行号（从 1 起）。
         line: u64,
+        /// 反序列化失败源头。
         source: serde_json::Error,
     },
 }
@@ -449,6 +462,61 @@ where
             _anchor: PhantomData,
         })
     }
+}
+
+/// 契约端口兑现：`skeleton::JournalPort`（零依赖端口，后端自换的稳定面）。
+///
+/// 后端自换路径：宿主面向 `skeleton::JournalPort` 三方法编程，换后端=另实现
+/// 该端口（内存账本/SQLite/网络皆可，序列化词表自选）；本件为 JSONL 参考实现。
+/// 本 crate 的 [`Journal`] trait 是全功能面（[`Replay`] 懒回放逐行解析，
+/// 不物化 Vec）——宿主要增量流式恢复用 [`Journal`]，要端口可换性用
+/// `JournalPort`。
+impl<A, S> skeleton::JournalPort<A, S> for JsonlJournal
+where
+    A: Serialize + DeserializeOwned,
+    S: Serialize + DeserializeOwned,
+{
+    type Err = JournalError;
+
+    fn append(&mut self, action: &A) -> Result<(), JournalError> {
+        Journal::<A, S>::append(self, action)
+    }
+
+    fn snapshot(&mut self, state: &S) -> Result<(), JournalError> {
+        Journal::<A, S>::snapshot(self, state)
+    }
+
+    fn restore(&self) -> Result<skeleton::Restore<S, A>, JournalError> {
+        match Journal::<A, S>::restore(self)? {
+            Some((state, replay)) => {
+                Ok(skeleton::Restore::FromSnapshot(state, collect_replay(&self.path, replay)?))
+            }
+            // 无快照行：全量动作流自 initial 起播；零动作=空账本
+            None => {
+                let actions = collect_replay(&self.path, Journal::<A, S>::replay(self)?)?;
+                if actions.is_empty() {
+                    Ok(skeleton::Restore::Empty)
+                } else {
+                    Ok(skeleton::Restore::FromInitial(actions))
+                }
+            }
+        }
+    }
+}
+
+/// 回放收编（懒迭代器 → Vec；错误如实上抛，Io 补路径）。
+fn collect_replay<A: DeserializeOwned>(
+    path: &Path,
+    replay: Replay<'_, A>,
+) -> Result<Vec<A>, JournalError> {
+    replay
+        .map(|a| {
+            a.map_err(|e| match e {
+                ReplayError::Io(source) => JournalError::Io { path: path.to_path_buf(), source },
+                ReplayError::Corrupt { line, source } => JournalError::Corrupt { line, source },
+            })
+        })
+        .collect()
 }
 
 /// 回放迭代器：Item=`Result<A, ReplayError>`；跳过面=未知 "t" tag 行与快照行

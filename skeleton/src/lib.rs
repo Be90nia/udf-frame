@@ -1,7 +1,7 @@
 //! 最小单向数据流（UDF / Elm 式架构）骨架——**契约层**。
 //!
 //! 本 crate 只承载「约束后面代码长法的形状」：trait（谁变形 / 谁解释 / 谁存储 /
-//! 谁呈现 / 什么算一个 store）、数据词汇（Effect/EffectBuf/EffectId/ActionSender/
+//! 谁呈现 / 谁持久化 / 什么算一个 store）、数据词汇（Effect/EffectBuf/EffectId/ActionSender/
 //! Subscription/NoFx）与语义契约文本（各 trait 文档中的承诺）。零
 //! `[dependencies]`——核心无 IO/运行时依赖，reducer「禁 IO」从评审约束升级为
 //! 编译期不可能。
@@ -19,6 +19,7 @@
 //! | 谁存储 | [`Store`]（[`Store::snapshot`] 取值语义快照） |
 //! | 谁消费 | [`Driver::render`] 下行呈现；[`Subscription`] 订阅票据收变更通知 |
 //! | 效果从哪出 | [`Effect::Run`] 描述值 → [`EffectRuntime::run`] 解释，经 [`ActionSender`] 回灌闭环 |
+//! | 谁持久化 | [`JournalPort`] 端口（后端自换；参考实现 `skeleton_infra::journal::JsonlJournal`） |
 //!
 //! # 契约即可实现（toy 最小环）
 //!
@@ -313,6 +314,19 @@ impl<S> Drop for Subscription<S> {
 
 /// 下行呈现端口（单向输出）：两职责两成员——上行通道一条（bind）、呈现入口
 /// 一条（render），签名里没有平台类型，无第三成员的位置。
+///
+/// # 宿主主循环接缝
+///
+/// Driver 是宿主主循环与 store 之间的接缝，**驱动权在宿主**：本 crate 不拥有
+/// 循环，宿主在自己的循环里反复「[`Self::render`] 最新状态 → 经 [`Self::bind`]
+/// 得到的句柄 [`ActionSender::dispatch`] 输入」（headless 无循环亦无碍，本端口
+/// 可不用）。两种典型宿主形态：
+///
+/// - **帧循环宿主**（如 Unity 每帧 Update step）：一帧一拍——`driver.render(&state);`
+///   刷新画面，随后把本帧输入 `sender.dispatch(input)` 上行，下一帧见新状态。
+/// - **事件循环宿主**（tokio select 每唤醒 step）：一事件一拍——select 命中
+///   时 `driver.render(&store.snapshot())` 刷新呈现，效果回灌由解释器持句柄
+///   异步入队。
 pub trait Driver<S, A> {
     /// 唯一上行通道
     fn bind(&mut self, sender: ActionSender<A>);
@@ -394,6 +408,74 @@ pub trait Store {
     fn close(&self);
     /// 停机闸状态。
     fn is_closed(&self) -> bool;
+}
+
+/// 状态持久化端口（框架留口、后端自换）：快照持久化 + 动作追加 + 恢复的
+/// 最小面。真相源「在后端怎么存」完全委托给实现方——JSONL/SQLite/网络皆可，
+/// 序列化词表由实现自选，本 crate 不绑格式（零依赖纪律）。参考实现：
+/// `skeleton_infra::journal::JsonlJournal`（`journal` feature）。
+///
+/// # 语义契约（实现必须兑现）
+///
+/// 1. **先落盘后 apply**：[`Self::append`] 返回 `Err` ⇒ 调用方禁 apply 该
+///    action——内存态永不领先已持久前缀。
+/// 2. **恢复完备**：[`Self::restore`] 返回三态 [`Restore`]，调用方按其语义
+///    重建当前态——`Empty` 取 [`Reducer::initial`] 零 apply；`FromInitial`
+///    自 initial 起按序 apply 全量动作；`FromSnapshot` 自快照态起按序
+///    apply 增量动作。
+/// 3. **fail-visible**：持久化失败如实 `Err`，禁静默丢弃——静默丢 action =
+///    真相源丢史。
+/// 4. **单写者**：本端口不设跨进程锁；多进程挂载同一账本的编排归上层。
+///
+/// # Examples
+///
+/// 后端自换即实现本 trait——一个内存账本（无任何序列化依赖）同样合法：
+///
+/// ```
+/// use skeleton::{JournalPort, Restore};
+///
+/// struct MemJournal {
+///     applied: Vec<String>,
+/// }
+///
+/// impl JournalPort<String, u64> for MemJournal {
+///     type Err = std::convert::Infallible;
+///     fn append(&mut self, action: &String) -> Result<(), Self::Err> {
+///         self.applied.push(action.clone());
+///         Ok(())
+///     }
+///     fn snapshot(&mut self, _state: &u64) -> Result<(), Self::Err> {
+///         Ok(()) // 快照可选：真相源恒为动作流
+///     }
+///     fn restore(&self) -> Result<Restore<u64, String>, Self::Err> {
+///         Ok(Restore::FromInitial(self.applied.clone())) // 无快照：自 initial 全量播
+///     }
+/// }
+///
+/// let mut j = MemJournal { applied: Vec::new() };
+/// j.append(&"inc".to_string()).unwrap();
+/// assert_eq!(j.restore().unwrap(), Restore::FromInitial(vec!["inc".to_string()]));
+/// ```
+pub trait JournalPort<A, S> {
+    /// 持久化失败类型（实现方定义；`Err` ⇒ 契约①「先落盘后 apply」生效）。
+    type Err;
+    /// 动作追加（真相源的增量单位）。
+    fn append(&mut self, action: &A) -> Result<(), Self::Err>;
+    /// 快照持久化（加速恢复的可选位；真相源恒为动作流）。
+    fn snapshot(&mut self, state: &S) -> Result<(), Self::Err>;
+    /// 恢复：三态 [`Restore`]，调用方按其语义重建当前态。
+    fn restore(&self) -> Result<Restore<S, A>, Self::Err>;
+}
+
+/// 恢复点三态（互斥态进类型，无双 `Option` 同义形）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Restore<S, A> {
+    /// 空账本：取 [`Reducer::initial`]，零 apply。
+    Empty,
+    /// 无快照行：自 [`Reducer::initial`] 起按序 apply 全量动作。
+    FromInitial(Vec<A>),
+    /// 有快照：自快照态起按序 apply 增量动作。
+    FromSnapshot(S, Vec<A>),
 }
 
 #[cfg(test)]

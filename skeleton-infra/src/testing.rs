@@ -108,6 +108,7 @@ pub struct ScriptedRuntime<A, Op> {
 }
 
 impl<A, Op> ScriptedRuntime<A, Op> {
+    /// 绑定解释作用域（效果任务在此 spawn；停机面归 `FxScope`）。
     pub fn new(scope: Arc<FxScope>) -> Self {
         Self {
             scope,
@@ -122,6 +123,7 @@ impl<A, Op> ScriptedRuntime<A, Op> {
         self.scripts.extend(scripts);
     }
 
+    /// 作用域读侧（测试收尾 expect_idle 断言用）。
     pub fn scope(&self) -> &Arc<FxScope> {
         &self.scope
     }

@@ -114,6 +114,116 @@ where
     Combine { get, set, wrap, unwrap, child, lift_fx, _slices: PhantomData }
 }
 
+/// 组合宏：从切片表达式生成六闭包，收口 [`combine`] 的 12 泛型参手写。
+///
+/// 两形态：
+///
+/// - **变体短形态**：`枚举::变体` 一体生成 wrap/unwrap（unwrap 自 `&PA` 克隆
+///   上浮，要求子 action `Clone`）；`lift` 省略 = 零效果上提——零效果词表
+///   （`Infallible`）用短形态正合适；非零效果词表省略 `lift` = 子效果静默
+///   丢弃，组合根必须自知（显式 `|_, _| {}` 同义，本宏不另设闸）。
+/// - **显式形态**：`wrap:`/`unwrap:`/`lift:` 逐项显式给——非 Clone 词表与
+///   复杂路由的逃生口，语义与 [`combine`] 函数逐参对应。
+///
+/// 切片表达式限 `状态类型.字段名` 裸段（宏字面限制：泛型/路径状态退回
+/// [`combine`] 显式形态）。产物 `Op` 由采用方返回类型注解钉住（与
+/// [`combine`] 同）；子切片类型与子 reducer 的 `State` 不匹配 = 装配点编译错。
+///
+/// # Examples
+///
+/// 变体短形态，组合面一行（完整分片语义与显式形态见 [`combine`] 的
+/// 父子分片例与 `tests/combine_teststore.rs`）：
+///
+/// ```
+/// use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+/// use skeleton_infra::runtime::SyncStore;
+///
+/// #[derive(Clone, Debug, PartialEq)]
+/// struct Parent { total: u32, child: u32 }
+///
+/// #[derive(Clone, Debug, PartialEq)]
+/// enum PAction { Child(u32), Touch }
+///
+/// struct ChildCounter;
+///
+/// impl Reducer for ChildCounter {
+///     type State = u32;
+///     type Action = u32;
+///     type Op = Infallible;
+///     fn initial(&self) -> u32 { 0 }
+///     fn reduce(&self, s: &u32, a: u32, _out: &mut EffectBuf<u32, Infallible>) -> u32 {
+///         s + a
+///     }
+/// }
+///
+/// fn counter_fragment() -> impl Reducer<State = Parent, Action = PAction, Op = Infallible> {
+///     skeleton_infra::combine!(ChildCounter, Parent.child, PAction::Child)
+/// }
+///
+/// struct ParentFeature;
+///
+/// impl Reducer for ParentFeature {
+///     type State = Parent;
+///     type Action = PAction;
+///     type Op = Infallible;
+///     fn initial(&self) -> Parent { Parent { total: 100, child: 0 } }
+///     fn reduce(&self, s: &Parent, a: PAction, out: &mut EffectBuf<PAction, Infallible>) -> Parent {
+///         match a {
+///             PAction::Child(_) => counter_fragment().reduce(s, a, out),
+///             PAction::Touch => Parent { total: s.total + 1, child: s.child },
+///         }
+///     }
+/// }
+///
+/// let store = SyncStore::new(ParentFeature, NoFx);
+/// store.dispatch(PAction::Child(2)); // unwrap 路由 → 子迁移 → set 写回切片
+/// store.dispatch(PAction::Touch);    // 未路由：本层自理，子切片不动
+/// assert_eq!(*store.snapshot(), Parent { total: 101, child: 2 });
+/// store.close();
+/// ```
+#[macro_export]
+macro_rules! combine {
+    // 变体短形态：wrap/unwrap 由变体构造子一体生成（unwrap 克隆上浮）；
+    // lift 省略 = 零效果上提（委托显式无 lift 臂）
+    ($child:expr, $state:ident . $field:ident, $pa:ident :: $variant:ident
+        $(, lift: $lift:expr $(,)?)?) => {
+        $crate::combine!(
+            $child,
+            $state . $field,
+            wrap: $pa :: $variant,
+            unwrap: |p: &$pa| match p {
+                $pa :: $variant(c) => Some(c.clone()),
+                _ => None,
+            },
+            $(lift: $lift,)?
+        )
+    };
+    // 显式形态（无 lift）：六闭包全生成/收编，lift 固定零效果上提
+    ($child:expr, $state:ident . $field:ident,
+        wrap: $wrap:expr, unwrap: $unwrap:expr $(,)?) => {
+        $crate::compose::combine(
+            |p: &$state| &p.$field,           // get：子切片读镜头
+            |p: &mut $state, c| p.$field = c, // set：子切片写回（c 类型由赋值位钉死）
+            $wrap,
+            $unwrap,
+            $child,
+            |_, _| {},
+        )
+    };
+    // 显式形态（有 lift）：与 combine 函数逐参对应
+    ($child:expr, $state:ident . $field:ident,
+        wrap: $wrap:expr, unwrap: $unwrap:expr, lift: $lift:expr $(,)?) => {
+        $crate::compose::combine(
+            |p: &$state| &p.$field,
+            |p: &mut $state, c| p.$field = c,
+            $wrap,
+            $unwrap,
+            $child,
+            $lift,
+        )
+    };
+}
+
 /// [`combine`] 产物（具名类型，字段私有、只经 [`combine`] 构造）：镜头/路由
 /// 闭包 + 子 reducer + 效果上提闭包，零 dyn 零装箱；六个状态/词表参数与六个
 /// 闭包参数经泛型记名——采用方可用 `Combine<_, _, …>` 注解或别名持有产物，
