@@ -1,8 +1,10 @@
+#![cfg(feature = "runtime")]
 //! panic 变砖（旗守卫+订阅者摘除）与 send 显式失效的回归。
-//! 死 Weak 回收与并发孤儿压力测试需私有态断言，在 src/lib.rs 单测模块
+//! 死 Weak 回收与并发孤儿压力测试需私有态断言，在 src/runtime.rs 单测模块
 //! （不变量监视线程 + 去 barrier 自由竞争）。
 
-use skeleton::{ActionSender, Effect, EffectBuf, EffectRuntime, Reducer, Store};
+use skeleton::{ActionSender, Effect, EffectBuf, EffectRuntime, Reducer, Store as _};
+use skeleton_infra::runtime::SyncStore as Store;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -108,10 +110,10 @@ fn subscriber_panic_removed_and_store_survives() {
 fn send_reports_delivery_explicitly() {
     let store = Store::new(Counting, Nop::<Act> { _m: PhantomData });
     let sender = store.sender();
-    assert!(sender.send(Act::Inc));
+    assert!(sender.dispatch(Act::Inc));
     assert_eq!(*store.snapshot(), 1, "回灌已入队并排空");
     drop(store);
-    assert!(!sender.send(Act::Inc), "store 丢弃后 send 必须显式返回 false");
+    assert!(!sender.dispatch(Act::Inc), "store 丢弃后 dispatch 必须显式返回 false");
 }
 
 /// close 对并发 push 的

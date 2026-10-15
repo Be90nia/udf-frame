@@ -5,22 +5,24 @@ edition = "2021"
 description = "Standard-library adapters for the skeleton UDF core: tokio effect runtime, serde journal, bounded registry, testing harness"
 license = "MIT"
 
-# default = [] 显式落，零 feature = 零依赖（cargo tree 单行证明）。
-# 引用不存在的 optional dep 会 manifest error，故 feature 不预声明；
-# memgov 零外部依赖；journal 绑 serde/serde_json；tokio 绑 fx。
+# default = ["runtime"]：契约参考实现 SyncStore 随默认 feature 可用（拍板点②）。
+# runtime 只依赖姊妹契约 crate skeleton（workspace path，非三方）——cargo tree
+# 零三方增量证明口径不变。journal 绑 serde/serde_json；tokio 绑 fx。
 [features]
-default = []
+default = ["runtime"]
+runtime = ["dep:skeleton"]
 memgov = []
 journal = ["dep:serde", "dep:serde_json"]
 tokio = ["dep:tokio"]
-# testing：测试替身需要 fx 底座。skeleton 走本 feature 门控而非全局依赖——
-# 守「零 feature = 零依赖」的 cargo tree 证明。
-testing = ["tokio", "dep:skeleton"]
+# testing：测试替身（TestStore 走 SyncStore + fx 底座）。runtime 连带启用
+# skeleton 依赖——「零三方依赖」cargo tree 证明不受影响。
+testing = ["tokio", "runtime"]
 log = ["dep:log", "dep:tracing", "dep:tracing-subscriber", "dep:tracing-log"]
 # tracing：骨架审计事件流 → tracing 桥。tokio/log 先例形态——feature 门控依赖，
-# 核心 skeleton crate 零依赖不破（cargo tree -p skeleton 单行证明照常成立；
-# 桥在本层消费审计事件值面）。
-tracing = ["dep:tracing", "dep:tracing-subscriber", "dep:skeleton"]
+# 桥在审计值面（crate::audit）上消费，skeleton 契约依赖经 runtime 带入。
+tracing = ["runtime", "dep:tracing", "dep:tracing-subscriber"]
+# compose：父子分片组合器（combine/Combine；宏另批）。只需契约词汇。
+compose = ["dep:skeleton"]
 
 [dependencies]
 # testing 域绑核心 EffectRuntime/ActionSender/Effect；optional=true 由
@@ -57,13 +59,33 @@ large_types_passed_by_value = "warn"
 disallowed_methods = "warn"
 
 # 端到端小例：五件套+combine+TestStore+fx/journal 解释器标准形
-#（--all-features 测试步顺带编译，feature 不全时跳过）。
+#（--all-features 测试步顺带编译，feature 不全时跳过；combine 走 compose 域）。
 [[example]]
 name = "end_to_end"
-required-features = ["tokio", "journal", "testing"]
+required-features = ["tokio", "journal", "testing", "compose"]
 
 # 多维实测数据采集器（评测基建非产品面，核心壳测量只需 memgov 计数分配器
 # + testing feature 的 skeleton 依赖）。
 [[example]]
 name = "multidim_eval"
 required-features = ["memgov", "testing"]
+
+# 快起最小环（README 快起段的可运行原件；runtime 默认 feature 已含）。
+[[example]]
+name = "quickstart"
+required-features = ["runtime"]
+
+# 订阅断言 + Emit 回灌链（撤销计数器）。
+[[example]]
+name = "counter_local_runtime"
+required-features = ["runtime"]
+
+# dispatch 热路径分段归因基准（性能锚：end_to_end_dispatch ≤100ns）。
+[[example]]
+name = "dispatch_profile"
+required-features = ["runtime"]
+
+# Driver 端口两职责（bind 上行 / render 呈现）。
+[[example]]
+name = "driver_tour"
+required-features = ["runtime"]

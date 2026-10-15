@@ -5,7 +5,8 @@
 //! 量级不看个位数。段清单对应契约：闸检查 / queue push / drain 循环内 reduce dyn、
 //! 快照 Arc::new / notify 段（notify_slots 锁+遍历）/ EffectBuf take-还 / back 克隆。
 
-use skeleton::{Effect, EffectBuf, EffectRuntime, Reducer, Store};
+use skeleton::{Effect, EffectBuf, EffectRuntime, Reducer, Store as _};
+use skeleton_infra::runtime::SyncStore as Store;
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::convert::Infallible;

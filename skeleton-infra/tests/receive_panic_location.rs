@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 //! `TestStore::receive`
 //! 的效果断言 panic 必须指采用方调用点（`#[track_caller]`），而非库内 assert 站
 //! （src/lib.rs）——报错定位与 IDE 跳转价值。
@@ -7,7 +8,8 @@
 //! 匹配本文件期望行号的记录」收敛，不受并发记录干扰。两个 panic 点各一：
 //! 队列空（no effect produced）与变体不符（effect mismatch）。
 
-use skeleton::{Effect, EffectBuf, EffectId, ExpectedEffect, Reducer, TestStore};
+use skeleton::{Effect, EffectBuf, EffectId, Reducer};
+use skeleton_infra::testing::{ExpectedEffect, TestStore};
 use std::convert::Infallible;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::channel;
@@ -62,7 +64,7 @@ fn receive_panic_reports_caller_location() {
     // 点 1：队列空断言（零效果 reducer → receive 弹空队列 → panic）
     let empty_line = {
         let mut ts = TestStore::new(QuietFeature);
-        ts.send(Msg::Inc);
+        ts.dispatch(Msg::Inc);
         let line = line!() + 1;
         let _ = catch_unwind(AssertUnwindSafe(|| ts.receive(ExpectedEffect::Cancel { id: None })));
         line
@@ -71,7 +73,7 @@ fn receive_panic_reports_caller_location() {
     // 点 2：变体不符（期望 Cancel 实际 Run { op: 7 } → mismatch panic）
     let mismatch_line = {
         let mut ts = TestStore::new(NotifyFeature);
-        ts.send(Msg::Inc);
+        ts.dispatch(Msg::Inc);
         let line = line!() + 1;
         let _ = catch_unwind(AssertUnwindSafe(|| ts.receive(ExpectedEffect::Cancel { id: None })));
         line

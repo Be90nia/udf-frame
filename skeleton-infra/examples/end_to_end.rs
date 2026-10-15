@@ -1,17 +1,17 @@
 //! 端到端小例：核心五件套 + `combine` + `TestStore`
 //! + fx/journal 解释器标准形——采用方起步链路的可运行样本。
 //!
-//! 跑法：`cargo run -p skeleton-infra --features tokio,journal,testing --example end_to_end`
+//! 跑法：`cargo run -p skeleton-infra --features tokio,journal,testing,compose --example end_to_end`
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use skeleton::{
-    combine, ActionSender, Driver, Effect, EffectBuf, EffectId, EffectRuntime, ExpectedEffect,
-    Reducer, Store, TestStore,
-};
+use skeleton::{ActionSender, Driver, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
+use skeleton_infra::compose::combine;
+use skeleton_infra::runtime::SyncStore as Store;
+use skeleton_infra::testing::{ExpectedEffect, TestStore};
 use skeleton_infra::{expect_idle, Journal, JsonlJournal, FxScope, Spawned};
 
 // ---- 领域：父 Board 挂一个 Tally 子 feature（combine 显式结构）----
@@ -125,13 +125,13 @@ impl Reducer for BoardFeature {
 
 fn test_store_face() {
     let mut ts = TestStore::new(BoardFeature);
-    ts.send(BoardAct::Tally(TallyAct::Increment(2)));
+    ts.dispatch(BoardAct::Tally(TallyAct::Increment(2)));
     // 效果回填断言：id: None = 不校验寻址 id（同义恒同值纪律见 TestStore 文档）
     ts.receive(ExpectedEffect::Run { id: None, op: BoardFx::Tally(TallyFx::Notify(2)) });
     assert_eq!(ts.state().tally.count, 2);
-    ts.send(BoardAct::Tally(TallyAct::Notified(2)));
+    ts.dispatch(BoardAct::Tally(TallyAct::Notified(2)));
     assert_eq!(ts.state().tally.last_notified, Some(2));
-    println!("[1/2] TestStore 验收面：send/receive/state 全过");
+    println!("[1/2] TestStore 验收面：dispatch/receive/state 全过");
 }
 
 // ---- 第二半：真 Store + fx/journal 解释器标准形（端到端环）----
@@ -169,7 +169,7 @@ impl EffectRuntime<BoardAct, BoardFx> for HostRuntime {
                 )
                 .is_ok();
                 assert!(appended, "journal append failed: refusing to re-enter (fail-closed)");
-                assert!(back.send(next), "store closed: re-entry rejected");
+                assert!(back.dispatch(next), "store closed: re-entry rejected");
             })
             .expect("scope open");
         self.pending.lock().expect("pending poisoned").push(handle);

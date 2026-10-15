@@ -2,7 +2,8 @@
 //! 零效果最小环，`Op = Infallible` 使 `Effect::Run` 编译期不可构造。
 //! 效果解释器直接配框架缺省件 `NoFx`——零手写空运行时样板。
 
-use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store};
+use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+use skeleton_infra::runtime::SyncStore as Store;
 
 #[derive(Clone)]
 struct Count(u32);

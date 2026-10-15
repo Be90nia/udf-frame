@@ -1,3 +1,4 @@
+#![cfg(all(feature = "runtime", feature = "compose"))]
 //! 公共 API 面回归。
 //!
 //! 覆盖：`Infallible` 根再导出 / `NoFx` 零效果缺省件 /
@@ -13,7 +14,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use skeleton::{Combine, EffectBuf, Infallible, NoFx, Reducer, Store};
+use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+use skeleton_infra::compose::{combine, Combine};
+use skeleton_infra::runtime::SyncStore as Store;
 
 // ── 共用根件：零效果计数器 ─────────────────────────────────────────────
 
@@ -134,7 +137,7 @@ where
 #[test]
 #[allow(clippy::type_complexity)] // 卡点 7 验收物本身：具名 12 参注解（6 泛型+6 闭包）可写出即卡点的证明，复杂度是特性不是坏味道
 fn combine_product_is_nameable_and_reducible() {
-    let shard: Combine<_, _, Infallible, _, _, Infallible, _, _, _, _, _, _> = skeleton::combine(
+    let shard: Combine<_, _, Infallible, _, _, Infallible, _, _, _, _, _, _> = combine(
         |s: &ParentState| &s.child,
         |s: &mut ParentState, v: i32| s.child = v,
         |ca: ChildAction| ParentAction::FromChild(ca),

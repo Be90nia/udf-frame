@@ -159,7 +159,8 @@ mod skeleton_alloc_twin {
     use std::hint::black_box;
 
     use super::*;
-    use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store};
+    use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
+    use skeleton_infra::runtime::SyncStore as Store;
 
     enum Bump {
         Bump,

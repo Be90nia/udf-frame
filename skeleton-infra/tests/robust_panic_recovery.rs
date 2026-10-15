@@ -1,10 +1,12 @@
+#![cfg(feature = "runtime")]
 //! 健壮性修复回归：解释器 panic / S::Clone panic / 效果吞没 / 回灌活锁四景。
 //!
 //! - 解释器 panic、效果续转、回灌预算三测为红测转绿（修复前必败）；
 //! - S::Clone 锁内 panic 为文档化显式契约（必须 panic-free，违者实例报废），
 //!   行为前后不变——本测为契约金丝，钉死「报废」语义防未来漂移。
 
-use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store};
+use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
+use skeleton_infra::runtime::SyncStore as Store;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -266,7 +268,7 @@ fn self_emit_feedback_livelock_budget_trips() {
 
 // ── 解释器 back 通道回灌绕预算 ─────────────────────────────────────────
 // 复现配方：reducer 对每个 action 产 Run 效果，解释器 run 内无条件
-// back.send(...)——同栈回灌曾以 External 标签入队、深度每次清零，预算永不
+// back.dispatch(...)——同栈回灌曾以 External 标签入队、深度每次清零，预算永不
 // 触发，dispatch 永挂且 feedback_budget_exceeded 恒 0（无任何计数留痕）。
 
 /// Spin 走 Run 效果载荷（解释器回灌），Bump 为外部流量探针。
@@ -306,7 +308,7 @@ struct BackSpinFx;
 impl EffectRuntime<LoopbackAction, LoopbackOp> for BackSpinFx {
     fn run(&mut self, effect: Effect<LoopbackAction, LoopbackOp>, back: &ActionSender<LoopbackAction>) {
         if let Effect::Run { .. } = effect {
-            let _ = back.send(LoopbackAction::Spin);
+            let _ = back.dispatch(LoopbackAction::Spin);
         }
     }
 }
@@ -383,7 +385,7 @@ impl EffectRuntime<LoopbackAction, LoopbackOp> for NestedThenSpin {
     fn run(&mut self, effect: Effect<LoopbackAction, LoopbackOp>, back: &ActionSender<LoopbackAction>) {
         if let Effect::Run { .. } = effect {
             self.b.dispatch(1); // 嵌套排空 B（同线程，A 的深度账在途）
-            let _ = back.send(LoopbackAction::Spin);
+            let _ = back.dispatch(LoopbackAction::Spin);
         }
     }
 }

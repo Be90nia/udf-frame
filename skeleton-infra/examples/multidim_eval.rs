@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use skeleton::{ActionSender, Effect, EffectBuf, EffectRuntime, Reducer, Store};
+use skeleton::{ActionSender, Effect, EffectBuf, EffectRuntime, Reducer, Store as _};
+use skeleton_infra::runtime::SyncStore as Store;
 use skeleton_infra::memgov::CountingAllocator;
 
 #[global_allocator]
@@ -402,7 +403,7 @@ fn concurrency_storm() {
         let sender = store.sender();
         let mut send_rejected = 0;
         for _ in 0..10 {
-            if !sender.send(()) {
+            if !sender.dispatch(()) {
                 send_rejected += 1;
             }
         }

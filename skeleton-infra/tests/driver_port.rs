@@ -1,3 +1,4 @@
+#![cfg(feature = "runtime")]
 //! Driver 端口行为验收。
 //!
 //! 端口契约（MVI 单输出，两职责两成员）：
@@ -9,7 +10,8 @@
 
 use std::convert::Infallible;
 
-use skeleton::{ActionSender, Driver, Effect, EffectBuf, EffectRuntime, Reducer, Store};
+use skeleton::{ActionSender, Driver, Effect, EffectBuf, EffectRuntime, Reducer, Store as _};
+use skeleton_infra::runtime::SyncStore as Store;
 
 enum Msg {
     Bump,
@@ -71,6 +73,6 @@ fn driver_bind_closes_event_loop_and_render_frames_track_state() {
 
     // 事件源经 bind 交付的句柄回灌——上行通道闭环推进 store
     let sender = driver.sender.take().expect("bind 必须交付上行句柄");
-    assert!(sender.send(Msg::Bump), "bind 交付的句柄必须可回灌");
+    assert!(sender.dispatch(Msg::Bump), "bind 交付的句柄必须可回灌");
     assert_eq!(*store.snapshot(), 3, "事件源回灌推进 store（闭环成立）");
 }

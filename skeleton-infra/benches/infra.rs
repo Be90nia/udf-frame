@@ -12,8 +12,9 @@ use std::path::Path;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use serde::{Deserialize, Serialize};
 
-use skeleton::Effect;
+use skeleton::{Effect, Store as _};
 use skeleton_infra::fx::FxScope;
+use skeleton_infra::runtime::SyncStore;
 use skeleton_infra::memgov::CountingAllocator;
 use skeleton_infra::{Journal, JournalError, JsonlJournal};
 
@@ -54,7 +55,7 @@ impl skeleton::EffectRuntime<Act, Beep> for Sink {
 }
 
 fn effect_steady_state(c: &mut Criterion) {
-    let store = skeleton::Store::new(Producer, Sink);
+    let store = SyncStore::new(Producer, Sink);
     // 预热：队列/EffectBuf/通知缓冲到稳态容量（此后 dispatch 恒复用）。
     for _ in 0..1_000u64 {
         store.dispatch(Act::Tick);

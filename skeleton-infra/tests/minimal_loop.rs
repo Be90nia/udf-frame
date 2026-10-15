@@ -1,7 +1,9 @@
+#![cfg(feature = "runtime")]
 //! 最小运转环验收：
 //! Op = Infallible 的零效果程序，编译期证明 Run 不可构造（Cancel 恒可构造、无注册时空转）。
 
-use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store};
+use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
+use skeleton_infra::runtime::SyncStore as Store;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

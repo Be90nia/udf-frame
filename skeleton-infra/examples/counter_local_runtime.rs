@@ -5,7 +5,8 @@
 //! 2. 订阅者：记录每次通知的 count，断言每次状态变更都到达、终值正确
 //! 3. Emit 回灌：Undo 触发 reducer 内派生 Replay(-d) 后续 Action——链长有界（Undo→Replay 即止，Replay 不再产出效果，不成环）
 
-use skeleton::{Effect, EffectBuf, NoFx, Reducer, Store};
+use skeleton::{Effect, EffectBuf, NoFx, Reducer, Store as _};
+use skeleton_infra::runtime::SyncStore as Store;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 

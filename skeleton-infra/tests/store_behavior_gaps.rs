@@ -1,3 +1,4 @@
+#![cfg(all(feature = "runtime", feature = "compose"))]
 //! Store/combine 行为面补测。每测守一条可观察契约；共享收集走 mpsc channel +
 //! 原子量——测试零锁零毒化面。
 
@@ -7,9 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use skeleton::{
-    combine, ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, ExpectedEffect, Reducer,
-    Store, TestStore,
+    ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _,
 };
+use skeleton_infra::compose::combine;
+use skeleton_infra::runtime::SyncStore as Store;
+use skeleton_infra::testing::{ExpectedEffect, TestStore};
 
 // ── 小固定装置：计数器（订阅/并发/send/重入面共用）────────────────────────
 
@@ -151,7 +154,7 @@ where
 #[test]
 fn combine_child_emitted_action_wraps_and_reenters_parent() {
     let mut ts = TestStore::new(Root { fragment: fragment() });
-    ts.send(ParentAct::Child(ChildAct::EmitSelf));
+    ts.dispatch(ParentAct::Child(ChildAct::EmitSelf));
     assert_eq!(ts.state().child, 2, "子产 Emit 必须经 wrap 上浮回灌：+1+1");
     // Emit 不留效果队列：receive 空队必 panic，且 panic 文案必须是「无效果」
     let leaked = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -178,7 +181,7 @@ fn combine_child_emitted_action_wraps_and_reenters_parent() {
 #[test]
 fn combine_child_cancel_lifts_through_lift_fx() {
     let mut ts = TestStore::new(Root { fragment: fragment() });
-    ts.send(ParentAct::Child(ChildAct::Abort));
+    ts.dispatch(ParentAct::Child(ChildAct::Abort));
     ts.receive(ExpectedEffect::Cancel { id: Some(EffectId(9)) });
     assert_eq!(ts.state().child, 1, "子切片照常迁移（Cancel 上提不改迁移）");
 }
@@ -196,7 +199,7 @@ impl EffectRuntime<Msg, Infallible> for ReentryFx {
     fn run(&mut self, _: Effect<Msg, Infallible>, back: &ActionSender<Msg>) {
         if !self.fired {
             self.fired = true;
-            self.accepted.store(back.send(Msg::Bonus), Ordering::SeqCst);
+            self.accepted.store(back.dispatch(Msg::Bonus), Ordering::SeqCst);
         }
     }
 }
@@ -213,7 +216,7 @@ fn interpreter_backchannel_reentry_drains_to_idle_within_outer_dispatch() {
         let _ = tx.send(*s);
     });
     store.dispatch(Msg::Ping);
-    assert!(accepted.load(Ordering::SeqCst), "排空中的重入 send 必须被接受（true）");
+    assert!(accepted.load(Ordering::SeqCst), "排空中的重入 dispatch 必须被接受（true）");
     assert_eq!(*store.snapshot(), 11, "回灌由同一排空循环执行至 idle");
     assert_eq!(store.pending_actions(), 0, "dispatch 返回即队列空");
     assert_eq!(
@@ -272,7 +275,7 @@ fn shared_sender_concurrent_send_delivers_every_action() {
         let sender = sender.clone();
         joins.push(std::thread::spawn(move || {
             for _ in 0..2500 {
-                assert!(sender.send(Msg::Bump), "未闭门 send 必须返回 true");
+                assert!(sender.dispatch(Msg::Bump), "未闭门 dispatch 必须返回 true");
             }
         }));
     }
@@ -291,7 +294,7 @@ fn sender_clones_deliver_to_the_same_store() {
     let a = store.sender();
     let b = store.sender();
     let c = a.clone();
-    assert!(a.send(Msg::Bump) && b.send(Msg::Bump) && c.send(Msg::Bump));
+    assert!(a.dispatch(Msg::Bump) && b.dispatch(Msg::Bump) && c.dispatch(Msg::Bump));
     assert_eq!(*store.snapshot(), 3, "三个克隆句柄驱动同一 store");
 }
 

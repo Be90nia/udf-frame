@@ -1,14 +1,16 @@
 //! 骨架审计事件流 → tracing 桥。
 //!
 //! 核心零原生输出、宿主无库内 hook/span 可挂——收口形态：核心出审计事件流
-//! （[`skeleton::Store::subscribe_events`]），本桥一行接线把每事件转
+//! （[`crate::runtime::SyncStore::subscribe_events`]），本桥一行接线把每事件转
 //! `tracing::event!`（target `skeleton::audit`，INFO 级）。核心 crate 保持零
-//! 依赖：桥在本层持 tracing/skeleton 依赖（feature 门控，tokio/log 先例形态）。
+//! 依赖：桥在本层持 tracing 依赖（feature 门控，tokio/log 先例形态）；审计值面
+//! 在本 crate `audit` 域，实现走 `runtime::SyncStore`。
 //!
 //! # Examples
 //!
 //! ```
-//! use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store};
+//! use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+//! use skeleton_infra::runtime::SyncStore;
 //! use skeleton_infra::tracingx;
 //!
 //! struct Step;
@@ -20,25 +22,26 @@
 //!     fn reduce(&self, s: &u32, _a: u32, _o: &mut EffectBuf<u32>) -> u32 { s + 1 }
 //! }
 //!
-//! let store = Store::new(Step, NoFx);
+//! let store = SyncStore::new(Step, NoFx);
 //! let _ticket = tracingx::bridge_events_to_tracing(&store, 64);
 //! store.dispatch(1); // → tracing::event!（target "skeleton::audit"）
 //! # store.close();
 //! ```
 
-use skeleton::{AuditEvent, AuditEventKind, AuditTicket, Store};
+use crate::audit::{AuditEvent, AuditEventKind, AuditTicket};
+use crate::runtime::SyncStore;
 
 /// 把 `store` 的审计事件流桥接到 tracing：每事件一条 `tracing::event!`
 /// （target `skeleton::audit`，INFO 级），字段 `seq`（单调序号）/ `kind`
 /// （生命周期节点名）/ `depth`（仅 Enqueued 事件携带回灌深度）。
-/// `capacity` 语义同 [`skeleton::Store::subscribe_events`]；返回票据 Drop =
+/// `capacity` 语义同 [`SyncStore::subscribe_events`]；返回票据 Drop =
 /// 停桥（零开销恢复）。
 pub fn bridge_events_to_tracing<
     S: Clone + Send + Sync + 'static,
     A: Send + 'static,
     Op: Send + 'static,
 >(
-    store: &Store<S, A, Op>,
+    store: &SyncStore<S, A, Op>,
     capacity: usize,
 ) -> AuditTicket {
     store.subscribe_events(capacity, emit)
@@ -83,7 +86,8 @@ fn emit(event: &AuditEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skeleton::{ActionSender, Effect, EffectBuf, EffectRuntime, Infallible, NoFx, Reducer};
+    use skeleton::{ActionSender, Effect, EffectBuf, EffectRuntime, Infallible, NoFx, Reducer, Store as _};
+    use crate::runtime::SyncStore as Store;
     use std::sync::{Arc, Mutex};
 
     enum Tick {

@@ -1,13 +1,14 @@
+#![cfg(all(feature = "testing", feature = "compose"))]
 //! combine 组合器 + TestStore 测试面验收。
 //!
 //! 覆盖：combine 段（lift_fx 同形出参）与
 //! TestStore 验收形状（send/receive/state + ExpectedEffect）。
 //! tests 先行（TDD）：先有本文件失败用例，再有 lib.rs 实现。
 
-use skeleton::{
-    combine, ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, ExpectedEffect, Reducer,
-    Store, TestStore,
-};
+use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer};
+use skeleton_infra::compose::combine;
+use skeleton_infra::runtime::SyncStore as Store;
+use skeleton_infra::testing::{ExpectedEffect, TestStore};
 use std::convert::Infallible;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::channel;
@@ -135,7 +136,7 @@ impl Reducer for ParentFeature {
 #[test]
 fn combine_routes_child_action_and_lifts_effect() {
     let mut ts = TestStore::new(ParentFeature);
-    ts.send(ParentAction::Child(ChildAction::Inc));
+    ts.dispatch(ParentAction::Child(ChildAction::Inc));
     assert_eq!(
         ts.state(),
         &ParentState { child: ChildState { count: 1 }, done: false },
@@ -149,8 +150,8 @@ fn combine_routes_child_action_and_lifts_effect() {
 #[test]
 fn combine_unrouted_action_leaves_child_slice() {
     let mut ts = TestStore::new(ParentFeature);
-    ts.send(ParentAction::Child(ChildAction::Inc));
-    ts.send(ParentAction::Finish);
+    ts.dispatch(ParentAction::Child(ChildAction::Inc));
+    ts.dispatch(ParentAction::Finish);
     assert_eq!(ts.state().child.count, 1, "父 action 不路由 → 子切片不动");
     assert!(ts.state().done, "父自有分支自理");
     // FIFO：先清第一条 send 的子效果，再验父自有 Cancel
@@ -174,8 +175,8 @@ fn combine_product_is_fragment_initial_panics() {
 fn teststore_tracks_state_and_effects() {
     let mut ts = TestStore::new(ParentFeature);
     assert_eq!(ts.state().child.count, 0, "new 即 initial 态");
-    ts.send(ParentAction::Child(ChildAction::Inc));
-    ts.send(ParentAction::Child(ChildAction::Inc));
+    ts.dispatch(ParentAction::Child(ChildAction::Inc));
+    ts.dispatch(ParentAction::Child(ChildAction::Inc));
     assert_eq!(ts.state().child.count, 2, "逐动作推进");
     ts.receive(ExpectedEffect::Run { id: None, op: ParentOp::ChildNotify });
     ts.receive(ExpectedEffect::Run { id: None, op: ParentOp::ChildNotify });
@@ -187,7 +188,7 @@ fn teststore_tracks_state_and_effects() {
 #[should_panic(expected = "effect mismatch")]
 fn teststore_receive_op_mismatch_panics() {
     let mut ts = TestStore::new(ParentFeature);
-    ts.send(ParentAction::Child(ChildAction::Inc));
+    ts.dispatch(ParentAction::Child(ChildAction::Inc));
     ts.receive(ExpectedEffect::Run { id: None, op: ParentOp::Audit });
 }
 
@@ -196,7 +197,7 @@ fn teststore_receive_op_mismatch_panics() {
 #[should_panic(expected = "effect mismatch")]
 fn teststore_receive_id_mismatch_panics() {
     let mut ts = TestStore::new(ParentFeature);
-    ts.send(ParentAction::Child(ChildAction::Inc));
+    ts.dispatch(ParentAction::Child(ChildAction::Inc));
     ts.receive(ExpectedEffect::Run { id: Some(EffectId(2)), op: ParentOp::ChildNotify });
 }
 
@@ -205,7 +206,7 @@ fn teststore_receive_id_mismatch_panics() {
 #[should_panic(expected = "no effect")]
 fn teststore_receive_empty_queue_panics() {
     let mut ts: TestStore<u32, LoopAction, Infallible> = TestStore::new(QuietFeature);
-    ts.send(LoopAction::Start);
+    ts.dispatch(LoopAction::Start);
     ts.receive(ExpectedEffect::Cancel { id: None });
 }
 
@@ -215,7 +216,7 @@ fn teststore_receive_empty_queue_panics() {
 #[should_panic(expected = "no effect")]
 fn emit_loopback_never_enters_teststore_effect_queue() {
     let mut ts: TestStore<u32, LoopAction, Infallible> = TestStore::new(LoopOnceFeature);
-    ts.send(LoopAction::Start);
+    ts.dispatch(LoopAction::Start);
     assert_eq!(*ts.state(), 2, "Emit 回灌被排空：两次 reduce");
     ts.receive(ExpectedEffect::Cancel { id: None });
 }
@@ -288,7 +289,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 #[test]
 fn emit_feedback_receive_message_reports_reenqueued_truthfully() {
     let mut ts: TestStore<u32, LoopAction, Infallible> = TestStore::new(LoopOnceFeature);
-    ts.send(LoopAction::Start);
+    ts.dispatch(LoopAction::Start);
     let m = catch_unwind(AssertUnwindSafe(|| {
         ts.receive(ExpectedEffect::Cancel { id: None });
     }))

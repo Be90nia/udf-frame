@@ -3,7 +3,8 @@
 //! ②`render`：唯一呈现入口（render(state) 纪律：状态快照进视图层）。
 //! 核心没有驱动循环——Driver 由宿主调用：状态变更后 render、事件到达后 send。
 
-use skeleton::{ActionSender, Driver, EffectBuf, NoFx, Reducer, Store};
+use skeleton::{ActionSender, Driver, EffectBuf, NoFx, Reducer, Store as _};
+use skeleton_infra::runtime::SyncStore as Store;
 use std::convert::Infallible;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -57,11 +58,11 @@ fn main() {
     driver.render(&store.snapshot());
 
     // ③ 上行：驱动经 bind 到的句柄把外部事件送回 store（模拟 IO 事件到达）
-    let delivered = driver.sender.as_ref().unwrap().send(Msg::Inc);
-    assert!(delivered, "开门状态 send 必须成功");
+    let delivered = driver.sender.as_ref().unwrap().dispatch(Msg::Inc);
+    assert!(delivered, "开门状态 dispatch 必须成功");
     driver.render(&store.snapshot());
 
-    // 帧序自断言：初始 0 → dispatch 后 1 → 回灌 send 后 2
+    // 帧序自断言：初始 0 → dispatch 后 1 → 回灌 dispatch 后 2
     assert_eq!(driver.frames, vec![0, 1, 2]);
     store.close();
     println!("driver tour ok: frames={:?}", driver.frames);
