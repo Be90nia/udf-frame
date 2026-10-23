@@ -21,7 +21,7 @@
 //! | `config-toml` | `load_toml`/`save_toml` 类型化直读直写 + `file_layer_toml`（TOML↔值面翻译；Datetime 层面显式拒；toml 仅此 feature 可达） |
 //! | `tokio` | `fx`：异步并发托管 |
 //! | `log-fs` | `logx` 文件落盘面（纯 std 零三方）：密钥掩码 mask_secrets + 路径解析 DefaultPathResolver（契约 `LogPathResolver` 住 `skeleton::logpath`）+ FileSink 按日滚动 |
-//! | `log` | `logx` 门面绑定层（=`log-fs`+log+tracing+tracing-subscriber+tracing-log）：init 系（init_tracing_from_env/init_with_file 双 sink）+ FileSinkWriter |
+//! | `log` | `logx` 门面绑定层（=`log-fs`+log+tracing+tracing-subscriber+tracing-log）：init 系（init_tracing_from_env/init_with_file 双 sink）+ FileSinkWriter；多通道扇出面（Channel/ChannelSink/ChannelRegistry/ChannelFileSink/PerChannelPathResolver，P1-10-a 前置件） |
 //! | `journal` | `journal`：账本（serde/serde_json 仅此 feature 可达） |
 //! | `testing` | `testing` + `parse_mock`：测试替身（TestStore/脚本化解释器 + 解析面 mock） |
 //! | `memgov` | `memgov`：内存治理 |
@@ -145,6 +145,11 @@ pub use logx::{mask_secrets, DefaultPathResolver, FileSink, HomeDirUnresolvable}
 pub use logx::{
     init_tracing_default, init_tracing_from_env, init_with_file, AlreadyInit, FileSinkWriter,
     LogInitError,
+};
+
+#[cfg(feature = "log")]
+pub use logx::{
+    Channel, ChannelError, ChannelFileSink, ChannelRegistry, ChannelSink, PerChannelPathResolver,
 };
 
 #[cfg(feature = "tracing")]

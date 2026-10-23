@@ -47,6 +47,15 @@
 //! 交错安全，永不改名/截断），每行 flush；写失败=计数+stderr 一次告警+继续
 //!（禁 panic 拖垮业务、禁纯吞）。时间戳与文件名恒 UTC（std 无本地时区 API，
 //! chrono 依赖判否）。
+//!
+//! 多通道扇出面（P1-10-a 前置件，拍板 2026-10-23；`log` feature）：固定三
+//! 通道 [`Channel`]（general/access/dns，封闭枚举=非法通道名在类型层不可
+//! 能）→ 每通道独立 sink（一通道一 sink 禁串扰）+ 独立 level（低于通道级
+//! 在 registry 即滤，不计丢弃）+ 重复注册 fail-visible（原 sink 不动）+
+//! [`ChannelRegistry`] 零分配扇出（未注册通道静默：不输出/不 panic/不分配/
+//! 不计数）+ 掩码唯一布点（`set_secrets`，写前统一过 [`mask_secrets`]）+
+//! 每通道独立落点（[`PerChannelPathResolver`] 通道子目录 +
+//! [`ChannelFileSink`] 组合件）。
 
 use skeleton::logpath::LogPathResolver;
 
@@ -467,6 +476,306 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileSinkWriter {
 
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
+    }
+}
+
+// ── 多通道扇出面（P1-10-a 前置件，拍板 2026-10-23）──
+//
+// general/access/dns 三固定通道；每通道独立 sink + 独立 level + 失败丢弃
+// 可观测；未注册通道 emit 静默（不输出/不 panic/不分配/不计数）。
+//
+// 扇出热路径零堆分配论证：通道查找=枚举判别式数组索引（无 HashMap、无开放
+// 字符串键），命中后 `Arc::clone` 只是引用计数增量（非堆分配），message 以
+// `&str` 直传 sink——掩码表未配置（默认）时 emit 全程零堆分配。配置掩码后
+// 写前统一过 [`mask_secrets`]（唯一布点，坑约束 11：掩码是机制面不是调用方
+// 自觉），掩码本身按其既有语义分配（性能锚见其文档：高频路径宜上游过滤先
+// 行再掩码）——这是掩码的安全成本，不在零分配契约内。
+
+/// 日志通道：固定三枚（框架级命名；Xray 侧映射 general/access/dns 由主仓
+/// 负责）。封闭枚举=非法通道名在类型层不可能，「注册 fail-visible」只剩
+/// 重复注册一臂（[`ChannelError`]），无运行时字符串校验面。
+#[cfg(feature = "log")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Channel {
+    /// 通用/框架日志。
+    General,
+    /// 访问日志。
+    Access,
+    /// DNS 日志。
+    Dns,
+}
+
+#[cfg(feature = "log")]
+impl Channel {
+    /// 通道名（每通道落盘子目录名与诊断文案；固定映射，禁运行时改名）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Access => "access",
+            Self::Dns => "dns",
+        }
+    }
+}
+
+/// 通道注册失败面（fail-visible；静默覆盖=通道日志无声丢失，禁）。
+#[cfg(feature = "log")]
+#[derive(Debug)]
+pub enum ChannelError {
+    /// 同通道已有 sink 时二次注册被拒；原 sink 保持不变。
+    AlreadyRegistered {
+        /// 被拒的通道。
+        channel: Channel,
+    },
+}
+
+#[cfg(feature = "log")]
+impl std::fmt::Display for ChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyRegistered { channel } => write!(
+                f,
+                "channel `{}` already registered (duplicate registration is rejected)",
+                channel.as_str()
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "log")]
+impl std::error::Error for ChannelError {}
+
+/// 通道 sink：一通道一 sink（禁共享文件锁竞争 + 禁级别串扰）。
+///
+/// 失败记账契约：[`ChannelSink::write`] 失败=丢一行，**由 sink 自计数**
+/// （[`ChannelSink::dropped_lines`]）——registry 无从知晓单次写成败（write
+/// 返回 `()`），记账下沉到唯一知道成败的一方。低于 [`ChannelSink::level`]
+/// 的过滤发生在 registry（事件根本不到 sink），**不**计丢弃。实现禁 panic
+///（日志失败拖垮业务是反模式，同 [`FileSink`] 软失败面纪律）。
+#[cfg(feature = "log")]
+pub trait ChannelSink: Send + Sync + 'static {
+    /// 本 sink 承载的通道（注册时由此定槽位）。
+    fn channel(&self) -> Channel;
+    /// 本通道独立级别下限（低于此级别的消息在 registry 即被过滤，不计丢弃）。
+    fn level(&self) -> log::LevelFilter;
+    /// 写一条；失败=丢一行（sink 自计数 [`Self::dropped_lines`]，禁 panic）。
+    fn write(&self, level: log::Level, target: &str, message: &str);
+    /// 本通道累计丢弃行数（写失败口径；级别过滤与未注册静默不在内）。
+    fn dropped_lines(&self) -> u64;
+}
+
+/// 多通道注册表：通道 → sink 一对一（固定三槽位，登记一次后零分配扇出）。
+///
+/// 并发面：每槽位独立 `RwLock`——register 只锁一个槽（互不阻塞），emit 读锁
+/// + `Arc` 克隆后锁外写 sink（锁内无 IO）。毒锁复用 [`FileSink`] 纪律
+///（`into_inner` 继续：日志面禁毒锁放大业务故障）。无注销面——注册表面向
+/// 进程生命期的装配期使用（同全局 logger 单次初始化纪律）。
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use skeleton_infra::logx::{Channel, ChannelRegistry, ChannelSink};
+///
+/// struct NullSink(Channel);
+/// impl ChannelSink for NullSink {
+///     fn channel(&self) -> Channel { self.0 }
+///     fn level(&self) -> log::LevelFilter { log::LevelFilter::Info }
+///     fn write(&self, _level: log::Level, _target: &str, _message: &str) {}
+///     fn dropped_lines(&self) -> u64 { 0 }
+/// }
+///
+/// let registry = ChannelRegistry::new();
+/// registry.register(Arc::new(NullSink(Channel::General))).expect("首注恒 Ok");
+/// assert!(
+///     registry.register(Arc::new(NullSink(Channel::General))).is_err(),
+///     "重复注册必须 Err（fail-visible）"
+/// );
+/// // 未注册通道静默：无输出、无 panic、零分配
+/// registry.emit(Channel::Dns, log::Level::Error, "app", "vanish");
+/// ```
+#[cfg(feature = "log")]
+pub struct ChannelRegistry {
+    /// 槽位按 `Channel` 判别式索引（General=0/Access=1/Dns=2）。
+    slots: [std::sync::RwLock<Option<std::sync::Arc<dyn ChannelSink>>>; 3],
+    /// 密钥掩码表（空=透传零分配）；Arc 快照读，emit 锁外掩码。
+    secrets: std::sync::RwLock<std::sync::Arc<Vec<String>>>,
+}
+
+#[cfg(feature = "log")]
+impl ChannelRegistry {
+    /// 空表：全部通道未注册（emit 恒静默）——默认静默纪律的构造起点。
+    pub fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| std::sync::RwLock::new(None)),
+            secrets: std::sync::RwLock::new(std::sync::Arc::new(Vec::new())),
+        }
+    }
+
+    /// 注册通道 sink（槽位由 [`ChannelSink::channel`] 定）。同通道已有
+    /// sink=`Err`（fail-visible，原 sink 不动）。
+    pub fn register(&self, sink: std::sync::Arc<dyn ChannelSink>) -> Result<(), ChannelError> {
+        let slot = &self.slots[sink.channel() as usize];
+        let mut guard = slot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_some() {
+            return Err(ChannelError::AlreadyRegistered {
+                channel: sink.channel(),
+            });
+        }
+        *guard = Some(sink);
+        Ok(())
+    }
+
+    /// 配置密钥掩码表：此后所有通道写前统一过 [`mask_secrets`]（唯一布点，
+    /// 可 grep）。空表（默认）=透传零分配；替换语义（非累加）。
+    pub fn set_secrets(&self, secrets: Vec<String>) {
+        *self
+            .secrets
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = std::sync::Arc::new(secrets);
+    }
+
+    /// 扇出一条：未注册通道=静默返回（不输出/不 panic/不分配/不计数）；
+    /// 低于本通道 level=过滤（不计数）；命中=掩码（如配置）后交 sink 写。
+    pub fn emit(&self, channel: Channel, level: log::Level, target: &str, message: &str) {
+        let sink = {
+            let slot = &self.slots[channel as usize];
+            let guard = slot.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.as_ref() {
+                None => return,
+                Some(sink) => {
+                    if level > sink.level() {
+                        return;
+                    }
+                    std::sync::Arc::clone(sink)
+                }
+            }
+        };
+        let secrets = self
+            .secrets
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if secrets.is_empty() {
+            sink.write(level, target, message);
+        } else {
+            let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+            let masked = mask_secrets(message, &refs);
+            sink.write(level, target, &masked);
+        }
+    }
+
+    /// 全部通道丢弃计数总和（写失败口径；级别过滤/未注册静默不在内）。
+    pub fn dropped_total(&self) -> u64 {
+        self.slots.iter().fold(0u64, |acc, slot| {
+            let guard = slot.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+            acc + guard.as_ref().map(|s| s.dropped_lines()).unwrap_or(0)
+        })
+    }
+}
+
+#[cfg(feature = "log")]
+impl Default for ChannelRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 通道文件落盘 sink：[`FileSink`]（按日滚动/软失败自计数/跨进程追加语义，
+/// 见其类型文档）+ 通道 + 独立级别的组合件——宿主「每通道一个文件汇」的
+/// 现成形态，亦可自定义 [`ChannelSink`] 替代（终端/网络面等）。
+///
+/// 行格式与 LineFormat 默认行格式同形：`[UTC 时间 LEVEL target] message`
+///（整行单写，行完整性同 [`FileSink`] 单落盘单元前提）。行合成每行分配一次
+/// String——零分配契约在 [`ChannelRegistry::emit`] 扇出面，sink 内行合成是
+/// 写入方固有成本，非扇出分配。
+#[cfg(feature = "log")]
+pub struct ChannelFileSink {
+    channel: Channel,
+    level: log::LevelFilter,
+    sink: FileSink,
+}
+
+#[cfg(feature = "log")]
+impl ChannelFileSink {
+    /// 建通道文件汇：`root` 通常取 [`PerChannelPathResolver::channel_root`]
+    /// （每通道独立子目录）。根目录立即递归创建（配置错误构造期显式失败，
+    /// 同 [`FileSink::new`]）。
+    pub fn new(
+        channel: Channel,
+        level: log::LevelFilter,
+        root: impl Into<std::path::PathBuf>,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            channel,
+            level,
+            sink: FileSink::new(root)?,
+        })
+    }
+}
+
+#[cfg(feature = "log")]
+impl ChannelSink for ChannelFileSink {
+    fn channel(&self) -> Channel {
+        self.channel
+    }
+
+    fn level(&self) -> log::LevelFilter {
+        self.level
+    }
+
+    fn write(&self, level: log::Level, target: &str, message: &str) {
+        let ts = format_utc_timestamp(std::time::SystemTime::now());
+        let line = format!("[{ts} {level} {target}] {message}\n");
+        self.sink.write_line_soft(line.as_bytes());
+    }
+
+    fn dropped_lines(&self) -> u64 {
+        self.sink.dropped_lines()
+    }
+}
+
+/// 每通道路径解析：复用 [`LogPathResolver`] 契约作基根，通道名作子目录——
+/// `channel_root(ch) = <base.log_root()>/<ch.as_str()>`，各通道落点互不相交
+///（独立文件锁竞争面 + 独立按日滚动序列）。
+///
+/// # Examples
+///
+/// ```
+/// use skeleton_infra::logx::{Channel, DefaultPathResolver, PerChannelPathResolver};
+///
+/// let base = DefaultPathResolver::new("agentwiki").expect("home 可解析");
+/// let resolver = PerChannelPathResolver::new(base);
+/// assert_eq!(
+///     resolver.channel_root(Channel::Access).file_name(),
+///     Some(std::ffi::OsStr::new("access")),
+///     "通道名=子目录名"
+/// );
+/// ```
+///
+/// # 采用方警示（与 [`DefaultPathResolver`] 同源）
+///
+/// base 为 [`DefaultPathResolver`] 时，debug 构建基根=框架包目录（编译期
+/// 锚），多通道默认同样落包目录 `log/{general,access,dns}/`——采用方 debug
+/// 态必须注入自有 resolver（构造参数传自定义 [`LogPathResolver`]），release
+/// 臂不受影响。
+#[cfg(feature = "log")]
+#[derive(Debug)]
+pub struct PerChannelPathResolver<R> {
+    base: R,
+}
+
+#[cfg(feature = "log")]
+impl<R: LogPathResolver> PerChannelPathResolver<R> {
+    /// 以既有 resolver 为基根（[`DefaultPathResolver`] 或采用方自有实现）。
+    pub fn new(base: R) -> Self {
+        Self { base }
+    }
+
+    /// 通道根目录（不预创建；由 [`ChannelFileSink::new`] 首建时递归创建）。
+    pub fn channel_root(&self, channel: Channel) -> std::path::PathBuf {
+        self.base.log_root().join(channel.as_str())
     }
 }
 
