@@ -224,9 +224,10 @@ fn home_xdg_alloc_anchors_match_doc() {
 /// 本机探针 Windows 面逐项复核 1/1/1/3 与 2/4）：
 /// 绝对值臂 6 次（home_dir 1 + XDG var_os 1 + env PathBuf 拷贝 1 +
 /// normalize_lexical 3——`"/xdg-alloc/cfg"` 14 字节超输出 PathBuf 首块
-/// 容量触发 1 次 grow：Vec 栈 1 + 输出 2）；默认臂 8 次（home 1 +
+/// 容量触发 1 次 grow：Vec 栈 1 + 输出 2）；默认臂 7 次（home 1 +
 /// var_os(None) 0 + join 2（home 拷贝 1 + push grow 1）+ normalize 4
-/// ——23 字节触发 2 次 grow：Vec 栈 1 + 输出 3）。旧背书 3/4 系作者推演
+/// ——23 字节触发 2 次 grow：Vec 栈 1 + 输出 3；CI macos+ubuntu 双平台
+/// 实测一致 = 7）。旧背书 3/4 系作者推演
 /// （Windows 机不可达），漏计 home 无条件求值、env PathBuf 拷贝与
 /// 输出缓冲按字长分级 grow——分配数是「std 版本 × 输入字节」的确定函数，
 /// 变更任一须连动本锚。
@@ -244,5 +245,5 @@ fn xdg_unix_alloc_anchors_match_doc() {
     std::env::set_var("XDG_CONFIG_HOME", "/xdg-alloc/cfg");
     assert_eq!(allocs(|| config_dir()), 6, "XDG 绝对值臂 6 次");
     std::env::remove_var("XDG_CONFIG_HOME");
-    assert_eq!(allocs(|| config_dir()), 8, "默认臂 8 次");
+    assert_eq!(allocs(|| config_dir()), 7, "默认臂 7 次");
 }
