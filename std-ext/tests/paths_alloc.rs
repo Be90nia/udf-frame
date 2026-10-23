@@ -4,9 +4,12 @@
 //! 只挂本集成测试二进制——lib 测试二进制禁挂全局分配器，tests/memgov.rs
 //! 纪律）。事件口径是硬约束：`memgov::CountingAllocator` 的 live 净计数测
 //! 不到窗内生灭的瞬时分配——simplify 保留名判定里的 String 瞬时件恰属此类
-//! （B1 盲评卡点 1 的实测口径即 events）。测试函数内同步单线程读数窗。
+//! （B1 盲评卡点 1 的实测口径即 events）。读数窗按**线程归属**：只有
+//! `allocs()` 窗内本线程的分配计入（IN_WINDOW 门，const TLS 免分配），
+//! libtest 主线程/并发测试线程的分配不进窗——并行整跑免疫污染。
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::hint::black_box;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,16 +19,14 @@ use std_ext::paths::{cache_dir, config_dir, data_dir, home_dir, normalize_lexica
 
 static EVENTS: AtomicUsize = AtomicUsize::new(0);
 
-/// 文件内串行闸（tests/memgov.rs 同款：libtest 并行线程共享全局事件计数，
-/// 窗被同二进制并发分配污染 = flaky-by-construction）。
+/// 文件内串行闸：环境变量是进程全局态（XdgEnvGuard 注入臂并发互踩会改
+/// 语义），本 Mutex 只服务这一点；计数本身已按线程归属（IN_WINDOW 门），
+/// 不再依赖串行（旧版全局计数被同二进制并发分配污染，实测 5 跑 2 红，
+/// 已根治）。
 ///
-/// 注意（终验波 B1）：本 Mutex 只串行**本文件**测试；真污染源=同二进制
-/// libtest 主线程（结果记录/输出分配）落在计数窗内——Mutex 拦不住主线程
-/// （它不持锁），并行整跑仍可 flake（实测 5 跑 2 红；其他 --test 目标是
-/// 独立进程，计数器不共享，非污染源）。
-/// 确定口径=CI 单列步 `--test-threads=1`（ci.yml "paths_alloc serial"），
-/// 本机复跑同口径：`cargo test -p udf-skeleton-infra --all-features --test
-/// paths_alloc -- --test-threads=1`。
+/// CI 口径（ci.yml）不变：「paths_alloc serial」单列步 `--test-threads=1`，
+/// 并行步以 `--skip anchors --skip verbatim` 隔离本文件。本机复跑同口径：
+/// `cargo test -p udf-std-ext --test paths_alloc -- --test-threads=1`。
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -36,21 +37,34 @@ fn serial() -> MutexGuard<'static, ()> {
 
 struct EventCounting;
 
-// SAFETY: 纯转发 System，仅在转发前累加事件计数；null 原样透传（alloc 契约）。
+// 计数窗门：仅窗内本线程的分配计入事件。const 初始化 TLS 无惰性分配、
+// 无析构注册，在分配器内读取不会递归进分配。
+thread_local! {
+    static IN_WINDOW: Cell<bool> = const { Cell::new(false) };
+}
+
+// SAFETY: 纯转发 System，仅在窗内转发前累加事件计数；null 原样透传（alloc 契约）。
 unsafe impl GlobalAlloc for EventCounting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        EVENTS.fetch_add(1, Ordering::Relaxed);
+        // try_with:线程 TLS 析构期访问会 panic(分配器内 panic=abort),取不到就当不在窗内
+        if IN_WINDOW.try_with(Cell::get).unwrap_or(false) {
+            EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        EVENTS.fetch_add(1, Ordering::Relaxed);
+        if IN_WINDOW.try_with(Cell::get).unwrap_or(false) {
+            EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
         unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        EVENTS.fetch_add(1, Ordering::Relaxed);
+        if IN_WINDOW.try_with(Cell::get).unwrap_or(false) {
+            EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -58,12 +72,16 @@ unsafe impl GlobalAlloc for EventCounting {
 #[global_allocator]
 static COUNTING: EventCounting = EventCounting;
 
-/// op 执行期的分配事件数（瞬时生灭也计入；结果活到函数尾，drop 不进窗）。
+/// op 执行期的分配事件数（瞬时生灭也计入；结果活到函数尾，drop 不进窗；
+/// 只计本线程，其他线程的并发分配不进窗）。
 fn allocs<T>(op: impl FnOnce() -> T) -> usize {
+    IN_WINDOW.with(|w| w.set(true));
     let before = EVENTS.load(Ordering::Relaxed);
     let out = op();
     black_box(&out);
-    EVENTS.load(Ordering::Relaxed) - before
+    let events = EVENTS.load(Ordering::Relaxed) - before;
+    IN_WINDOW.with(|w| w.set(false));
+    events
 }
 
 /// doc 分配声明逐字背书：simplify legacy 直通零事件 + normalize 事件数。
@@ -202,10 +220,18 @@ fn home_xdg_alloc_anchors_match_doc() {
     }
 }
 
-/// Unix 面 doc 分配声明逐字背书：XDG 绝对值臂 3 次（env OsString 1 +
-/// normalize_lexical 2）、默认臂 4 次（home 1 + join 1 + normalize 2）。
-/// 本测试在 Unix 面自证（Windows 开发机不可达，CI 覆盖）；env 臂 1 次的
-/// 假设已由 home_xdg_alloc_anchors_match_doc 在 Windows 面实测背书。
+/// Unix 面 doc 分配声明逐字背书（CI ubuntu 实测校准 + std 分配机制推导，
+/// 本机探针 Windows 面逐项复核 1/1/1/3 与 2/4）：
+/// 绝对值臂 6 次（home_dir 1 + XDG var_os 1 + env PathBuf 拷贝 1 +
+/// normalize_lexical 3——`"/xdg-alloc/cfg"` 14 字节超输出 PathBuf 首块
+/// 容量触发 1 次 grow：Vec 栈 1 + 输出 2）；默认臂 8 次（home 1 +
+/// var_os(None) 0 + join 2（home 拷贝 1 + push grow 1）+ normalize 4
+/// ——23 字节触发 2 次 grow：Vec 栈 1 + 输出 3）。旧背书 3/4 系作者推演
+/// （Windows 机不可达），漏计 home 无条件求值、env PathBuf 拷贝与
+/// 输出缓冲按字长分级 grow——分配数是「std 版本 × 输入字节」的确定函数，
+/// 变更任一须连动本锚。
+/// 本测试在 Unix 面自证（CI 覆盖）；home 臂 var_os 单次分配 1 已由
+/// home_xdg_alloc_anchors_match_doc 双面实测背书。
 #[cfg(not(windows))]
 #[test]
 fn xdg_unix_alloc_anchors_match_doc() {
@@ -216,7 +242,7 @@ fn xdg_unix_alloc_anchors_match_doc() {
     black_box(home_dir()); // 预热
     black_box(config_dir());
     std::env::set_var("XDG_CONFIG_HOME", "/xdg-alloc/cfg");
-    assert_eq!(allocs(|| config_dir()), 3, "XDG 绝对值臂 3 次");
+    assert_eq!(allocs(|| config_dir()), 6, "XDG 绝对值臂 6 次");
     std::env::remove_var("XDG_CONFIG_HOME");
-    assert_eq!(allocs(|| config_dir()), 4, "默认臂 4 次");
+    assert_eq!(allocs(|| config_dir()), 8, "默认臂 8 次");
 }

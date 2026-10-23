@@ -377,18 +377,24 @@ pub fn expect_idle(scope: &FxScope) {
 mod tests {
     use super::*;
 
-    /// abort 的取消 poll 异步生效：让渡至计数归零（有界，防挂死）。
+    /// abort 的取消 poll 异步生效：等计数归零（1ms 实时钟轮询，5s 墙钟上限，防挂死）。
+    /// 不能用纯让渡预算：让渡不释放 OS 线程，wrapper drop 序列（tx drop 唤醒在前、
+    /// FlightGuard drop 在后）被 OS 量子级抢占时，10⁴ 让渡毫秒级耗尽而对方几十毫秒
+    /// 后才被调度回来（CI 2 核饱和实测）——真实 sleep 让核给 drop 执行线程。
     async fn wait_idle(scope: &FxScope) {
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
             if scope.in_flight() == 0 {
                 return;
             }
-            tokio::task::yield_now().await;
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "fx scope not idle: {} task(s) still in flight",
+                    scope.in_flight()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        panic!(
-            "fx scope not idle: {} task(s) still in flight",
-            scope.in_flight()
-        );
     }
 
     /// ①spawn/join 值直传 Ok。
@@ -465,7 +471,10 @@ mod tests {
 
     /// ⑥shutdown 等净（in_flight==0）+ shutdown_timeout 超时路径 Err(TimedOut)。
     /// 超时路径按「不可 abort 段」语义：abort 只在下一 await 生效，任务 poll 不返回
-    /// 则 drain 真超时——需多线程 rt + 实时钟（spin 段 ≥4× 超时，时序单调成立）。
+    /// 则 drain 真超时——需多线程 rt + 实时钟。确定性构造：hold 闸时序由测试持有
+    /// ——holding 握手确认任务已滞留 poll（无可让渡 await 点）后才起 50ms 计时，
+    /// 忙段持续到 hold 放开，慢机调度延迟无法击穿（旧实现靠「200ms spin 段 > 50ms
+    /// 超时」固定余量，2 核 CI 握手延迟 >150ms 即翻成 Ok(())）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_drains_and_shutdown_timeout_reports_timed_out() {
         let scope = FxScope::new();
@@ -476,25 +485,32 @@ mod tests {
         expect_idle(&scope);
 
         use std::time::Instant;
+        let hold = Arc::new(AtomicBool::new(false)); // 测试→任务：留在 poll 内不让渡
+        let holding = Arc::new(AtomicBool::new(false)); // 任务→测试：已进不可让渡段
         let stop = Arc::new(AtomicBool::new(false));
-        let spinning = Arc::new(AtomicBool::new(false));
         let scope = FxScope::new();
+        let hold_task = Arc::clone(&hold);
+        let holding_task = Arc::clone(&holding);
         let stop_task = Arc::clone(&stop);
-        let spinning_task = Arc::clone(&spinning);
         let spinner = scope
             .spawn(async move {
-                spinning_task.store(true, Ordering::Relaxed); // 已进 poll，abort 只能等下一 await
                 while !stop_task.load(Ordering::Relaxed) {
-                    let deadline = Instant::now() + Duration::from_millis(200);
-                    while Instant::now() < deadline {
-                        std::hint::spin_loop();
+                    if hold_task.load(Ordering::Relaxed) {
+                        holding_task.store(true, Ordering::Relaxed); // 已进 poll 无 await 点，abort 只能等让渡
+                        while hold_task.load(Ordering::Relaxed)
+                            && !stop_task.load(Ordering::Relaxed)
+                        {
+                            std::hint::spin_loop();
+                        }
+                        holding_task.store(false, Ordering::Relaxed);
                     }
-                    tokio::task::yield_now().await;
+                    tokio::task::yield_now().await; // 唯一 abort 点
                 }
             })
             .unwrap();
-        // 握手：任务确实在 spin 段内（未启动任务的 abort=免运行即撤，模拟不了该场景）。
-        while !spinning.load(Ordering::Relaxed) {
+        // 握手：任务确实滞留在 poll 段内（未启动任务的 abort=免运行即撤，模拟不了该场景）。
+        hold.store(true, Ordering::Relaxed);
+        while !holding.load(Ordering::Relaxed) {
             tokio::task::yield_now().await;
         }
         let started = Instant::now();
@@ -503,15 +519,16 @@ mod tests {
             Err(TaskError::TimedOut)
         );
         assert!(started.elapsed() >= Duration::from_millis(50));
+        hold.store(false, Ordering::Relaxed); // 放行让渡，abort 在下一 await 点生效
         stop.store(true, Ordering::Relaxed); // 放行自终止，运行时干净退出
-                                             // flaky 治理：join 任务句柄
-                                             // 等真实终止——事件化收尾替代定长 350ms 猜窗（sleep 不足时 expect_idle
-                                             // 的 10⁴ 让渡上限兜底才拦住，报错误导）。
         assert_eq!(
             spinner.join().await,
             Err(TaskError::Cancelled),
             "超时收割：abort 在任务下一 await 点生效（事件化等待其消亡）"
         );
+        // join 返回≠guard 已归零：tx drop（唤醒 join）与 wrapper 内 FlightGuard drop
+        // 是相邻语句，跨线程可被抢占观测（macos 2 核 CI flake 实证）——有界让渡等真实归零。
+        wait_idle(&scope).await;
         expect_idle(&scope);
     }
 
@@ -628,37 +645,48 @@ mod tests {
     /// 零覆盖 #14：shutdown 超时路径对在途任务的 abort 收割——超时返回
     /// Err(TimedOut) 后，遗留 JoinSet Drop=abort 兜底；abort 在任务下一 await
     /// 点生效，join 即收割事件：join=Err(Cancelled) 且 in_flight 归零（旧 ⑥
-    /// 只断言超时本身，未直接断言 abort 语义与 join 的组合）。
+    /// 只断言超时本身，未直接断言 abort 语义与 join 的组合）。确定性构造同 ⑥：
+    /// hold 闸由测试持有（holding 握手确认滞留 poll 后才计时），不用固定 spin 段
+    /// 余量赌慢机调度延迟。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_timeout_aborts_inflight_and_join_yields_cancelled() {
-        use std::time::Instant;
         let scope = FxScope::new();
-        let entered = Arc::new(AtomicBool::new(false));
-        let entered_task = Arc::clone(&entered);
+        let hold = Arc::new(AtomicBool::new(false));
+        let holding = Arc::new(AtomicBool::new(false));
+        let hold_task = Arc::clone(&hold);
+        let holding_task = Arc::clone(&holding);
         let handle = scope
             .spawn(async move {
-                entered_task.store(true, Ordering::Relaxed); // 已进 poll：abort 只能等下一 await
                 loop {
-                    let deadline = Instant::now() + Duration::from_millis(200);
-                    while Instant::now() < deadline {
-                        std::hint::spin_loop();
+                    if hold_task.load(Ordering::Relaxed) {
+                        holding_task.store(true, Ordering::Relaxed); // 已进 poll 无 await 点，abort 只能等让渡
+                        while hold_task.load(Ordering::Relaxed) {
+                            std::hint::spin_loop();
+                        }
+                        holding_task.store(false, Ordering::Relaxed);
                     }
-                    tokio::task::yield_now().await;
+                    tokio::task::yield_now().await; // 唯一 abort 点
                 }
             })
             .unwrap();
-        while !entered.load(Ordering::Relaxed) {
-            tokio::task::yield_now().await; // 握手：任务已在 spin 段内（免运行即撤模拟不了该场景）
+        // 握手：任务确实滞留在 poll 段内（免运行即撤模拟不了该场景）。
+        hold.store(true, Ordering::Relaxed);
+        while !holding.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
         }
         assert_eq!(
             scope.shutdown_timeout(Duration::from_millis(50)).await,
             Err(TaskError::TimedOut)
         );
+        hold.store(false, Ordering::Relaxed); // 放行让渡，abort 在下一 await 点生效
         assert_eq!(
             handle.join().await,
             Err(TaskError::Cancelled),
             "超时遗留任务被 abort 收割"
         );
+        // join 返回≠guard 已归零（tx drop 唤醒在前、FlightGuard drop 在后的跨线程
+        // 观测窗，见 ⑥）——有界让渡等真实归零。
+        wait_idle(&scope).await;
         expect_idle(&scope); // abort 即刻回收（FlightGuard Drop）——零 sleep、事件化
     }
 }

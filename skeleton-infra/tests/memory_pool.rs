@@ -1,46 +1,68 @@
 #![cfg(all(feature = "memgov", feature = "pool"))]
 //! MemoryPool 内存池特化端到端：借还语义（RAII Drop 即还 / 获取超时必填 / 容量
 //! 有界）+ resize（扩容即时唤醒 / 缩容只弃 idle）+ 审计事件全断言 + 稳态零分配
-//! （性能矩阵①，counting allocator）。
+//! （性能矩阵①，counting allocator 本线程净额口径）。
 //!
 //! 分工：PoolBase 公共逻辑（校验/水位线/审计/溢出计数）已在 `tests/pool_base.rs`
 //! 逐件覆盖——本文件只测**特化面**（槽位借还/等待/resize 联动/工厂 panic 恢复），
 //! 与基座交汇处按端到端断言不复测基座内部。
 
+use std::alloc::{GlobalAlloc, Layout};
 use std::borrow::Borrow;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use skeleton::pool::{PoolAuditKind, PoolManaged, PoolResizeError};
 use skeleton_infra::memgov::{CountingAllocator, MemoryPool, MemoryTuning};
 
-/// 计数分配器挂全局（本二进制专用；同 tests/memgov.rs 纪律——lib 二进制不挂）。
-#[global_allocator]
-static COUNTING: CountingAllocator = CountingAllocator;
+// 本线程存活分配净额（alloc/alloc_zeroed 成功 +1、dealloc −1；realloc 换块
+// 旧死新生对消，净额不动）。稳态窗只读本线程净额：同二进制并发测试线程/
+// libtest 主线程的分配不进窗，并行整跑免疫污染（旧版全局 live 净额被并发
+// 净漂移打穿，CI windows 实测 64→57）。
+thread_local! {
+    static OWN_LIVE: Cell<isize> = const { Cell::new(0) };
+}
 
-/// 稳态零分配断言的读数窗口隔离（同 tests/memgov.rs：libtest 主线程打印前序
-/// 结果的分配窗与读数窗物理重叠——静止检测收敛真实排空时刻，不赌固定时长）。
-static SERIAL: Mutex<()> = Mutex::new(());
+struct TlLive;
 
-fn serial() -> MutexGuard<'static, ()> {
-    match SERIAL.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
+// SAFETY: 转发 CountingAllocator（全局五计数器照常累计），外加本线程归属净额；
+// null 原样透传（alloc 契约）。const 初始化 TLS 无惰性分配、无析构注册，
+// 分配器内读写不递归进分配。
+unsafe impl GlobalAlloc for TlLive {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { CountingAllocator.alloc(layout) };
+        if !ptr.is_null() {
+            // try_with:线程 TLS 析构期访问会 panic(分配器内 panic=abort),取不到就不计
+            OWN_LIVE.try_with(|c| c.set(c.get() + 1)).ok();
+        }
+        ptr
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { CountingAllocator.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            OWN_LIVE.try_with(|c| c.set(c.get() + 1)).ok();
+        }
+        ptr
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        OWN_LIVE.try_with(|c| c.set(c.get() - 1)).ok();
+        unsafe { CountingAllocator.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        unsafe { CountingAllocator.realloc(ptr, layout, new_size) }
     }
 }
 
-fn settle() {
-    let mut last = CountingAllocator::live_allocs();
-    for _ in 0..500 {
-        thread::sleep(Duration::from_millis(1));
-        let now = CountingAllocator::live_allocs();
-        if now == last {
-            return;
-        }
-        last = now;
-    }
+/// 计数分配器挂全局（本二进制专用；同 tests/memgov.rs 纪律——lib 二进制不挂）。
+#[global_allocator]
+static COUNTING: TlLive = TlLive;
+
+/// 本线程当前存活分配净额。
+fn own_live() -> isize {
+    OWN_LIVE.with(Cell::get)
 }
 
 fn pool(max: usize, idle_cap: usize) -> MemoryPool<Vec<u8>, fn() -> Vec<u8>> {
@@ -470,25 +492,22 @@ fn concurrent_resize_and_hammering_stays_consistent() {
     assert!(m.core.idle <= 8, "终态 idle 不得越界：实际 {}", m.core.idle);
 }
 
-// ── 性能矩阵①：稳态借/还热路径零分配（counting allocator 断言=0）─────────
+// ── 性能矩阵①：稳态借/还热路径零分配（本线程 live 净额断言=0）─────────────
 
 #[test]
 fn steady_state_borrow_return_is_zero_alloc() {
-    let _guard = serial();
-    settle();
-
-    // 稳态复用路径：预热一件，借/还各 1000 次
+    // 稳态复用路径：预热一件，借/还各 1000 次。读数窗只认本线程净额，
+    // 并发分配本就不进窗——无需 settle/串行闸。
     let p = pool(2, 2);
     drop(p.acquire(Duration::from_millis(100)).unwrap()); // 预热：工厂/Vec 容量分配在窗外
-    settle();
-    let allocs_before = CountingAllocator::live_allocs();
+    let own_before = own_live();
     for _ in 0..1000 {
         drop(p.acquire(Duration::from_millis(100)).unwrap());
     }
     assert_eq!(
-        CountingAllocator::live_allocs(),
-        allocs_before,
-        "稳态借/还热路径零分配（1000 次往返 alloc delta 必须为 0）"
+        own_live(),
+        own_before,
+        "稳态借/还热路径零分配（1000 次往返本线程 live 净增必须为 0）"
     );
 
     // 溢出丢弃归还路径（丢弃+计数）：同样零分配。
@@ -496,19 +515,14 @@ fn steady_state_borrow_return_is_zero_alloc() {
     // 单件自还永不判溢出（0+0<max 恒真），两件轮转才持续走到丢弃分支。
     let p = MemoryPool::<Vec<u8>>::new(2, 1, Vec::new);
     drop(p.acquire(Duration::from_millis(100)).unwrap()); // 预热 idle=1
-    settle();
-    let allocs_before = CountingAllocator::live_allocs();
+    let own_before = own_live();
     for _ in 0..1000 {
         let a = p.acquire(Duration::from_millis(100)).unwrap();
         let b = p.acquire(Duration::from_millis(100)).unwrap();
         drop(a); // 留存（idle 未满）
         drop(b); // 溢出丢弃（idle_cap=1 已满）
     }
-    assert_eq!(
-        CountingAllocator::live_allocs(),
-        allocs_before,
-        "溢出丢弃归还路径零分配"
-    );
+    assert_eq!(own_live(), own_before, "溢出丢弃归还路径零分配");
     assert!(
         p.metrics().core.dropped_overflow > 0,
         "溢出路径确实走到了丢弃分支"
