@@ -1,8 +1,9 @@
 //! # std-ext
 //!
-//! 纯 std 常驻生态标准件（批 5-1/5-2 自 skeleton-infra 物理拆出，切面决策见
-//! `udf-frame/docs/adr/0004-std-ext-split.md`）：十三域零三方（默认树），
-//! 零 feature 门常驻可用。
+//! 常驻生态标准件（批 5-1/5-2 自 skeleton-infra 物理拆出，切面决策见
+//! `udf-frame/docs/adr/0004-std-ext-split.md`）：十四域零 feature 门常驻可用
+//! （默认树：十三域纯 std；`json` 域引 serde_json 普通依赖——P1-9 拍板，
+//! 自主仓 xray-conf 上浮）。
 //!
 //! 分层方向：`skeleton`（最底层契约）← **`std-ext`（本 crate，散件）** ←
 //! `skeleton-infra`（核+胶水，反向依赖本 crate）。本 crate 内部自闭合：
@@ -20,6 +21,7 @@
 //! | （常驻，零 feature） | `encode`：hex/base64/BOM/UTF-16 编解码（显式策略，禁静默） |
 //! | （常驻，零 feature） | `hash`：确定性哈希（`stable64`=FNV-1a 64（RFC 9923）+ `xxh64`=XXH64 spec v0.2.0；算法集版本化=稳定承诺） |
 //! | （常驻，零 feature） | `iter`：迭代器扩展精选（zip_longest 显式三态/interleave/minmax 三态/dedup_by 连续去重/process_results 错误短路；itertools 语义子集，std 缺位面） |
+//! | （常驻，零 feature） | `json`：JSON 双模解码（RFC 8259 严格 / 注释容忍对齐 Go json_reader；64MiB 输入上限 fail-visible + 行列位置错误；P1-9 自 xray-conf 上浮） |
 //! | （常驻，零 feature） | `paths`：路径归一/相对化/containment（Windows verbatim 兼容）+ 家目录/XDG 用户基目录解析（env 面，零 IO 不创建） |
 //! | （常驻，零 feature） | `clock`：时长人读格式化 + RFC 3339 双向（时间源契约 `Clock`/`SystemClock`/`MockClock` 住 `skeleton::clock`，批 1 契约真下沉） |
 //! | （常驻，零 feature） | `retry`：同步重试编排（政策显式/确定性退避/预算闸/fail-visible 耗尽回灌；退避计算用 `crate::backoff`） |
@@ -74,6 +76,7 @@ pub mod fsx;
 pub mod hash;
 pub mod id;
 pub mod iter;
+pub mod json;
 pub mod paths;
 pub mod ratelimit;
 pub mod retry;
