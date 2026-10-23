@@ -2,7 +2,7 @@
 //!
 //! 跑法（仓库根）：
 //! ```text
-//! cargo run --release -p skeleton-infra --example multidim_eval --features memgov,testing
+//! cargo run --release -p udf-skeleton-infra --example multidim_eval --features memgov,testing
 //! ```
 //!
 //! 口径注：
@@ -19,13 +19,13 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use skeleton::{ActionSender, Effect, EffectBuf, EffectRuntime, Reducer, Store as _};
-use skeleton_infra::runtime::SyncStore as Store;
 use skeleton_infra::memgov::CountingAllocator;
+use skeleton_infra::runtime::SyncStore as Store;
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;
@@ -61,7 +61,10 @@ struct RawQueue {
 
 impl RawQueue {
     fn new() -> Self {
-        Self { queue: Mutex::new(VecDeque::new()), state: Mutex::new(0) }
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            state: Mutex::new(0),
+        }
     }
     /// 与 Store::dispatch 同形：入队→同步排空至 idle→状态更新。
     fn dispatch(&self) {
@@ -83,7 +86,10 @@ struct RawSnap {
 
 impl RawSnap {
     fn new() -> Self {
-        Self { queue: Mutex::new(VecDeque::new()), state: Mutex::new(Arc::new(0)) }
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            state: Mutex::new(Arc::new(0)),
+        }
     }
     fn dispatch(&self) {
         self.queue.lock().unwrap().push_back(());
@@ -138,13 +144,18 @@ fn main() {
         acc = acc.wrapping_add(a.elapsed().as_nanos() as u64);
     }
     black_box(acc);
-    println!("clock_pair_ns_mean={:.1}", t.elapsed().as_nanos() as f64 / n as f64);
+    println!(
+        "clock_pair_ns_mean={:.1}",
+        t.elapsed().as_nanos() as f64 / n as f64
+    );
 
     perf_dispatch_idle();
     perf_broadcast_1k();
     perf_snapshot();
     mem_store_subs_peak();
     concurrency_storm();
+    perf_subs_contention_decay();
+    perf_false_sharing_gates();
 }
 
 fn perf_dispatch_idle() {
@@ -158,7 +169,11 @@ fn perf_dispatch_idle() {
     }
     let (p50, p99) = sample_dist(|| store.dispatch(()), SAMPLES);
     let mean = batch_mean(|| store.dispatch(()), BATCH);
-    assert_eq!(*store.snapshot(), 10_000 + SAMPLES as u64 + BATCH, "dispatch 计数守恒");
+    assert_eq!(
+        *store.snapshot(),
+        10_000 + SAMPLES as u64 + BATCH,
+        "dispatch 计数守恒"
+    );
     println!("skeleton_dispatch_p50_ns={p50} skeleton_dispatch_p99_ns={p99} skeleton_dispatch_batch_mean_ns={mean:.1}");
 
     let raw = RawQueue::new();
@@ -420,4 +435,221 @@ fn concurrency_storm() {
         "storm_rounds_pass={pass}/{ROUNDS} storm_throughput_ops_per_s={throughput:.0} close_gate_ok=true"
     );
     assert_eq!(pass, ROUNDS, "pass^k：全轮零违例才达标");
+}
+
+// ---- runtime 域扩段（perf-audit P1-3：③ 订阅争用衰减 + ⑦ 伪共享专项）----
+
+/// ③ 扩展性：多订阅者争用吞吐衰减曲线。8 线程争用 dispatch（concurrency_storm
+/// 同形 harness），订阅者 K∈{0,1,2,4,8}（空回调，隔离「通知面成本」单变量），
+/// 5 轮取中位吞吐。口径沿用本文件口径注①-④；并发段只断言计数守恒不计内存。
+fn perf_subs_contention_decay() {
+    println!("== conc: 订阅争用衰减（8 线程 × 10k dispatch × K 订阅者，5 轮中位吞吐）==");
+    const THREADS: usize = 8;
+    const PER_THREAD: u64 = 10_000;
+    const ROUNDS: usize = 5;
+    let expected = THREADS as u64 * PER_THREAD;
+
+    let mut base_ops_per_s = 0.0f64;
+    let mut last_per_dispatch_ns = 0.0f64;
+    let mut base_per_dispatch_ns = 0.0f64;
+    for subs in [0usize, 1, 2, 4, 8] {
+        let mut rounds: Vec<u64> = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            let store = Arc::new(Store::new(Count, Nop));
+            let mut tickets = Vec::with_capacity(subs);
+            for _ in 0..subs {
+                tickets.push(store.subscribe(|_| {}));
+            }
+            assert_eq!(store.subscriber_count(), subs);
+            let t0 = Instant::now();
+            let mut hs = Vec::with_capacity(THREADS);
+            for _ in 0..THREADS {
+                let st = Arc::clone(&store);
+                hs.push(std::thread::spawn(move || {
+                    for _ in 0..PER_THREAD {
+                        st.dispatch(());
+                    }
+                }));
+            }
+            for h in hs {
+                h.join().expect("decay thread panicked");
+            }
+            rounds.push(t0.elapsed().as_nanos() as u64);
+            assert_eq!(*store.snapshot(), expected, "衰减段计数守恒");
+            drop(tickets);
+        }
+        rounds.sort_unstable();
+        let med = rounds[ROUNDS / 2];
+        let ops_per_s = expected as f64 * 1e9 / med as f64;
+        let per_dispatch_ns = 1e9 / ops_per_s;
+        let decay_pct = if subs == 0 {
+            0.0
+        } else {
+            (base_ops_per_s - ops_per_s) / base_ops_per_s * 100.0
+        };
+        println!(
+            "subs={subs:>2} throughput_ops_per_s={ops_per_s:.0} per_dispatch_ns={per_dispatch_ns:.1} decay_vs_0_pct={decay_pct:.1}"
+        );
+        if subs == 0 {
+            base_ops_per_s = ops_per_s;
+            base_per_dispatch_ns = per_dispatch_ns;
+        }
+        last_per_dispatch_ns = per_dispatch_ns;
+    }
+    let marginal = (last_per_dispatch_ns - base_per_dispatch_ns) / 8.0;
+    println!("implied_marginal_per_sub_ns(0→8, contended)={marginal:.1}");
+}
+
+/// ⑦ 伪共享代理形：StoreInner 内联热词对（runtime.rs 声明序 draining/closed
+/// 紧邻，gate 镜像 local_subs 闸计数——真实布局 gate 经 Arc 独立分配，此臂
+/// 并入内联是「最坏打包」对照）。真实布局中 subs_version/local_subs/audit_gate/
+/// subs/audit 五个热词均 Arc 装载（独立分配，结构性不与内联字段同线），不测。
+/// queue/state 两把 Mutex 的 CAS 争用是有意争用（锁本体语义），不入本对照。
+mod gateshapes {
+    use std::hint::black_box;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // repr(C)：被测机制就是字段邻接/垫片隔离，布局必须按声明落。
+    #[repr(C)]
+    pub struct Adjacent {
+        pub closed: AtomicBool, // 读热：dispatch is_closed 闸 + 锁内复检（Acquire load）
+        pub draining: AtomicBool, // 写热：夺权 swap(AcqRel) + 出口放旗 store(Release)
+        pub gate: AtomicUsize,  // 读热：local_subs 闸（drain 每轮 Relaxed load）
+    }
+
+    #[repr(align(64))]
+    pub struct Pad(pub ());
+
+    #[repr(C)]
+    pub struct Isolated {
+        pub closed: AtomicBool,
+        pub _p0: Pad,
+        pub draining: AtomicBool,
+        pub _p1: Pad,
+        pub gate: AtomicUsize,
+        pub _p2: Pad,
+    }
+
+    /// 写混：夺权/放旗（DrainGuard 生命周期镜像：swap 夺权、出口 Release 放旗）。
+    #[inline]
+    pub fn write_mix(draining: &AtomicBool) {
+        if !draining.swap(true, Ordering::AcqRel) {
+            draining.store(false, Ordering::Release);
+        }
+    }
+
+    /// 读混：停机闸 + 本地闸（dispatch/drain 读侧镜像，黑箱防消除）。
+    #[inline]
+    pub fn read_mix(closed: &AtomicBool, gate: &AtomicUsize) {
+        black_box(closed.load(Ordering::Acquire));
+        black_box(gate.load(Ordering::Relaxed));
+    }
+
+    /// dispatch 热路径原子面镜像：读闸 + 夺权/放旗 + 本地闸读。
+    #[inline]
+    pub fn dispatch_atomic_mix(closed: &AtomicBool, draining: &AtomicBool, gate: &AtomicUsize) {
+        read_mix(closed, gate);
+        write_mix(draining);
+    }
+}
+
+/// ⑦ 伪共享防：热词对相邻 vs align(64) 垫片隔离（沿 memory_pool_profile ⑦
+/// 对照法）。两臂：2 线程不对称对撞（写混×读闸）+ 8 线程全混 hammer（风暴形态
+/// 镜像）。纯 std 原子，零分配热窗，内存段不适用。
+fn perf_false_sharing_gates() {
+    println!("== perf: false_sharing_gates（⑦ 内联热词 draining/closed/gate：相邻 vs 垫片隔离）==");
+    use gateshapes::{dispatch_atomic_mix, Adjacent, Isolated};
+
+    /// 双线程对撞：一线程写混（夺权/放旗），一线程读闸（closed+gate）。
+    /// ns/op = 总墙钟摊到每 op（两线程等 op 数，口径同 memory_pool_profile ⑦）。
+    fn bounce(write: impl Fn() + Send + 'static, read: impl Fn() + 'static, iters: u64) -> f64 {
+        let t0 = Instant::now();
+        let h = std::thread::spawn(move || {
+            for _ in 0..iters {
+                write();
+            }
+        });
+        for _ in 0..iters {
+            read();
+        }
+        h.join().unwrap();
+        t0.elapsed().as_nanos() as f64 / iters as f64
+    }
+
+    /// N 线程同撞完整 dispatch 原子面（读闸+夺权/放旗+本地闸读），ns/op。
+    fn hammer(n: usize, iters_per: u64, mix: impl Fn() + Send + Sync + 'static) -> f64 {
+        let mix = Arc::new(mix);
+        let t0 = Instant::now();
+        let mut hs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let m = Arc::clone(&mix);
+            hs.push(std::thread::spawn(move || {
+                for _ in 0..iters_per {
+                    m();
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        t0.elapsed().as_nanos() as f64 / (n as u64 * iters_per) as f64
+    }
+
+    const ITERS: u64 = 5_000_000;
+    const HAMMER_PER: u64 = 1_000_000;
+
+    let adj = Arc::new(Adjacent {
+        closed: AtomicBool::new(false),
+        draining: AtomicBool::new(false),
+        gate: AtomicUsize::new(0),
+    });
+    let adjacent_bounce = {
+        let w = Arc::clone(&adj);
+        let r = Arc::clone(&adj);
+        bounce(
+            move || gateshapes::write_mix(&w.draining),
+            move || gateshapes::read_mix(&r.closed, &r.gate),
+            ITERS,
+        )
+    };
+    let adj8 = {
+        let a = Arc::clone(&adj);
+        hammer(8, HAMMER_PER, move || {
+            dispatch_atomic_mix(&a.closed, &a.draining, &a.gate)
+        })
+    };
+
+    let iso = Arc::new(Isolated {
+        closed: AtomicBool::new(false),
+        _p0: gateshapes::Pad(()),
+        draining: AtomicBool::new(false),
+        _p1: gateshapes::Pad(()),
+        gate: AtomicUsize::new(0),
+        _p2: gateshapes::Pad(()),
+    });
+    let isolated_bounce = {
+        let w = Arc::clone(&iso);
+        let r = Arc::clone(&iso);
+        bounce(
+            move || gateshapes::write_mix(&w.draining),
+            move || gateshapes::read_mix(&r.closed, &r.gate),
+            ITERS,
+        )
+    };
+    let iso8 = {
+        let a = Arc::clone(&iso);
+        hammer(8, HAMMER_PER, move || {
+            dispatch_atomic_mix(&a.closed, &a.draining, &a.gate)
+        })
+    };
+
+    println!(
+        "⑦ gate bounce (2thr × {ITERS}, write-mix × read-gate): adjacent={adjacent_bounce:.1} ns/op isolated(pad)={isolated_bounce:.1} ns/op ratio={:.2}x",
+        adjacent_bounce / isolated_bounce
+    );
+    println!(
+        "⑦ gate hammer (8thr × {HAMMER_PER}, full atomic mix): adjacent={adj8:.1} ns/op isolated(pad)={iso8:.1} ns/op ratio={:.2}x",
+        adj8 / iso8
+    );
+    println!("⑦ product 布局=adjacent 形（StoreInner 内联紧邻）；若风暴吞吐需此余量，热词拆线（Pad/Arc 化）为候选改法——本采集器只留痕不改布局。");
 }

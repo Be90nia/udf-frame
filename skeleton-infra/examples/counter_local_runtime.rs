@@ -39,7 +39,10 @@ impl Reducer for CounterFeature {
     type Op = Infallible;
 
     fn initial(&self) -> CounterState {
-        CounterState { count: 0, undo_log: Vec::new() }
+        CounterState {
+            count: 0,
+            undo_log: Vec::new(),
+        }
     }
 
     fn reduce(
@@ -51,25 +54,41 @@ impl Reducer for CounterFeature {
         match action {
             CounterAction::Inc => CounterState {
                 count: state.count + 1,
-                undo_log: state.undo_log.as_slice().iter().copied().chain([1]).collect(),
+                undo_log: state
+                    .undo_log
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .chain([1])
+                    .collect(),
             },
             CounterAction::Dec => CounterState {
                 count: state.count - 1,
-                undo_log: state.undo_log.as_slice().iter().copied().chain([-1]).collect(),
+                undo_log: state
+                    .undo_log
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .chain([-1])
+                    .collect(),
             },
             CounterAction::Undo => match state.undo_log.as_slice() {
                 // 有账可撤：弹一条，派生 Replay(-d) 回灌应用——本帧不改 count。
                 // 链有界：Replay 分支零效果产出，环在此终止（不失控）。
                 [log @ .., d] => {
                     out.push(Effect::Emit(CounterAction::Replay(-d)));
-                    CounterState { count: state.count, undo_log: log.to_vec() }
+                    CounterState {
+                        count: state.count,
+                        undo_log: log.to_vec(),
+                    }
                 }
                 // 空账：无事可撤，零效果 no-op（否则 Undo→Undo 死环）。
                 [] => state.clone(),
             },
-            CounterAction::Replay(d) => {
-                CounterState { count: state.count + d, undo_log: state.undo_log.clone() }
-            }
+            CounterAction::Replay(d) => CounterState {
+                count: state.count + d,
+                undo_log: state.undo_log.clone(),
+            },
         }
     }
 }
@@ -101,7 +120,13 @@ fn main() {
     let final_state = store.snapshot();
     assert_eq!(final_state.count, 0, "连撤到底应归零");
     assert!(final_state.undo_log.is_empty(), "撤销账应排空");
-    assert_eq!(*final_state, CounterState { count: 0, undo_log: vec![] });
+    assert_eq!(
+        *final_state,
+        CounterState {
+            count: 0,
+            undo_log: vec![]
+        }
+    );
 
     // —— 断言 2：每次状态变更都有通知到达，且通知终值 = 快照终值 ——
     let frames = notified.lock().unwrap().clone();
@@ -116,7 +141,11 @@ fn main() {
         vec![1, 2, 3, 2, 3, 4, 3, 2, 1, 0],
         "每次真实状态变更都应有一条通知（含 Undo 中间帧与 Replay 派生帧）"
     );
-    assert_eq!(*frames.last().unwrap(), final_state.count, "通知终值应等于快照终值");
+    assert_eq!(
+        *frames.last().unwrap(),
+        final_state.count,
+        "通知终值应等于快照终值"
+    );
 
     // —— 断言 3：Emit 回灌链的逐帧序列（通知点=每 action 处理后，可能见链中间态帧；
     //    Undo 帧可见 count 未变、仅账本弹出的中间态）——
@@ -126,5 +155,8 @@ fn main() {
         "逐帧：…2,2(Undo 中间帧),3(Replay)… 16 帧 = 16 次被处理的 action"
     );
 
-    println!("ALL ASSERTIONS PASSED: count=0, {} notifications, emit-chain bounded (Undo→Replay→∅)", frames.len());
+    println!(
+        "ALL ASSERTIONS PASSED: count=0, {} notifications, emit-chain bounded (Undo→Replay→∅)",
+        frames.len()
+    );
 }

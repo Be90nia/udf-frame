@@ -42,7 +42,11 @@ impl Reducer for CounterFeature {
 struct NullRuntime;
 
 impl EffectRuntime<CounterAction, Infallible> for NullRuntime {
-    fn run(&mut self, _effect: Effect<CounterAction, Infallible>, _back: &ActionSender<CounterAction>) {
+    fn run(
+        &mut self,
+        _effect: Effect<CounterAction, Infallible>,
+        _back: &ActionSender<CounterAction>,
+    ) {
     }
 }
 
@@ -106,7 +110,9 @@ struct NullRuntimeFor<A> {
 
 impl<A> Default for NullRuntimeFor<A> {
     fn default() -> Self {
-        Self { _marker: std::marker::PhantomData }
+        Self {
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
@@ -129,9 +135,18 @@ fn reducer_effects_forward_in_push_order() {
             0
         }
         fn reduce(&self, s: &u32, _: Burst, out: &mut EffectBuf<Burst, u32>) -> u32 {
-            out.push(Effect::Run { id: EffectId(1), op: 1 });
-            out.push(Effect::Run { id: EffectId(2), op: 2 });
-            out.push(Effect::Run { id: EffectId(3), op: 3 });
+            out.push(Effect::Run {
+                id: EffectId(1),
+                op: 1,
+            });
+            out.push(Effect::Run {
+                id: EffectId(2),
+                op: 2,
+            });
+            out.push(Effect::Run {
+                id: EffectId(3),
+                op: 3,
+            });
             s + 1
         }
     }
@@ -147,7 +162,11 @@ fn reducer_effects_forward_in_push_order() {
     let store = Store::new(BurstFeature, Recorder(Arc::clone(&seen)));
     store.dispatch(Burst::Burst);
     assert_eq!(*store.snapshot(), 1);
-    assert_eq!(*seen.lock().unwrap(), vec![1, 2, 3], "转发顺序必须等于写入顺序");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![1, 2, 3],
+        "转发顺序必须等于写入顺序"
+    );
 }
 
 /// 空效果 reducer 不触碰解释器（Run/Cancel 零转发）。

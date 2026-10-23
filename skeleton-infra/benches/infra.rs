@@ -5,7 +5,7 @@
 //! 计时同受每分配 2 次原子加的噪声；预算门为 10µs 量级，余量充足。
 //!
 //! 跑法（required-features 并集，见 Cargo.toml）：
-//! `cargo bench -p skeleton-infra --all-features --bench infra`
+//! `cargo bench -p udf-skeleton-infra --all-features --bench infra`
 
 use std::path::Path;
 
@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use skeleton::{Effect, Store as _};
 use skeleton_infra::fx::FxScope;
-use skeleton_infra::runtime::SyncStore;
 use skeleton_infra::memgov::CountingAllocator;
+use skeleton_infra::runtime::SyncStore;
 use skeleton_infra::{Journal, JournalError, JsonlJournal};
 
 // ---- effect_steady_state 的最小效果域（单效果 dispatch 稳态，零订阅者）----
@@ -43,7 +43,10 @@ impl skeleton::Reducer for Producer {
     }
 
     fn reduce(&self, s: &Hits, _a: Act, out: &mut skeleton::EffectBuf<Act, Beep>) -> Hits {
-        out.push(Effect::Run { id: skeleton::EffectId(s.0 + 1), op: Beep::One });
+        out.push(Effect::Run {
+            id: skeleton::EffectId(s.0 + 1),
+            op: Beep::One,
+        });
         Hits(s.0 + 1)
     }
 }
@@ -62,9 +65,10 @@ fn effect_steady_state(c: &mut Criterion) {
     }
     // 预算闸：稳态每 dispatch 净新增分配=0——快照
     // `Arc::new(next)` 一配一释自抵消（快照即模型本体，口径扣除后=零新增）。
-    // 口径注：live_allocs() 为净存活计数（memgov pub 面无累积分配调用计数），
-    // 净零无法区分「除快照外零分配」与「同量 churn」——盲区与泄漏判据
-    // 同口径诚实分级（alloc 调用计数口径留 memgov 升级位）。
+    // 口径注：live_allocs() 为净存活计数，净零无法区分「除快照外零分配」与
+    // 「同量 churn」——churn 对账面已出厂（`CountingAllocator::total_allocs`/
+    // `total_deallocs`，churn=total 差值）；本闸仍用 live 净额（预算=无净增量，
+    // churn 辨识归采集器内存锚段双口径）。
     let before = CountingAllocator::live_allocs();
     store.dispatch(black_box(Act::Tick));
     assert_eq!(
@@ -90,9 +94,12 @@ struct BenchState {
     seen: u64,
 }
 
-// Journal<A, S> 的 S 与 append 无关，具体化以便方法解析。
-fn append_one(journal: &mut JsonlJournal, action: &BenchAction) -> Result<(), JournalError> {
-    Journal::<BenchAction, BenchState>::append(journal, action)
+// 批 6A 关联类型化：A/S 由 Self 钉死，append 直呼零标注。
+fn append_one(
+    journal: &mut JsonlJournal<BenchAction, BenchState>,
+    action: &BenchAction,
+) -> Result<(), JournalError> {
+    journal.append_action(action)
 }
 
 fn journal_append_line(c: &mut Criterion) {
@@ -101,8 +108,12 @@ fn journal_append_line(c: &mut Criterion) {
     std::fs::create_dir_all(dir).expect("mkdir target-iso/bench-journal");
     let path = dir.join("bench.jsonl");
     let _ = std::fs::remove_file(&path); // create_new 撞残留=Err，先清
-    let mut journal = JsonlJournal::create(&path).expect("create journal");
-    let action = BenchAction { id: 1, label: "bench".to_string() };
+    let mut journal =
+        JsonlJournal::<BenchAction, BenchState>::create(&path).expect("create journal");
+    let action = BenchAction {
+        id: 1,
+        label: "bench".to_string(),
+    };
 
     c.bench_function("journal_append_line", |b| {
         b.iter(|| append_one(&mut journal, black_box(&action)).expect("append ok"))
@@ -132,5 +143,10 @@ fn fxscope_spawn_join(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, fxscope_spawn_join, journal_append_line, effect_steady_state);
+criterion_group!(
+    benches,
+    fxscope_spawn_join,
+    journal_append_line,
+    effect_steady_state
+);
 criterion_main!(benches);

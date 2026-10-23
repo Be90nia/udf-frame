@@ -4,6 +4,7 @@
 //! （不变量监视线程 + 去 barrier 自由竞争）。
 
 use skeleton::{ActionSender, Effect, EffectBuf, EffectRuntime, Reducer, Store as _};
+use skeleton_infra::audit::AuditEventKind;
 use skeleton_infra::runtime::SyncStore as Store;
 use std::convert::Infallible;
 use std::marker::PhantomData;
@@ -91,7 +92,10 @@ fn subscriber_panic_removed_and_store_survives() {
     });
     assert_eq!(store.subscriber_count(), 2, "订阅计数读侧可见");
     let r1 = catch_unwind(AssertUnwindSafe(|| store.dispatch(Act::Inc)));
-    assert!(r1.is_ok(), "订阅回调 panic 必须被归一（摘除+继续），不外溢 dispatch");
+    assert!(
+        r1.is_ok(),
+        "订阅回调 panic 必须被归一（摘除+继续），不外溢 dispatch"
+    );
     assert_eq!(hits.load(Ordering::SeqCst), 1, "后继订阅者照常收到通知");
     assert_eq!(
         store.subscriber_count(),
@@ -101,7 +105,11 @@ fn subscriber_panic_removed_and_store_survives() {
     let r2 = catch_unwind(AssertUnwindSafe(|| store.dispatch(Act::Inc)));
     assert!(r2.is_ok(), "中毒 slot 已摘除：后续通知不再撞毒锁");
     assert_eq!(hits.load(Ordering::SeqCst), 2);
-    assert_eq!(*store.snapshot(), 2, "store 存活：reduce 链未受订阅 panic 影响");
+    assert_eq!(
+        *store.snapshot(),
+        2,
+        "store 存活：reduce 链未受订阅 panic 影响"
+    );
 }
 
 /// send 显式化——store 存活返回 true；store 丢弃后返回 false（停机窗显式
@@ -113,7 +121,10 @@ fn send_reports_delivery_explicitly() {
     assert!(sender.dispatch(Act::Inc));
     assert_eq!(*store.snapshot(), 1, "回灌已入队并排空");
     drop(store);
-    assert!(!sender.dispatch(Act::Inc), "store 丢弃后 dispatch 必须显式返回 false");
+    assert!(
+        !sender.dispatch(Act::Inc),
+        "store 丢弃后 dispatch 必须显式返回 false"
+    );
 }
 
 /// close 对并发 push 的
@@ -188,7 +199,51 @@ fn close_vs_dispatch_race_conserves_and_freezes() {
         for _ in 0..3 {
             store.dispatch(Act::Inc);
         }
-        assert_eq!(store.rejected_after_close(), rejected + 3, "闭门后 dispatch 恒显式拒绝");
+        assert_eq!(
+            store.rejected_after_close(),
+            rejected + 3,
+            "闭门后 dispatch 恒显式拒绝"
+        );
         assert_eq!(*store.snapshot(), final_state, "闭门后快照冻结（零新执行）");
     }
+}
+
+// ── reducer panic 计数留痕（可观测对称：四条 panic/异常路径全有读侧）──────
+
+/// reducer panic 与其余三路（解释器 panic / 订阅回调 panic / 回灌超限）同一
+/// fail-visible 留痕纪律：catch_unwind 只观察（计数+审计现场）后 resume_unwind
+/// 原样重抛——传播语义不变，本测钉的是读侧面。动作本体已出队随栈展开丢失
+/// （已知语义，见 Store doc「Panic 契约」），状态不前进、实例可复用。
+#[test]
+fn reducer_panic_is_counted_and_audited() {
+    let store = Store::new(BoomFeature, Nop::<Boom> { _m: PhantomData });
+    let _ticket = store.subscribe_events(64, |_| {});
+    let r1 = catch_unwind(AssertUnwindSafe(|| store.dispatch(Boom::Detonate)));
+    assert!(r1.is_err(), "panic 传播语义不变（fail-fast 不吞）");
+    assert_eq!(
+        store.reducer_panic_count(),
+        1,
+        "reducer panic 必须计数留痕（四路唯一无读侧者收口）"
+    );
+    assert_eq!(store.runtime_panic_count(), 0, "解释器计数不得串线");
+    assert_eq!(store.subscriber_panics(), 0, "订阅回调计数不得串线");
+    // 审计现场：ReducerInterrupted 在时间线上，且 panic 拍不记 Reduced
+    //（reduce 未完成——时间线如实）。
+    let kinds: Vec<_> = store.take_events().iter().map(|e| e.kind).collect();
+    assert!(
+        kinds.contains(&AuditEventKind::ReducerInterrupted),
+        "审计流必须有病理现场，实际: {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&AuditEventKind::Reduced),
+        "panic 拍不得记 Reduced（状态迁移未完成），实际: {kinds:?}"
+    );
+    // 实例照常复用，计数不重复上浮。
+    store.dispatch(Boom::Fine);
+    assert_eq!(*store.snapshot(), 1);
+    assert_eq!(
+        store.reducer_panic_count(),
+        1,
+        "正常 dispatch 不得推进 panic 计数"
+    );
 }

@@ -8,16 +8,28 @@
 //!
 //! std-only：`runtime` feature 零三方依赖（cargo tree 证明口径见 crate 文档）。
 
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
-use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use skeleton::{ActionSender, Effect, EffectBuf, EffectRuntime, Infallible, Reducer, Store, Subscription};
+use skeleton::{
+    ActionSender, Effect, EffectBuf, EffectRuntime, Infallible, Reducer, Restore, Store,
+    Subscription,
+};
 
 use crate::audit::{AuditEvent, AuditEventKind, AuditSink, AuditTicket};
+
+// 关注面切缝（可维护性 R1）：排空环主文件只留 store 机器；本地订阅 TLS 机制
+// 与审计发射沿自然缝独立成子模块（对内 pub(super)，公共面经本模块 re-export
+// 原路不变）。
+mod audit_emit;
+mod local_subs;
+
+use audit_emit::{audit_emit, audit_enqueued};
+pub use local_subs::LocalSubscription;
+use local_subs::{local_notify, next_local_sub_id};
 
 /// std Mutex 取锁：中毒 = 持锁方已 panic、状态不可信——按 fail-fast 纪律传播
 /// panic，禁静默吞掉毒锁继续跑。（crate 内共享：testing 域 TestStore 同纪律取锁。）
@@ -27,7 +39,8 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     )
 }
 
-/// 构造回灌句柄：仅 [`SyncStore::new`] 经
+/// 构造回灌句柄：仅装配构造器（[`SyncStore::new`] / [`SyncStore::restore_from`]
+/// 共用装配段）经
 /// [`Arc::new_cyclic`] 调用一次，产物缓存为 [`StoreInner::back`]——`sender()`
 /// 克隆复用、排空循环借用，禁每 action 新建 Arc 闭包（稳态零新增分配的构成部分）。
 fn back_sender<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
@@ -35,30 +48,30 @@ fn back_sender<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
 ) -> ActionSender<A> {
     let weak = weak.clone();
     ActionSender::new(move |action| match weak.upgrade() {
-            Some(inner) => {
-                // 与 dispatch 同闸——闭门 sender dispatch 显式 false 并计数；
-                // push/夺权/首 pop 同临界区（锁消融，论证同 enqueue/dispatch）。
-                // 同栈判定经 reentrant_origin——排空线程在 run 内回灌计深，
-                // 他线程异步回灌=外部流量（环防护责任边界见 EffectRuntime::run）。
-                let origin = reentrant_origin(inner.store_id);
-                match enqueue(&inner, action, origin) {
-                    Enqueue::Rejected => {
-                        audit_emit(&inner, AuditEventKind::Rejected);
-                        false
-                    }
-                    Enqueue::Queued => {
-                        audit_enqueued(&inner, origin);
-                        true
-                    }
-                    Enqueue::Draining(first) => {
-                        audit_enqueued(&inner, origin);
-                        drain_owned(&inner, first);
-                        true
-                    }
+        Some(inner) => {
+            // 与 dispatch 同闸——闭门 sender dispatch 显式 false 并计数；
+            // push/夺权/首 pop 同临界区（锁消融，论证同 enqueue/dispatch）。
+            // 同栈判定经 reentrant_origin——排空线程在 run 内回灌计深，
+            // 他线程异步回灌=外部流量（环防护责任边界见 EffectRuntime::run）。
+            let origin = reentrant_origin(inner.store_id);
+            match enqueue(&inner, action, origin) {
+                Enqueue::Rejected => {
+                    audit_emit(&inner, AuditEventKind::Rejected);
+                    false
+                }
+                Enqueue::Queued => {
+                    audit_enqueued(&inner, origin);
+                    true
+                }
+                Enqueue::Draining(first) => {
+                    audit_enqueued(&inner, origin);
+                    drain_owned(&inner, first);
+                    true
                 }
             }
-            None => false,
-        })
+        }
+        None => false,
+    })
 }
 
 /// 订阅回调闭包（私有别名收口 type_complexity，零公共面增量）
@@ -84,7 +97,9 @@ unsafe impl<T: Send> Sync for DrainExclusive<T> {}
 
 impl<T> DrainExclusive<T> {
     fn new(value: T) -> Self {
-        Self { value: UnsafeCell::new(value) }
+        Self {
+            value: UnsafeCell::new(value),
+        }
     }
 
     /// SAFETY: 调用方必须持排空权（drain 内，DrainGuard 未 disarm），且不得让
@@ -154,6 +169,10 @@ struct StoreInner<S, A, Op> {
     /// 解释器 panic 毒锁恢复计数：每次 into_inner 恢复自增（= 此前恰一次
     /// 解释器 panic，恢复后 clear_poison 复位毒位）。读侧 [`SyncStore::runtime_panic_count`]。
     runtime_panics: AtomicU64,
+    /// reducer panic 计数：排空环 catch_unwind 观察点计数后原样 resume（传播
+    /// 语义不变，只加留痕）。读侧 [`SyncStore::reducer_panic_count`]——四条
+    /// panic/异常路径（解释器/订阅回调/回灌超限/reducer）的最后一处读侧收口。
+    reducer_panics: AtomicU64,
     /// 回灌深度预算触发计数：单任排空连续回灌超 [`FEEDBACK_DEPTH_BUDGET`]
     /// 即停排+自增。读侧 [`SyncStore::feedback_budget_exceeded`]。
     feedback_exceeded: AtomicU64,
@@ -209,7 +228,8 @@ struct StoreInner<S, A, Op> {
 /// 显式契约而非可恢复路径：state 锁内「只剩 memcpy 与计数」的形态纪律不为用户
 /// State 的 panic-free 性兜底。对照：`S::Drop` 的 panic 已由「旧快照锁外析构」
 /// 排除（见 `drain_owned` 落位段）；解释器 panic 不报废实例（毒锁恢复+计数，
-/// 见 [`Self::runtime_panic_count`]）。
+/// 见 [`Self::runtime_panic_count`]）；reducer panic 同不报废（计数+审计现场，
+/// 见 [`Self::reducer_panic_count`]——action 本体已出队随栈展开丢失，状态不前进）。
 pub struct SyncStore<S, A, Op = Infallible> {
     inner: Arc<StoreInner<S, A, Op>>,
 }
@@ -317,7 +337,9 @@ fn enqueue<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'stat
 
 // S: Sync：ActionSender 的回灌闭包跨线程共享（Send+Sync），Weak<StoreInner> 的
 // Send/Sync 要求 StoreInner 整体 Send+Sync——其中 Mutex<Arc<S>> 传导出 S: Sync。
-impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Store for SyncStore<S, A, Op> {
+impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Store
+    for SyncStore<S, A, Op>
+{
     type State = S;
     type Action = A;
     type Op = Op;
@@ -330,7 +352,9 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
         // 闸序（锁消融批论证）：closed 单调 false→true，load Acquire——见
         // [`SyncStore::close`] 的 Release 配对与锁内复检论证。
         if self.is_closed() {
-            self.inner.rejected_after_close.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .rejected_after_close
+                .fetch_add(1, Ordering::SeqCst);
             // 取证面：早闸拒绝与 enqueue 复检拒绝同一事件节点（两条 push
             // 路径 + 两个闸位的拒绝在时间线上同形）。
             audit_emit(&self.inner, AuditEventKind::Rejected);
@@ -402,9 +426,13 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
     fn subscribe(&self, f: impl FnMut(&S) + Send + 'static) -> Subscription<S> {
         // 闭门登记显形（登记照常生效，但永无通知——见类型文档对照表）
         if self.is_closed() {
-            self.inner.subscriptions_after_close.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .subscriptions_after_close
+                .fetch_add(1, Ordering::SeqCst);
         }
-        let slot = Arc::new(SubscriptionSlot { notify: Mutex::new(Box::new(f)) });
+        let slot = Arc::new(SubscriptionSlot {
+            notify: Mutex::new(Box::new(f)),
+        });
         lock(&self.inner.subs).push(Arc::downgrade(&slot));
         self.inner.subs_version.fetch_add(1, Ordering::Release);
         let dead = Arc::downgrade(&slot);
@@ -446,7 +474,6 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
     fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
     }
-
 }
 
 impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> SyncStore<S, A, Op> {
@@ -461,6 +488,61 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ///
     /// 构造即接线：回灌句柄经 `Arc::new_cyclic` 缓存（[`SyncStore::sender`] 克隆复用），
     /// 初始状态 = `root.initial()`；此后 [`SyncStore::dispatch`] / `sender().dispatch` 驱动。
+    ///
+    /// # 界不对称（有意，接口维 R1）
+    ///
+    /// 根 Reducer 要 `Send + Sync`、解释器只要求 `Send`，依据在 std 类型律：
+    /// store 部件经 `Arc<StoreInner>` 跨线程共享，`Arc<T>: Sync` 要求 `T: Sync`，
+    /// 故 reducer 的 trait 对象必须挂全 `Send + Sync`；解释器装箱在 `Mutex`
+    /// 之后（`Mutex<T>: Sync` 只要求 `T: Send`）——锁后独占访问、从不并发
+    /// 共享，能安全移动即足，多要 `Sync` 是白缴的税。
+    ///
+    /// # 解释器观测的惯用形（fx 按值收走后）
+    ///
+    /// `new` 按值拿走解释器——产品代码要观测解释器行为（处理过哪些 op、
+    /// 何时处理）时，把观测面放进共享句柄：解释器持 `Arc<Mutex<…>>` 克隆份，
+    /// 宿主持原份，装配后随处可读（测试语境的收口见 `testing::TestStore`；
+    /// 本例是产品语境的手写形）：
+    ///
+    /// ```
+    /// use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
+    /// use skeleton_infra::runtime::SyncStore;
+    /// use std::convert::Infallible;
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// #[derive(Debug, PartialEq)]
+    /// enum Op { Ping }
+    ///
+    /// struct Pinger;
+    /// impl Reducer for Pinger {
+    ///     type State = u32;
+    ///     type Action = u32;
+    ///     type Op = Op;
+    ///     fn initial(&self) -> u32 { 0 }
+    ///     fn reduce(&self, s: &u32, _a: u32, out: &mut EffectBuf<u32, Op>) -> u32 {
+    ///         out.push(Effect::Run { id: EffectId(1), op: Op::Ping });
+    ///         *s
+    ///     }
+    /// }
+    ///
+    /// /// 解释器外壳：执行逻辑外的观测面（此处记录处理序；真实宿主在同一位置执行）。
+    /// struct Observed {
+    ///     seen: Arc<Mutex<Vec<Op>>>,
+    /// }
+    /// impl EffectRuntime<u32, Op> for Observed {
+    ///     fn run(&mut self, effect: Effect<u32, Op>, _back: &ActionSender<u32>) {
+    ///         if let Effect::Run { op, .. } = effect {
+    ///             self.seen.lock().unwrap().push(op); // 解释后记录（时机自选）
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// let seen = Arc::new(Mutex::new(Vec::new()));
+    /// let store = SyncStore::new(Pinger, Observed { seen: Arc::clone(&seen) });
+    /// store.dispatch(1);
+    /// assert_eq!(*seen.lock().unwrap(), vec![Op::Ping]); // 装配后随处可读
+    /// # store.close();
+    /// ```
     // `#[track_caller]`：把采用方装配行转发给 `Reducer::initial` 的 panic 位置
     // （分片误用作根，O 小项）。
     #[track_caller]
@@ -468,17 +550,78 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         root: impl Reducer<State = S, Action = A, Op = Op> + Send + Sync + 'static,
         fx: impl EffectRuntime<A, Op> + Send + 'static,
     ) -> Self {
-        let initial = root.initial();
+        Self::restore_from(root, fx, Restore::Empty)
+    }
+
+    /// 恢复装配（接口维 R1 落点）：自 [`Restore`] 三态播种新 store——
+    /// [`skeleton::JournalPort::restore`] 的返回值直传本构造，`FromSnapshot`
+    /// 由此获得第一类落点（采用方不再自造协议级合成 action 污染词表）。
+    ///
+    /// 播种语义（契约②「恢复完备」的兑现）：
+    ///
+    /// - [`Restore::Empty`]：取 [`Reducer::initial`]，零 apply（[`Self::new`] 即本态）；
+    /// - [`Restore::FromInitial`]：自 initial 起步，动作全量经 [`Store::dispatch`] 重放；
+    /// - [`Restore::FromSnapshot`]：**快照态直入**（不经 `initial`——快照即真相），
+    ///   增量动作经 [`Store::dispatch`] 重放。
+    ///
+    /// 重放走 dispatch 而非裸 reduce 是契约而非实现细节：效果环照常运转，
+    /// `Effect::Emit` 回灌等派生动作由排空环再生，终态与 live 收敛（裸 reduce
+    /// 丢派生链）；收敛回归锚见 `tests/journal_port.rs`。
+    ///
+    /// # Examples
+    ///
+    /// 快照态 100 + 增量 [10, 5]：快照直入、增量重放，重建后照常 live：
+    ///
+    /// ```
+    /// use skeleton::{EffectBuf, NoFx, Reducer, Restore, Store as _};
+    /// use skeleton_infra::runtime::SyncStore;
+    /// use std::convert::Infallible;
+    ///
+    /// struct Counter;
+    /// impl Reducer for Counter {
+    ///     type State = u64;
+    ///     type Action = u64;
+    ///     type Op = Infallible;
+    ///     fn initial(&self) -> u64 { 0 }
+    ///     fn reduce(&self, s: &u64, a: u64, _out: &mut EffectBuf<u64, Infallible>) -> u64 { s + a }
+    /// }
+    ///
+    /// let store = SyncStore::restore_from(
+    ///     Counter,
+    ///     NoFx,
+    ///     Restore::FromSnapshot(100u64, vec![10u64, 5]),
+    /// );
+    /// assert_eq!(*store.snapshot(), 115);
+    /// store.dispatch(1);
+    /// assert_eq!(*store.snapshot(), 116);
+    /// # store.close();
+    /// ```
+    // `#[track_caller]`：同 [`Self::new`]——播种期 `initial()` 的 panic 归采用方装配行。
+    #[track_caller]
+    pub fn restore_from(
+        root: impl Reducer<State = S, Action = A, Op = Op> + Send + Sync + 'static,
+        fx: impl EffectRuntime<A, Op> + Send + 'static,
+        restore: Restore<A, S>,
+    ) -> Self {
+        let (state, actions) = match restore {
+            Restore::Empty => (root.initial(), Vec::new()),
+            Restore::FromInitial(actions) => (root.initial(), actions),
+            // 快照态直入：不经 initial（快照即真相），增量留给下方 dispatch 重放
+            Restore::FromSnapshot(state, actions) => (state, actions),
+        };
         // new_cyclic：back 缓存句柄持 Weak 指回 inner，环构造一步完成
         let inner = Arc::new_cyclic(|weak| StoreInner {
             reducer: Arc::new(root),
-            state: Mutex::new(Arc::new(initial)),
+            state: Mutex::new(Arc::new(state)),
             runtime: Mutex::new(Box::new(fx)),
             queue: Mutex::new(VecDeque::new()),
             subs: Arc::new(Mutex::new(Vec::new())),
             back: back_sender(weak),
             effect_buf: DrainExclusive::new(EffectBuf::new()),
-            notify_cache: DrainExclusive::new(NotifyCache { version: 0, slots: Vec::new() }),
+            notify_cache: DrainExclusive::new(NotifyCache {
+                version: 0,
+                slots: Vec::new(),
+            }),
             subs_version: Arc::new(AtomicUsize::new(0)),
             local_subs: Arc::new(AtomicUsize::new(0)),
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
@@ -489,6 +632,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             subscriber_panic_cause: Mutex::new(None),
             subscriptions_after_close: AtomicU64::new(0),
             runtime_panics: AtomicU64::new(0),
+            reducer_panics: AtomicU64::new(0),
             feedback_exceeded: AtomicU64::new(0),
             feedback_emitted: AtomicU64::new(0),
             audit_gate: Arc::new(AtomicBool::new(false)),
@@ -498,7 +642,13 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             #[cfg(test)]
             in_flight: AtomicUsize::new(0),
         });
-        SyncStore { inner }
+        let store = SyncStore { inner };
+        // 重放协议（契约②）：动作流经同一装配的 store 逐条 dispatch——效果环
+        // 照常运转，Emit 回灌等派生动作由排空环再生；裸 reduce 会丢派生链。
+        for action in actions {
+            store.dispatch(action);
+        }
+        store
     }
 
     /// 单线程订阅：回调免 `Send` 约束——闭包体内可用 `Rc`/`RefCell` 等线程
@@ -541,18 +691,15 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     pub fn subscribe_local(&self, f: impl FnMut(&S) + 'static) -> LocalSubscription {
         // 闭门登记显形（与 subscribe 同一纪律）
         if self.is_closed() {
-            self.inner.subscriptions_after_close.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .subscriptions_after_close
+                .fetch_add(1, Ordering::SeqCst);
         }
-        let sub_id = NEXT_LOCAL_SUB_ID.fetch_add(1, Ordering::Relaxed);
+        let sub_id = next_local_sub_id();
         let store_id = self.inner.store_id;
-        local_sub_register(store_id, sub_id, Box::new(LocalSlot { notify: Box::new(f) }));
+        local_subs::register(store_id, sub_id, Box::new(f));
         self.inner.local_subs.fetch_add(1, Ordering::Release);
-        LocalSubscription {
-            store_id,
-            sub_id,
-            count: Arc::clone(&self.inner.local_subs),
-            _not_send: PhantomData,
-        }
+        LocalSubscription::new(store_id, sub_id, Arc::clone(&self.inner.local_subs))
     }
 
     /// 活跃订阅者数（跨线程订阅；本地订阅不入此表，见 [`Self::subscribe_local`]）。
@@ -568,6 +715,9 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 代笔回收，通知快照缓存持强引用为死槽「续命」，实测证伪后修复为即时摘表；
     /// 「先 dispatch 后 drop 再读」序下滞后实测可复现，见
     /// tests/store_behavior_gaps.rs 的即时性回归）。
+    ///
+    /// 口径：**仅计 `subscribe` 订阅**——`subscribe_local`（TLS 亲和档）不在
+    /// 本计数内（两档订阅面不对称，设计见 subscribe_local 文档）。
     pub fn subscriber_count(&self) -> usize {
         lock(&self.inner.subs)
             .iter()
@@ -620,13 +770,27 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         self.inner.runtime_panics.load(Ordering::SeqCst)
     }
 
+    /// reducer panic 计数（fail-visible 留痕读侧）：reduce 的 panic 在排空环
+    /// catch_unwind 观察点计数后 `resume_unwind` 原样重抛——传播语义不变，
+    /// panic 照常在 dispatch 调用点上浮。动作本体已出队、以值传入 reduce，
+    /// panic 即丢失（状态不前进、实例可复用、已产效果原地留缓冲先续转）；
+    /// 审计时间线现场 = [`AuditEventKind::ReducerInterrupted`]。至此四条
+    /// panic/异常路径读侧齐全：解释器 [`Self::runtime_panic_count`]、订阅回调
+    /// [`Self::subscriber_panics`]、回灌超限 [`Self::feedback_budget_exceeded`]、
+    /// reducer 本计数。持续上升的读数 = 用户 reducer 存在 panic 路径。
+    pub fn reducer_panic_count(&self) -> u64 {
+        self.inner.reducer_panics.load(Ordering::SeqCst)
+    }
+
     /// 回灌深度预算触发计数（fail-visible 上浮）：单任排空内连续处理的
     /// 回灌链深度超过 `FEEDBACK_DEPTH_BUDGET`（64）即停排并自增。触发点回灌
     /// action 原值退回队尾（零丢失），本任 dispatch 随即返回——非 panic 非静默
     /// no-op。持续上升的读数 = 用户程序存在自指回灌环（reducer 恒 Emit 自身、
     /// 解释器经 `back.send` 同栈回灌），需在宿主侧修复；读数不升的正常流量不受
     /// 预算影响（外部 action 深度恒 0）。store drop 时若队列仍滞留（预算止步
-    /// 残留），弃队数一并计入本计数留痕（禁静默弃队）。
+    /// 残留），弃队数一并计入本计数留痕（禁静默弃队）。时间线现场 =
+    /// [`AuditEventKind::FeedbackBudgetExceeded`]（`subscribe_events` 订阅窗内
+    /// 可查——环结构重建走事件流，快速巡检走本计数）。
     pub fn feedback_budget_exceeded(&self) -> u64 {
         self.inner.feedback_exceeded.load(Ordering::SeqCst)
     }
@@ -744,7 +908,9 @@ impl<S, A, Op> Drop for SyncStore<S, A, Op> {
             Err(poisoned) => poisoned.into_inner().len(),
         };
         if discarded > 0 {
-            self.inner.feedback_exceeded.fetch_add(discarded as u64, Ordering::SeqCst);
+            self.inner
+                .feedback_exceeded
+                .fetch_add(discarded as u64, Ordering::SeqCst);
         }
     }
 }
@@ -802,7 +968,10 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
     inner: &Arc<StoreInner<S, A, Op>>,
     first: Option<(A, ActionOrigin)>,
 ) {
-    let mut guard = DrainGuard { flag: &inner.draining, armed: true };
+    let mut guard = DrainGuard {
+        flag: &inner.draining,
+        armed: true,
+    };
     let mut first = first;
     loop {
         let (action, origin) = match first.take() {
@@ -856,7 +1025,20 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // 下一任排空的 reduce 向其追加、转发时先续转（panic 前已产效果禁吞，
         // fail-visible；迭代头 clear 会无声吞掉残留）。成功路径转发即摘除，缓冲
         // 照常回空，保容量语义不变，稳态零新增分配不受影响。
-        let next_val = inner.reducer.reduce(&current, action, buf);
+        // reducer panic 与解释器 panic 同形留痕（与全链计数纪律对称）：catch 只
+        // 观察（计数+审计现场）即 resume_unwind 原样重抛——传播语义不变，
+        // panic 照常在 dispatch 调用点上浮；动作本体已出队随栈展开丢失（已知
+        // 契约），缓冲已产效果原地留（续转不受观察影响）。
+        let next_val = match catch_unwind(AssertUnwindSafe(|| {
+            inner.reducer.reduce(&current, action, buf)
+        })) {
+            Ok(next) => next,
+            Err(payload) => {
+                inner.reducer_panics.fetch_add(1, Ordering::SeqCst);
+                audit_emit(inner, AuditEventKind::ReducerInterrupted);
+                std::panic::resume_unwind(payload);
+            }
+        };
         audit_emit(inner, AuditEventKind::Reduced);
         // CoW 前置：reduce 后立即放手 current——不放
         // 手则 state 强计数恒 2，下方 make_mut 永走伪克隆分支，稳态零分配落空。
@@ -884,18 +1066,8 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
             });
             cache.version = version;
         }
-        // CoW 快照落位（快照分配税消除）：稳态
-        // （current 已放手、无外部 snapshot() 持有者）强计数=1 → make_mut 原地
-        // 写入零分配；有外部持有者时自动克隆新分配、旧分配冻结——持有者永见旧
-        // 快照，快照一致性逐比特保持（CoW 即快照语义的业界标准实现）。
-        // **mem::replace 把旧 S 挪出锁外析构是本形态最大风险点**：原地赋值会在
-        // state 锁内 drop 旧值，S:Drop panic 即毒锁变砖——锁内必须
-        // 只剩 memcpy 与计数原子，析构在 drop(old_snapshot) 处（锁外）发生。
-        let old_snapshot = {
-            let mut slot = lock(&inner.state);
-            std::mem::replace(Arc::make_mut(&mut slot), next_val)
-        };
-        drop(old_snapshot);
+        // CoW 快照落位（快照分配税消除；析构在锁外——契约细节见 helper 文档）。
+        place_snapshot(inner, next_val);
         // 通知句柄：订阅态在落位后补一次 state 锁克隆新快照（回调锁外借用）；
         // 句柄随迭代末消亡，稳态计数回落 1，下一 action 的 make_mut 仍原地命中。
         let notified_next = if cache.slots.is_empty() {
@@ -903,147 +1075,147 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         } else {
             Some(Arc::clone(&lock(&inner.state)))
         };
-        // 转发环：逐条借出转发，
-        // 成功才从缓冲摘除——panic 时未转发的效果原地留在缓冲，由下一任排空的
-        // reduce 追加、转发时先续转（禁吞：panic 前已产效果零丢失）。不能用
-        // `drain(..)`：其 Drop 语义是「完成排空」（未消费元素被 drop，drain_keep_rest
-        // 才回填且 unstable）——`drain(..)` 的静默蒸发本体在此，「clear 吞掉」
-        // 是次生路径。正在转发的一条随 panic 丢弃：其失败已显式传播+计数，重投
-        // 会恒 panic 死循环。remove(0) 稳态（单效果）零搬移，保容量。
-        // 回灌句柄为 StoreInner 缓存字段，禁每 action 新建 Arc 闭包
-        while let Some(effect) = buf.pop_front() {
-            match effect {
-                Effect::Emit(a) => {
-                    inner.feedback_emitted.fetch_add(1, Ordering::Relaxed);
-                    lock(&inner.queue).push_back((a, ActionOrigin::Feedback(feedback_depth + 1)));
-                    // 回灌入队与外部入队同一事件节点（深度链 = 环结构重建键）
-                    audit_emit(inner, AuditEventKind::Enqueued { feedback_depth: feedback_depth + 1 });
-                }
-                effect => {
-                    // 解释器 panic 毒化 runtime 锁，此后每个产效果 dispatch
-                    // 恒 panic（半砖：reduce 照常执行、状态持续前进，效果路径
-                    // 原地无恢复 API）。修法 = PoisonError into_inner 恢复守卫 +
-                    // clear_poison 复位毒位 + 计数上浮（runtime_panic_count），
-                    // panic 本体照常传播（禁 catch_unwind，fail-visible）。恢复
-                    // 的 Box 可能已被 panic 打断在任意中间态——run panic 后解释器
-                    // 自身一致性自证（宿主适配层责任，见 EffectRuntime 契约注）。
-                    let mut runtime = match inner.runtime.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => {
-                            inner.runtime_panics.fetch_add(1, Ordering::SeqCst);
-                            let guard = poisoned.into_inner();
-                            inner.runtime.clear_poison();
-                            guard
-                        }
-                    };
-                    // 解释器 panic 在时间线留痕
-                    // （EffectInterrupted）——catch_unwind 只观察不吞：发完事件
-                    // 原样 resume（payload/传播面不变；runtime 守卫在闭包外存活，
-                    // 随外层展开照常毒化，恢复路径与 fail-visible 均不受影响）。
-                    let run = catch_unwind(AssertUnwindSafe(|| runtime.run(effect, &inner.back)));
-                    if let Err(payload) = run {
-                        audit_emit(inner, AuditEventKind::EffectInterrupted);
-                        std::panic::resume_unwind(payload);
-                    }
-                    audit_emit(inner, AuditEventKind::EffectForwarded);
-                }
-            }
-        }
-        // 本地订阅（单线程档）：先于跨线程广播判读——零本地订阅一次 relaxed
-        // 读即短路；有本地订阅时零跨线程订阅也必触发（快照按需取，本地闭包
-        // panic 摘除计入 subscriber_panics，fail-closed）。同一 dispatch 通知
-        // 序：本地先行、跨线程随后（确定性）。
-        let local_notified = inner.local_subs.load(Ordering::Relaxed) > 0;
-        if local_notified {
-            let snapshot = Arc::clone(&lock(&inner.state));
-            let (poisoned, cause) = local_notify(inner.store_id, &*snapshot);
-            if poisoned > 0 {
-                inner.subscriber_panics.fetch_add(poisoned, Ordering::Release);
-                *lock(&inner.subscriber_panic_cause) = cause;
-            }
-        }
-        if let Some(next) = &notified_next {
-            for slot in cache.slots.iter() {
-                // 订阅回调 panic 归一：摘除该订阅者后继续——中毒 slot.notify
-                // 永久再 panic，留表即「每次 dispatch 必 panic」的双重变砖。摘除自增
-                // 版本，快照缓存下一次 dispatch 冷重建时收敛。
-                let notified = catch_unwind(AssertUnwindSafe(|| {
-                    let mut notify = lock(&slot.notify);
-                    notify(next);
-                }));
-                if let Err(payload) = notified {
-                    let dead = Arc::downgrade(slot);
-                    lock(&inner.subs).retain(|w| !Weak::ptr_eq(w, &dead));
-                    inner.subs_version.fetch_add(1, Ordering::Release);
-                    inner.subscriber_panics.fetch_add(1, Ordering::Release);
-                    // 成因摘要留痕（回答「为什么」，计数只答「谁死了」）
-                    *lock(&inner.subscriber_panic_cause) = Some(panic_cause_summary(&*payload));
-                }
-            }
-        }
+        // 转发环（禁吞语义见 helper 文档）：Emit 回灌入队、Run/Cancel 交解释器。
+        forward_effects(inner, buf, feedback_depth);
+        // 通知段（本地先行、跨线程随后；返回当拍是否有订阅者收到快照）。
+        let snapshot_notified = notify_snapshot_consumers(inner, cache, &notified_next);
         // 通知节点（R1-2）：只在当拍确有订阅者收到快照时记录——零订阅者的
         // dispatch 无 Notified 事件（时间线如实，不造心跳噪声）。
-        if local_notified || notified_next.is_some() {
+        if snapshot_notified {
             audit_emit(inner, AuditEventKind::Notified);
         }
     }
 }
 
-// ── 本地订阅（[`SyncStore::subscribe_local`]）的线程本地登记机制 ─────────────
-//
-// 回调只登记在注册线程的 thread-local 表——store 侧从不持有本地闭包，跨线程
-// dispatch 在自己的表里查不到该 store，本地回调「只在注册线程触发」与「免
-// Send」的安全性全部由线程亲和保证，零 unsafe（RefCell 作用域即单线程）。
-
-/// store 身份号：本地订阅 TLS 表的键。全局单调、进程内唯一。
-static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
-
-/// 本地订阅序号：注销定位键（与 store_id 联合唯一定位一条登记）。
-static NEXT_LOCAL_SUB_ID: AtomicU64 = AtomicU64::new(1);
-
-thread_local! {
-    static LOCAL_SUBS: RefCell<Vec<LocalSubEntry>> = const { RefCell::new(Vec::new()) };
+/// CoW 快照落位（快照分配税消除）：稳态
+/// （current 已放手、无外部 snapshot() 持有者）强计数=1 → make_mut 原地
+/// 写入零分配；有外部持有者时自动克隆新分配、旧分配冻结——持有者永见旧
+/// 快照，快照一致性逐比特保持（CoW 即快照语义的业界标准实现）。
+/// **mem::replace 把旧 S 挪出锁外析构是本形态最大风险点**：原地赋值会在
+/// state 锁内 drop 旧值，S:Drop panic 即毒锁变砖——锁内必须
+/// 只剩 memcpy 与计数原子，析构在本函数返回后的 drop(old_snapshot) 处（锁外）发生。
+fn place_snapshot<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
+    inner: &Arc<StoreInner<S, A, Op>>,
+    next_val: S,
+) {
+    let old_snapshot = {
+        let mut slot = lock(&inner.state);
+        std::mem::replace(Arc::make_mut(&mut slot), next_val)
+    };
+    drop(old_snapshot);
 }
 
-struct LocalSubEntry {
-    store_id: u64,
-    sub_id: u64,
-    notify: Box<dyn LocalNotify>,
-}
-
-/// 状态擦除的本地回调：TLS 容器无泛型，快照经 `dyn Any` 下发——store_id
-/// 唯一性保证下发必是本 store 的 `S`（downcast 失败属 TLS 键碰撞，不可达）。
-trait LocalNotify {
-    fn notify(&mut self, state: &dyn std::any::Any);
-}
-
-struct LocalSlot<S> {
-    notify: Box<dyn FnMut(&S)>,
-}
-
-impl<S: 'static> LocalNotify for LocalSlot<S> {
-    fn notify(&mut self, state: &dyn std::any::Any) {
-        let snapshot = state
-            .downcast_ref::<S>()
-            .expect("local subscription: state type mismatch (TLS store_id collision)");
-        (self.notify)(snapshot);
+/// 转发环：逐条借出转发，
+/// 成功才从缓冲摘除——panic 时未转发的效果原地留在缓冲，由下一任排空的
+/// reduce 追加、转发时先续转（禁吞：panic 前已产效果零丢失）。不能用
+/// `drain(..)`：其 Drop 语义是「完成排空」（未消费元素被 drop，drain_keep_rest
+/// 才回填且 unstable）——`drain(..)` 的静默蒸发本体在此，「clear 吞掉」
+/// 是次生路径。正在转发的一条随 panic 丢弃：其失败已显式传播+计数，重投
+/// 会恒 panic 死循环。remove(0) 稳态（单效果）零搬移，保容量。
+/// 回灌句柄为 StoreInner 缓存字段，禁每 action 新建 Arc 闭包。
+fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
+    inner: &Arc<StoreInner<S, A, Op>>,
+    buf: &mut EffectBuf<A, Op>,
+    feedback_depth: u64,
+) {
+    while let Some(effect) = buf.pop_front() {
+        match effect {
+            Effect::Emit(a) => {
+                inner.feedback_emitted.fetch_add(1, Ordering::Relaxed);
+                lock(&inner.queue).push_back((a, ActionOrigin::Feedback(feedback_depth + 1)));
+                // 回灌入队与外部入队同一事件节点（深度链 = 环结构重建键）
+                audit_emit(
+                    inner,
+                    AuditEventKind::Enqueued {
+                        feedback_depth: feedback_depth + 1,
+                    },
+                );
+            }
+            effect => {
+                // 解释器 panic 毒化 runtime 锁，此后每个产效果 dispatch
+                // 恒 panic（半砖：reduce 照常执行、状态持续前进，效果路径
+                // 原地无恢复 API）。修法 = PoisonError into_inner 恢复守卫 +
+                // clear_poison 复位毒位 + 计数上浮（runtime_panic_count），
+                // panic 本体照常传播（禁 catch_unwind，fail-visible）。恢复
+                // 的 Box 可能已被 panic 打断在任意中间态——run panic 后解释器
+                // 自身一致性自证（宿主适配层责任，见 EffectRuntime 契约注）。
+                let mut runtime = match inner.runtime.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        inner.runtime_panics.fetch_add(1, Ordering::SeqCst);
+                        let guard = poisoned.into_inner();
+                        inner.runtime.clear_poison();
+                        guard
+                    }
+                };
+                // 解释器 panic 在时间线留痕
+                // （EffectInterrupted）——catch_unwind 只观察不吞：发完事件
+                // 原样 resume（payload/传播面不变；runtime 守卫在闭包外存活，
+                // 随外层展开照常毒化，恢复路径与 fail-visible 均不受影响）。
+                let run = catch_unwind(AssertUnwindSafe(|| runtime.run(effect, &inner.back)));
+                if let Err(payload) = run {
+                    audit_emit(inner, AuditEventKind::EffectInterrupted);
+                    std::panic::resume_unwind(payload);
+                }
+                audit_emit(inner, AuditEventKind::EffectForwarded);
+            }
+        }
     }
 }
 
-/// 登记（注册线程执行）：TLS 插入先于闸自增——注册线程上程序序保证
-/// 「表里有 → 闸 >0」，本线程的 dispatch 必能查到自己的回调。
-fn local_sub_register(store_id: u64, sub_id: u64, notify: Box<dyn LocalNotify>) {
-    LOCAL_SUBS.with(|table| {
-        table.borrow_mut().push(LocalSubEntry { store_id, sub_id, notify });
-    });
+/// 通知段：本地订阅先行、跨线程订阅随后（确定性），返回当拍是否有订阅者
+/// 收到快照（审计 `Notified` 节点的判据）。
+fn notify_snapshot_consumers<
+    S: Clone + Send + Sync + 'static,
+    A: Send + 'static,
+    Op: Send + 'static,
+>(
+    inner: &Arc<StoreInner<S, A, Op>>,
+    cache: &NotifyCache<S>,
+    notified_next: &Option<Arc<S>>,
+) -> bool {
+    // 本地订阅（单线程档）：先于跨线程广播判读——零本地订阅一次 relaxed
+    // 读即短路；有本地订阅时零跨线程订阅也必触发（快照按需取，本地闭包
+    // panic 摘除计入 subscriber_panics，fail-closed）。同一 dispatch 通知
+    // 序：本地先行、跨线程随后（确定性）。
+    let local_notified = inner.local_subs.load(Ordering::Relaxed) > 0;
+    if local_notified {
+        let snapshot = Arc::clone(&lock(&inner.state));
+        let (poisoned, cause) = local_notify(inner.store_id, &*snapshot);
+        if poisoned > 0 {
+            inner
+                .subscriber_panics
+                .fetch_add(poisoned, Ordering::Release);
+            *lock(&inner.subscriber_panic_cause) = cause;
+        }
+    }
+    if let Some(next) = notified_next {
+        for slot in cache.slots.iter() {
+            // 订阅回调 panic 归一：摘除该订阅者后继续——中毒 slot.notify
+            // 永久再 panic，留表即「每次 dispatch 必 panic」的双重变砖。摘除自增
+            // 版本，快照缓存下一次 dispatch 冷重建时收敛。
+            let notified = catch_unwind(AssertUnwindSafe(|| {
+                let mut notify = lock(&slot.notify);
+                notify(next);
+            }));
+            if let Err(payload) = notified {
+                let dead = Arc::downgrade(slot);
+                lock(&inner.subs).retain(|w| !Weak::ptr_eq(w, &dead));
+                inner.subs_version.fetch_add(1, Ordering::Release);
+                inner.subscriber_panics.fetch_add(1, Ordering::Release);
+                // 成因摘要留痕（回答「为什么」，计数只答「谁死了」）
+                *lock(&inner.subscriber_panic_cause) = Some(panic_cause_summary(&*payload));
+            }
+        }
+    }
+    local_notified || notified_next.is_some()
 }
 
-/// 注销（注册线程执行——票据 `!Send`，Drop 只会发生在注册线程）。
-fn local_sub_unregister(store_id: u64, sub_id: u64) {
-    LOCAL_SUBS.with(|table| {
-        table.borrow_mut().retain(|e| !(e.store_id == store_id && e.sub_id == sub_id));
-    });
-}
+// ── 本地订阅：线程本地登记机制在 runtime/local_subs.rs（关注面切缝）────────
+// 排空环的通知段经 local_notify 触发本线程登记的回调；store 侧只持闸计数。
+
+/// store 身份号：本地订阅 TLS 表的键。全局单调、进程内唯一。
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// panic payload 成因摘要：str/String 原文截断 200 字符；其余
 /// 载荷类型不可静态提取（`Box<dyn Any>` 无 Debug 面），存占位说明。
@@ -1060,130 +1232,8 @@ fn panic_cause_summary(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// 触发本线程登记的某 store 全部本地订阅；返回 (panic 摘除数, 最近一次成因
-/// 摘要)（调用方计入 `subscriber_panics` + 留痕 `subscriber_panic_last_cause`，
-/// 摘除即从此不再触发——fail-closed）。回调内重入
-/// dispatch 只入队即返（排空权互斥），不会重入本函数，RefCell 不可重入
-/// 借用天然满足。通知序 = 登记序（确定性）。
-fn local_notify(store_id: u64, state: &dyn std::any::Any) -> (u64, Option<String>) {
-    LOCAL_SUBS.with(|table| {
-        let mut table = table.borrow_mut();
-        let mut dead = Vec::new();
-        let mut last_cause = None;
-        for entry in table.iter_mut() {
-            if entry.store_id != store_id {
-                continue;
-            }
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| entry.notify.notify(state))) {
-                dead.push(entry.sub_id);
-                last_cause = Some(panic_cause_summary(&*payload));
-            }
-        }
-        let removed = dead.len() as u64;
-        if !dead.is_empty() {
-            table.retain(|e| e.store_id != store_id || !dead.contains(&e.sub_id));
-        }
-        (removed, last_cause)
-    })
-}
-
-/// 本地订阅票据（[`SyncStore::subscribe_local`]）：Drop = 注销（TLS 摘除 + 闸计数
-/// 回落）。`PhantomData<*const ()>` 即 `!Send + !Sync` 的类型化表达——票据
-/// 不可跨线程移动，注销只会发生在注册线程，与本地登记的线程亲和语义互锁。
-#[must_use = "本地订阅票据被丢弃即立即注销（Drop=注销）——`store.subscribe_local(..);` 裸调用 = 静默死订阅；绑定持有才持续收通知"]
-pub struct LocalSubscription {
-    store_id: u64,
-    sub_id: u64,
-    count: Arc<AtomicUsize>,
-    _not_send: PhantomData<*const ()>,
-}
-
-impl Drop for LocalSubscription {
-    fn drop(&mut self) {
-        local_sub_unregister(self.store_id, self.sub_id);
-        self.count.fetch_sub(1, Ordering::Release);
-    }
-}
-
-thread_local! {
-    /// 审计回调在途标记（键 = store_id）：回调内重入 dispatch 的事件只录
-    /// 环不再进回调——封死「回调→dispatch→回调」自指递归（栈爆），与回灌深度
-    /// 预算同一病理类别。嵌套回调（另一 store）按栈配对（prev 恢复）。
-    static AUDIT_CB_IN_FLIGHT: Cell<Option<u64>> = const { Cell::new(None) };
-}
-
-/// 审计回调在途守卫：进入置位、离开（含 panic 栈展开）恢复原值。
-struct AuditCallbackGuard {
-    prev: Option<u64>,
-}
-
-impl AuditCallbackGuard {
-    fn enter(store_id: u64) -> Self {
-        Self { prev: AUDIT_CB_IN_FLIGHT.with(|cell| cell.replace(Some(store_id))) }
-    }
-}
-
-impl Drop for AuditCallbackGuard {
-    fn drop(&mut self) {
-        AUDIT_CB_IN_FLIGHT.with(|cell| cell.set(self.prev.take()));
-    }
-}
-
-/// 入队事件发射（[`audit_emit`] 的 Enqueued 收口：来源标签 → 回灌深度）。
-fn audit_enqueued<S, A, Op>(inner: &StoreInner<S, A, Op>, origin: ActionOrigin) {
-    let feedback_depth = match origin {
-        ActionOrigin::External => 0,
-        ActionOrigin::Feedback(depth) => depth,
-    };
-    audit_emit(inner, AuditEventKind::Enqueued { feedback_depth });
-}
-
-/// 审计发射唯一收口：未订阅 = 一次 gate load 即返；订阅态 = 有界环入账
-/// （溢出丢最旧）+ 实时回调（锁外调用——回调可重入本 store 的一切入口，
-/// 持锁即死锁；take/归还窗口内订阅被替换则宁弃旧回调禁覆盖新槽）。
-fn audit_emit<S, A, Op>(inner: &StoreInner<S, A, Op>, kind: AuditEventKind) {
-    if !inner.audit_gate.load(Ordering::Acquire) {
-        return;
-    }
-    let event = AuditEvent { seq: inner.audit_seq.fetch_add(1, Ordering::Relaxed) + 1, kind };
-    let mut notify = {
-        let mut guard = lock(&inner.audit);
-        match guard.as_mut() {
-            Some(sink) => {
-                if sink.ring.len() >= sink.cap {
-                    sink.ring.pop_front();
-                }
-                sink.ring.push_back(event);
-                sink.notify.take()
-            }
-            None => return,
-        }
-    };
-    if let Some(f) = notify.as_mut() {
-        if AUDIT_CB_IN_FLIGHT.with(Cell::get) != Some(inner.store_id) {
-            let _guard = AuditCallbackGuard::enter(inner.store_id);
-            match catch_unwind(AssertUnwindSafe(|| f(&event))) {
-                Ok(()) => {}
-                // 回调 panic：fail-closed 摘除（环照录、dispatch 行为不变——观测
-                // 面禁改变被观测者），成因留痕与订阅回调同一纪律（审计回调也是
-                // 订阅回调：subscriber_panics / last_cause）。
-                Err(payload) => {
-                    inner.subscriber_panics.fetch_add(1, Ordering::Release);
-                    *lock(&inner.subscriber_panic_cause) = Some(panic_cause_summary(&*payload));
-                    notify = None;
-                }
-            }
-        }
-    }
-    if let Some(f) = notify {
-        let mut guard = lock(&inner.audit);
-        if let Some(sink) = guard.as_mut() {
-            if sink.notify.is_none() {
-                sink.notify = Some(f);
-            }
-        }
-    }
-}
+// ── 审计事件流发射面：runtime/audit_emit.rs（关注面切缝）────────────────────
+// 发射点（值面 crate::audit）与 gate 快路径随排空环走，本文件只持调用点。
 
 #[cfg(test)]
 mod tests {
@@ -1284,10 +1334,19 @@ mod tests {
             h.join().expect("dispatch 线程不得 panic");
         }
         // 静止态终检（确定性判据）：全部 dispatch 已返回，滞留孤儿必在此现形
-        assert!(!orphan.load(Ordering::SeqCst), "孤儿 action：无在途 dispatch 且排空旗已放，队列仍滞留 action（监视线程持锁核实）");
+        assert!(
+            !orphan.load(Ordering::SeqCst),
+            "孤儿 action：无在途 dispatch 且排空旗已放，队列仍滞留 action（监视线程持锁核实）"
+        );
         assert_eq!(inner.in_flight.load(Ordering::SeqCst), 0);
-        assert!(!inner.draining.load(Ordering::SeqCst), "静止态排空旗必须已放");
-        assert!(lock(&inner.queue).is_empty(), "静止态队列必须空：滞留即孤儿");
+        assert!(
+            !inner.draining.load(Ordering::SeqCst),
+            "静止态排空旗必须已放"
+        );
+        assert!(
+            lock(&inner.queue).is_empty(),
+            "静止态队列必须空：滞留即孤儿"
+        );
         // 全部 dispatch 返回 = 排空至 idle：滞留即少计
         assert_eq!(*store.snapshot(), (THREADS * ITERS) as u32);
         done.store(true, Ordering::SeqCst);
@@ -1316,7 +1375,10 @@ mod tests {
         let sender = store.sender();
         assert!(sender.dispatch(Tick::Tick), "闭门前 dispatch 照常入队");
         store.close();
-        assert!(!sender.dispatch(Tick::Tick), "闭门后 dispatch 必须显式 false");
+        assert!(
+            !sender.dispatch(Tick::Tick),
+            "闭门后 dispatch 必须显式 false"
+        );
         assert_eq!(store.rejected_after_close(), 1);
     }
 
@@ -1386,8 +1448,15 @@ mod tests {
         let p1 = Arc::as_ptr(&*lock(&store.inner.state));
         store.dispatch(Tick::Tick);
         let p2 = Arc::as_ptr(&*lock(&store.inner.state));
-        assert_eq!(p1, p2, "稳态无外部持有者：make_mut 必须原地写入，禁每 action 换分配");
-        assert_eq!(Arc::strong_count(&*lock(&store.inner.state)), 1, "稳态强计数必须回落 1");
+        assert_eq!(
+            p1, p2,
+            "稳态无外部持有者：make_mut 必须原地写入，禁每 action 换分配"
+        );
+        assert_eq!(
+            Arc::strong_count(&*lock(&store.inner.state)),
+            1,
+            "稳态强计数必须回落 1"
+        );
     }
 
     /// 旧 S 析构必须发生在 state 锁外（锁消融形态回归）：
@@ -1414,7 +1483,9 @@ mod tests {
         type Action = Tick;
         type Op = Infallible;
         fn initial(&self) -> PanicOnDrop {
-            PanicOnDrop { armed: Arc::clone(&self.armed) }
+            PanicOnDrop {
+                armed: Arc::clone(&self.armed),
+            }
         }
         fn reduce(
             &self,
@@ -1422,18 +1493,25 @@ mod tests {
             _: Tick,
             _out: &mut EffectBuf<Tick, Infallible>,
         ) -> PanicOnDrop {
-            PanicOnDrop { armed: Arc::clone(&s.armed) }
+            PanicOnDrop {
+                armed: Arc::clone(&s.armed),
+            }
         }
     }
 
     #[test]
     fn snapshot_replacement_drops_old_value_outside_state_lock() {
         let store = SyncStore::new(
-            PanicDropFeature { armed: Arc::new(AtomicBool::new(false)) },
+            PanicDropFeature {
+                armed: Arc::new(AtomicBool::new(false)),
+            },
             NopRuntime,
         );
         let first = std::panic::catch_unwind(AssertUnwindSafe(|| store.dispatch(Tick::Tick)));
-        assert!(first.is_err(), "旧快照析构 panic 必须如实传播（fail-visible）");
+        assert!(
+            first.is_err(),
+            "旧快照析构 panic 必须如实传播（fail-visible）"
+        );
         // 析构在锁外 ⇒ state mutex 未中毒 ⇒ store 继续可用（毒锁形态下此处必 panic）
         store.dispatch(Tick::Tick);
         store.dispatch(Tick::Tick);
@@ -1454,7 +1532,12 @@ mod tests {
         fn initial(&self) -> u32 {
             0
         }
-        fn reduce(&self, s: &u32, _: DropAction, out: &mut EffectBuf<DropAction, Infallible>) -> u32 {
+        fn reduce(
+            &self,
+            s: &u32,
+            _: DropAction,
+            out: &mut EffectBuf<DropAction, Infallible>,
+        ) -> u32 {
             out.push(Effect::Emit(DropAction::Spin));
             *s
         }

@@ -55,7 +55,10 @@ impl Reducer for ChildFeature {
     ) -> ChildState {
         match a {
             ChildAction::Inc => {
-                out.push(Effect::Run { id: EffectId(1), op: ChildOp::Notify });
+                out.push(Effect::Run {
+                    id: EffectId(1),
+                    op: ChildOp::Notify,
+                });
                 ChildState { count: s.count + 1 }
             }
         }
@@ -94,8 +97,14 @@ fn parent_child_fragment() -> impl Reducer<State = ParentState, Action = ParentA
         },
         ChildFeature,
         |fx, out: &mut EffectBuf<ParentAction, ParentOp>| match fx {
-            Effect::Run { id, op: ChildOp::Notify } => {
-                out.push(Effect::Run { id, op: ParentOp::ChildNotify });
+            Effect::Run {
+                id,
+                op: ChildOp::Notify,
+            } => {
+                out.push(Effect::Run {
+                    id,
+                    op: ParentOp::ChildNotify,
+                });
             }
             // Emit 不达 lift_fx（核心经 wrap 上浮）；穷尽性占位
             Effect::Emit(_) => {}
@@ -112,7 +121,10 @@ impl Reducer for ParentFeature {
     type Action = ParentAction;
     type Op = ParentOp;
     fn initial(&self) -> ParentState {
-        ParentState { child: ChildFeature.initial(), done: false }
+        ParentState {
+            child: ChildFeature.initial(),
+            done: false,
+        }
     }
     fn reduce(
         &self,
@@ -124,7 +136,10 @@ impl Reducer for ParentFeature {
             ParentAction::Child(_) => parent_child_fragment().reduce(s, a, out),
             ParentAction::Finish => {
                 out.push(Effect::Cancel { id: EffectId(9) });
-                ParentState { done: true, ..s.clone() }
+                ParentState {
+                    done: true,
+                    ..s.clone()
+                }
             }
         }
     }
@@ -139,10 +154,16 @@ fn combine_routes_child_action_and_lifts_effect() {
     ts.dispatch(ParentAction::Child(ChildAction::Inc));
     assert_eq!(
         ts.state(),
-        &ParentState { child: ChildState { count: 1 }, done: false },
+        &ParentState {
+            child: ChildState { count: 1 },
+            done: false
+        },
         "子 action 经 unwrap 路由 → set 写回子切片"
     );
-    ts.receive(ExpectedEffect::Run { id: Some(EffectId(1)), op: ParentOp::ChildNotify });
+    ts.receive(ExpectedEffect::Run {
+        id: Some(EffectId(1)),
+        op: ParentOp::ChildNotify,
+    });
 }
 
 /// 分片语义 2：未路由的父 action → 本层不动子切片（克隆返回、零效果），
@@ -155,8 +176,13 @@ fn combine_unrouted_action_leaves_child_slice() {
     assert_eq!(ts.state().child.count, 1, "父 action 不路由 → 子切片不动");
     assert!(ts.state().done, "父自有分支自理");
     // FIFO：先清第一条 send 的子效果，再验父自有 Cancel
-    ts.receive(ExpectedEffect::Run { id: Some(EffectId(1)), op: ParentOp::ChildNotify });
-    ts.receive(ExpectedEffect::Cancel { id: Some(EffectId(9)) });
+    ts.receive(ExpectedEffect::Run {
+        id: Some(EffectId(1)),
+        op: ParentOp::ChildNotify,
+    });
+    ts.receive(ExpectedEffect::Cancel {
+        id: Some(EffectId(9)),
+    });
 }
 
 /// 分片非根：combine 产物没有父 initial 工厂，用作根 = 组合根误用，
@@ -193,7 +219,10 @@ fn macro_fragment() -> impl Reducer<State = ParentState, Action = ParentAction, 
 /// 宏产物与函数产物对拍：同输入恒同状态、同效果序列（路由命中/未路由两路）。
 #[test]
 fn combine_macro_fragment_matches_function_semantics() {
-    let s0 = ParentState { child: ChildState { count: 0 }, done: false };
+    let s0 = ParentState {
+        child: ChildState { count: 0 },
+        done: false,
+    };
     let cases = [ParentAction::Child(ChildAction::Inc), ParentAction::Finish];
     for a in cases {
         let mut o_macro = EffectBuf::new();
@@ -240,10 +269,20 @@ fn combine_macro_short_form_one_line_assembly() {
     }
 
     let f = short_fragment();
-    let s0 = P { total: 10, child: 0 };
+    let s0 = P {
+        total: 10,
+        child: 0,
+    };
     let mut out = EffectBuf::new();
     let s1 = f.reduce(&s0, A::Child(7), &mut out);
-    assert_eq!(s1, P { total: 10, child: 7 }, "短形态：子迁移+切片写回");
+    assert_eq!(
+        s1,
+        P {
+            total: 10,
+            child: 7
+        },
+        "短形态：子迁移+切片写回"
+    );
     let mut out2 = EffectBuf::new();
     let s2 = f.reduce(&s1, A::Touch, &mut out2);
     assert_eq!(s2, s1, "短形态：未路由零漂移");
@@ -260,8 +299,14 @@ fn teststore_tracks_state_and_effects() {
     ts.dispatch(ParentAction::Child(ChildAction::Inc));
     ts.dispatch(ParentAction::Child(ChildAction::Inc));
     assert_eq!(ts.state().child.count, 2, "逐动作推进");
-    ts.receive(ExpectedEffect::Run { id: None, op: ParentOp::ChildNotify });
-    ts.receive(ExpectedEffect::Run { id: None, op: ParentOp::ChildNotify });
+    ts.receive(ExpectedEffect::Run {
+        id: None,
+        op: ParentOp::ChildNotify,
+    });
+    ts.receive(ExpectedEffect::Run {
+        id: None,
+        op: ParentOp::ChildNotify,
+    });
     assert!(matches!(ts.state(), ParentState { .. }));
 }
 
@@ -271,7 +316,10 @@ fn teststore_tracks_state_and_effects() {
 fn teststore_receive_op_mismatch_panics() {
     let mut ts = TestStore::new(ParentFeature);
     ts.dispatch(ParentAction::Child(ChildAction::Inc));
-    ts.receive(ExpectedEffect::Run { id: None, op: ParentOp::Audit });
+    ts.receive(ExpectedEffect::Run {
+        id: None,
+        op: ParentOp::Audit,
+    });
 }
 
 /// 效果寻址校验：id: Some 不匹配 = panic。
@@ -280,7 +328,10 @@ fn teststore_receive_op_mismatch_panics() {
 fn teststore_receive_id_mismatch_panics() {
     let mut ts = TestStore::new(ParentFeature);
     ts.dispatch(ParentAction::Child(ChildAction::Inc));
-    ts.receive(ExpectedEffect::Run { id: Some(EffectId(2)), op: ParentOp::ChildNotify });
+    ts.receive(ExpectedEffect::Run {
+        id: Some(EffectId(2)),
+        op: ParentOp::ChildNotify,
+    });
 }
 
 /// 队列空时 receive = panic（效果缺失不可静默）。
@@ -319,12 +370,7 @@ impl Reducer for QuietFeature {
     fn initial(&self) -> u32 {
         0
     }
-    fn reduce(
-        &self,
-        s: &u32,
-        _: LoopAction,
-        _out: &mut EffectBuf<LoopAction, Infallible>,
-    ) -> u32 {
+    fn reduce(&self, s: &u32, _: LoopAction, _out: &mut EffectBuf<LoopAction, Infallible>) -> u32 {
         s + 1
     }
 }
@@ -338,12 +384,7 @@ impl Reducer for LoopOnceFeature {
     fn initial(&self) -> u32 {
         0
     }
-    fn reduce(
-        &self,
-        s: &u32,
-        _: LoopAction,
-        out: &mut EffectBuf<LoopAction, Infallible>,
-    ) -> u32 {
+    fn reduce(&self, s: &u32, _: LoopAction, out: &mut EffectBuf<LoopAction, Infallible>) -> u32 {
         if *s == 0 {
             out.push(Effect::Emit(LoopAction::Start));
         }
@@ -383,7 +424,10 @@ fn emit_feedback_receive_message_reports_reenqueued_truthfully() {
         m.contains("1 emitted action(s) were re-enqueued as feedback"),
         "回灌事实计数必须在消息内：{m:?}"
     );
-    assert!(!m.contains("queue empty"), "Emit 情形禁再报队列空（文不对题本体）：{m:?}");
+    assert!(
+        !m.contains("queue empty"),
+        "Emit 情形禁再报队列空（文不对题本体）：{m:?}"
+    );
 }
 
 // ── combine 误用 panic 指采用方装配行 ──────────────────────────────────
@@ -401,9 +445,14 @@ fn combine_misuse_panic_reports_adopter_line() {
     }));
     let adopter_line = {
         let fragment = parent_child_fragment();
-        let line = line!() + 1;
-        let _ = catch_unwind(AssertUnwindSafe(|| { let _ = Store::new(fragment, ProbeNop); }));
-        line
+        let mut adopter_line = 0u32;
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            // 动态锚紧邻装配行（track_caller 报告点）——fmt 重排外围不漂移
+            // （FinalWave/格式化双教训：硬编码或固定偏移的行号锚必随重排坏）。
+            adopter_line = line!() + 1;
+            let _ = Store::new(fragment, ProbeNop);
+        }));
+        adopter_line
     };
     std::panic::set_hook(prev_hook);
     let locations: Vec<String> = rx.try_iter().collect();

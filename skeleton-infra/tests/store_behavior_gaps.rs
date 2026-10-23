@@ -7,9 +7,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
-use skeleton::{
-    ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _,
-};
+use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
 use skeleton_infra::compose::combine;
 use skeleton_infra::runtime::SyncStore as Store;
 use skeleton_infra::testing::{ExpectedEffect, TestStore};
@@ -111,7 +109,10 @@ fn fragment() -> impl Reducer<State = ParentState, Action = ParentAct, Op = Pare
         },
         Child,
         |fx: Effect<ChildAct, ()>, out: &mut EffectBuf<ParentAct, ParentOp>| match fx {
-            Effect::Run { id, op: () } => out.push(Effect::Run { id, op: ParentOp::Notified }),
+            Effect::Run { id, op: () } => out.push(Effect::Run {
+                id,
+                op: ParentOp::Notified,
+            }),
             Effect::Cancel { id } => out.push(Effect::Cancel { id }),
             // Emit 由核心经 wrap 上浮，到不了 lift_fx——到达即核心分支断裂（fail-visible）
             Effect::Emit(_) => unreachable!("Emit 必须经核心 wrap 上浮，不经 lift_fx"),
@@ -153,7 +154,9 @@ where
 /// 不可路由 action→回灌无效=1 红。
 #[test]
 fn combine_child_emitted_action_wraps_and_reenters_parent() {
-    let mut ts = TestStore::new(Root { fragment: fragment() });
+    let mut ts = TestStore::new(Root {
+        fragment: fragment(),
+    });
     ts.dispatch(ParentAct::Child(ChildAct::EmitSelf));
     assert_eq!(ts.state().child, 2, "子产 Emit 必须经 wrap 上浮回灌：+1+1");
     // Emit 不留效果队列：receive 空队必 panic，且 panic 文案必须是「无效果」
@@ -180,9 +183,13 @@ fn combine_child_emitted_action_wraps_and_reenters_parent() {
 /// 可观察：Child(Abort) 产 Cancel{id=9} 逐值上提到父词表，子切片照常迁移。
 #[test]
 fn combine_child_cancel_lifts_through_lift_fx() {
-    let mut ts = TestStore::new(Root { fragment: fragment() });
+    let mut ts = TestStore::new(Root {
+        fragment: fragment(),
+    });
     ts.dispatch(ParentAct::Child(ChildAct::Abort));
-    ts.receive(ExpectedEffect::Cancel { id: Some(EffectId(9)) });
+    ts.receive(ExpectedEffect::Cancel {
+        id: Some(EffectId(9)),
+    });
     assert_eq!(ts.state().child, 1, "子切片照常迁移（Cancel 上提不改迁移）");
 }
 
@@ -199,7 +206,8 @@ impl EffectRuntime<Msg, Infallible> for ReentryFx {
     fn run(&mut self, _: Effect<Msg, Infallible>, back: &ActionSender<Msg>) {
         if !self.fired {
             self.fired = true;
-            self.accepted.store(back.dispatch(Msg::Bonus), Ordering::SeqCst);
+            self.accepted
+                .store(back.dispatch(Msg::Bonus), Ordering::SeqCst);
         }
     }
 }
@@ -209,14 +217,20 @@ fn interpreter_backchannel_reentry_drains_to_idle_within_outer_dispatch() {
     let accepted = Arc::new(AtomicBool::new(false));
     let store = Arc::new(Store::new(
         Counter,
-        ReentryFx { fired: false, accepted: Arc::clone(&accepted) },
+        ReentryFx {
+            fired: false,
+            accepted: Arc::clone(&accepted),
+        },
     ));
     let (tx, rx) = mpsc::channel();
     let _sub = store.subscribe(move |s: &u32| {
         let _ = tx.send(*s);
     });
     store.dispatch(Msg::Ping);
-    assert!(accepted.load(Ordering::SeqCst), "排空中的重入 dispatch 必须被接受（true）");
+    assert!(
+        accepted.load(Ordering::SeqCst),
+        "排空中的重入 dispatch 必须被接受（true）"
+    );
     assert_eq!(*store.snapshot(), 11, "回灌由同一排空循环执行至 idle");
     assert_eq!(store.pending_actions(), 0, "dispatch 返回即队列空");
     assert_eq!(
@@ -243,8 +257,16 @@ fn dropped_subscription_stops_receiving_notifications() {
     store.dispatch(Msg::Bump);
     drop(ticket_b);
     store.dispatch(Msg::Bump);
-    assert_eq!(ra.try_iter().collect::<Vec<u32>>(), vec![1, 2], "在册订阅者照常通知");
-    assert_eq!(rb.try_iter().collect::<Vec<u32>>(), vec![1], "票据丢弃后不再通知");
+    assert_eq!(
+        ra.try_iter().collect::<Vec<u32>>(),
+        vec![1, 2],
+        "在册订阅者照常通知"
+    );
+    assert_eq!(
+        rb.try_iter().collect::<Vec<u32>>(),
+        vec![1],
+        "票据丢弃后不再通知"
+    );
     assert_eq!(store.subscriber_count(), 1, "死槽在下一次 dispatch 后摘除");
 }
 
@@ -259,7 +281,11 @@ fn subscriber_receives_post_reduce_state_per_dispatch() {
     });
     store.dispatch(Msg::Bump);
     store.dispatch(Msg::Bump);
-    assert_eq!(rx.try_iter().collect::<Vec<u32>>(), vec![1, 2], "回调实参 = reduce 后新态");
+    assert_eq!(
+        rx.try_iter().collect::<Vec<u32>>(),
+        vec![1, 2],
+        "回调实参 = reduce 后新态"
+    );
     assert_eq!(*store.snapshot(), 2, "与最新快照一致");
 }
 
@@ -317,5 +343,43 @@ fn subscriber_count_is_live_immediately_after_ticket_drop() {
         "票据 drop 后读数必须立即回落（读侧实时判活，无一拍滞后）"
     );
     store.dispatch(Msg::Bump);
-    assert_eq!(store.subscriber_count(), 1, "dispatch 后仍为 1（不回归滞后语义）");
+    assert_eq!(
+        store.subscriber_count(),
+        1,
+        "dispatch 后仍为 1（不回归滞后语义）"
+    );
+}
+
+// ── 闭门 dispatch 的审计现场（可观测 R1：拒绝不止轮询计数，订阅者有节点可查）──
+
+/// 闭门后 dispatch 的两条 push 路径（no-op 与 sender false）在审计时间线上
+/// 同形落 `Rejected` 节点——审计订阅者对每次拒绝有现场可查，与轮询读侧
+/// [`Store::rejected_after_close`] 互为对照（同一触发点各计一次）。
+#[test]
+fn closed_gate_dispatch_leaves_rejected_audit_scene() {
+    use skeleton_infra::audit::AuditEventKind;
+
+    let store = Store::new(Counter, NoFx);
+    let _ticket = store.subscribe_events(64, |_| {});
+    store.close();
+    store.dispatch(Msg::Bump); // 早闸位
+    assert!(!store.sender().dispatch(Msg::Bump), "sender 闭门显式 false");
+    store.dispatch(Msg::Bump); // enqueue 复检闸位（闭门后早闸必先命中，此行只加固计数）
+                               // 订阅窗内全部事件即三次拒绝（闭门后无其他节点），seq 单调连续。
+    let events = store.take_events();
+    assert_eq!(
+        events.len(),
+        3,
+        "三次拒绝 = 三个 Rejected 现场，实际: {events:?}"
+    );
+    assert!(events.iter().all(|e| e.kind == AuditEventKind::Rejected));
+    let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    assert_eq!(seqs, sorted, "取走序即发射序（seq 单调）");
+    assert_eq!(
+        store.rejected_after_close(),
+        3,
+        "审计事件与拒绝计数同一触发点对账"
+    );
 }

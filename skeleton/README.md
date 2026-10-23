@@ -2,6 +2,7 @@
 
 `Reducer` / `Store` / `EffectRuntime` / `Driver` 契约 trait + 数据词汇
 （`Effect`/`EffectBuf`/`EffectId`/`ActionSender`/`Subscription`/`NoFx`）+ 语义契约文本。
+`pool` 模块承载池化管理基座 `PoolManaged`（调参/读数/审计三挂点，「约定不是锁定」）。
 **零依赖**（tokio/serde 都不进树），纯函数纪律由「核心无 IO 依赖」结构性保证——reducer 想 IO 也编译不过。
 
 本 crate 只承载「约束后面代码长法的形状」：trait 是数据契约，名字即数据流向，
@@ -25,7 +26,7 @@ fail-visible/回灌有界）。**可运行的实现在姊妹 crate**
 ## 三分钟跑起来（真实现）
 
 ```sh
-cargo run -p skeleton-infra --example quickstart
+cargo run -p udf-skeleton-infra --example quickstart
 ```
 
 `Op = Infallible` 的计数器：`Run` 在类型层不可构造——零效果程序编译期证明无副作用
@@ -73,7 +74,9 @@ fn main() {
 - `examples/dispatch_profile.rs` — dispatch 热路径分段归因基准
 - `examples/driver_tour.rs` — Driver 端口两职责（bind 上行 / render 呈现）
 - `examples/end_to_end.rs` — 五件套 + `combine` + `TestStore` + fx/journal 解释器标准形
+- `examples/multidim_eval.rs` — 多维实测数据采集器（性能/内存/并发三维；评测基建非产品面，核心壳测量只需 memgov+testing）
 
 ```sh
-cargo run -p skeleton-infra --features tokio,journal,testing,compose --example end_to_end
+cargo run -p udf-skeleton-infra --features tokio,journal,testing,compose --example end_to_end
+cargo run --release -p udf-skeleton-infra --features memgov,testing --example multidim_eval
 ```

@@ -1,0 +1,8 @@
+# disallowed_methods 清单（杠精盲审 2026-10-17）：skeleton-infra/Cargo.toml
+# [lints.clippy] disallowed_methods="warn" 只启用 lint 组，缺本文件=清单空=
+# 闸完全惰性——「效果只经 FxScope 唯一口」在此落地。
+disallowed-methods = [
+  # tokio::spawn 直调：任务脱离 JoinSet 生命周期集/accepting 闸/取消令牌树——
+  # 效果只经 skeleton_infra::fx::FxScope 唯一口（tokio feature）
+  "tokio::spawn",
+]

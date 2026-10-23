@@ -87,7 +87,12 @@ impl Reducer for ChildCounter {
     fn initial(&self) -> i32 {
         0
     }
-    fn reduce(&self, s: &i32, a: ChildAction, _out: &mut EffectBuf<ChildAction, Infallible>) -> i32 {
+    fn reduce(
+        &self,
+        s: &i32,
+        a: ChildAction,
+        _out: &mut EffectBuf<ChildAction, Infallible>,
+    ) -> i32 {
         match a {
             ChildAction::Add(n) => s + n,
         }
@@ -175,7 +180,11 @@ fn subscribe_local_accepts_non_send_callback() {
     assert_eq!(store.subscriber_count(), 0, "本地订阅不入跨线程订阅计数");
     store.dispatch(1);
     store.dispatch(2);
-    assert_eq!(*seen.borrow(), vec![1, 3], "注册线程 dispatch 同步触发本地回调（通知态=迁移后新态，与跨线程订阅一致）");
+    assert_eq!(
+        *seen.borrow(),
+        vec![1, 3],
+        "注册线程 dispatch 同步触发本地回调（通知态=迁移后新态，与跨线程订阅一致）"
+    );
     drop(sub);
     store.dispatch(3);
     assert_eq!(*seen.borrow(), vec![1, 3], "票据 Drop = 注销");
@@ -195,7 +204,11 @@ fn subscribe_local_notifies_only_on_registering_thread() {
         .expect("他线程 dispatch 不得 panic（本地订阅不得被跨界触达）");
     assert_eq!(*seen.borrow(), 0, "他线程 dispatch 不触发本地订阅");
     store.dispatch(5);
-    assert_eq!(*seen.borrow(), 15, "注册线程 dispatch 正常触发（5+10 累计后新态）");
+    assert_eq!(
+        *seen.borrow(),
+        15,
+        "注册线程 dispatch 正常触发（5+10 累计后新态）"
+    );
 }
 
 /// 回调 panic 的 fail-closed 摘除与共享订阅同一纪律：摘除 + 计数，
@@ -257,7 +270,9 @@ fn local_subscriber_panic_cause_is_recorded_too() {
     let _poison = store.subscribe_local(|_s: &u32| panic!("local watcher exploded"));
     store.dispatch(1);
     assert_eq!(store.subscriber_panics(), 1);
-    let cause = store.subscriber_panic_last_cause().expect("本地路径同样留痕");
+    let cause = store
+        .subscriber_panic_last_cause()
+        .expect("本地路径同样留痕");
     assert!(cause.contains("local watcher exploded"), "实际: {cause}");
 }
 
