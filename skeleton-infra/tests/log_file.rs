@@ -38,13 +38,11 @@ fn guard(tag: &str) -> TempDir {
 
 /// env 守卫：构造留存原值、Drop 恢复（panic 展开路径同样恢复；与
 /// src/logx.rs 单测守卫同形——env 是进程单例，禁自改自清）。
-#[cfg(not(debug_assertions))]
 struct EnvGuard {
     var: &'static str,
     saved: Option<String>,
 }
 
-#[cfg(not(debug_assertions))]
 impl EnvGuard {
     fn save(var: &'static str) -> Self {
         Self {
@@ -54,7 +52,6 @@ impl EnvGuard {
     }
 }
 
-#[cfg(not(debug_assertions))]
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match self.saved.take() {
@@ -66,6 +63,10 @@ impl Drop for EnvGuard {
 
 #[test]
 fn init_with_file_lifecycle_line_format_and_skeleton_off() {
+    // RUST_LOG 显式值恒赢预设（产品语义）——外部环境注入（如 shell 的
+    // RUST_LOG=warn）会把本测试 info! 事件全滤成 0 行，测试须隔离之。
+    let _rl = EnvGuard::save("RUST_LOG");
+    std::env::remove_var("RUST_LOG");
     let scratch = guard("e2e");
     let root = scratch.path().join("logs");
     let resolver = FixedRoot(root.clone());

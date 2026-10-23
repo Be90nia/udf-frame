@@ -768,6 +768,9 @@ mod file_sink_tests {
         let base = std::env::var_os("CARGO_TARGET_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from("target"));
+        // lib 测试 cwd=package 根，workspace 共享 target 在仓根——相对回退时
+        // base 可能不存在（temp_dir_in 用独占 create_dir 不建父链），先补建
+        std::fs::create_dir_all(&base).expect("create scratch base");
         temp_dir_in(&base, &format!("logx-{tag}-")).expect("scratch under target/")
     }
 
