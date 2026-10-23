@@ -74,6 +74,12 @@ fn submit_borrows_runs_and_returns_buffer() {
     ptp.submit(move |_| tx.send(()).unwrap()).unwrap();
     rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
+    // sentinel 只证明任务2已跑到 send，不证明其包装体结束（任务2 自身的
+    // guard 仍在借）——归还记账以 worker 全停为界，join 后零在借=确定口径，
+    // 跨平台调度差异免疫（Linux 快调度曾致断言抢跑 left:1）。
+    ptp.threads().shutdown();
+    ptp.threads().join();
+
     let m = ptp.mem_pool().metrics();
     assert_eq!(m.core.borrowed, 0, "任务结束缓冲必已归还");
     assert_eq!(m.core.idle, 1, "归还件留存闲槽");
@@ -101,17 +107,7 @@ fn task_panic_returns_buffer_and_pool_stays_usable() {
     ptp.submit(move |_| tx.send(()).unwrap()).unwrap();
     rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-    let m = ptp.mem_pool().metrics();
-    assert_eq!(m.core.borrowed, 0, "panic unwind 中 guard Drop 必归还缓冲");
-    assert_eq!(m.core.idle, 1, "归还件照常留存");
-    assert_eq!(
-        ptp.threads().metrics().task_panics,
-        1,
-        "panic 另册留痕（fail-visible）"
-    );
-    assert_eq!(ptp.borrow_rejected(), 0);
-
-    // 池可继续用：后续提交正常借还。
+    // 池可继续用：后续提交正常借还。（shutdown 是单向闸，活性验证必须在其前）
     let hit = Arc::new(AtomicUsize::new(0));
     let hit2 = Arc::clone(&hit);
     ptp.submit(move |_| {
@@ -122,10 +118,21 @@ fn task_panic_returns_buffer_and_pool_stays_usable() {
     ptp.submit(move |_| tx.send(()).unwrap()).unwrap();
     rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(hit.load(Ordering::SeqCst), 1);
-    assert_eq!(ptp.mem_pool().metrics().core.borrowed, 0);
 
+    // 归还记账断言：全部任务结束 + worker 全停后（join 后零在借=确定口径；
+    // sentinel 只证明任务跑到 send，不证包装体结束——Linux 快调度曾致断言
+    // 抢跑 borrowed=1，那是哨兵任务自己的缓冲）。
     ptp.threads().shutdown();
     ptp.threads().join();
+    let m = ptp.mem_pool().metrics();
+    assert_eq!(m.core.borrowed, 0, "panic unwind 中 guard Drop 必归还缓冲");
+    assert_eq!(m.core.idle, 1, "归还件照常留存");
+    assert_eq!(
+        ptp.threads().metrics().task_panics,
+        1,
+        "panic 另册留痕（fail-visible）"
+    );
+    assert_eq!(ptp.borrow_rejected(), 0);
 }
 
 // ── 并发提交：N 任务全归还，dropped_overflow 零 ──────────────────────────

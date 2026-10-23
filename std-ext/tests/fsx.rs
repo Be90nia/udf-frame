@@ -102,7 +102,10 @@ fn walk_yields_root_then_children_with_depth() {
     write_file(g.path().join("sub/b.txt"), b"b");
     write_file(g.path().join("a.txt"), b"a");
 
-    let entries = walk_names(walk(g.path()));
+    let mut entries = walk_names(walk(g.path()));
+    // Sort::None 契约=「顺序不做任何承诺」（fsx.rs Sort 文档）——断言集合与
+    // 深度结构，顺序敏感断言在 Linux readdir 碰巧同序、macos 即红
+    entries.sort();
     assert_eq!(
         entries,
         vec![
@@ -181,12 +184,14 @@ fn walk_default_no_follow_skips_symlink_dir() {
     if !try_dir_link(g.path().join("link"), g.path().join("real")) {
         return;
     }
-    let names: Vec<String> = walk_names(walk(g.path()).min_depth(1))
+    let mut names: Vec<String> = walk_names(walk(g.path()).min_depth(1))
         .into_iter()
         .map(|(_, n)| n)
         .collect();
-    // link 产出为条目本身，目标内容不被穿透（S1：只认 is_dir 被穿透的反面）
-    assert_eq!(names, vec!["link", "real", "inside.txt"]);
+    // link 产出为条目本身，目标内容不被穿透（S1：只认 is_dir 被穿透的反面）；
+    // Sort::None 顺序不承诺——集合序断言（macos readdir 序与 Linux 不同）
+    names.sort();
+    assert_eq!(names, vec!["inside.txt", "link", "real"]);
 }
 
 #[test]
