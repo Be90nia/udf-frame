@@ -6,9 +6,14 @@
 //! `[dependencies]`——核心无 IO/运行时依赖，reducer「禁 IO」从评审约束升级为
 //! 编译期不可能。
 //!
+//! 基础端口域（契约+参考实现+测试替身同模块，`skeleton_infra` 承载行为件）：
+//! [`clock`]（时间源双口分流）、[`config`]（env 覆盖→校验）、[`logpath`]
+//! （日志根目录解析）——被多域消费的核心契约住契约层（批 1 契约真下沉）。
+//!
 //! 可运行的实现（同步排空环、订阅/通知机器、审计事件流、组合器、测试替身）
-//! 在姊妹 crate [`skeleton-infra`](https://docs.rs/skeleton-infra)
-//! （`skeleton_infra::runtime::SyncStore` 等，按 feature 取用）。
+//! 在姊妹 crate `skeleton_infra`（仓库内 `skeleton-infra/`——0.1.0 未发布，
+//! docs.rs 页面随首次发布生效；`skeleton_infra::runtime::SyncStore` 等，按
+//! feature 取用）。
 //!
 //! # 数据链路（只看名字即可复述）
 //!
@@ -64,6 +69,12 @@
 //! assert_eq!(*toy.snapshot(), 5); // 三分钟读完契约即可写出最小环
 //! ```
 
+pub mod clock;
+pub mod config;
+pub mod logpath;
+pub mod parse;
+pub mod pool;
+
 pub use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -109,7 +120,11 @@ pub struct EffectId(pub u64);
 /// Debug 供测试替身的断言失败消息如实回放实际效果。
 #[derive(Debug)]
 pub enum Effect<A, Op = Infallible> {
-    /// 零副作用回灌：环闭合/表单回写的唯一形态
+    /// 零副作用回灌：环闭合/表单回写的唯一形态。
+    /// 账本语义：Emit 派生动作由 store 核心直接回灌入队（不经解释器，无挂点
+    /// 可设），**不入账本**——它是已落盘 action 经纯 reducer 的确定性派生，
+    /// 重放经 store 逐条 dispatch 再生、终态收敛（挂点矩阵见实现方
+    /// `skeleton_infra::journal` 的 `Journal::append` 文档）。
     Emit(A),
     /// 描述式副作用：`id` 供 [`Effect::Cancel`] 寻址；`op` 由解释器解释
     Run {
@@ -137,7 +152,9 @@ pub struct EffectBuf<A, Op = Infallible> {
 impl<A, Op> EffectBuf<A, Op> {
     /// 空缓冲（实现面便利：排空循环构造一次，此后 clear 复用）。
     pub fn new() -> Self {
-        Self { effects: Vec::new() }
+        Self {
+            effects: Vec::new(),
+        }
     }
 
     /// reducer 写入一条效果；写入顺序 = 解释器转发顺序。
@@ -213,7 +230,9 @@ pub struct ActionSender<A> {
 
 impl<A> Clone for ActionSender<A> {
     fn clone(&self) -> Self {
-        Self { push: Arc::clone(&self.push) }
+        Self {
+            push: Arc::clone(&self.push),
+        }
     }
 }
 
@@ -221,7 +240,9 @@ impl<A> ActionSender<A> {
     /// 实现面便利：由 store 实现方在装配时构造（闭包返回 `false` = 已闭门或
     /// 已丢弃）。采用方经 [`Store::sender`] 取句柄，不直接调本构造。
     pub fn new(push: impl Fn(A) -> bool + Send + Sync + 'static) -> Self {
-        Self { push: Arc::new(push) }
+        Self {
+            push: Arc::new(push),
+        }
     }
 
     /// 回灌 Action（入队并同步排空至 idle，与 [`Store::dispatch`] 同语义）。
@@ -300,7 +321,10 @@ impl<S> Subscription<S> {
     /// 实现面便利：由 store 实现方构造——`unsubscribe` 在票据 Drop 时执行一次
     /// （摘表 + 计数回落等注销语义由实现方定义）。
     pub fn new(unsubscribe: impl FnOnce() + Send + Sync + 'static) -> Self {
-        Self { unsubscribe: Some(Box::new(unsubscribe)), _state: std::marker::PhantomData }
+        Self {
+            unsubscribe: Some(Box::new(unsubscribe)),
+            _state: std::marker::PhantomData,
+        }
     }
 }
 
@@ -351,7 +375,8 @@ pub trait Driver<S, A> {
 /// 4. **停机闸**：[`Store::close`] 单向；闭门后 dispatch no-op、
 ///    `sender().dispatch` 返 false、订阅照常登记但永无通知（已知取舍，见下表）。
 /// 5. **fail-visible**：订阅回调 panic 摘除留痕、解释器 panic 计数不报废实例、
-///    状态锁中毒 fail-fast 实例报废——三条都有读侧/异常可见面，禁静默吞。
+///    reducer panic 计数留痕（传播语义不变）、状态锁中毒 fail-fast 实例报废
+///    ——四条都有读侧/异常可见面，禁静默吞。
 /// 6. **回灌有界**：同栈回灌环有界（预算 64 止步），越界止步且计数留痕、
 ///    禁静默弃队。
 ///
@@ -415,6 +440,11 @@ pub trait Store {
 /// 序列化词表由实现自选，本 crate 不绑格式（零依赖纪律）。参考实现：
 /// `skeleton_infra::journal::JsonlJournal`（`journal` feature）。
 ///
+/// 参考实现的行格式约束（细节归实现方）：action/state 须可序列化为
+/// **JSON 对象**（行 tag 与载荷平铺同层）——非对象载荷（如 `A = u64` 序列化
+/// 为裸数字）首条 [`Self::append`] 即 `Err`；先落盘后 apply ⇒ 零副作用，
+/// 换对象形状重试即可。
+///
 /// # 语义契约（实现必须兑现）
 ///
 /// 1. **先落盘后 apply**：[`Self::append`] 返回 `Err` ⇒ 调用方禁 apply 该
@@ -422,10 +452,23 @@ pub trait Store {
 /// 2. **恢复完备**：[`Self::restore`] 返回三态 [`Restore`]，调用方按其语义
 ///    重建当前态——`Empty` 取 [`Reducer::initial`] 零 apply；`FromInitial`
 ///    自 initial 起按序 apply 全量动作；`FromSnapshot` 自快照态起按序
-///    apply 增量动作。
+///    apply 增量动作。重放协议：动作流**经同一装配的 store 逐条
+///    [`Store::dispatch`]**（效果环照常运转）——[`Effect::Emit`] 回灌等派生
+///    动作由排空环再生，终态与 live 收敛；裸 reduce 逐条套用会丢派生链
+///    （挂点矩阵与收敛回归见实现方 `skeleton_infra::journal`）。
 /// 3. **fail-visible**：持久化失败如实 `Err`，禁静默丢弃——静默丢 action =
 ///    真相源丢史。
 /// 4. **单写者**：本端口不设跨进程锁；多进程挂载同一账本的编排归上层。
+///
+/// # 与实现层 `Journal` trait 的分工
+///
+/// 实现层全功能面 trait `skeleton_infra::journal::Journal` 的同名方法已改名
+/// （`append_action`/`restore_stream`/`append_snapshot`；`replay` 为实现层
+/// 独有），本端口独占契约词表（`append`/`restore`/`persist_snapshot`）——两
+/// trait 同屏 import 直呼无歧义（旧三同名双候选拒编译已结构性消灭，批 2A）。
+/// 状态面同款关联类型化（批 6A，与实现层同步）：[`JournalPort::State`] 被
+/// `Self` 钉死，端口方法直呼零 turbofish 零绑定标注（`j.append(&a)` /
+/// `let r = j.restore()`）。
 ///
 /// # Examples
 ///
@@ -438,38 +481,49 @@ pub trait Store {
 ///     applied: Vec<String>,
 /// }
 ///
-/// impl JournalPort<String, u64> for MemJournal {
+/// impl JournalPort<String> for MemJournal {
+///     type State = u64;
 ///     type Err = std::convert::Infallible;
 ///     fn append(&mut self, action: &String) -> Result<(), Self::Err> {
 ///         self.applied.push(action.clone());
 ///         Ok(())
 ///     }
-///     fn snapshot(&mut self, _state: &u64) -> Result<(), Self::Err> {
+///     fn persist_snapshot(&mut self, _state: &u64) -> Result<(), Self::Err> {
 ///         Ok(()) // 快照可选：真相源恒为动作流
 ///     }
-///     fn restore(&self) -> Result<Restore<u64, String>, Self::Err> {
+///     fn restore(&self) -> Result<Restore<String, u64>, Self::Err> {
 ///         Ok(Restore::FromInitial(self.applied.clone())) // 无快照：自 initial 全量播
 ///     }
 /// }
 ///
 /// let mut j = MemJournal { applied: Vec::new() };
-/// j.append(&"inc".to_string()).unwrap();
+/// j.append(&"inc".to_string()).unwrap(); // 直呼：写面零标注
 /// assert_eq!(j.restore().unwrap(), Restore::FromInitial(vec!["inc".to_string()]));
 /// ```
-pub trait JournalPort<A, S> {
+pub trait JournalPort<A> {
     /// 持久化失败类型（实现方定义；`Err` ⇒ 契约①「先落盘后 apply」生效）。
     type Err;
+    /// 账本状态面（快照与恢复语义的载荷类型；实现方定义）。
+    type State;
     /// 动作追加（真相源的增量单位）。
+    ///
+    /// payload 契约：`A` 序列化结果**必须是 JSON object**（实现层按
+    /// `#[serde(tag)]` 事件行校验）——unit variant 序列化为裸字符串，
+    /// 运行时 `Err`（fail-visible）；给 enum 挂 `#[serde(tag = "t")]` 即免。
     fn append(&mut self, action: &A) -> Result<(), Self::Err>;
-    /// 快照持久化（加速恢复的可选位；真相源恒为动作流）。
-    fn snapshot(&mut self, state: &S) -> Result<(), Self::Err>;
-    /// 恢复：三态 [`Restore`]，调用方按其语义重建当前态。
-    fn restore(&self) -> Result<Restore<S, A>, Self::Err>;
+    /// 快照持久化（加速恢复的可选位；真相源恒为动作流）。动名
+    /// `persist_snapshot` 与 [`Store::snapshot`] 的读侧快照跨层同名反向消歧
+    /// （接口维 R1：账本侧=持久化写入，store 侧=拉取读取）。
+    fn persist_snapshot(&mut self, state: &Self::State) -> Result<(), Self::Err>;
+    /// 恢复：三态 [`Restore`]，调用方按其语义重建当前态。参考落点（实现层）：
+    /// `skeleton_infra::runtime::SyncStore::restore_from` 直收本返回值播种
+    /// 新 store——`FromSnapshot` 的第一类落点（接口维 R1）。
+    fn restore(&self) -> Result<Restore<A, Self::State>, Self::Err>;
 }
 
 /// 恢复点三态（互斥态进类型，无双 `Option` 同义形）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Restore<S, A> {
+pub enum Restore<A, S> {
     /// 空账本：取 [`Reducer::initial`]，零 apply。
     Empty,
     /// 无快照行：自 [`Reducer::initial`] 起按序 apply 全量动作。

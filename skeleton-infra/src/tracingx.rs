@@ -36,6 +36,12 @@ use crate::runtime::SyncStore;
 /// （生命周期节点名）/ `depth`（仅 Enqueued 事件携带回灌深度）。
 /// `capacity` 语义同 [`SyncStore::subscribe_events`]；返回票据 Drop =
 /// 停桥（零开销恢复）。
+///
+/// 性能锚（2026-10-16 批 C 定性，release/std Instant 粗测，详见
+/// reports/2026-10-16-perf-batchc.md）：订阅态 dispatch 全含 ~142ns（无订阅
+/// ~77）中，订阅分发本体 ~63-72ns、本桥净转译 ~10ns/事件（八分支 match +
+/// `event!` 兴趣缓存，无订阅者零输出面）、有订阅者实收再 +~11ns（计数订阅
+/// 者字段记录下限，全含 ~21ns）——桥常挂的成本集中在宿主订阅者本体。
 pub fn bridge_events_to_tracing<
     S: Clone + Send + Sync + 'static,
     A: Send + 'static,
@@ -47,7 +53,7 @@ pub fn bridge_events_to_tracing<
     store.subscribe_events(capacity, emit)
 }
 
-/// 单事件转译：六节点六分支，`kind` 字段值即节点名（过滤/聚合的稳定键）。
+/// 单事件转译：八节点八分支，`kind` 字段值即节点名（过滤/聚合的稳定键）。
 fn emit(event: &AuditEvent) {
     let seq = event.seq;
     match event.kind {
@@ -58,6 +64,10 @@ fn emit(event: &AuditEvent) {
         }
         AuditEventKind::Reduced => {
             let kind = "reduced";
+            tracing::event!(target: "skeleton::audit", tracing::Level::INFO, seq, kind);
+        }
+        AuditEventKind::ReducerInterrupted => {
+            let kind = "reducer_interrupted";
             tracing::event!(target: "skeleton::audit", tracing::Level::INFO, seq, kind);
         }
         AuditEventKind::EffectForwarded => {
@@ -86,8 +96,10 @@ fn emit(event: &AuditEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skeleton::{ActionSender, Effect, EffectBuf, EffectRuntime, Infallible, NoFx, Reducer, Store as _};
     use crate::runtime::SyncStore as Store;
+    use skeleton::{
+        ActionSender, Effect, EffectBuf, EffectRuntime, Infallible, NoFx, Reducer, Store as _,
+    };
     use std::sync::{Arc, Mutex};
 
     enum Tick {
@@ -116,7 +128,10 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             // 偏差申报：tracing-subscriber 生态件锁形态，本 crate 零新依赖纪律下
             // 不可换无锁写；测试专件，锁竞争不存在。
-            self.0.lock().expect("capture buffer lock").extend_from_slice(buf);
+            self.0
+                .lock()
+                .expect("capture buffer lock")
+                .extend_from_slice(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -169,7 +184,10 @@ mod tests {
             0
         }
         fn reduce(&self, s: &u32, _: Tick, out: &mut EffectBuf<Tick, DrillOp>) -> u32 {
-            out.push(Effect::Run { id: skeleton::EffectId(1), op: DrillOp::Run });
+            out.push(Effect::Run {
+                id: skeleton::EffectId(1),
+                op: DrillOp::Run,
+            });
             s + 1
         }
     }
@@ -201,6 +219,9 @@ mod tests {
         assert!(panicked, "解释器 panic 必须照常传播（桥零吞）");
         let out = String::from_utf8(buf.lock().expect("capture buffer lock").clone())
             .expect("fmt 输出恒 UTF-8");
-        assert!(out.contains("kind=\"effect_interrupted\""), "中断节点必须入桥：{out}");
+        assert!(
+            out.contains("kind=\"effect_interrupted\""),
+            "中断节点必须入桥：{out}"
+        );
     }
 }

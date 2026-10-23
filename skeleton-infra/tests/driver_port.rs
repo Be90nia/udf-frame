@@ -59,7 +59,10 @@ impl Driver<u32, Msg> for FrameDriver {
 #[test]
 fn driver_bind_closes_event_loop_and_render_frames_track_state() {
     let store = Store::new(Counter, NoFx);
-    let mut driver = FrameDriver { sender: None, frames: Vec::new() };
+    let mut driver = FrameDriver {
+        sender: None,
+        frames: Vec::new(),
+    };
 
     // 宿主接线：bind 拿上行通道
     driver.bind(store.sender());

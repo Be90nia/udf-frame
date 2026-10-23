@@ -1,8 +1,9 @@
 //! 组合域：父子分片组合器（协作 = 显式结构，字符串路由组合的封死形态）。
 //!
 //! 契约层的组合概念只有一句——「Feature 以显式委托组合：父 reduce 内调子
-//! reduce + 镜头闭包」（[`Reducer`](skeleton::Reducer) 的自然用法）；本域是把六参样板
-//! 收口的便利件。`combine!` 宏（从切片表达式生成六闭包）后续批次落地。
+//! reduce + 镜头闭包」（[`Reducer`] 的自然用法）；本域是把六参样板收口的
+//! 便利件：[`combine`] 函数（12 泛型参具名形态）+ [`combine()`] 宏（从切片
+//! 表达式生成六闭包，见下）。
 
 use std::marker::PhantomData;
 
@@ -111,7 +112,15 @@ where
     C: Reducer<State = CS, Action = CA, Op = CO>,
     L: Fn(Effect<CA, CO>, &mut EffectBuf<PA, PO>) + 'static,
 {
-    Combine { get, set, wrap, unwrap, child, lift_fx, _slices: PhantomData }
+    Combine {
+        get,
+        set,
+        wrap,
+        unwrap,
+        child,
+        lift_fx,
+        _slices: PhantomData,
+    }
 }
 
 /// 组合宏：从切片表达式生成六闭包，收口 [`combine`] 的 12 泛型参手写。
@@ -228,6 +237,12 @@ macro_rules! combine {
 /// 闭包 + 子 reducer + 效果上提闭包，零 dyn 零装箱；六个状态/词表参数与六个
 /// 闭包参数经泛型记名——采用方可用 `Combine<_, _, …>` 注解或别名持有产物，
 /// 匿名 `impl Reducer` 形态做不到。
+///
+/// 性能锚（2026-10-16 批 C 定性，release/std Instant 粗测，详见
+/// reports/2026-10-16-perf-batchc.md）：组合税个位数 ns——combine! 装配 vs
+/// 等义手装单 Feature 的 dispatch 全含差值五轮交错中位 ~0-2ns（带 ±5ns）；
+/// 裸 reduce 两臂同折叠至 ~1ns 不可分辨（闭包全 ZST 逐字内联、子
+/// `EffectBuf` 空态零分配）——「零 dyn 零装箱」零额外分配实证。
 pub struct Combine<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L> {
     get: G,
     set: Se,
@@ -270,7 +285,9 @@ where
         // （稳态零新增分配纪律约束的是 store 效果转发路径，见 EffectBuf 头注；
         // reducer 禁写共享态——本地缓冲进出即弃，不违纯函数契约）
         let mut child_out = EffectBuf::new();
-        let child_next = self.child.reduce((self.get)(state), child_action, &mut child_out);
+        let child_next = self
+            .child
+            .reduce((self.get)(state), child_action, &mut child_out);
         while let Some(effect) = child_out.pop_front() {
             match effect {
                 // Emit 回灌是子 action 上浮（wrap 的职责），核心代 lifted；

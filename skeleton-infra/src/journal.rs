@@ -7,7 +7,9 @@
 //! - 行格式：版本头 `{"v":1}`（`deny_unknown_fields`——未知字段=协议不兼容 fail-closed
 //!   拒挂载；`"seed"` 落点须同步扩 Header 字段集）；action 行/snapshot 行
 //!   均为 `{"t":"a"|"s", ...payload}` 平铺——**`"t"` 为顶层保留键**（payload 携带顶层
-//!   `"t"`=append 显式拒绝 Err(Serialize)；值语义仍不校验）。
+//!   `"t"`=append 显式拒绝 Err(Serialize)；值语义仍不校验）；payload 须序列化为
+//!   **JSON 对象**（tag 平铺的前提）——非对象载荷（`A=u64` 裸数字等）首条
+//!   append 即 Err(Serialize)。
 //!
 //! 零依赖纪律（同 text.rs 先例）：thiserror 不入 manifest，手写同形
 //! `Display`/`Error` impl（错误文案与 thiserror 派生形态逐字一致），引入
@@ -84,7 +86,10 @@ impl std::error::Error for JournalError {
 /// Io 错误构造（统一携带文件路径；`From<std::io::Error>` 无法承载 path，
 /// 故收口于此、各 io 调用点显式 `map_err`）。
 fn io_err(path: &Path, source: std::io::Error) -> JournalError {
-    JournalError::Io { path: path.to_path_buf(), source }
+    JournalError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 impl From<serde_json::Error> for JournalError {
@@ -131,33 +136,81 @@ impl From<std::io::Error> for ReplayError {
     }
 }
 
-/// 追加式真相源端口（dyn 只在组合根一次——冷边界，铁律二）。
-pub trait Journal<A, S>
+/// 追加式真相源端口（热路径静态分发优先、禁新增 dyn；本 trait 的 dyn 只在
+/// 组合根装配点出现一次，属冷边界常数豁免）。
+///
+/// **与 [`skeleton::JournalPort`] 分工**：本 trait 是全功能面（[`Replay`]
+/// 懒回放逐行解析，不物化 Vec），方法名带实现层词形（[`Journal::append_action`]/
+/// [`Journal::restore_stream`]/[`Journal::append_snapshot`]，[`Journal::replay`]
+/// 为实现层独有）；契约词表（`append`/`restore`/`persist_snapshot`）归端口
+/// 独占——两 trait 同屏 import 时直呼无歧义（旧三同名 E0034/E0283 双候选
+/// 已结构性消灭）。
+///
+/// **状态面关联类型化（批 6A）**：状态类型由 [`Journal::State`] 承载、被
+/// `Self` 钉死——方法调用零 turbofish 零显式 deref（`j.append_action(&a)`
+/// 直呼，`A` 从 action 参数自然推断；`MutexGuard` 后 `g.append_action(&a)`
+/// 同形），读侧 `restore_stream`/`replay` 返回值全推断免绑定标注。类型标注
+/// 只剩构造一处（`JsonlJournal::<A, S>::create(..)`——税落最冷点；惯用形见
+/// [`JsonlJournal`] 类型文档 doctest）。
+pub trait Journal<A>
 where
     A: Serialize + DeserializeOwned,
-    S: Serialize + DeserializeOwned,
 {
+    /// 账本状态面（快照行与恢复语义的载荷类型）。
+    type State: Serialize + DeserializeOwned;
+
     /// 追加一行 action。**契约：Err ⇒ 调用方禁 apply 该 Action**（先落盘后 apply 的另一半）。
     ///
-    /// 挂点矩阵：外部动作=组合根包装层 append→dispatch；回灌动作=解释器标准形
-    /// 模板强制 append-before-send（成功才 back.send）。核心不设钩子=有意（零依赖）。
+    /// 行格式约束：action/state 必须序列化为 **JSON 对象**（tag `"t"` 与载荷
+    /// 平铺同层）——非对象载荷（如 `A = u64` 序列化为裸数字）首条
+    /// `append_action` 即 `Err(JournalError::Serialize)`；序列化先于任何字节落盘（零残行），
+    /// 换对象形状重试无副作用。
+    ///
+    /// 挂点矩阵：外部动作=组合根包装层 append→dispatch；`Run`/`Cancel` 效果的
+    /// 回灌动作=解释器标准形模板强制 append-before-send（成功才 back.send）；
+    /// **Emit 回灌不入账**——派生动作由 store 核心直接入队（不经解释器，无挂点
+    /// 可设），它是已落盘 action 经纯 reducer 的确定性派生（同 (state, action)
+    /// 恒同输出）：重放=Restore 动作流经同一装配的 store 逐条 dispatch，派生链
+    /// 由排空环再生、终态收敛（回归锚：`tests/journal_port.rs`
+    /// emit_feedback_replay_converges_with_live——live==重放==审计深度链三方可
+    /// 查）。需逐动作账本的宿主须在自设派生挂点上 append。核心不设钩子=有意
+    /// （零依赖）。
     ///
     /// BufWriter 缓冲，非逐行 flush；`snapshot_every` 命中时自动 flush（见模块注）。
-    fn append(&mut self, action: &A) -> Result<(), JournalError>;
+    fn append_action(&mut self, action: &A) -> Result<(), JournalError>;
 
-    /// 快照读侧：自最新 "s" 行起播——`Some((快照态, 后续 action 回放))`；
+    /// 快照读侧（流式）：自最新 "s" 行起播——`Some((快照态, 后续 action 回放))`；
     /// 无快照行=`None`（调用方回退 initial 全量回放）。快照截断/压实留升级位。
     /// 可见性=已 flush 前缀（BufWriter 未 flush 尾部对读侧不可见）；实时面用 Store 快照。
-    fn restore(&self) -> Result<Option<(S, Replay<'_, A>)>, JournalError>;
+    /// 动名 `restore_stream`：账本侧=流式回放（`Option<(Self::State, Replay<'_>)>`，
+    /// 逐行懒解析迭代器），端口侧 [`skeleton::JournalPort::restore`]=三态物化
+    /// （`Restore<A, S>`）——同名已消（E0034/E0283 治理，批 2A 改名消重），
+    /// 两 trait 同屏直呼各达其面。
+    fn restore_stream(&self) -> Result<SnapshotStream<'_, A, Self::State>, JournalError>;
 
-    /// flush + 写快照行（周期位；语义可选——真相源恒为全量 action 流，快照只为加速恢复）。
-    fn snapshot(&mut self, state: &S) -> Result<(), JournalError>;
+    /// flush + 写快照行（周期位；语义可选——真相源恒为全量 action 流，快照只为
+    /// 加速恢复）。动名 `append_snapshot`：写侧语义自明（追加快照行），与端口侧
+    /// [`skeleton::JournalPort::persist_snapshot`] 同物异名已消（E0034/E0283
+    /// 治理）；与 [`skeleton::Store::snapshot`] 的读侧快照反向前缀区分照旧
+    ///（接口维 R1：账本侧=持久化写入，store 侧=拉取读取）。
+    fn append_snapshot(&mut self, state: &Self::State) -> Result<(), JournalError>;
 
-    /// 只读回放迭代器（逐行懒解析）。未知变体行：跳过+计数（schema 演化）；
-    /// 畸形 JSON 行：Err fail-closed（禁静默跳过）。
+    /// 只读回放迭代器（逐行懒解析）。**双层 Result 语义**：外层 `Err`=调用级
+    /// 失败（文件打不开等，调用本身）；内层迭代 item 的 `Result<A, ReplayError>`=
+    /// 行级——未知变体行：跳过+计数（schema 演化）；畸形 JSON 行：`Err`
+    /// fail-closed（禁静默跳过）。调用成功后逐行消费。
     /// 可见性=已 flush 前缀；实时面用 Store 快照。
     fn replay(&self) -> Result<Replay<'_, A>, JournalError>;
 }
+
+/// `(A, S)` 焊接别名（`dyn Journal<A, State = S>` 短形）：关联类型化后
+/// trait-object 面仍一线可达——把 `State` 焊进对象类型后 dyn 上方法调用
+/// 同样零标注（对象寿命取默认 `+ 'static`，`JsonlJournal` 全自有句柄恒满足）。
+pub type DynJournal<A, S> = dyn Journal<A, State = S>;
+
+/// 快照流读侧（[`Journal::restore_stream`] 返回的 `Ok` 载荷形）：
+/// `Some((快照态, 增量回放))` 或 `None`（无快照行，调用方回退 initial 全量回放）。
+pub type SnapshotStream<'j, A, S> = Option<(S, Replay<'j, A>)>;
 
 /// JSONL 追加式账本（`Journal` 默认实现；单写者）。
 ///
@@ -173,15 +226,16 @@ where
 /// struct State { count: u64 }
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let mut j = JsonlJournal::create("journal.jsonl")?;
-/// Journal::<Action, State>::append(&mut j, &Action { id: 1 })?; // 先落盘：Err ⇒ 禁 apply
-/// let _restored = Journal::<Action, State>::restore(&j)?; // Some((快照态, 增量回放)) 或 None
-/// Journal::<Action, State>::snapshot(&mut j, &State { count: 1 })?; // 周期位：flush+写快照行
-/// j.flush()?; // 停机三段式③：shutdown 前 flush journal
+/// // (A, S) 在构造期钉死（一次 turbofish，税落最冷点）；此后方法调用全直呼：
+/// let mut j = JsonlJournal::<Action, State>::create("journal.jsonl")?;
+/// j.append_action(&Action { id: 1 })?; // 先落盘：Err ⇒ 禁 apply（A 从参数推断）
+/// let _restored = j.restore_stream()?; // 全推断：Some((快照态, 增量回放)) 或 None
+/// j.append_snapshot(&State { count: 1 })?; // 周期位：flush+写快照行（S 由 Self 归一）
+/// j.flush()?; // 宿主停机序的 flush 位：解释器 close → 排空 idle → flush → drop
 /// # Ok(())
 /// # }
 /// ```
-pub struct JsonlJournal {
+pub struct JsonlJournal<A, S> {
     writer: BufWriter<std::fs::File>,
     path: PathBuf,
     version: u32,
@@ -189,9 +243,11 @@ pub struct JsonlJournal {
     append_count: u64,
     /// open 时截断的崩溃残行字节数（Debug 可见留痕——残行必未越过 flush 点=非持久）。
     truncated_tail: u64,
+    /// A/S 类型标记（不进存储布局；`fn()` 形对 Send/Sync/变体中性）。
+    _types: PhantomData<fn() -> (A, S)>,
 }
 
-impl fmt::Debug for JsonlJournal {
+impl<A, S> fmt::Debug for JsonlJournal<A, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JsonlJournal")
             .field("path", &self.path)
@@ -211,7 +267,7 @@ struct Header {
     v: u32,
 }
 
-impl JsonlJournal {
+impl<A, S> JsonlJournal<A, S> {
     /// 新建文件+写版本头 `{"v":1}`；文件已存在=Err(Io kind AlreadyExists，Display 含路径)。
     pub fn create(path: impl AsRef<Path>) -> Result<Self, JournalError> {
         let path = path.as_ref();
@@ -222,7 +278,9 @@ impl JsonlJournal {
             .map_err(|e| io_err(path, e))?;
         let mut writer = BufWriter::with_capacity(WRITE_BUF, file);
         // 版本头写后即刷：open 往返与挂载校验都依赖头行对读侧可见（flush 点=持久点）。
-        writer.write_all(b"{\"v\":1}\n").map_err(|e| io_err(path, e))?;
+        writer
+            .write_all(b"{\"v\":1}\n")
+            .map_err(|e| io_err(path, e))?;
         writer.flush().map_err(|e| io_err(path, e))?;
         Ok(Self {
             writer,
@@ -231,6 +289,7 @@ impl JsonlJournal {
             snapshot_every: None,
             append_count: 0,
             truncated_tail: 0,
+            _types: PhantomData,
         })
     }
 
@@ -288,16 +347,34 @@ impl JsonlJournal {
             snapshot_every: None,
             append_count: 0,
             truncated_tail,
+            _types: PhantomData,
         })
     }
 
-    /// 显式冲刷（停机三段式③：shutdown 前 flush journal）。
+    /// 显式冲刷（宿主停机序的 flush 位：解释器 close → 排空 idle → **flush** →
+    /// drop——shutdown 前把 BufWriter 尾部落盘，读侧可见性=已 flush 前缀）。
+    ///
+    /// flush 末尾 `sync_all`（杠精盲审 2026-10-17）：裸 flush 只到 OS 页缓存，
+    /// 掉电面「flush 点=持久点」不成立——同 crate atomic_write 有完整 fsync
+    /// 纪律而本件没有=双标。flush 是低频点（停机序/snapshot 自动位），补
+    /// fsync 后掉电读侧可见性=真持久前缀。
+    ///
+    /// **「flush 点=持久点」精确语义**：flush=写进 OS+`sync_all` 落盘（掉电
+    /// 真持久）。读侧可见性另有分界——未 flush 的缓冲在**干净 drop** 时由
+    /// `BufWriter` 兜底写出（重开同样可见）；真正丢数据的分界是**进程崩溃/
+    /// `mem::forget`**（缓冲未落盘），不是 drop。
     pub fn flush(&mut self) -> Result<(), JournalError> {
         self.writer.flush().map_err(|e| io_err(&self.path, e))?;
+        self.writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| io_err(&self.path, e))?;
         Ok(())
     }
 
     /// 每 n 次 append 自动 flush 一次（0/None=关闭自动快照；见模块注）。
+    /// flush 含 `sync_all`（掉电真持久）——n 设小（如 1）=每 append 一次
+    /// fsync，µs→ms 级延迟跳变属预期；高频持久需求请改显式 `flush()` 位。
     pub fn with_snapshot_every(mut self, n: u64) -> Self {
         self.snapshot_every = if n == 0 { None } else { Some(n) };
         self
@@ -355,12 +432,14 @@ fn tagged_line<T: Serialize>(tag: &str, value: &T) -> Result<String, JournalErro
     })
 }
 
-impl<A, S> Journal<A, S> for JsonlJournal
+impl<A, S> Journal<A> for JsonlJournal<A, S>
 where
     A: Serialize + DeserializeOwned,
     S: Serialize + DeserializeOwned,
 {
-    fn append(&mut self, action: &A) -> Result<(), JournalError> {
+    type State = S;
+
+    fn append_action(&mut self, action: &A) -> Result<(), JournalError> {
         let line = tagged_line("a", action)?;
         self.writer
             .write_all(line.as_bytes())
@@ -378,11 +457,10 @@ where
         Ok(())
     }
 
-    fn restore(&self) -> Result<Option<(S, Replay<'_, A>)>, JournalError> {
+    fn restore_stream(&self) -> Result<Option<(S, Replay<'_, A>)>, JournalError> {
         // 单遍扫描找最后一条 "s" 行；返回的 Replay 从该行下一字节起（快照行之前的行
         // 一律跳过且不解析——含更早快照行与畸形行；行后畸形由增量回放 fail-closed）。
-        let file =
-            std::fs::File::open(&self.path).map_err(|e| io_err(&self.path, e))?;
+        let file = std::fs::File::open(&self.path).map_err(|e| io_err(&self.path, e))?;
         let mut reader = BufReader::new(file);
         let mut line = String::new();
         let mut offset = 0u64;
@@ -390,17 +468,27 @@ where
         let mut latest: Option<(S, u64, u64)> = None; // (快照态, 行后字节偏移, 行号)
         loop {
             line.clear();
-            let n = reader.read_line(&mut line).map_err(|e| io_err(&self.path, e))?;
+            let n = reader
+                .read_line(&mut line)
+                .map_err(|e| io_err(&self.path, e))?;
             if n == 0 {
                 break;
             }
             line_no += 1;
             // 扫描只认 "s" 行：畸形行/其他 tag 行不在此处裁决（留给回放面）。
-            let is_snapshot = serde_json::from_str::<serde_json::Value>(line.trim_end())
-                .ok()
-                .and_then(|v| {
-                    (v.get("t").and_then(|t| t.as_str()) == Some("s")).then_some(v)
-                });
+            // 快照探测=字节前缀短路：tagged_line 恒产 `{"t":"s"...}` tag 置首形，
+            // 非 "s" 形行零 JSON 解析——此前逐行 Value 解析成本 ≈ 全量 typed 回放
+            //（0.40 vs 0.43µs/行），叠加增量回放=快照加速收益反转（perf-journal
+            // §3-C）。非 writer 形（tag 不置首）漏检只退化全量重放：真相源恒为
+            // action 流，终态不变。
+            let trimmed = line.trim_end();
+            let is_snapshot = if trimmed.starts_with("{\"t\":\"s\"") {
+                serde_json::from_str::<serde_json::Value>(trimmed)
+                    .ok()
+                    .and_then(|v| (v.get("t").and_then(|t| t.as_str()) == Some("s")).then_some(v))
+            } else {
+                None
+            };
             if let Some(mut v) = is_snapshot {
                 if let Some(m) = v.as_object_mut() {
                     m.remove("t");
@@ -424,19 +512,22 @@ where
                 let mut file = reader.into_inner();
                 file.seek(SeekFrom::Start(start))
                     .map_err(|e| io_err(&self.path, e))?;
-                Ok(Some((state, Replay {
-                    reader: BufReader::new(file),
-                    line_no: snap_line,
-                    skipped: 0,
-                    buf: String::new(),
-                    _marker: PhantomData,
-                    _anchor: PhantomData,
-                })))
+                Ok(Some((
+                    state,
+                    Replay {
+                        reader: BufReader::new(file),
+                        line_no: snap_line,
+                        skipped: 0,
+                        buf: String::new(),
+                        _marker: PhantomData,
+                        _anchor: PhantomData,
+                    },
+                )))
             }
         }
     }
 
-    fn snapshot(&mut self, state: &S) -> Result<(), JournalError> {
+    fn append_snapshot(&mut self, state: &S) -> Result<(), JournalError> {
         // flush 先行：快照行必须落在全部已 append action 之后（先落盘后 apply 的持久点纪律）。
         self.flush()?;
         let line = tagged_line("s", state)?;
@@ -470,30 +561,33 @@ where
 /// 该端口（内存账本/SQLite/网络皆可，序列化词表自选）；本件为 JSONL 参考实现。
 /// 本 crate 的 [`Journal`] trait 是全功能面（[`Replay`] 懒回放逐行解析，
 /// 不物化 Vec）——宿主要增量流式恢复用 [`Journal`]，要端口可换性用
-/// `JournalPort`。
-impl<A, S> skeleton::JournalPort<A, S> for JsonlJournal
+/// `JournalPort`。端口同款关联类型化（批 6A）：`State` 被 `Self` 钉死，
+/// 端口方法直呼零标注。
+impl<A, S> skeleton::JournalPort<A> for JsonlJournal<A, S>
 where
     A: Serialize + DeserializeOwned,
     S: Serialize + DeserializeOwned,
 {
     type Err = JournalError;
+    type State = S;
 
     fn append(&mut self, action: &A) -> Result<(), JournalError> {
-        Journal::<A, S>::append(self, action)
+        self.append_action(action)
     }
 
-    fn snapshot(&mut self, state: &S) -> Result<(), JournalError> {
-        Journal::<A, S>::snapshot(self, state)
+    fn persist_snapshot(&mut self, state: &S) -> Result<(), JournalError> {
+        self.append_snapshot(state)
     }
 
-    fn restore(&self) -> Result<skeleton::Restore<S, A>, JournalError> {
-        match Journal::<A, S>::restore(self)? {
-            Some((state, replay)) => {
-                Ok(skeleton::Restore::FromSnapshot(state, collect_replay(&self.path, replay)?))
-            }
+    fn restore(&self) -> Result<skeleton::Restore<A, S>, JournalError> {
+        match self.restore_stream()? {
+            Some((state, replay)) => Ok(skeleton::Restore::FromSnapshot(
+                state,
+                collect_replay(&self.path, replay)?,
+            )),
             // 无快照行：全量动作流自 initial 起播；零动作=空账本
             None => {
-                let actions = collect_replay(&self.path, Journal::<A, S>::replay(self)?)?;
+                let actions = collect_replay(&self.path, self.replay()?)?;
                 if actions.is_empty() {
                     Ok(skeleton::Restore::Empty)
                 } else {
@@ -512,7 +606,10 @@ fn collect_replay<A: DeserializeOwned>(
     replay
         .map(|a| {
             a.map_err(|e| match e {
-                ReplayError::Io(source) => JournalError::Io { path: path.to_path_buf(), source },
+                ReplayError::Io(source) => JournalError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                },
                 ReplayError::Corrupt { line, source } => JournalError::Corrupt { line, source },
             })
         })
@@ -545,16 +642,15 @@ impl<'j, A: DeserializeOwned> Iterator for Replay<'j, A> {
                 return None;
             }
             self.line_no += 1;
-            let value: serde_json::Value =
-                match serde_json::from_str(self.buf.trim_end()) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Some(Err(ReplayError::Corrupt {
-                            line: self.line_no,
-                            source: e,
-                        }))
-                    }
-                };
+            let value: serde_json::Value = match serde_json::from_str(self.buf.trim_end()) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Some(Err(ReplayError::Corrupt {
+                        line: self.line_no,
+                        source: e,
+                    }))
+                }
+            };
             if value.get("t").and_then(|t| t.as_str()) == Some("a") {
                 // 摘掉 tag 后整行交给 A：payload 缺字段走 schema default（add-only 演化），
                 // 真畸形=Err fail-closed（禁静默跳过）。
@@ -562,12 +658,10 @@ impl<'j, A: DeserializeOwned> Iterator for Replay<'j, A> {
                 if let Some(m) = payload.as_object_mut() {
                     m.remove("t");
                 }
-                return Some(
-                    A::deserialize(&payload).map_err(|e| ReplayError::Corrupt {
-                        line: self.line_no,
-                        source: e,
-                    }),
-                );
+                return Some(A::deserialize(&payload).map_err(|e| ReplayError::Corrupt {
+                    line: self.line_no,
+                    source: e,
+                }));
             }
             // "s" 行与未知 tag 一律跳过+计数（schema 演化）。
             self.skipped += 1;
@@ -609,18 +703,19 @@ mod tests {
         dir
     }
 
-    /// `Journal<A, S>` 双参在非泛型 `JsonlJournal` 上需显式消歧——测试侧收敛为四个薄封装。
-    fn app(j: &mut JsonlJournal, a: &Act) {
-        Journal::<Act, St>::append(j, a).unwrap();
+    /// 批 6A 关联类型化后调用面：直呼零标注（A/S 被 Self 钉死）——helper 只
+    /// 收敛 unwrap 噪声；dyn 焊接面由 tests/journal_port.rs 的 Port 别名钉。
+    fn app(j: &mut JsonlJournal<Act, St>, a: &Act) {
+        j.append_action(a).unwrap();
     }
-    fn snap(j: &mut JsonlJournal, s: &St) {
-        Journal::<Act, St>::snapshot(j, s).unwrap();
+    fn snap(j: &mut JsonlJournal<Act, St>, s: &St) {
+        j.append_snapshot(s).unwrap();
     }
-    fn rep(j: &JsonlJournal) -> Replay<'_, Act> {
-        Journal::<Act, St>::replay(j).unwrap()
+    fn rep(j: &JsonlJournal<Act, St>) -> Replay<'_, Act> {
+        j.replay().unwrap()
     }
-    fn rest(j: &JsonlJournal) -> Option<(St, Replay<'_, Act>)> {
-        Journal::<Act, St>::restore(j).unwrap()
+    fn rest(j: &JsonlJournal<Act, St>) -> Option<(St, Replay<'_, Act>)> {
+        j.restore_stream().unwrap()
     }
 
     /// 恒等序列：中文/引号/反斜杠/换行转义/空串。
@@ -647,7 +742,7 @@ mod tests {
         let path = dir.join("j.jsonl");
         let acts = sample_acts();
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
             for a in &acts {
                 app(&mut j, a);
             }
@@ -665,12 +760,18 @@ mod tests {
         let dir = case_dir("version-header");
         let path = dir.join("j.jsonl");
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
-            app(&mut j, &Act { id: 1, label: "a".into() });
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
+            app(
+                &mut j,
+                &Act {
+                    id: 1,
+                    label: "a".into(),
+                },
+            );
         }
         // create→open 往返；VersionMismatch。
-        JsonlJournal::open(&path, 1).unwrap();
-        match JsonlJournal::open(&path, 2) {
+        JsonlJournal::<Act, St>::open(&path, 1).unwrap();
+        match JsonlJournal::<Act, St>::open(&path, 2) {
             Err(JournalError::VersionMismatch { found, expected }) => {
                 assert_eq!((found, expected), (1, 2));
             }
@@ -679,12 +780,12 @@ mod tests {
         // 版本头未知字段：deny_unknown_fields → fail-closed。
         let seeded = dir.join("seeded.jsonl");
         std::fs::write(&seeded, "{\"v\":1,\"seed\":42}\n").unwrap();
-        match JsonlJournal::open(&seeded, 1) {
+        match JsonlJournal::<Act, St>::open(&seeded, 1) {
             Err(JournalError::Corrupt { line: 1, .. }) => {}
             other => panic!("expected Corrupt at line 1, got {other:?}"),
         }
         // create 撞已存在=Err(Io kind AlreadyExists，Display 含路径)。
-        match JsonlJournal::create(&path) {
+        match JsonlJournal::<Act, St>::create(&path) {
             Err(JournalError::Io { source: e, .. }) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
             }
@@ -701,7 +802,7 @@ mod tests {
         let dir = case_dir("header-unknown-field");
         let path = dir.join("j.jsonl");
         std::fs::write(&path, "{\"v\":1,\"extra\":true}\n").unwrap();
-        match JsonlJournal::open(&path, 1) {
+        match JsonlJournal::<Act, St>::open(&path, 1) {
             Err(JournalError::Corrupt { line, .. }) => assert_eq!(line, 1),
             other => panic!("expected Corrupt at line 1, got {other:?}"),
         }
@@ -714,8 +815,8 @@ mod tests {
     fn io_error_display_carries_path() {
         let dir = case_dir("io-error-carries-path");
         let path = dir.join("ledger.jsonl");
-        JsonlJournal::create(&path).unwrap();
-        let second = JsonlJournal::create(&path); // 撞已存在
+        JsonlJournal::<Act, St>::create(&path).unwrap();
+        let second = JsonlJournal::<Act, St>::create(&path); // 撞已存在
         std::fs::remove_dir_all(&dir).unwrap();
         match second {
             Ok(_) => panic!("create 撞已存在文件必须 Err"),
@@ -739,19 +840,28 @@ mod tests {
     fn unknown_tag_lines_are_skipped_and_counted() {
         let dir = case_dir("unknown-tag");
         let path = dir.join("j.jsonl");
-        let a1 = Act { id: 1, label: "a".into() };
-        let a2 = Act { id: 2, label: "b".into() };
+        let a1 = Act {
+            id: 1,
+            label: "a".into(),
+        };
+        let a2 = Act {
+            id: 2,
+            label: "b".into(),
+        };
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
             app(&mut j, &a1);
             j.flush().unwrap();
             // 手工注入未知 tag 行与无 tag 行（schema 演化）。
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             writeln!(f, "{{\"t\":\"future_tag\",\"x\":1}}").unwrap();
             writeln!(f, "{{\"note\":\"no tag at all\"}}").unwrap();
         }
         {
-            let mut j = JsonlJournal::open(&path, 1).unwrap();
+            let mut j = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
             app(&mut j, &a2);
             j.flush().unwrap();
             let mut r = rep(&j);
@@ -767,14 +877,23 @@ mod tests {
         let dir = case_dir("corrupt-line");
         let path = dir.join("j.jsonl");
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
-            app(&mut j, &Act { id: 1, label: "a".into() });
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
+            app(
+                &mut j,
+                &Act {
+                    id: 1,
+                    label: "a".into(),
+                },
+            );
             j.flush().unwrap();
             // 注入畸形行（行 3）：header=1, a1=2。
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             writeln!(f, "这行不是 JSON").unwrap();
         }
-        let j = JsonlJournal::open(&path, 1).unwrap();
+        let j = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
         let mut r = rep(&j);
         assert!(r.next().unwrap().is_ok()); // 行 2 完整
         match r.next() {
@@ -788,10 +907,16 @@ mod tests {
     fn snapshot_lines_stay_out_of_action_stream() {
         let dir = case_dir("snapshot-stream");
         let path = dir.join("j.jsonl");
-        let a1 = Act { id: 1, label: "a".into() };
-        let a2 = Act { id: 2, label: "b".into() };
+        let a1 = Act {
+            id: 1,
+            label: "a".into(),
+        };
+        let a2 = Act {
+            id: 2,
+            label: "b".into(),
+        };
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
             app(&mut j, &a1);
             snap(&mut j, &St { count: 1 });
             app(&mut j, &a2);
@@ -808,14 +933,22 @@ mod tests {
     fn with_snapshot_every_auto_flushes() {
         let dir = case_dir("auto-flush");
         let path = dir.join("j.jsonl");
-        let a1 = Act { id: 1, label: "a".into() };
-        let a2 = Act { id: 2, label: "b".into() };
-        let mut j = JsonlJournal::create(&path).unwrap().with_snapshot_every(2);
+        let a1 = Act {
+            id: 1,
+            label: "a".into(),
+        };
+        let a2 = Act {
+            id: 2,
+            label: "b".into(),
+        };
+        let mut j = JsonlJournal::<Act, St>::create(&path)
+            .unwrap()
+            .with_snapshot_every(2);
         app(&mut j, &a1);
         app(&mut j, &a2); // 达 n=2 → 自动 flush，无手动 flush
-        // j 保持存活（BufWriter drop 兜底 flush 会污染断言），用第二句柄验证重开可见。
+                          // j 保持存活（BufWriter drop 兜底 flush 会污染断言），用第二句柄验证重开可见。
         {
-            let j2 = JsonlJournal::open(&path, 1).unwrap();
+            let j2 = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
             let mut r = rep(&j2);
             let got: Vec<Act> = r.by_ref().map(Result::unwrap).collect();
             assert_eq!(got, vec![a1, a2]);
@@ -838,8 +971,8 @@ mod tests {
         let dir = case_dir("serialize-err");
         let path = dir.join("j.jsonl");
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
-            match Journal::<BoomAct, St>::append(&mut j, &BoomAct) {
+            let mut j = JsonlJournal::<BoomAct, St>::create(&path).unwrap();
+            match j.append_action(&BoomAct) {
                 Err(JournalError::Serialize(_)) => {}
                 other => panic!("expected Serialize error, got {other:?}"),
             }
@@ -866,9 +999,12 @@ mod tests {
         let dir = case_dir("reserved-t-key");
         let path = dir.join("j.jsonl");
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
-            let a = TaggedAct { t: "a".into(), v: 1 };
-            match Journal::<TaggedAct, St>::append(&mut j, &a) {
+            let mut j = JsonlJournal::<TaggedAct, St>::create(&path).unwrap();
+            let a = TaggedAct {
+                t: "a".into(),
+                v: 1,
+            };
+            match j.append_action(&a) {
                 Err(JournalError::Serialize(_)) => {}
                 other => panic!("expected Serialize error, got {other:?}"),
             }
@@ -884,10 +1020,16 @@ mod tests {
         let dir = case_dir("large-action");
         let path = dir.join("j.jsonl");
         let big = "字".repeat(70_000); // 210KiB UTF-8，跨 64KiB 写缓冲
-        let a_big = Act { id: 1, label: big.clone() };
-        let a_small = Act { id: 2, label: "s".into() };
+        let a_big = Act {
+            id: 1,
+            label: big.clone(),
+        };
+        let a_small = Act {
+            id: 2,
+            label: "s".into(),
+        };
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
             app(&mut j, &a_big);
             app(&mut j, &a_small);
             j.flush().unwrap();
@@ -904,20 +1046,29 @@ mod tests {
     fn crash_residual_line_truncated_on_open() {
         let dir = case_dir("crash-residual");
         let path = dir.join("j.jsonl");
-        let a1 = Act { id: 1, label: "a".into() };
-        let a2 = Act { id: 2, label: "after-crash".into() };
+        let a1 = Act {
+            id: 1,
+            label: "a".into(),
+        };
+        let a2 = Act {
+            id: 2,
+            label: "after-crash".into(),
+        };
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
             app(&mut j, &a1);
             j.flush().unwrap();
         }
         {
             // 模拟崩溃残行：无 \n 的半行。
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             write!(f, "{{\"t\":\"a\",\"id\":99,\"label\":\"torn").unwrap();
         }
         {
-            let mut j = JsonlJournal::open(&path, 1).unwrap(); // 截断残行
+            let mut j = JsonlJournal::<Act, St>::open(&path, 1).unwrap(); // 截断残行
             app(&mut j, &a2); // 从完整行边界续写
             j.flush().unwrap();
             let mut r = rep(&j);
@@ -931,17 +1082,26 @@ mod tests {
     fn restore_identity_snapshot_plus_delta_equals_full_replay() {
         let dir = case_dir("restore");
         let path = dir.join("j.jsonl");
-        let a1 = Act { id: 1, label: "a".into() };
-        let a2 = Act { id: 2, label: "b".into() };
-        let a3 = Act { id: 3, label: "c".into() };
+        let a1 = Act {
+            id: 1,
+            label: "a".into(),
+        };
+        let a2 = Act {
+            id: 2,
+            label: "b".into(),
+        };
+        let a3 = Act {
+            id: 3,
+            label: "c".into(),
+        };
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
             app(&mut j, &a1);
             app(&mut j, &a2);
             snap(&mut j, &St { count: 3 }); // fold(a1,a2)
             app(&mut j, &a3);
             j.flush().unwrap(); // 可见性=已 flush 前缀：先 flush 再 restore
-            // 有快照行：起点=快照态，续回放=快照行之后的增量。
+                                // 有快照行：起点=快照态，续回放=快照行之后的增量。
             let (s0, mut r) = rest(&j).unwrap();
             assert_eq!(s0, St { count: 3 });
             let inc: Vec<Act> = r.by_ref().map(Result::unwrap).collect();
@@ -960,7 +1120,7 @@ mod tests {
         // 无快照行=None。
         let empty = dir.join("empty.jsonl");
         {
-            let j0 = JsonlJournal::create(&empty).unwrap();
+            let j0 = JsonlJournal::<Act, St>::create(&empty).unwrap();
             assert!(rest(&j0).is_none());
         }
         std::fs::remove_dir_all(&dir).unwrap();
@@ -985,15 +1145,23 @@ mod tests {
         let dir = case_dir("snapshot-serialize-err");
         let path = dir.join("j.jsonl");
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
-            app(&mut j, &Act { id: 1, label: "a".into() });
-            match Journal::<Act, BoomState>::snapshot(&mut j, &BoomState) {
+            let mut j = JsonlJournal::<Act, BoomState>::create(&path).unwrap();
+            j.append_action(&Act {
+                id: 1,
+                label: "a".into(),
+            })
+            .unwrap();
+            match j.append_snapshot(&BoomState) {
                 Err(JournalError::Serialize(_)) => {}
                 other => panic!("expected Serialize error, got {other:?}"),
             }
         }
         let content = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(content.lines().count(), 2, "版本头 + 已 append 的 action，无快照残行");
+        assert_eq!(
+            content.lines().count(),
+            2,
+            "版本头 + 已 append 的 action，无快照残行"
+        );
         assert!(!content.contains("\"t\":\"s\""), "失败快照不得落盘");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1006,18 +1174,33 @@ mod tests {
         let dir = case_dir("restore-bad-snapshot");
         let path = dir.join("j.jsonl");
         {
-            let mut j = JsonlJournal::create(&path).unwrap();
-            app(&mut j, &Act { id: 1, label: "a".into() });  // 行 2
-            snap(&mut j, &St { count: 1 });                  // 行 3：好快照
-            app(&mut j, &Act { id: 2, label: "b".into() });  // 行 4
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
+            app(
+                &mut j,
+                &Act {
+                    id: 1,
+                    label: "a".into(),
+                },
+            ); // 行 2
+            snap(&mut j, &St { count: 1 }); // 行 3：好快照
+            app(
+                &mut j,
+                &Act {
+                    id: 2,
+                    label: "b".into(),
+                },
+            ); // 行 4
             j.flush().unwrap();
             // 行 5：JSON 合法、t:"s" 可识别，但 count 类型不符——S 反序列化必败
             use std::io::Write as _;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             writeln!(f, "{{\"t\":\"s\",\"count\":\"not-a-number\"}}").unwrap();
         }
-        let j = JsonlJournal::open(&path, 1).unwrap();
-        match Journal::<Act, St>::restore(&j) {
+        let j = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
+        match j.restore_stream() {
             Ok(_) => panic!("坏快照必须 Err：静默回退旧快照=恢复陈旧态还自认成功"),
             Err(JournalError::Corrupt { line, .. }) => {
                 assert_eq!(line, 5, "坏快照行号如实上报");
@@ -1027,4 +1210,56 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// 恢复反转回归钉（perf-journal §3-C）：中点快照恢复必须不慢于全量重放。
+    /// 断言形态=同机同文件相对比值（min-of-3 自校准，抗一次性 OS 停顿），非裸
+    /// 时间上限（防 CI flaky）；另附「只重放增量」语义断言（行为面）。变异检出：
+    /// 扫描退回逐行 Value 解析（历史行无效解析）即红——Value 解析成本 ≈ 全量
+    /// typed 回放（0.40 vs 0.43µs/行），叠加增量回放必超基线（62-66 vs 43ms）。
+    #[test]
+    fn restore_with_mid_snapshot_not_slower_than_full_replay() {
+        let dir = case_dir("restore-inversion");
+        let path = dir.join("j.jsonl");
+        const HALF: u64 = 50_000;
+        {
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
+            let a = Act {
+                id: 7,
+                label: "x".into(),
+            };
+            for _ in 0..HALF {
+                app(&mut j, &a);
+            }
+            snap(&mut j, &St { count: HALF * 7 });
+            for _ in 0..HALF {
+                app(&mut j, &a);
+            }
+            j.flush().unwrap();
+        }
+        let j = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
+        // min-of-3：OS 停顿至多污染一轮，min 收敛到无噪声固有成本。
+        let mut snap_ms = u128::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let (s0, r) = rest(&j).unwrap();
+            let inc: Vec<Act> = r.map(Result::unwrap).collect();
+            let e = t.elapsed();
+            assert_eq!(s0, St { count: HALF * 7 }, "快照态播种");
+            assert_eq!(inc.len() as u64, HALF, "只重放快照后增量，历史行不得重出");
+            snap_ms = snap_ms.min(e.as_millis());
+        }
+        let mut full_ms = u128::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let full: Vec<Act> = rep(&j).map(Result::unwrap).collect();
+            let e = t.elapsed();
+            assert_eq!(full.len() as u64, HALF * 2);
+            full_ms = full_ms.min(e.as_millis());
+        }
+        eprintln!("restore(mid-snapshot) = {snap_ms}ms, full replay = {full_ms}ms");
+        assert!(
+            snap_ms < full_ms,
+            "快照恢复慢于全量重放=反转回归：snap={snap_ms}ms full={full_ms}ms"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

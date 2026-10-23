@@ -63,7 +63,8 @@ impl fmt::Display for ScopeClosed {
 
 impl std::error::Error for ScopeClosed {}
 
-/// 取消源（停机三段式②通知面）；幂等 cancel。
+/// 取消源（fx 域停机三段的② abort 协作取消通知面，三段定义见
+/// [`FxScope::shutdown`] 文档）；幂等 cancel。
 pub struct CancelSource {
     tx: watch::Sender<bool>,
 }
@@ -239,7 +240,8 @@ impl FxScope {
         self.token.clone()
     }
 
-    /// accepting 闸：拒新 spawn，放行在途（kameo 语义；停机三段式①→②之间）。
+    /// accepting 闸：拒新 spawn，放行在途（kameo 语义；fx 域停机三段的①段
+    /// ——闸已关、② abort_all 未发的窗，三段定义见 [`Self::shutdown`] 文档）。
     pub fn close(&self) {
         // CAS 失败=已关幂等（close 侧显式）。
         let _ = self
@@ -288,7 +290,9 @@ impl FxScope {
         Ok(Spawned { handle: abort, rx })
     }
 
-    /// 停机三段式③：close + abort_all + 等净。锁内 abort_all + mem::take(JoinSet)，
+    /// fx 域停机三段一次收拢：① close（accepting 闸关，拒新 spawn）→
+    /// ② abort_all（在途任务收取消通知——[`CancelSource`] 协作取消面）→
+    /// ③ 等净（join_next 循环至任务集清空）。锁内 abort_all + mem::take(JoinSet)，
     /// take 后的 set 在锁外 await join_next 循环（禁持 std 锁跨 await）。
     pub async fn shutdown(&self) {
         let mut set = self.close_and_take();
@@ -299,9 +303,7 @@ impl FxScope {
     /// （剩余集 Drop=abort 兜底）；不可 abort 段依赖自终止契约。
     pub async fn shutdown_timeout(&self, d: Duration) -> Result<(), TaskError> {
         let mut set = self.close_and_take();
-        let drain = async {
-            while set.join_next().await.is_some() {}
-        };
+        let drain = async { while set.join_next().await.is_some() {} };
         if tokio::time::timeout(d, drain).await.is_err() {
             // 超时即返回：set 在此 drop = 剩余任务 abort 兜底（零残留）。
             return Err(TaskError::TimedOut);
@@ -502,9 +504,9 @@ mod tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(50));
         stop.store(true, Ordering::Relaxed); // 放行自终止，运行时干净退出
-        // flaky 治理：join 任务句柄
-        // 等真实终止——事件化收尾替代定长 350ms 猜窗（sleep 不足时 expect_idle
-        // 的 10⁴ 让渡上限兜底才拦住，报错误导）。
+                                             // flaky 治理：join 任务句柄
+                                             // 等真实终止——事件化收尾替代定长 350ms 猜窗（sleep 不足时 expect_idle
+                                             // 的 10⁴ 让渡上限兜底才拦住，报错误导）。
         assert_eq!(
             spinner.join().await,
             Err(TaskError::Cancelled),
@@ -659,5 +661,4 @@ mod tests {
         );
         expect_idle(&scope); // abort 即刻回收（FlightGuard Drop）——零 sleep、事件化
     }
-
 }

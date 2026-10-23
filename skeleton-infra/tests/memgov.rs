@@ -39,10 +39,16 @@ fn serial() -> MutexGuard<'static, ()> {
 /// 计数器相邻两次读数一致（1ms 间隔）才认基线成立——打印窗真实排空的时刻收敛，
 /// 不赌固定时长；500 次有界上限永不挂死，超限放行最后读数、由断言定成败（fail-visible）。
 fn settle() {
-    let mut prev = (CountingAllocator::live_allocs(), CountingAllocator::live_bytes());
+    let mut prev = (
+        CountingAllocator::live_allocs(),
+        CountingAllocator::live_bytes(),
+    );
     for _ in 0..500 {
         std::thread::sleep(std::time::Duration::from_millis(1));
-        let now = (CountingAllocator::live_allocs(), CountingAllocator::live_bytes());
+        let now = (
+            CountingAllocator::live_allocs(),
+            CountingAllocator::live_bytes(),
+        );
         if now == prev {
             return;
         }
@@ -83,6 +89,44 @@ fn counting_allocator_counts_alloc_dealloc_peak_and_reset() {
     drop(big);
 }
 
+/// ⑥b churn 累计计数（终盲测槽点 3）：total_allocs/total_deallocs 只增不减，
+/// churn 窗口 = total 差值——live 净额「即用即还恒 0」盲区（同量 churn 不可辨）
+/// 的对账面。分配 N 次 total 至少 +N；drop M 个 total_allocs 不减、deallocs 至少 +M。
+#[test]
+fn total_alloc_dealloc_counters_track_churn_monotonically() {
+    let _serial = serial();
+    settle();
+
+    // 分配 N=8 次（每 Vec 精确一次 alloc；外层预容纳扩容不扰计数窗）。
+    let a0 = CountingAllocator::total_allocs();
+    let d0 = CountingAllocator::total_deallocs();
+    let mut keep: Vec<Vec<u8>> = Vec::with_capacity(8);
+    for i in 0..8u8 {
+        keep.push(vec![i; 16]);
+    }
+    let a1 = CountingAllocator::total_allocs();
+    assert!(
+        a1 >= a0 + 8,
+        "分配 N 次后 total_allocs 至少 +N（实际 +{}）",
+        a1 - a0
+    );
+
+    // drop M=5 个：total_allocs 不减（累计语义单调），total_deallocs 至少 +M。
+    let before_drop = a1;
+    keep.truncate(3);
+    let d1 = CountingAllocator::total_deallocs();
+    assert!(
+        CountingAllocator::total_allocs() >= before_drop,
+        "dealloc 不得回拨 total_allocs（累计计数单调不减）"
+    );
+    assert!(
+        d1 >= d0 + 5,
+        "drop M 个后 total_deallocs 至少 +M（实际 +{}）",
+        d1 - d0
+    );
+    drop(keep);
+}
+
 /// ⑦ LeakGuard 干净路径 Ok。
 #[test]
 fn leak_guard_reports_clean_scope_as_ok() {
@@ -113,7 +157,7 @@ fn leak_guard_reports_leak_with_exact_delta() {
 #[should_panic(expected = "registry not drained")]
 fn expect_empty_panics_with_diagnostics() {
     let _serial = serial();
-    let mut reg = BoundedRegistry::bounded(2, Eviction::Reject);
+    let mut reg = BoundedRegistry::new(2, Eviction::Reject);
     reg.insert(1, "a").expect("within capacity");
     expect_empty(&reg);
 }
@@ -125,7 +169,10 @@ fn expect_empty_panics_with_diagnostics() {
 fn realloc_grow_and_shrink_track_live_bytes() {
     let _serial = serial();
     settle();
-    let base = (CountingAllocator::live_allocs(), CountingAllocator::live_bytes());
+    let base = (
+        CountingAllocator::live_allocs(),
+        CountingAllocator::live_bytes(),
+    );
 
     let mut v = vec![0u8; 64]; // len=cap=64：顶满构造，shrink_to_fit 走缩分支
     v.reserve(2048); // grow：realloc 增分支
@@ -147,7 +194,11 @@ fn realloc_grow_and_shrink_track_live_bytes() {
     );
 
     drop(v);
-    assert_eq!(CountingAllocator::live_allocs(), base.0, "realloc 往返不改变净分配计数");
+    assert_eq!(
+        CountingAllocator::live_allocs(),
+        base.0,
+        "realloc 往返不改变净分配计数"
+    );
     assert_eq!(CountingAllocator::live_bytes(), base.1, "全释放回基线");
 }
 
@@ -197,7 +248,10 @@ mod skeleton_alloc_twin {
         settle();
         let store = Store::new(Counter, NoFx);
         let mut handles = Vec::with_capacity(8);
-        let base = (CountingAllocator::live_allocs(), CountingAllocator::live_bytes());
+        let base = (
+            CountingAllocator::live_allocs(),
+            CountingAllocator::live_bytes(),
+        );
 
         for _ in 0..8 {
             handles.push(store.sender());
@@ -224,7 +278,10 @@ mod skeleton_alloc_twin {
         for _ in 0..8 {
             store.dispatch(Bump::Bump); // 预热：队列/缓存/缓冲的首撞分配
         }
-        let base = (CountingAllocator::live_allocs(), CountingAllocator::live_bytes());
+        let base = (
+            CountingAllocator::live_allocs(),
+            CountingAllocator::live_bytes(),
+        );
 
         for _ in 0..64 {
             store.dispatch(Bump::Bump);

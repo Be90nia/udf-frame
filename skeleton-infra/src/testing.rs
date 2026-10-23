@@ -97,8 +97,10 @@ pub enum Script<A, Op> {
 /// # }
 /// ```
 ///
-/// 本件不实现 clock——取消竞窗测试用 `tokio::time::start_paused`（三断言形：
-/// 取消后零副作用 / 显式 Cancelled / journal 显式行，模板归 CONCURRENCY.md）。
+/// 本件不实现 clock——取消竞窗测试用 `tokio::time::start_paused`。竞窗三断言形
+/// （就地模板）：①取消后零副作用（效果体未产生任何可观测变更）；②显式
+/// `Cancelled`（join 归一 TaskError::Cancelled，非静默丢弃）；③journal 显式行
+/// （取消进审计/账本时间线，可事后归因）。
 pub struct ScriptedRuntime<A, Op> {
     scope: Arc<FxScope>,
     scripts: VecDeque<Script<A, Op>>,
@@ -154,7 +156,7 @@ where
                     }
                     // 任务内 panic!→scope catch_unwind 归一 TaskError::Panicked（fail-closed 链）
                     Script::Panic(msg) => panic!("{}", msg),
-                    // 永不完成：挂起面/取消竞窗锚（start_paused 模板归 CONCURRENCY.md）
+                    // 永不完成：挂起面/取消竞窗锚（start_paused 测试模板见本类型文档）
                     Script::Never => std::future::pending::<()>().await,
                     // 占位透传：任务内持 op，零行为（采用方断言锚）
                     Script::Run(op) => {
@@ -234,9 +236,19 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Te
     #[track_caller]
     pub fn new(root: impl Reducer<State = S, Action = A, Op = Op> + Send + Sync + 'static) -> Self {
         let effects = Arc::new(Mutex::new(VecDeque::new()));
-        let store = SyncStore::new(root, CollectRuntime { sink: Arc::clone(&effects) });
+        let store = SyncStore::new(
+            root,
+            CollectRuntime {
+                sink: Arc::clone(&effects),
+            },
+        );
         let current = store.snapshot();
-        Self { store, effects, current, last_dispatch_feedback: 0 }
+        Self {
+            store,
+            effects,
+            current,
+            last_dispatch_feedback: 0,
+        }
     }
 
     /// 逐动作断言入口：dispatch 并刷新 idle 快照（同步排空至 idle 后取，
@@ -247,8 +259,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Te
         self.current = self.store.snapshot();
         // 本轮回灌 Emit 快照——Emit 不进效果队列，receive 空队列时据此
         // 如实归因（禁再报「no effect produced」文不对题）。
-        self.last_dispatch_feedback =
-            self.store.feedback_emitted_total() - feedback_before;
+        self.last_dispatch_feedback = self.store.feedback_emitted_total() - feedback_before;
     }
 
     /// 效果回填断言：弹出最早一条未消费效果与期望值比对。队列空或值不符 =
@@ -275,7 +286,10 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Te
         let matched = match (&expected, &actual) {
             (
                 ExpectedEffect::Run { id, op },
-                Effect::Run { id: actual_id, op: actual_op },
+                Effect::Run {
+                    id: actual_id,
+                    op: actual_op,
+                },
             ) => op == actual_op && id_matches(*id, *actual_id),
             (ExpectedEffect::Cancel { id }, Effect::Cancel { id: actual_id }) => {
                 id_matches(*id, *actual_id)
@@ -329,7 +343,11 @@ mod tests {
         fn run(&mut self, _: Effect<Act, Infallible>, _: &ActionSender<Act>) {}
     }
 
-    fn fixture() -> (Arc<FxScope>, SyncStore<i32, Act, Infallible>, ActionSender<Act>) {
+    fn fixture() -> (
+        Arc<FxScope>,
+        SyncStore<i32, Act, Infallible>,
+        ActionSender<Act>,
+    ) {
         let scope = Arc::new(FxScope::new());
         let store = SyncStore::new(Counter, NopRuntime);
         let back = store.sender();
@@ -344,7 +362,10 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        panic!("fx scope not idle: {} task(s) still in flight", scope.in_flight());
+        panic!(
+            "fx scope not idle: {} task(s) still in flight",
+            scope.in_flight()
+        );
     }
 
     /// ① Emit 脚本→经 ActionSender 回灌收到（store 状态推进为证）。
@@ -407,7 +428,11 @@ mod tests {
     async fn scripts_consume_fifo() {
         let (scope, store, back) = fixture();
         let mut rt = ScriptedRuntime::<Act, Infallible>::new(Arc::clone(&scope));
-        rt.feed([Script::Emit(Act::Bump), Script::Never, Script::Panic("third")]);
+        rt.feed([
+            Script::Emit(Act::Bump),
+            Script::Never,
+            Script::Panic("third"),
+        ]);
         rt.run(Effect::Cancel { id: EffectId(4) }, &back);
         rt.run(Effect::Cancel { id: EffectId(5) }, &back);
         rt.run(Effect::Cancel { id: EffectId(6) }, &back);
@@ -444,5 +469,4 @@ mod tests {
         wait_idle(&fxscope_scope).await;
         expect_idle(&fxscope_scope);
     }
-
 }

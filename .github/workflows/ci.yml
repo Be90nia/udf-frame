@@ -1,4 +1,9 @@
-name: ci
+# udf-frame 独立仓 CI（2026-10-23 与主仓 udf-frame.yml 对齐适配：独立仓根即 crate
+# 根，无 working-directory/paths 前缀；补 std-ext 测试步对齐正典口径）。
+#
+# Rust 版本 pin 1.96.0 对齐开发/验证基线，防工具链漂移；三 OS 矩阵。
+# 自持 workspace：members = udf-skeleton + udf-std-ext + udf-skeleton-infra。
+name: udf-frame CI
 
 on:
   push:
@@ -6,21 +11,62 @@ on:
   pull_request:
 
 jobs:
-  test:
+  udf-frame:
+    name: fmt / test / bench / clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust 1.96.0 (pinned)
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Build (all features)
-        run: cargo build --workspace --all-features
-      - name: Test (all features)
-        run: cargo test --workspace --all-features
+          components: clippy, rustfmt
+
+      # fmt 闸：防风格再漂移+行号钉位断言类测试因格式化重排批量假红
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      # 契约 doctest 门（r2 审计建议-2 单列口径随迁）：skeleton 为纯契约 crate，
+      # 行为测试矩阵随实现居 skeleton-infra
+      - name: Test skeleton
+        run: cargo test -p udf-skeleton
+
+      # std-ext 十三常驻域（批 5-2 拆分后新增步）：默认树零依赖域行为面
+      - name: Test std-ext
+        run: cargo test -p udf-std-ext
+
+      # infra 六域 feature 矩阵闸：--workspace 只跑 default=[]（P12 零 feature 面），
+      # memgov/journal/log/tokio/testing 全在盲区，单列 all-features 步防漏
+      - name: Test skeleton-infra (all features)
+        run: cargo test -p udf-skeleton-infra --all-features
+
+      # release 门测试（审计 F1）：release 专用代码（DefaultPathResolver
+      # release 臂 home 解析/开发者路径泄漏禁断言）在 debug 步不编译不执行
+      # ——单列 release 步防漏（cfg(not(debug_assertions)) 测试在此生效）
+      - name: Test skeleton-infra (release gates)
+        run: cargo test -p udf-skeleton-infra --release --features log --test log_file
+
+      # LeakGuard 泄漏断言串行闸（infra §3.3/审计 M9）：泄漏 delta 被同二进制并发
+      # 分配污染=flaky-by-construction，CI 确定口径=--test-threads=1
+      - name: LeakGuard serial (memgov)
+        run: cargo test -p udf-skeleton-infra --features memgov --test memgov -- --test-threads=1
+
+      # paths_alloc 事件计数串行闸（终验波 B1）：文件内 Mutex 只串行本文件，
+      # 其他测试线程的分配仍进全局事件计数——主线程窗口污染=并行 flake
+      # （本机 5 跑 2 红、单线程恒绿），CI 确定口径=独立步 --test-threads=1
+      - name: paths_alloc serial
+        run: cargo test -p udf-skeleton-infra --all-features --test paths_alloc -- --test-threads=1
+
+      # bench 编译门（infra §3.3/P10 一级）：bench 三组 required-features 为
+      # fx/journal/memgov/testing 并集，--no-run 裸跑会整目标跳过（hollow gate），故 all-features
+      - name: Bench compile gate
+        run: cargo bench -p udf-skeleton-infra --all-features --no-run && cargo bench -p udf-skeleton --no-run
+
+      # 记录级：升级 -D warnings 前需先清零存量告警。
+      # --all-features --all-targets 必带：P12 零 default feature，裸 clippy=空心闸
       - name: Clippy
-        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-features --all-targets

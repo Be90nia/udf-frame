@@ -47,7 +47,10 @@ impl Driver<Count, Msg> for FrameDriver {
 
 fn main() {
     let store = Store::new(Counter, NoFx);
-    let mut driver = FrameDriver { sender: None, frames: Vec::new() };
+    let mut driver = FrameDriver {
+        sender: None,
+        frames: Vec::new(),
+    };
 
     // ① 接线：宿主把回灌句柄交给驱动（事件源上行通道建立）
     driver.bind(store.sender());

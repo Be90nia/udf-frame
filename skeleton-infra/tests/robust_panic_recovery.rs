@@ -69,7 +69,10 @@ impl Reducer for PanicRunFeature {
         match a {
             // 配方：解释器对 Effect::Run 先记录后 panic!
             DemoAction::Run1 => {
-                out.push(Effect::Run { id: EffectId(1), op: BoomOp::Boom });
+                out.push(Effect::Run {
+                    id: EffectId(1),
+                    op: BoomOp::Boom,
+                });
                 s + 1
             }
             DemoAction::Noop => *s,
@@ -82,17 +85,35 @@ impl Reducer for PanicRunFeature {
 /// 状态前进如实保留（两次 reduce 均已落账）。
 #[test]
 fn interpreter_panic_does_not_brick_runtime_mutex() {
-    let store = Store::new(PanicRunFeature, BoomRuntime::<DemoAction, BoomOp> { _m: PhantomData });
+    let store = Store::new(
+        PanicRunFeature,
+        BoomRuntime::<DemoAction, BoomOp> { _m: PhantomData },
+    );
     let r1 = catch_unwind(AssertUnwindSafe(|| store.dispatch(DemoAction::Run1)));
     assert!(r1.is_err(), "解释器 panic 必须如实传播（fail-visible）");
     // 修复前：runtime mutex 中毒，本 dispatch 恒 panic "mutex poisoned"（半砖）
     let r2 = catch_unwind(AssertUnwindSafe(|| store.dispatch(DemoAction::Run1)));
-    let msg = r2.as_ref().err().map(|b| panic_message(b.as_ref())).unwrap_or_default();
-    assert!(!msg.contains("poisoned"), "毒锁必须恢复、实例不得半砖（实际 panic：{msg}）");
+    let msg = r2
+        .as_ref()
+        .err()
+        .map(|b| panic_message(b.as_ref()))
+        .unwrap_or_default();
+    assert!(
+        !msg.contains("poisoned"),
+        "毒锁必须恢复、实例不得半砖（实际 panic：{msg}）"
+    );
     // 计数上浮：恢复过一次 = 第一个 panic 已计入（第二个 panic 待下次效果转发恢复）
-    assert_eq!(store.runtime_panic_count(), 1, "panic 事件必须经计数显式上浮");
+    assert_eq!(
+        store.runtime_panic_count(),
+        1,
+        "panic 事件必须经计数显式上浮"
+    );
     store.dispatch(DemoAction::Noop);
-    assert_eq!(*store.snapshot(), 2, "两次 reduce 已落账：状态前进必须如实保留");
+    assert_eq!(
+        *store.snapshot(),
+        2,
+        "两次 reduce 已落账：状态前进必须如实保留"
+    );
 }
 
 // ── S::Clone 锁内 panic 整体变砖（文档化契约）────────────────────────────
@@ -106,7 +127,9 @@ impl Clone for CloneBoomState {
         if self.gate.load(Ordering::SeqCst) {
             panic!("S::clone boom (drill)");
         }
-        CloneBoomState { gate: Arc::clone(&self.gate) }
+        CloneBoomState {
+            gate: Arc::clone(&self.gate),
+        }
     }
 }
 
@@ -119,7 +142,9 @@ impl Reducer for CloneBoomFeature {
     type Action = DemoAction;
     type Op = Infallible;
     fn initial(&self) -> CloneBoomState {
-        CloneBoomState { gate: Arc::clone(&self.gate) }
+        CloneBoomState {
+            gate: Arc::clone(&self.gate),
+        }
     }
     // 直构不走 trait clone：clone 闸只由 make_mut 克隆分支触发
     fn reduce(
@@ -128,7 +153,9 @@ impl Reducer for CloneBoomFeature {
         _: DemoAction,
         _: &mut EffectBuf<DemoAction, Infallible>,
     ) -> CloneBoomState {
-        CloneBoomState { gate: Arc::clone(&s.gate) }
+        CloneBoomState {
+            gate: Arc::clone(&s.gate),
+        }
     }
 }
 
@@ -139,19 +166,34 @@ impl Reducer for CloneBoomFeature {
 #[test]
 fn clone_panic_inside_state_lock_bricks_instance_by_contract() {
     let store = Store::new(
-        CloneBoomFeature { gate: Arc::new(AtomicBool::new(false)) },
+        CloneBoomFeature {
+            gate: Arc::new(AtomicBool::new(false)),
+        },
         NopFx::<DemoAction> { _m: PhantomData },
     );
     let held = store.snapshot(); // 外部持有：强计数 ≥2 → make_mut 必走克隆分支
     held.gate.store(true, Ordering::SeqCst);
     let r = catch_unwind(AssertUnwindSafe(|| store.dispatch(DemoAction::Noop)));
-    assert!(r.is_err(), "make_mut 克隆分支的 S::clone panic 必须如实传播");
+    assert!(
+        r.is_err(),
+        "make_mut 克隆分支的 S::clone panic 必须如实传播"
+    );
     let brick1 = catch_unwind(AssertUnwindSafe(|| store.snapshot()));
-    let msg1 = brick1.as_ref().err().map(|b| panic_message(b.as_ref())).unwrap_or_default();
-    assert!(msg1.contains("poisoned"), "契约：state 毒锁 → snapshot 报废（实际：{msg1}）");
+    let msg1 = brick1
+        .as_ref()
+        .err()
+        .map(|b| panic_message(b.as_ref()))
+        .unwrap_or_default();
+    assert!(
+        msg1.contains("poisoned"),
+        "契约：state 毒锁 → snapshot 报废（实际：{msg1}）"
+    );
     drop(held);
     let brick2 = catch_unwind(AssertUnwindSafe(|| store.snapshot()));
-    assert!(brick2.is_err(), "F2 契约：报废不因外部持有释放而解除（毒锁粘滞）");
+    assert!(
+        brick2.is_err(),
+        "F2 契约：报废不因外部持有释放而解除（毒锁粘滞）"
+    );
 }
 
 /// 毒锁消息必须自含——子系统名（skeleton Store state lock）+ 契约指位
@@ -160,20 +202,32 @@ fn clone_panic_inside_state_lock_bricks_instance_by_contract() {
 #[test]
 fn poisoned_lock_message_names_subsystem_and_contract() {
     let store = Store::new(
-        CloneBoomFeature { gate: Arc::new(AtomicBool::new(false)) },
+        CloneBoomFeature {
+            gate: Arc::new(AtomicBool::new(false)),
+        },
         NopFx::<DemoAction> { _m: PhantomData },
     );
     let held = store.snapshot(); // 外部持有：make_mut 必走克隆分支
     held.gate.store(true, Ordering::SeqCst);
     let _ = catch_unwind(AssertUnwindSafe(|| store.dispatch(DemoAction::Noop)));
     let brick = catch_unwind(AssertUnwindSafe(|| store.snapshot()));
-    let msg = brick.as_ref().err().map(|b| panic_message(b.as_ref())).unwrap_or_default();
+    let msg = brick
+        .as_ref()
+        .err()
+        .map(|b| panic_message(b.as_ref()))
+        .unwrap_or_default();
     assert!(
         msg.contains("skeleton Store state lock poisoned"),
         "子系统名必须在消息内（非自含缺陷本体）：{msg}"
     );
-    assert!(msg.contains("Panic 契约"), "必须指向 Store Panic 契约文档节：{msg}");
-    assert!(msg.contains("状态不可取出"), "严重度判断必须在消息内：{msg}");
+    assert!(
+        msg.contains("Panic 契约"),
+        "必须指向 Store Panic 契约文档节：{msg}"
+    );
+    assert!(
+        msg.contains("状态不可取出"),
+        "严重度判断必须在消息内：{msg}"
+    );
 }
 
 // ── 部分转发失败静默吞效果 ───────────────────────────────────────────────
@@ -200,7 +254,10 @@ impl Reducer for TrioFeature {
             // 配方：缓冲 [Emit(Noop), Run, Emit(Inc)]，Run 转发即 panic
             TrioAction::EmitRunEmit => {
                 out.push(Effect::Emit(TrioAction::Noop));
-                out.push(Effect::Run { id: EffectId(2), op: BoomOp::Boom });
+                out.push(Effect::Run {
+                    id: EffectId(2),
+                    op: BoomOp::Boom,
+                });
                 out.push(Effect::Emit(TrioAction::Inc));
                 *s
             }
@@ -212,7 +269,10 @@ impl Reducer for TrioFeature {
 /// 残留 Emit(Inc) 必须在恢复排空续转，终态 1（健康语义；修复前实测终态 0）。
 #[test]
 fn residual_effects_forwarded_after_forward_panic() {
-    let store = Store::new(TrioFeature, BoomRuntime::<TrioAction, BoomOp> { _m: PhantomData });
+    let store = Store::new(
+        TrioFeature,
+        BoomRuntime::<TrioAction, BoomOp> { _m: PhantomData },
+    );
     let r = catch_unwind(AssertUnwindSafe(|| store.dispatch(TrioAction::EmitRunEmit)));
     assert!(r.is_err(), "转发 panic 必须如实传播");
     store.dispatch(TrioAction::Noop);
@@ -249,7 +309,10 @@ impl Reducer for SpinFeature {
 /// no-op，结构化错误经计数上浮）。修复前 dispatch 永不返回，recv_timeout 必超时。
 #[test]
 fn self_emit_feedback_livelock_budget_trips() {
-    let store = Arc::new(Store::new(SpinFeature, NopFx::<SpinAction> { _m: PhantomData }));
+    let store = Arc::new(Store::new(
+        SpinFeature,
+        NopFx::<SpinAction> { _m: PhantomData },
+    ));
     let (tx, rx) = mpsc::channel();
     let s2 = Arc::clone(&store);
     std::thread::spawn(move || {
@@ -291,10 +354,18 @@ impl Reducer for LoopbackFeature {
     fn initial(&self) -> u32 {
         0
     }
-    fn reduce(&self, s: &u32, a: LoopbackAction, out: &mut EffectBuf<LoopbackAction, LoopbackOp>) -> u32 {
+    fn reduce(
+        &self,
+        s: &u32,
+        a: LoopbackAction,
+        out: &mut EffectBuf<LoopbackAction, LoopbackOp>,
+    ) -> u32 {
         match a {
             LoopbackAction::Spin => {
-                out.push(Effect::Run { id: EffectId(9), op: LoopbackOp::Spin });
+                out.push(Effect::Run {
+                    id: EffectId(9),
+                    op: LoopbackOp::Spin,
+                });
                 *s
             }
             LoopbackAction::Bump => s + 1,
@@ -306,7 +377,11 @@ impl Reducer for LoopbackFeature {
 struct BackSpinFx;
 
 impl EffectRuntime<LoopbackAction, LoopbackOp> for BackSpinFx {
-    fn run(&mut self, effect: Effect<LoopbackAction, LoopbackOp>, back: &ActionSender<LoopbackAction>) {
+    fn run(
+        &mut self,
+        effect: Effect<LoopbackAction, LoopbackOp>,
+        back: &ActionSender<LoopbackAction>,
+    ) {
         if let Effect::Run { .. } = effect {
             let _ = back.dispatch(LoopbackAction::Spin);
         }
@@ -347,13 +422,17 @@ fn budget_residual_does_not_starve_external_traffic() {
         s2.dispatch(LoopbackAction::Spin);
         let _ = tx.send(());
     });
-    rx.recv_timeout(Duration::from_millis(500)).expect("预算必须止步");
+    rx.recv_timeout(Duration::from_millis(500))
+        .expect("预算必须止步");
     assert_eq!(store.pending_actions(), 1, "前置：残留尚在队列");
     let mut n = 0;
     while *store.snapshot() < 200 {
         store.dispatch(LoopbackAction::Bump);
         n += 1;
-        assert!(n <= 400, "外部流量被残留链饿死（200 个 Bump 未在 400 次 dispatch 内完成）");
+        assert!(
+            n <= 400,
+            "外部流量被残留链饿死（200 个 Bump 未在 400 次 dispatch 内完成）"
+        );
     }
     assert_eq!(*store.snapshot(), 200, "外部流量零丢失");
     assert!(store.feedback_budget_exceeded() >= 1, "预算必须曾触发");
@@ -382,7 +461,11 @@ struct NestedThenSpin {
 }
 
 impl EffectRuntime<LoopbackAction, LoopbackOp> for NestedThenSpin {
-    fn run(&mut self, effect: Effect<LoopbackAction, LoopbackOp>, back: &ActionSender<LoopbackAction>) {
+    fn run(
+        &mut self,
+        effect: Effect<LoopbackAction, LoopbackOp>,
+        back: &ActionSender<LoopbackAction>,
+    ) {
         if let Effect::Run { .. } = effect {
             self.b.dispatch(1); // 嵌套排空 B（同线程，A 的深度账在途）
             let _ = back.dispatch(LoopbackAction::Spin);
@@ -393,17 +476,29 @@ impl EffectRuntime<LoopbackAction, LoopbackOp> for NestedThenSpin {
 #[test]
 fn nested_store_drain_keeps_depth_accounting_paired() {
     let b = Arc::new(Store::new(PlainB, NopFx::<u32> { _m: PhantomData }));
-    let store = Arc::new(Store::new(LoopbackFeature, NestedThenSpin { b: Arc::clone(&b) }));
+    let store = Arc::new(Store::new(
+        LoopbackFeature,
+        NestedThenSpin { b: Arc::clone(&b) },
+    ));
     let (tx, rx) = mpsc::channel();
     let s2 = Arc::clone(&store);
     std::thread::spawn(move || {
         s2.dispatch(LoopbackAction::Spin);
         let _ = tx.send(());
     });
-    rx.recv_timeout(Duration::from_millis(500)).expect("A 的预算必须正常止步");
+    rx.recv_timeout(Duration::from_millis(500))
+        .expect("A 的预算必须正常止步");
     // 65 个 Spin（Ext + FB1..64）各嵌套排空 B 一次；65th 回灌止步
-    assert_eq!(*b.snapshot(), 65, "嵌套排空的 B 必须完整处理，不受 A 的预算影响");
-    assert_eq!(store.feedback_budget_exceeded(), 1, "A 的深度账不因嵌套排空串账");
+    assert_eq!(
+        *b.snapshot(),
+        65,
+        "嵌套排空的 B 必须完整处理，不受 A 的预算影响"
+    );
+    assert_eq!(
+        store.feedback_budget_exceeded(),
+        1,
+        "A 的深度账不因嵌套排空串账"
+    );
     // 泄漏哨兵：泄漏的 (A_id, 大深度) 会把后续 Bump 误标回灌而瞬间触顶，
     // 状态永不前进——能推进即证明守卫按栈恢复干净
     let mut n = 0;

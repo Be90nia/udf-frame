@@ -45,7 +45,10 @@ impl Reducer for NotifyFeature {
         0
     }
     fn reduce(&self, s: &u32, _: Msg, out: &mut EffectBuf<Msg, u8>) -> u32 {
-        out.push(Effect::Run { id: EffectId(1), op: 7 });
+        out.push(Effect::Run {
+            id: EffectId(1),
+            op: 7,
+        });
         s + 1
     }
 }
@@ -65,18 +68,26 @@ fn receive_panic_reports_caller_location() {
     let empty_line = {
         let mut ts = TestStore::new(QuietFeature);
         ts.dispatch(Msg::Inc);
-        let line = line!() + 1;
-        let _ = catch_unwind(AssertUnwindSafe(|| ts.receive(ExpectedEffect::Cancel { id: None })));
-        line
+        let mut empty_line = 0u32;
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            // 动态锚紧邻 receive 调用行（track_caller 报告点），fmt 重排外围不漂移
+            empty_line = line!() + 1;
+            ts.receive(ExpectedEffect::Cancel { id: None })
+        }));
+        empty_line
     };
 
     // 点 2：变体不符（期望 Cancel 实际 Run { op: 7 } → mismatch panic）
     let mismatch_line = {
         let mut ts = TestStore::new(NotifyFeature);
         ts.dispatch(Msg::Inc);
-        let line = line!() + 1;
-        let _ = catch_unwind(AssertUnwindSafe(|| ts.receive(ExpectedEffect::Cancel { id: None })));
-        line
+        let mut mismatch_line = 0u32;
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            // 动态锚紧邻 receive 调用行（track_caller 报告点），fmt 重排外围不漂移
+            mismatch_line = line!() + 1;
+            ts.receive(ExpectedEffect::Cancel { id: None })
+        }));
+        mismatch_line
     };
 
     std::panic::set_hook(prev_hook);

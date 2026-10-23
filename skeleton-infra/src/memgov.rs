@@ -7,12 +7,13 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// 淘汰策略（②档必选参数）：Reject=满则显式错（fail-closed，默认推荐）；
+/// 淘汰策略（必选参数——「上限+策略必填」由构造签名类型强制，非约定自觉）：
+/// Reject=满则显式错（fail-closed，默认推荐）；
 /// EvictOldest=按 BTreeMap 首键淘汰。
 ///
 /// K 契约：K 须单调指派（序号/时间戳键），此时语义=逐最旧；
 /// K 乱序时语义如实退化为 EvictMinKey——调用方纪律，本件不静默补偿。
-/// LRU/TTL→moka 对表，不在此实现。
+/// LRU/TTL 精确语义在 [`crate::cache`]（本件首键退化语义的邻接补全件）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Eviction {
     /// 满=Err(BoundError)（fail-closed）。
@@ -44,7 +45,7 @@ impl std::fmt::Display for BoundError {
 
 impl std::error::Error for BoundError {}
 
-/// 有界注册表：上限+策略必填（无默认无界构造——②档门面强制）。
+/// 有界注册表：上限+策略必填（无默认无界构造——构造签名层类型强制，不经约定自觉）。
 /// 迭代恒升序确定序；缓存形态别名 BoundedCache=本类型（文档级别名，不另造类型）。
 pub struct BoundedRegistry<K: Ord, V> {
     map: BTreeMap<K, V>,
@@ -54,10 +55,10 @@ pub struct BoundedRegistry<K: Ord, V> {
 
 impl<K: Ord, V> BoundedRegistry<K, V> {
     /// 构造有界注册表。`max == 0` 构造期 panic（assert fail-fast：恒满注册表必是 bug）。
-    pub fn bounded(max: usize, evict: Eviction) -> Self {
+    pub fn new(max: usize, evict: Eviction) -> Self {
         assert!(
             max > 0,
-            "BoundedRegistry::bounded: max == 0 is a bug (always-full registry)"
+            "BoundedRegistry::new: max == 0 is a bug (always-full registry)"
         );
         Self {
             map: BTreeMap::new(),
@@ -120,10 +121,13 @@ impl<K: Ord, V> BoundedRegistry<K, V> {
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LIVE_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_DEALLOCS: AtomicUsize = AtomicUsize::new(0);
 
-/// counting allocator：System 包装+三计数器（live_bytes/live_allocs/peak_bytes，Relaxed 序）。
+/// counting allocator：System 包装+五计数器——净额面 `live_bytes`/`live_allocs`/
+/// `peak_bytes`，累计面 `total_allocs`/`total_deallocs`（Relaxed 序）。
 /// **仅测试/基准侧声明**：`#[global_allocator] static A: CountingAllocator = CountingAllocator;`
-/// 发布构建不声明=零开销（内存红线铁律三的配置面）。
+/// 发布构建不声明=零开销（内存红线「泄漏=断言兜底+计数器可观测」的配置面）。
 pub struct CountingAllocator;
 
 impl CountingAllocator {
@@ -147,13 +151,32 @@ impl CountingAllocator {
     pub fn reset_peak() {
         PEAK_BYTES.store(0, Ordering::Relaxed);
     }
+
+    /// 历史累计成功分配次数（只增不减；与 [`Self::live_allocs`] 净额面互补）。
+    ///
+    /// **口径（churn 对账，与 live 联用）**：窗口 churn = `total_allocs(t2) −
+    /// total_allocs(t1)`。live 净额对「即用即还」恒 0——净 0 无法区分「真零分配」
+    /// 与「同量 churn」；联用判级：live 不变 + total 大增 = 高 churn 零泄漏，
+    /// 两者皆平 = 窗口真零分配。realloc 成功按「换块」计（total_allocs/deallocs
+    /// 各 +1：块替换即 churn；live 面照旧不动）。Relaxed 序尽力而为观测面。
+    pub fn total_allocs() -> usize {
+        TOTAL_ALLOCS.load(Ordering::Relaxed)
+    }
+
+    /// 历史累计释放次数（只增不减）。口径同 [`Self::total_allocs`]；与
+    /// total_allocs 差值长期不等 = 累计泄漏/外部遗忘面（live 持平下的慢泄漏可辨）。
+    pub fn total_deallocs() -> usize {
+        TOTAL_DEALLOCS.load(Ordering::Relaxed)
+    }
 }
 
-/// 成功分配的记账三连：bytes 增、峰值刷新、allocs 增（alloc/alloc_zeroed 共用，防漂移）。
+/// 成功分配的记账四连：bytes 增、峰值刷新、allocs 增、total 增（alloc/alloc_zeroed
+/// 共用，防漂移）。
 fn record_alloc(layout: Layout) {
     let live = LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
     PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
     LIVE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+    TOTAL_ALLOCS.fetch_add(1, Ordering::Relaxed);
 }
 
 // SAFETY: 计数器增减仅在 System 分配成功/释放后发生，不改变分配器本身的内存安全性；
@@ -173,6 +196,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         unsafe { System.dealloc(ptr, layout) };
         LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
         LIVE_ALLOCS.fetch_sub(1, Ordering::Relaxed);
+        TOTAL_DEALLOCS.fetch_add(1, Ordering::Relaxed);
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
@@ -195,6 +219,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
             } else {
                 LIVE_BYTES.fetch_sub(old_layout.size() - new_size, Ordering::Relaxed);
             }
+            // 换块即 churn（total 口径）：+1 alloc 且 +1 dealloc；live 面照旧不动。
+            TOTAL_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            TOTAL_DEALLOCS.fetch_add(1, Ordering::Relaxed);
         }
         new_ptr
     }
@@ -275,6 +302,369 @@ pub fn expect_empty<K: Ord, V>(reg: &BoundedRegistry<K, V>) {
     );
 }
 
+// ═══ MemoryPool：内存池特化（pool feature——PoolManaged 契约 + PoolBase 组合件）═══
+//
+// 形态：memgov 池三件（有界槽+RAII 归还+获取超时必填 D21）升一等（armor #26 /
+// 调研档 §4.2）；管理面（校验/水位线/审计/溢出计数）委托 `crate::pool::PoolBase`
+// 组合件，本块只写槽位借还特化面。
+//
+// 并发形态（性能矩阵③④⑦的机制基础）：
+// - **锁不嵌套**：acquire 只取槽位锁；归还/读数=PoolBase 账本锁与槽位锁**顺序**
+//   各取（绝不同时持有）——零死锁面；
+// - **边界副本**：create 配额判定（`created < max`）必须与 `created` 变更原子，
+//   副本写只发生在 `resize`（`resizing` 串行闸保证与 PoolBase 账本同序成对写，
+//   并发 resize 不交错）；热路径零跨锁判定；
+// - **伪共享防（⑦）**：`#[repr(C)]` 定序 + align(64) 垫片，把账本锁/槽位锁/
+//   condvar 三条热词线分进独立 cache line。
+#[cfg(feature = "pool")]
+mod memory_pool {
+    use std::borrow::Borrow;
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::sync::{Condvar, Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    use skeleton::pool::{
+        PoolAuditEvent, PoolAuditTicket, PoolManaged, PoolMetrics, PoolResizeError,
+    };
+
+    use crate::pool::{PoolBase, AUDIT_RING_DEFAULT_CAP};
+
+    /// std Mutex 取锁：中毒 = 持锁方已 panic——fail-fast 传播（同 `pool::lock`
+    /// 纪律）。收口一处，调用点只见加锁。
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .expect("memgov pool lock poisoned (prior holder panicked)")
+    }
+
+    /// cache line 隔离垫（性能矩阵⑦）：ZST + align(64)，在 `#[repr(C)]` 定序下
+    /// 把后继字段推到下一条 cache line——账本锁词与槽位锁词相邻时，跨锁竞争
+    /// 会互相打脏对方线（伪共享），垫片隔离后两条锁线独立弹跳。
+    #[repr(align(64))]
+    struct CachePad(());
+
+    /// 内存池调参形状（三参封顶之二：池深+闲槽上限；第三参=获取超时，逐调用
+    /// 必填——`acquire` 签名层类型强制 D21，无默认无限等）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MemoryTuning {
+        /// 池深：idle + borrowed 总量上限。
+        pub max: usize,
+        /// 空闲槽上限（归还留存判据之一）。
+        pub idle_cap: usize,
+    }
+
+    /// 内存池指标：共享核心形 + 内存池特有读数（闲槽上限）。经 [`Borrow`] 可达
+    /// [`PoolMetrics`]（宿主对任何池取同一组核心读数——契约面）。
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct MemoryPoolMetrics {
+        /// 共享核心读数（max/idle/borrowed/dropped_overflow/watermark）。
+        pub core: PoolMetrics,
+        /// 闲槽上限（resize 可调）。
+        pub idle_cap: usize,
+    }
+
+    impl Borrow<PoolMetrics> for MemoryPoolMetrics {
+        fn borrow(&self) -> &PoolMetrics {
+            &self.core
+        }
+    }
+
+    /// [`MemoryPool::acquire`] 超时（D21 的显式错面）：期限窗内既无闲槽、配额
+    /// 也无空位。值语义 `Copy` 零分配；`Display` 即用即格式化（只走错误路径，
+    /// 热路径禁格式化）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PoolAcquireTimeout;
+
+    impl std::fmt::Display for PoolAcquireTimeout {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "pool acquire timed out: no slot available within the caller-supplied deadline"
+            )
+        }
+    }
+
+    impl std::error::Error for PoolAcquireTimeout {}
+
+    /// 槽位账（槽位锁单权威内）：闲置对象栈 + 存活件数 + 边界副本。
+    struct PoolInner<T> {
+        /// 闲置对象栈（LIFO——热件常驻热缓存）；容量=历史闲槽高水位，缩容
+        /// truncate 保容量（归还再留存零再分配）。
+        idle: Vec<T>,
+        /// 池宇宙存活件数（= idle.len() + 借出在外）。缩容弃 idle/溢出丢弃/
+        /// 工厂 panic 回滚均递减——配额随件回吐。
+        created: usize,
+        /// 池深副本（只由 resize 经串行闸写；create 配额判定用）。
+        max: usize,
+        /// 闲槽上限副本（只由 resize 经串行闸写；缩容 truncate 与读数用）。
+        idle_cap: usize,
+    }
+
+    /// 内存池：有界对象池特化（memgov 池三件升一等）。借还面（槽位借还/等待/
+    /// RAII 归还）在本类型，管理面（动态调参/水位线/池域审计/溢出计数）经
+    /// [`PoolManaged`] + [`PoolBase`] 全套自动到手。
+    ///
+    /// # 三参封顶（Less is More）
+    ///
+    /// max / idle_cap 在 [`MemoryTuning`]（resize 可调）；获取超时逐调用必填
+    /// （D21——拿不到=显式 [`PoolAcquireTimeout`]，结构上不存在无限等模式，
+    /// `Duration::ZERO` = 非阻塞尝试）。其余（初始预热、栈序留存、扩缩时机）
+    /// 内部自适应，不设旋钮。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use skeleton::pool::PoolManaged;
+    /// use skeleton_infra::memgov::{MemoryPool, MemoryTuning};
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let pool: MemoryPool<Vec<u8>> = MemoryPool::new(4, 2, Vec::new);
+    /// let mut buf = pool.acquire(Duration::from_millis(10))?;
+    /// buf.push(7);
+    /// assert_eq!(pool.metrics().core.borrowed, 1);
+    /// drop(buf); // RAII：Drop 即还（禁手动还）
+    /// assert_eq!(pool.metrics().core.idle, 1);
+    ///
+    /// // 管理面：动态调参 + 池域审计流（票据 Drop 即关流）
+    /// pool.resize(MemoryTuning { max: 8, idle_cap: 4 })?;
+    /// let mut kinds = Vec::new();
+    /// let ticket = PoolManaged::subscribe_audit(&pool, move |e| kinds.push(e.kind));
+    /// let again = pool.acquire(Duration::from_millis(10))?; // 复用同一件
+    /// assert_eq!(&*again, &[7]);
+    /// drop(again);
+    /// drop(ticket);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[repr(C)]
+    pub struct MemoryPool<T, F = fn() -> T> {
+        base: PoolBase,
+        pad0: CachePad,
+        inner: Mutex<PoolInner<T>>,
+        pad1: CachePad,
+        cv: Condvar,
+        /// 调参串行闸：并发 resize 对账本锁与槽位锁**顺序**各写（锁不嵌套），
+        /// 两把写会交错出 base/inner 边界不一致——闸保证「base 写→inner 写」
+        /// 成对同序。热路径零触碰。
+        resizing: Mutex<()>,
+        factory: F,
+    }
+
+    impl<T, F: Fn() -> T> MemoryPool<T, F> {
+        /// 构造。非法边界 panic fail-fast（委托 [`PoolBase::new`] 同一套规则：
+        /// `max == 0` / `idle_cap == 0` / `idle_cap > max`）；获取超时不设默认
+        /// （逐调用必填，D21）。
+        ///
+        /// # Panics
+        ///
+        /// 同 [`PoolBase::new`]：恒不合法的配置必是 bug。
+        pub fn new(max: usize, idle_cap: usize, factory: F) -> Self {
+            Self {
+                base: PoolBase::new(max, idle_cap),
+                pad0: CachePad(()),
+                inner: Mutex::new(PoolInner {
+                    idle: Vec::new(),
+                    created: 0,
+                    max,
+                    idle_cap,
+                }),
+                pad1: CachePad(()),
+                cv: Condvar::new(),
+                resizing: Mutex::new(()),
+                factory,
+            }
+        }
+
+        /// 借出一件（超时必填，D21）：闲槽直取（LIFO）；空槽且配额未满则工厂
+        /// 新建（**锁外**构造——工厂可能昂贵，panic 经配额回滚后如实传播）；
+        /// 否则 condvar park 至期限（零自旋），期限到=显式 Err。resize 即时
+        /// 生效：等待谓词每 wake 复判（调参 notify_all，扩容零阻塞等待者）。
+        ///
+        /// # Errors
+        ///
+        /// [`PoolAcquireTimeout`]：期限窗内无件可借。
+        pub fn acquire(&self, timeout: Duration) -> Result<PoolGuard<'_, T>, PoolAcquireTimeout> {
+            let deadline = Instant::now() + timeout;
+            let mut inner = lock(&self.inner);
+            loop {
+                if let Some(obj) = inner.idle.pop() {
+                    drop(inner);
+                    self.base.note_idle_delta(-1);
+                    self.base.note_borrow();
+                    return Ok(self.guard(obj));
+                }
+                if inner.created < inner.max {
+                    inner.created += 1;
+                    drop(inner);
+                    let obj = match catch_unwind(AssertUnwindSafe(|| (self.factory)())) {
+                        Ok(obj) => obj,
+                        Err(payload) => {
+                            // 配额回滚 + 唤醒（等待者可重试），panic 原样传播
+                            lock(&self.inner).created -= 1;
+                            self.cv.notify_one();
+                            resume_unwind(payload);
+                        }
+                    };
+                    self.base.note_borrow();
+                    return Ok(self.guard(obj));
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(PoolAcquireTimeout);
+                }
+                let (guard, _) = self
+                    .cv
+                    .wait_timeout(inner, deadline - now)
+                    .expect("memgov pool lock poisoned (prior holder panicked)");
+                inner = guard; // spurious/notify/超时统一回环复判谓词
+            }
+        }
+
+        /// 运行时调参：事前校验非法参数入口拒绝（不改任何状态）；生效后缩容
+        /// 只弃 idle 槽（超限闲置件**锁外**析构，`created` 同步递减=配额回吐），
+        /// 借出句柄不受影响——归还时由 [`PoolBase::note_return`] 按新边界裁决
+        /// （槽满=丢弃+`dropped_overflow` 计数）。末尾 notify_all：扩容即时
+        /// 唤醒等待者（调参暂停窗零等待）。
+        ///
+        /// # Errors
+        ///
+        /// [`PoolResizeError`]：非法参数（拒绝路径零状态变更）。
+        pub fn resize(&self, tuning: MemoryTuning) -> Result<(), PoolResizeError> {
+            let _serial = lock(&self.resizing);
+            self.base.resize(tuning.max, tuning.idle_cap)?;
+            let excess = {
+                let mut inner = lock(&self.inner);
+                inner.max = tuning.max;
+                inner.idle_cap = tuning.idle_cap;
+                if inner.idle.len() > tuning.idle_cap {
+                    let excess = inner.idle.split_off(tuning.idle_cap);
+                    inner.created = inner
+                        .created
+                        .checked_sub(excess.len())
+                        .expect("created below idle on shrink (bookkeeping bug)");
+                    Some(excess)
+                } else {
+                    None
+                }
+            };
+            drop(_serial);
+            if let Some(excess) = excess {
+                self.base.note_idle_delta(-(excess.len() as isize));
+                drop(excess);
+            }
+            self.cv.notify_all();
+            Ok(())
+        }
+
+        /// 指标快照：核心形（PoolBase 账本单锁 Copy）+ 特有读数 `idle_cap`。
+        /// O(1) 顺序两锁零分配（实测锚见 `examples/memory_pool_profile.rs`）。
+        pub fn metrics(&self) -> MemoryPoolMetrics {
+            let core = self.base.metrics();
+            let idle_cap = lock(&self.inner).idle_cap;
+            MemoryPoolMetrics { core, idle_cap }
+        }
+
+        /// 取走环内审计事件（事后取证对账面；环随取随清——委托
+        /// [`PoolBase::take_audit_events`]，批量读侧非热路径）。
+        pub fn take_audit_events(&self) -> Vec<PoolAuditEvent> {
+            self.base.take_audit_events()
+        }
+
+        /// 句柄装配（借出两路共用：闲槽直取 / 工厂新建）。
+        fn guard(&self, obj: T) -> PoolGuard<'_, T> {
+            PoolGuard {
+                base: &self.base,
+                inner: &self.inner,
+                cv: &self.cv,
+                slot: Some(obj),
+            }
+        }
+    }
+
+    impl<T, F: Fn() -> T> PoolManaged for MemoryPool<T, F> {
+        type Tuning = MemoryTuning;
+        type Metrics = MemoryPoolMetrics;
+
+        fn resize(&self, tuning: MemoryTuning) -> Result<(), PoolResizeError> {
+            MemoryPool::resize(self, tuning)
+        }
+
+        fn metrics(&self) -> MemoryPoolMetrics {
+            MemoryPool::metrics(self)
+        }
+
+        fn subscribe_audit(
+            &self,
+            f: impl FnMut(&PoolAuditEvent) + Send + 'static,
+        ) -> PoolAuditTicket {
+            self.base.subscribe_audit(AUDIT_RING_DEFAULT_CAP, f)
+        }
+    }
+
+    /// 借出句柄（RAII）：[`Deref`](std::ops::Deref)/[`DerefMut`](std::ops::DerefMut)
+    /// 到池件；**Drop 即还**（禁手动还——armor #26）：闲槽未满留存（LIFO 入栈
+    /// +唤醒等待者），槽满（缩容后超限/闲槽上限满）对象直接析构+计数，归还
+    /// 永不阻塞永不报错。
+    pub struct PoolGuard<'p, T> {
+        base: &'p PoolBase,
+        inner: &'p Mutex<PoolInner<T>>,
+        cv: &'p Condvar,
+        slot: Option<T>,
+    }
+
+    impl<T> PoolGuard<'_, T> {
+        /// 池件本体引用（`slot` 在 Drop 前恒 Some——Drop 路径 take）。
+        fn slot_ref(&self) -> &T {
+            self.slot
+                .as_ref()
+                .expect("guard slot empty before drop (bookkeeping bug)")
+        }
+    }
+
+    impl<T> std::ops::Deref for PoolGuard<'_, T> {
+        type Target = T;
+
+        fn deref(&self) -> &T {
+            self.slot_ref()
+        }
+    }
+
+    impl<T> std::ops::DerefMut for PoolGuard<'_, T> {
+        fn deref_mut(&mut self) -> &mut T {
+            self.slot
+                .as_mut()
+                .expect("guard slot empty before drop (bookkeeping bug)")
+        }
+    }
+
+    impl<T> Drop for PoolGuard<'_, T> {
+        fn drop(&mut self) {
+            let obj = self
+                .slot
+                .take()
+                .expect("guard slot empty on drop (bookkeeping bug)");
+            if self.base.note_return() {
+                lock(self.inner).idle.push(obj);
+                self.cv.notify_one();
+            } else {
+                // 槽满：对象离开池宇宙——配额回吐（等待者可新建）+ 锁外析构
+                let mut inner = lock(self.inner);
+                inner.created = inner
+                    .created
+                    .checked_sub(1)
+                    .expect("created underflow on overflow drop (bookkeeping bug)");
+                drop(inner);
+                self.cv.notify_one();
+                drop(obj);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "pool")]
+pub use memory_pool::{MemoryPool, MemoryPoolMetrics, MemoryTuning, PoolAcquireTimeout, PoolGuard};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,7 +672,7 @@ mod tests {
     /// ① insert/get/remove/len 恒等。
     #[test]
     fn insert_get_remove_len_roundtrip() {
-        let mut reg = BoundedRegistry::bounded(4, Eviction::Reject);
+        let mut reg = BoundedRegistry::new(4, Eviction::Reject);
         assert!(reg.is_empty());
         assert_eq!(reg.capacity(), 4);
         reg.insert(1, "a").expect("within capacity");
@@ -300,7 +690,7 @@ mod tests {
     /// ② 满+Reject=Err(BoundError)，原内容不动。
     #[test]
     fn reject_at_capacity_leaves_registry_untouched() {
-        let mut reg = BoundedRegistry::bounded(2, Eviction::Reject);
+        let mut reg = BoundedRegistry::new(2, Eviction::Reject);
         reg.insert(1, "a").expect("within capacity");
         reg.insert(2, "b").expect("within capacity");
         let err = reg.insert(3, "c").expect_err("full + Reject");
@@ -319,7 +709,7 @@ mod tests {
     #[test]
     fn evict_oldest_pops_min_key_then_inserts() {
         // K 契约实证：乱序插入（10 后插 5）时淘汰的是首键 5——如实退化 EvictMinKey。
-        let mut reg = BoundedRegistry::bounded(2, Eviction::EvictOldest);
+        let mut reg = BoundedRegistry::new(2, Eviction::EvictOldest);
         reg.insert(10, "ten").expect("within capacity");
         reg.insert(5, "five").expect("within capacity");
         reg.insert(7, "seven").expect("eviction makes room");
@@ -332,7 +722,7 @@ mod tests {
     /// ④ 同 key 覆盖不触发淘汰。
     #[test]
     fn overwrite_existing_key_neither_evicts_nor_grows() {
-        let mut reg = BoundedRegistry::bounded(1, Eviction::EvictOldest);
+        let mut reg = BoundedRegistry::new(1, Eviction::EvictOldest);
         reg.insert(1, "a").expect("within capacity");
         reg.insert(1, "b").expect("overwrite keeps len");
         assert_eq!(reg.len(), 1);
@@ -341,18 +731,20 @@ mod tests {
         assert_eq!(reg.get(&1), None);
         assert_eq!(reg.get(&2), Some(&"c"));
 
-        let mut rej = BoundedRegistry::bounded(2, Eviction::Reject);
+        let mut rej = BoundedRegistry::new(2, Eviction::Reject);
         rej.insert(1, "a").expect("within capacity");
         rej.insert(1, "b").expect("overwrite keeps len");
         assert_eq!(rej.len(), 1);
-        rej.insert(2, "c").expect("still one slot free after overwrite");
-        rej.insert(3, "d").expect_err("full + Reject, overwrite did not grow");
+        rej.insert(2, "c")
+            .expect("still one slot free after overwrite");
+        rej.insert(3, "d")
+            .expect_err("full + Reject, overwrite did not grow");
     }
 
     /// ⑤ iter 升序确定序（乱序插入断言序）。
     #[test]
     fn iter_is_ascending_deterministic_order() {
-        let mut reg = BoundedRegistry::bounded(8, Eviction::Reject);
+        let mut reg = BoundedRegistry::new(8, Eviction::Reject);
         for k in [5, 1, 3] {
             reg.insert(k, k * 10).expect("within capacity");
         }
@@ -380,7 +772,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "max == 0 is a bug")]
     fn bounded_zero_capacity_panics_fail_fast() {
-        let _ = BoundedRegistry::<u32, u32>::bounded(0, Eviction::Reject);
+        let _ = BoundedRegistry::<u32, u32>::new(0, Eviction::Reject);
     }
-
 }

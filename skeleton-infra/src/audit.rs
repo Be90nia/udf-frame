@@ -21,10 +21,20 @@ fn lock_audit<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// 审计事件：单笔 dispatch 生命周期的一个节点。
 ///
-/// 生命周期重建协议：一笔 dispatch = `Enqueued(depth) → Reduced →
-/// [EffectForwarded* | EffectInterrupted | Enqueued(depth+1) → …] → Notified?`；`Notified` 仅当拍
-/// 确有订阅者收到快照时记录。`seq` 单调；订阅窗内**连续**，空洞 = 有界环溢出
-/// 丢最旧的显式证据（禁静默重写历史的对账键）。
+/// 生命周期重建协议：记账单位是 **action 而非 dispatch**——一笔 dispatch 的
+/// 主 action 走 `Enqueued(depth) → Reduced → [EffectForwarded* |
+/// EffectInterrupted] → Notified?`；Emit 回灌派生的每个动作**各走一条同形
+/// 链**，交错嵌进主链时间线（派生 `Enqueued(depth+1)` 在外层 `Reduced` 后
+/// 入账，外层 `Notified` 先于派生 `Reduced`），如带状态订阅者的实测形
+/// `Enqueued(0)→Reduced→Enqueued(1)→Notified→Reduced→Notified`（回归锚：
+/// `tests/journal_port.rs` snapshot_restore_seeds_* 交错链断言）。多订阅者
+/// 之间的逐字交错顺序不可预推（与订阅/转发时点耦合）；单订阅者内仅
+/// per-action `seq` 递增确定——时间线断言用语义不变量（深度链/节点计数），
+/// 勿钉逐字全局顺序。`Notified`
+/// 仅当拍确有**状态快照订阅者**收到快照时记录（事件订阅不开此闸）。病理终点
+/// 两类：`ReducerInterrupted`（reduce 中断，
+/// 后继无 Reduced）与 `FeedbackBudgetExceeded`（回灌环预算止步）。`seq` 单调；
+/// 订阅窗内**连续**，空洞 = 有界环溢出丢最旧的显式证据（禁静默重写历史的对账键）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditEvent {
     /// 进程内单调序号（store 级计数器，跨订阅窗不重复）。
@@ -33,7 +43,8 @@ pub struct AuditEvent {
     pub kind: AuditEventKind,
 }
 
-/// 生命周期节点枚举（七节点：入队/reduce 完成/效果转发/效果中断/通知/拒绝/回灌超限）。
+/// 生命周期节点枚举（八节点：入队/reduce 完成/reduce 中断/效果转发/效果中断/
+/// 通知/拒绝/回灌超限）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditEventKind {
     /// action 入队（dispatch / [`skeleton::ActionSender::dispatch`] / Emit 回灌三路同闸）。
@@ -45,6 +56,12 @@ pub enum AuditEventKind {
     },
     /// reduce 完成（状态迁移已产出，效果在缓冲）。
     Reduced,
+    /// reduce 执行中断（reducer panic）：状态迁移未完成，本 action 已出队、
+    /// 随栈展开丢失（不回队——出队即离队是排空环的所有权契约）；panic 前已产
+    /// 效果原地留缓冲，由下一任排空先续转。panic 本体照常传播出 dispatch
+    /// （fail-visible 传播语义不变），计数读侧
+    /// [`crate::runtime::SyncStore::reducer_panic_count`]。
+    ReducerInterrupted,
     /// 一条 `Run`/`Cancel` 效果已转发解释器（[`skeleton::Effect::Emit`] 不经此处——
     /// 回灌以 [`AuditEventKind::Enqueued`] 入账）。
     EffectForwarded,
@@ -56,7 +73,9 @@ pub enum AuditEventKind {
     Notified,
     /// 闭门拒绝（dispatch no-op / sender dispatch `false` 的共享计数路径）。
     Rejected,
-    /// 回灌深度预算止步（自指回灌环在时间线的显式终点）。
+    /// 回灌深度预算止步（自指回灌环在时间线的显式终点）。轮询式对照读侧：
+    /// [`crate::runtime::SyncStore::feedback_budget_exceeded`]（计数与事件同一
+    /// 触发点各计一次——环结构重建走事件流，快速巡检走计数）。
     FeedbackBudgetExceeded,
 }
 

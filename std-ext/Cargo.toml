@@ -1,0 +1,51 @@
+[package]
+name = "udf-std-ext"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-std ecosystem standard parts split out of skeleton-infra: text/encode/hash/iter/backoff/fsx leaf domains"
+license = "MIT"
+readme = "README.md"
+keywords = ["std", "extensions", "cache", "retry", "scheduler"]
+categories = ["algorithms", "rust-patterns"]
+rust-version = "1.87"
+# MSRV 实证（2026-10-18 clippy::incompatible_msrv 全仓扫描）：is_multiple_of(1.87，
+# encode/rfc3339)/is_none_or(1.82，scheduler) 等，最高 1.87；三 crate 同版首发取统一值。
+# repository：待 PM 提供 URL 后补一行（本仓 git remote 未配置；见 docs/PUBLISHING.md §1）
+
+# 分层（ADR udf-frame/docs/adr/0004-std-ext-split.md）：skeleton（最底层契约）
+# ← std-ext（本 crate，散件）← skeleton-infra（核+胶水，反向依赖本 crate）。
+# 零三方纪律（默认树）：skeleton 为 workspace path 非三方；tracing 仅
+# `log-embed` 埋点 optional（默认关=不进树，cargo tree -p udf-std-ext 零三方证明）。
+# 十三域本体纯 std——迁移前逐域验证过（text/encode/hash/paths/clock/id 零埋点；
+# iter/backoff/fsx/scheduler/ratelimit/retry/cache 仅 embed_event! 宏调用点）。
+# 包名/lib 名分离（PM 拍板 2026-10-18）：发布名 udf-std-ext；lib 名保持 std_ext，
+# `use std_ext::` 零改动（docs/PUBLISHING.md §3）。
+[lib]
+name = "std_ext"
+
+[features]
+# log-embed：行为域 tracing 埋点（七域 35 调用点：backoff 1/fsx 6/iter 2/
+# scheduler 11/ratelimit 4/retry 6/cache 5；默认关=宏消除零依赖零开销）。
+# target 前缀沿用 `skeleton::<domain>[::<phase>]`——观测
+# 契约跨 crate 稳定（EnvFilter 与断言字符串零改动），不随物理 crate 拆分更名。
+# 宏与纪律注为 skeleton-infra lib.rs 同款文本作用域副本（两 crate 各自一份）。
+log-embed = ["dep:tracing"]
+
+[dependencies]
+# 契约 crate（workspace path，非三方）：scheduler/cache/id/retry/ratelimit 消费
+# skeleton::clock 时间源契约（Clock/SystemClock/MockClock，批 1 契约真下沉）。
+udf-skeleton = { path = "../skeleton", version = "0.1.0" }
+tracing = { version = "0.1", optional = true }
+
+[lints.clippy]
+# 与 skeleton/skeleton-infra 同款默认集（本 crate 无 async 面，deny 两条为
+# 纵深防御；无 tokio 故不启用 disallowed_methods）。
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+large_types_passed_by_value = "warn"
+
+[dev-dependencies]
+# humantime：RFC3339 域行为对照基线（clock::rfc3339 R18 跨实现 parse 等值 +
+# roundtrip），dev-dep only——零依赖证明不受影响（批 5-2 随 clock 域自
+# skeleton-infra 迁入）。
+humantime = "2"

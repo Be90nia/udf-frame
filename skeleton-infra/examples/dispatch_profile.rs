@@ -25,7 +25,11 @@ fn batch_mean<T>(mut op: impl FnMut() -> T, n: u64) -> f64 {
 
 /// 三连批取中位，压单批噪声。
 fn median3<T>(mut op: impl FnMut() -> T, n: u64) -> f64 {
-    let mut xs = [batch_mean(&mut op, n), batch_mean(&mut op, n), batch_mean(&mut op, n)];
+    let mut xs = [
+        batch_mean(&mut op, n),
+        batch_mean(&mut op, n),
+        batch_mean(&mut op, n),
+    ];
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     xs[1]
 }
@@ -148,7 +152,9 @@ fn main() {
     println!(
         "reduce_dyn_only={:.1}",
         median3(
-            || black_box(reducer.reduce(black_box(&7u64), Tick::Tick, unsafe { &mut *buf_cell.get() })),
+            || black_box(reducer.reduce(black_box(&7u64), Tick::Tick, unsafe {
+                &mut *buf_cell.get()
+            })),
             N
         )
     );
@@ -200,11 +206,17 @@ fn main() {
         )
     );
     let version = AtomicUsize::new(0);
-    println!("notify_version_read={:.1}", median3(|| version.load(Ordering::Acquire), N));
+    println!(
+        "notify_version_read={:.1}",
+        median3(|| version.load(Ordering::Acquire), N)
+    );
 
     let weak_holder = Arc::new(());
     let weak = Arc::downgrade(&weak_holder);
-    println!("weak_upgrade_drop={:.1}", median3(|| drop(weak.upgrade()), N));
+    println!(
+        "weak_upgrade_drop={:.1}",
+        median3(|| drop(weak.upgrade()), N)
+    );
 
     println!(
         "catch_unwind_noop={:.1}",
@@ -220,7 +232,10 @@ fn main() {
         store.dispatch(Tick::Tick);
     }
     let e2e = median3(|| store.dispatch(Tick::Tick), 200_000);
-    println!("end_to_end_dispatch={e2e:.1} final={}", black_box(*store.snapshot()));
+    println!(
+        "end_to_end_dispatch={e2e:.1} final={}",
+        black_box(*store.snapshot())
+    );
 
     // ── 审计事件流零开销双证（observability 批，R1-2 收口）────────────────
     // 未订阅：上行 end_to_end_dispatch 即默认关闭锚（emit 点仅一次 gate load，
