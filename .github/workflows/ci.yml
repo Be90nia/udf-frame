@@ -35,9 +35,12 @@ jobs:
       - name: Test skeleton
         run: cargo test -p udf-skeleton
 
-      # std-ext 十三常驻域（批 5-2 拆分后新增步）：默认树零依赖域行为面
+      # std-ext 十三常驻域（批 5-2 拆分后新增步）：默认树零依赖域行为面。
+      # paths_alloc 文件内事件计数器被 libtest 主线程分配污染（同进程并行，
+      # 实测 5 跑 2 红）——本步 --skip 隔离其测试，serial 步单列 --test-threads=1。
+      # 新增该文件测试时务必命中 anchors/verbatim 二 skip 之一。
       - name: Test std-ext
-        run: cargo test -p udf-std-ext
+        run: cargo test -p udf-std-ext -- --skip anchors --skip verbatim
 
       # infra 六域 feature 矩阵闸：--workspace 只跑 default=[]（P12 零 feature 面），
       # memgov/journal/log/tokio/testing 全在盲区，单列 all-features 步防漏
@@ -57,9 +60,10 @@ jobs:
 
       # paths_alloc 事件计数串行闸（终验波 B1）：文件内 Mutex 只串行本文件，
       # 其他测试线程的分配仍进全局事件计数——主线程窗口污染=并行 flake
-      # （本机 5 跑 2 红、单线程恒绿），CI 确定口径=独立步 --test-threads=1
+      # （本机 5 跑 2 红、单线程恒绿），CI 确定口径=独立步 --test-threads=1。
+      # 批 5-2 拆分后该测试文件居 std-ext（原指 skeleton-infra 已无此目标）。
       - name: paths_alloc serial
-        run: cargo test -p udf-skeleton-infra --all-features --test paths_alloc -- --test-threads=1
+        run: cargo test -p udf-std-ext --test paths_alloc -- --test-threads=1
 
       # bench 编译门（infra §3.3/P10 一级）：bench 三组 required-features 为
       # fx/journal/memgov/testing 并集，--no-run 裸跑会整目标跳过（hollow gate），故 all-features
