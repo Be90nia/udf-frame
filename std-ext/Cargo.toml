@@ -14,10 +14,11 @@ rust-version = "1.87"
 
 # 分层（ADR udf-frame/docs/adr/0004-std-ext-split.md）：skeleton（最底层契约）
 # ← std-ext（本 crate，散件）← skeleton-infra（核+胶水，反向依赖本 crate）。
-# 零三方纪律（默认树）：skeleton 为 workspace path 非三方；tracing 仅
-# `log-embed` 埋点 optional（默认关=不进树，cargo tree -p udf-std-ext 零三方证明）。
-# 十三域本体纯 std——迁移前逐域验证过（text/encode/hash/paths/clock/id 零埋点；
-# iter/backoff/fsx/scheduler/ratelimit/retry/cache 仅 embed_event! 宏调用点）。
+# 依赖纪律（P1-9 拍板修订，2026-10-23）：十四域中十三域本体纯 std；
+# `json` 域引 serde_json 普通依赖（零 feature 常开，自主仓 xray-conf 上浮）；
+# tracing 仅 `log-embed` 埋点 optional（默认关=不进树）。迁移前逐域验证过
+#（text/encode/hash/paths/clock/id 零埋点；iter/backoff/fsx/scheduler/
+# ratelimit/retry/cache 仅 embed_event! 宏调用点；json 无埋点）。
 # 包名/lib 名分离（PM 拍板 2026-10-18）：发布名 udf-std-ext；lib 名保持 std_ext，
 # `use std_ext::` 零改动（docs/PUBLISHING.md §3）。
 [lib]
@@ -35,6 +36,8 @@ log-embed = ["dep:tracing"]
 # 契约 crate（workspace path，非三方）：scheduler/cache/id/retry/ratelimit 消费
 # skeleton::clock 时间源契约（Clock/SystemClock/MockClock，批 1 契约真下沉）。
 udf-skeleton = { path = "../skeleton", version = "0.1.0" }
+# json 域解析底座（P1-9：零 feature 常开的普通依赖，版本与主仓 workspace 一致）。
+serde_json = "1"
 tracing = { version = "0.1", optional = true }
 
 [lints.clippy]

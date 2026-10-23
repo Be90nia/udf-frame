@@ -719,6 +719,7 @@ name = "udf-std-ext"
 version = "0.1.0"
 dependencies = [
  "humantime",
+ "serde_json",
  "tracing",
  "udf-skeleton",
 ]
