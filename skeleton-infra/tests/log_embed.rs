@@ -7,8 +7,8 @@
 //!    单测（测试无法观测「依赖不存在」）。
 //!
 //! backoff/fsx/iter 三域断言随批 5-1、scheduler/ratelimit/retry/cache 四域
-//! 断言随批 5-2 拆至 std-ext/tests/log_embed.rs（本 crate 埋点面收窄为
-//! shutdown 一域 6 调用点）。
+//! 断言随批 5-2 拆至 std-ext/tests/log_embed.rs（本 crate 埋点面=shutdown
+//! 一域 6 调用点 + fx 一域 1 调用点：panic 且句柄已被丢=warn 留痕）。
 //!
 //! 捕获订阅器：手写最小 `Subscriber`（std-ext 同款形态），线程作用域
 //! `set_default` 挂载不动全局默认；shutdown 埋点全在调用方线程发出，无跨线程
@@ -22,6 +22,8 @@ use std::thread;
 use std::time::Duration;
 
 use skeleton_infra::shutdown::{OutcomeKind, ShutdownCoordinator};
+#[cfg(feature = "tokio")]
+use skeleton_infra::fx::FxScope;
 
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Record};
@@ -188,4 +190,35 @@ fn shutdown_timed_out_outcome_warns() {
         Level::WARN,
         &["name=stuck", "kind=timed_out"],
     );
+}
+
+// ---- fx 域（target skeleton::fx；panic 且句柄已被丢=异常路径 warn）----
+
+/// abort/panic 后等计数归零（1ms 实钟轮询 + 5s 墙钟上限，同 src/fx.rs 库内
+/// wait_idle 形——current-thread rt 下 sleep 即让位驱动任务跑完，禁忙等）。
+#[cfg(feature = "tokio")]
+async fn wait_idle(scope: &FxScope) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while scope.in_flight() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fx scope not idle: {} task(s) still in flight",
+            scope.in_flight()
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// spawn panic → drop 句柄 → warn 留痕一行：panic 结果无人消费不可静默丢失
+///（任务在 wait_idle 轮询期跑完 panic 归一+投递失败，埋点与捕获同线程）。
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn fx_panic_with_dropped_handle_leaves_warn_trace() {
+    let cap = capture();
+    let scope = FxScope::new();
+    let _guard = tracing::subscriber::set_default(cap.clone());
+    let handle = scope.spawn(async { panic!("boom-unconsumed") }).unwrap();
+    drop(handle); // 句柄先亡：结果无处投递
+    wait_idle(&scope).await;
+    cap.assert_event("skeleton::fx", Level::WARN, &["msg=boom-unconsumed"]);
 }
