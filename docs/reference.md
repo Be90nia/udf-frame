@@ -1954,6 +1954,10 @@ impl ViewBridge<S, A, M, I, J, R> {
 
 要点：桥 = 纯订阅者（票据归桥，Drop = 注销；store 所有权随桥）；版本 = 桥内单调消费代数（同步档，与区域头同源，撕裂结构性不可能）；投影 panic = 毒化唯一残因（catch + 计数 + `resync` 位 ⇒ `snapshot_doc` 收口）；未知标签跳过（读侧 `view::read` 实现一次，TS/Py/C 镜像复刻，禁整区失败）；正典验收环 `examples/view_bridge_demo.rs`，行为面 `tests/view_bridge_test.rs`。
 
+**边界：同一进程内 vs 跨进程/跨重启**。桥保证的是**同一进程内**的自洽与重同步——票据、补丁水位、快照与区域版本都活在同一个桥实例里，`snapshot_doc()` 是进程内重同步原语、**不是持久化**。进程死亡后 UI 侧无从复现：**视图复现由 store/持久化层负责**（journal 回放或采用方自有存储），桥不缓存状态、不作此承诺（Android 分层对照：ViewModel 保进程内，SavedStateHandle 保进程死亡——后者不属渲染层职责）。
+
+**纪律指向**：①视图词表用 enum 表达互斥状态、禁布尔旗子（正反例见 `skeleton::view::ViewMap` 文档与 `bindings()` 语义）；②「派生 input 覆盖 compute 实读」红线的最小可执行反例 = `tests/view_bridge_test.rs::narrow_input_leaks_stale_and_is_detectable`——漏报的三处签名：`projection_runs` 停滞、水位推进而补丁为空、快照真值与最后交付的补丁值不等。
+
 ---
 
 ## log-embed — 埋点规范

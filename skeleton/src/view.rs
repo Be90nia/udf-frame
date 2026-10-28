@@ -41,6 +41,23 @@ pub struct BindingDecl {
 /// 视图映射（纯函数契约）：State → 类型化视图值集合（按项）。纯度纪律同
 /// reducer：确定性、禁 IO/时钟/随机/写共享态；panic 不跨边界裸传（机器内
 /// catch + 计数 + 毒化闩收口）。
+///
+/// # 视图词表纪律：互斥状态用 enum，禁布尔旗子
+///
+/// [`Self::View`] 是采用方的**状态词表**（不是数据传输结构）：互斥状态必须落在
+/// 不同变体上，禁「同一绑定 + 载荷里若干 `bool` 旗子」。
+///
+/// - 正例：`enum Status { Loading, Ready(Data), Failed(Why) }`——三态互斥，
+///   非法组合（`loading && failed`）**不可构造**。
+/// - 反例：`struct V { loading: bool, failed: bool }`——4 种组合里 3 种非法，
+///   采用方 UI 每个组合都得兜，漏一个就是静默错渲染（React「impossible
+///   states」/ Kotlin sealed 同向纪律；Bloc 官方对本形态的判词是
+///   「Not Type Safe: possible to emit a malformed state」）。
+///
+/// 该纪律是**契约层**的（零宏下机器咬不住采用方的字段形状），复核靠**穷尽
+/// match**：Rust 编码器按变体 `match`（漏臂 = E0004，加变体即爆）；跨语言 UI
+/// 侧靠判别式联合 + `never` 兜底臂（缺臂 = 类型检查期错）。旗子形态两头都没
+/// 这道闸。
 pub trait ViewMap<S> {
     /// 类型化视图词表：**一绑定一变体的采用方 enum**。bound 全部 std 内建
     /// derive 可满足（零 proc-macro 零三方）；**bound 只落本关联类型，领域
@@ -48,6 +65,16 @@ pub trait ViewMap<S> {
     type View: Clone + PartialEq + Send + 'static;
     /// 绑定词表：装配期定死；返回序即绑定序（机器装配期对账，错位 =
     /// debug_assert + 计数留痕，fail-visible）。
+    ///
+    /// **语义**：本方法声明的每一项 = [`Self::View`] 词表的一个**消费点**
+    /// （一项绑定投影出一个变体实例，见 trait 级「视图词表纪律」）。增删项 =
+    /// 词表变体增删 ⇒ `kind` 换新标签号（只加不改、退役号不复用）。
+    ///
+    /// **反例（词表躲进载荷）**：一条 `/state` 绑定 + 载荷
+    /// `{"loading": bool, "error": bool}`——互斥状态进了 JSON，机器与编码器都
+    /// 咬不住非法组合，UI 侧也无词表可对账。正例：互斥状态拆成
+    /// `/detail/loading`、`/detail/failed`（或一个 `Status` 变体各占一绑定），
+    /// 每项一枚 `BindingDecl`。
     fn bindings(&self) -> &[BindingDecl];
     /// 绑定级输入哨兵（L1 记忆化的绑定级应用）：index 输入切片是否变更。
     /// **false ⇒ 机器跳过该绑定的投影与比较**。承诺：`project(index)` 输出与
