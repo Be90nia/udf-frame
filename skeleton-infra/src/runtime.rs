@@ -85,10 +85,10 @@ struct SubscriptionSlot<S> {
 }
 
 /// 排空权独占字段：仅持排空权（[`StoreInner::draining`] 旗互斥下的 drain 循环）
-/// 触及的可变态。锁消融的载体——`effect_buf` 与订阅集快照缓存全 dispatch 生命
-/// 周期内只有排空者读写（重入 dispatch 只入队即返，到不了这两处），互斥由排空
-/// 旗外部同步，无需各自上锁：原 `Mutex` 的 lock/unlock（每 action 3 对）与毒锁
-/// 面一并消融。
+/// 触及的可变态。锁消融的载体——`effect_buf`、订阅集快照缓存与异步投递收集缓冲
+/// 全 dispatch 生命周期内只有排空者读写（重入 dispatch 只入队即返，到不了这三处），
+/// 互斥由排空旗外部同步，无需各自上锁：原 `Mutex` 的 lock/unlock（每 action 3 对）
+/// 与毒锁面一并消融。
 struct DrainExclusive<T> {
     value: UnsafeCell<T>,
 }
@@ -166,6 +166,11 @@ struct StoreInner<S, A, Op> {
     /// 异步投递累计次数（成功投递逐口逐拍 +1，成本可见）。读侧
     /// [`SyncStore::notify_published`]。
     notify_published: AtomicU64,
+    /// 异步投递收集缓冲（复用容量，消除每拍堆分配）：原实现每次 `collect` 新建
+    /// Vec，有订阅者时每拍一次分配（PerfProbe 实测 total = 1.00 alloc/拍，见
+    /// `verify/perf-probe/`）。排空权独占（同 `effect_buf`/`notify_cache`）：只在
+    /// 排空环通知段读写，无需自锁。容量保留到订阅数峰值（每槽一针宽）。
+    notify_sink_buf: DrainExclusive<Vec<Arc<NotifySinkSlot>>>,
     /// store 身份号（本地订阅在注册线程 TLS 表中的键）：全局单调，进程内唯一。
     store_id: u64,
     /// 单写者排空守卫（确定性：同序 action 序列恒同终态；重入回灌只入队）
@@ -771,6 +776,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             notify_subs: Arc::new(AtomicUsize::new(0)),
             state_version: AtomicU64::new(0),
             notify_published: AtomicU64::new(0),
+            notify_sink_buf: DrainExclusive::new(Vec::new()),
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             draining: AtomicBool::new(false),
             closed: AtomicBool::new(false),

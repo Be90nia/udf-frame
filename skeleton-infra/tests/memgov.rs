@@ -203,9 +203,14 @@ fn realloc_grow_and_shrink_track_live_bytes() {
 }
 
 /// cqb⑥ Borrow 泛型查找热路径零分配（armor 性能锚：借用查找禁退化成
-/// `to_string` 分配查找——含分配路径实测 10×+ 慢）：借用形 get/get_mut
-/// 查找窗 live/total 双平。live 净额对「即用即还」恒 0，total 面抓临时
-/// 分配 churn——两面对账才是真零分配（口径同 total_allocs 文档）。
+/// `to_string` 分配查找）：借用形 get/get_mut 查找窗 live/total 双平。
+/// live 净额对「即用即还」恒 0，total 面抓临时分配 churn——两面对账才是真
+/// 零分配（口径同 total_allocs 文档）。
+///
+/// 含分配路径的代价口径（旧文「10×+ 慢」不实，按实测改写）：PerfProbe
+/// （`verify/perf-probe/` 的 `registry` 组，借用查找 vs `to_string` 三口径
+/// 10k/44c/100 键，7 轮中位）实测 **1.5–1.9×**——差 ~50ns ≈ 一次 alloc +
+/// 拷贝。本锚守的是「不分配」这一结构性质，不依赖倍数大小。
 #[test]
 fn borrow_lookup_allocates_nothing() {
     let _serial = serial();
@@ -332,5 +337,227 @@ mod skeleton_alloc_twin {
         );
         assert_eq!(CountingAllocator::live_bytes(), base.1);
         assert_eq!(*store.snapshot(), 8 + 64, "预热+测量段全部送达");
+    }
+}
+
+/// PerfProbe 锚回归（双口径：live 净增 + total 累计）：dispatch 命中 /
+/// dispatch route-miss 稳态 / notify 单订阅者 三锚，每锚窗内 live=0 **且** total=0。
+///
+/// 依据：`verify/perf-probe/`（2026-10-28 全量测量；口径 = 分配事件次数；复跑
+/// 命令见其 README）。live 净额对「即用即还」恒 0（churn 盲区），total 面抓窗内
+/// 临时分配——两面同时为 0 才是真零分配。与 `skeleton_alloc_twin` 的分工：那边测
+/// live 净额（预算闸），这边加 total 面（churn 闸），且覆盖异步通知段。
+#[cfg(feature = "runtime")]
+mod perf_anchor_alloc {
+    use std::convert::Infallible;
+    use std::hint::black_box;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+    use skeleton::notify::{Notify as _, NotifySink};
+    use skeleton::{Effect, EffectBuf, EffectRuntime, Reducer, Store as _};
+    use skeleton_infra::runtime::SyncStore as Store;
+
+    /// 测量窗读数：(live 净增, live 字节净增, total 累计)。
+    fn window(op: impl FnOnce()) -> (i64, i64, usize) {
+        let live = CountingAllocator::live_allocs() as i64;
+        let bytes = CountingAllocator::live_bytes() as i64;
+        let total = CountingAllocator::total_allocs();
+        op();
+        (
+            CountingAllocator::live_allocs() as i64 - live,
+            CountingAllocator::live_bytes() as i64 - bytes,
+            CountingAllocator::total_allocs() - total,
+        )
+    }
+
+    /// 命中热路径最小域：零效果「+1」reducer（probe `dispatch/命中` 同形）。
+    struct Bump;
+
+    impl Reducer for Bump {
+        type State = u32;
+        type Action = u32;
+        type Op = Infallible;
+
+        fn initial(&self) -> u32 {
+            0
+        }
+
+        fn reduce(&self, s: &u32, _a: u32, _out: &mut EffectBuf<u32, Infallible>) -> u32 {
+            s + 1
+        }
+    }
+
+    struct NoFx;
+
+    impl EffectRuntime<u32, Infallible> for NoFx {
+        fn run(&mut self, _: Effect<u32, Infallible>, _: &skeleton::ActionSender<u32>) {}
+    }
+
+    /// 投递口只落一个原子（O(1) 契约的最省形态；不引入测量噪声）。
+    struct Latest(Arc<AtomicU64>);
+
+    impl NotifySink for Latest {
+        fn publish(&self, version: u64) {
+            self.0.store(version, Ordering::Relaxed);
+        }
+    }
+
+    /// 锚①：命中热路径（零效果、零订阅者）稳态 dispatch 双口径零分配。
+    /// probe 依据：`dispatch/命中` [mem] total 0.00/次（skeleton-infra 侧稳态零分配，
+    /// 快照 make_mut 原地落位 + EffectBuf 保容量后成立）。
+    #[test]
+    fn dispatch_hit_zero_alloc_dual_caliber() {
+        let _serial = super::serial();
+        super::settle();
+        let store = Store::new(Bump, NoFx);
+        for _ in 0..8 {
+            store.dispatch(1u32); // 预热：队列/缓冲首撞容量
+        }
+        let (live, bytes, total) = window(|| {
+            for _ in 0..64 {
+                store.dispatch(black_box(1u32));
+            }
+        });
+        assert_eq!(
+            (live, bytes, total),
+            (0, 0, 0),
+            "命中稳态 dispatch 必须双口径零分配（live 净增 / total churn 各 0）"
+        );
+        assert_eq!(*store.snapshot(), 8 + 64, "预热+测量段全部送达");
+    }
+
+    /// 锚③：有 1 个异步订阅者时，投递增量零分配（Phase 1 钉子）。
+    /// 依据：PerfProbe `notify/dispatch 1 异步订阅者` [mem] total = 1.00/次——
+    /// 每拍 `collect::<Vec<_>>()` 一次堆分配（修复前）。修复后收集缓冲挂
+    /// StoreInner 跨拍复用，本锚转绿；回退成每拍新建即红。
+    #[test]
+    fn notify_single_subscriber_zero_alloc_dual_caliber() {
+        let _serial = super::serial();
+        super::settle();
+        let store = Store::new(Bump, NoFx);
+        let seen = Arc::new(AtomicU64::new(0));
+        let _ticket = store.subscribe_notify(Latest(Arc::clone(&seen)));
+        for _ in 0..8 {
+            store.dispatch(1u32); // 预热：收集缓冲首撞容量
+        }
+        let published0 = store.notify_published();
+        let (live, bytes, total) = window(|| {
+            for _ in 0..64 {
+                store.dispatch(black_box(1u32));
+            }
+        });
+        assert_eq!(
+            (live, bytes, total),
+            (0, 0, 0),
+            "1 订阅者时投递稳态必须双口径零分配（每拍 collect 回退即红）"
+        );
+        assert_eq!(
+            store.notify_published() - published0,
+            64,
+            "每拍恰一次投递（语义不变）"
+        );
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            8 + 64,
+            "版本号经 publish 出站（订阅后逐拍 +1）"
+        );
+    }
+
+    /// 锚②：route-miss 稳态 dispatch 双口径零分配（compose 域）。
+    /// miss 路径 = `route_misses` 计数 + 状态克隆原样返回；状态是纯标量
+    /// （Clone = memcpy）时零分配——probe `bc-route/miss reduce` 口径同源。
+    #[cfg(feature = "compose")]
+    #[test]
+    fn dispatch_route_miss_zero_alloc_dual_caliber() {
+        use skeleton::Fragment;
+
+        let _serial = super::serial();
+        super::settle();
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct Parent {
+            total: u32,
+            child: u32,
+        }
+
+        #[derive(Clone, Debug, PartialEq)]
+        enum PAct {
+            Child(u32),
+            Miss,
+        }
+
+        struct ChildAdd;
+
+        impl Reducer for ChildAdd {
+            type State = u32;
+            type Action = u32;
+            type Op = Infallible;
+
+            fn initial(&self) -> u32 {
+                0
+            }
+
+            fn reduce(&self, s: &u32, a: u32, _out: &mut EffectBuf<u32, Infallible>) -> u32 {
+                s + a
+            }
+        }
+
+        /// 装配一次持有的委托父 reducer（compose.rs 正典形态）。
+        struct Delegate<F> {
+            frag: F,
+        }
+
+        impl<F> Reducer for Delegate<F>
+        where
+            F: Fragment<State = Parent, Action = PAct, Op = Infallible> + Send + Sync,
+        {
+            type State = Parent;
+            type Action = PAct;
+            type Op = Infallible;
+
+            fn initial(&self) -> Parent {
+                Parent { total: 0, child: 0 }
+            }
+
+            fn reduce(&self, s: &Parent, a: PAct, out: &mut EffectBuf<PAct, Infallible>) -> Parent {
+                self.frag.reduce(s, a, out)
+            }
+        }
+
+        struct NoFx2;
+
+        impl EffectRuntime<PAct, Infallible> for NoFx2 {
+            fn run(&mut self, _: Effect<PAct, Infallible>, _: &skeleton::ActionSender<PAct>) {}
+        }
+
+        let store = Store::new(
+            Delegate {
+                frag: skeleton_infra::combine!(ChildAdd, Parent.child, PAct::Child),
+            },
+            NoFx2,
+        );
+        // 命中一次：证明路由臂在工作（miss 断言才有鉴别力）
+        store.dispatch(PAct::Child(1));
+        assert_eq!(store.snapshot().child, 1, "命中臂路由到子切片");
+        for _ in 0..8 {
+            store.dispatch(PAct::Miss); // 预热：miss 路径首次落位
+        }
+        let (live, bytes, total) = window(|| {
+            for _ in 0..64 {
+                store.dispatch(black_box(PAct::Miss));
+            }
+        });
+        assert_eq!(
+            (live, bytes, total),
+            (0, 0, 0),
+            "route-miss 稳态必须双口径零分配（状态为纯标量，clone = memcpy）"
+        );
+        assert_eq!(
+            *store.snapshot(),
+            Parent { total: 0, child: 1 },
+            "miss 只计数留痕、状态克隆原样返回（语义不变）"
+        );
     }
 }

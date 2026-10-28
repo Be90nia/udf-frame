@@ -48,6 +48,11 @@
 - 性能锚口径诚实化：dispatch 锚（无订阅 ~77ns / 订阅态 ~142ns）此前无适用边界，现补「锚仅在小 State 成立」——外部持有快照时状态落位走 `Arc::make_mut` 克隆分支，每次 dispatch 额外付一次 `S::clone`（锁内），实测 1MiB State ≈210µs/dispatch；`README.md` 埋点规范段 + `docs/reference.md` runtime 锚段同口径（审计报告 F-05）。
 - CI 门整改：`.github/workflows/ci.yml` 的 std-ext 步去掉全局 `--skip anchors --skip verbatim`——该字面量匹配连带屏蔽 13 个真实测试（含 `hash` 的 XXH64 官方向量锚、`paths` 的 Windows verbatim 路径语义测试、`scheduler` 的 every_anchors_* 等），属 hollow gate；并行污染根因已在 fe5728a 根治（计数窗加 IN_WINDOW 线程归属门），主步改全量跑，`paths_alloc serial` 单列步保留作双保险。
 - 孤儿源文件处置：删 `skeleton-infra/src/text.rs`、`skeleton-infra/src/backoff.rs`（ADR 0004 迁移后残留的无 `mod` 声明副本，不参与编译、不产文档，且 backoff 双份实现已漂移——infra 副本无 `log-embed` 埋点）；内容已在 `std-ext`，无 shim 需求。
+- **notify 每拍堆分配修复**（性能修复）：`notify_async` 对有订阅者的每次 dispatch 原走 `collect::<Vec<_>>()` 新建收集缓冲（PerfProbe 实测 total = 1.00 alloc/拍）；改为排空权独占的复用缓冲（`StoreInner::notify_sink_buf`，每 store 独立、跨拍 `clear` 保容量）。语义零变化：每订阅者每拍恰一次投递、投递仍在表锁外、`state_version` 门控与冻结（无人订阅不自增/增减订不回退）原样；钉住锚 `tests/memgov.rs::perf_anchor_alloc::notify_single_subscriber_zero_alloc_dual_caliber`（回退成每拍新建即红）。
+- 分配锚注释口径修正：`skeleton-infra/tests/memgov.rs` 的 Borrow 查找锚称含分配路径「10×+ 慢」，PerfProbe 实测仅 **1.5–1.9×**（差 ~50ns ≈ 一次 alloc + copy）——按实测值改写并注明口径与 `verify/perf-probe/`（`registry` 组，10k/44c/100 键三口径）。
+
+### Tests（分配锚与 bench 目标补齐，2026-10-28）
+- 新增双口径（live 净增 + total 累计）分配锚：`skeleton-infra` 的 dispatch 命中 / route-miss 稳态 / notify 单订阅者（`tests/memgov.rs::perf_anchor_alloc`），`std-ext` 的 `SyncLruCache`/`SyncTtlCache` get+insert、`retry_async` 首试、`RandomId` 单枚与 fill 批量（`tests/alloc_anchors.rs`，事件计数 + 仪器自检）；补 `std-ext` 的 bench 目标 `std_ext`（cache/retry/id）与 `infra` bench 两组（`dispatch_per_beat` 命中 vs Cancel、`notify_dispatch` 0/1 订阅者）。
 
 ## [0.1.0] — 2026-10-18
 
