@@ -182,7 +182,7 @@ impl EffectRuntime<BoardAct, BoardFx> for HostRuntime {
         let journal = self.journal.clone();
         let handle = self
             .scope
-            .spawn(async move {
+            .spawn_tracked(async move {
                 tokio::time::sleep(Duration::from_millis(5)).await; // 模拟外部 IO（真实宿主超时必填）
                                                                     // 回灌挂点（append-before-send）：账本写成功才回灌；
                                                                     // append Err ⇒ 禁 send（fail-closed，禁静默丢）

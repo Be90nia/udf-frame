@@ -1,4 +1,6 @@
-//! 托管 spawn 唯一合法口：JoinSet 生命周期集 + oneshot 结果旁路 + accepting 闸 + 取消令牌。
+//! 托管 spawn 唯一合法口：`spawn_tracked`（JoinSet 生命周期集 + oneshot 结果旁路，
+//! scope drop ⇒ 全组 abort）与 `spawn_detached`（显式脱管，drop 语义相反的另一半）
+//! 双命名 + accepting 闸 + 取消令牌；两套语义对照见 [`FxScope::spawn_tracked`] 文档。
 //!
 //! feature 门 `tokio`。绑 tokio（JoinSet/oneshot/watch/time::timeout/
 //! Semaphore）；CancellationToken 树/tokio-util 不引入（语义零增量+父 drop 陷阱）。
@@ -259,9 +261,53 @@ impl FxScope {
         self.in_flight.load(Ordering::Acquire)
     }
 
-    /// 唯一合法 spawn 口。闸关=Err(ScopeClosed)；并发闸不在 spawn 点排队（permit 在
-    /// future 内）。
-    pub fn spawn<T>(
+    /// 托管 spawn（tracked）：任务进 JoinSet 生命周期集——过闸任务必被停机三段
+    /// 覆盖，scope drop ⇒ 全组 abort。结果走 oneshot 旁路（生命周期集统一产出 ()，
+    /// 规避 JoinSet 单类型限制）；[`Spawned`] Drop 不 abort（忘 join 也不泄漏，
+    /// JoinSet Drop 兜底）。闸关=Err(ScopeClosed)；并发闸不在 spawn 点排队
+    /// （permit 在 future 内）。
+    ///
+    /// # 两套 drop 语义对照（选口先选语义）
+    ///
+    /// tokio 两套原生语义相反且类型上无区分：`JoinHandle` Drop = **detach**
+    /// （任务继续跑，"its return value is lost"）；`JoinSet` Drop = **立即 abort
+    /// 全部**。本 API 以命名分开，禁混用：
+    ///
+    /// | 口 | 任务归宿 | scope `shutdown()` / drop | 返回句柄 Drop |
+    /// |---|---|---|---|
+    /// | [`Self::spawn_tracked`] | JoinSet 生命周期集（计 in_flight） | 等净 / abort 全组 | 无影响（任务归集托管） |
+    /// | [`Self::spawn_detached`] | 完全脱离 scope（不计 in_flight） | 不等待、不中止 | detach，任务自生自灭 |
+    ///
+    /// # `'static + Send` 标准写法
+    ///
+    /// `'static` = future 不得借用任务外的拥有数据（不是「活 forever」）；`Send` =
+    /// 多线程 runtime 工作窃取所需。**持外部句柄须先 `Arc` 化 move 进 future**
+    /// （裸引用/`Rc` 编译错是 armor；`Arc` 的分配+原子计数是必要代价。可变共享面
+    /// 锁选型：短临界区无 await 持锁用 `std::sync::Mutex`，持锁跨 await 用
+    /// `tokio::sync::Mutex`）：
+    ///
+    /// ```ignore
+    /// let ledger: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    /// let task_ledger = Arc::clone(&ledger);
+    /// // &ledger 裸借用进 'static future 编译不过——Arc clone 后 move：
+    /// scope.spawn_tracked(async move {
+    ///     task_ledger.lock().expect("poisoned").insert(1, 41);
+    /// }).unwrap();
+    /// ```
+    ///
+    /// # cancel-safe 组合清单
+    ///
+    /// scope 暴露的取消面全部 cancel-safe：[`CancelToken::cancelled`]（watch
+    /// false→true 恰一次）、[`CancelToken::run_until_cancelled`]（biased select，
+    /// 取消臂优先）。任务体内自写 `select!` 时非 cancel-safe 分支（`write_all`、
+    /// `recv_many` 等）被轮转 drop 会丢半截操作——分支选择对照 tokio `select!`
+    /// 官方 cancel-safety 表，不安全组合属文档红线（本 API 不代管）。
+    ///
+    /// # LocalSet 边界
+    ///
+    /// 本口只收 `Send` future；`!Send` future 走 `tokio::task::spawn_local`
+    /// （须 LocalSet 同线程驱动），其句柄禁跨 runtime/LocalSet await（契约外行为）。
+    pub fn spawn_tracked<T>(
         &self,
         fut: impl Future<Output = T> + Send + 'static,
     ) -> Result<Spawned<T>, ScopeClosed>
@@ -288,6 +334,40 @@ impl FxScope {
             task_body(sem, fut, tx).await;
         });
         Ok(Spawned { handle: abort, rx })
+    }
+
+    /// 脱管 spawn（detached）：任务不进 JoinSet 生命周期集——shutdown/close 不等
+    /// 它、scope drop 不 abort 它；返回裸 tokio `JoinHandle`，其 Drop=detach（任务
+    /// 自生自灭）。不计 in_flight（等净断言/泄漏判据均不含它，`expect_idle` 对它
+    /// 沉默）；不吃并发闸（permit 语义属托管集）。accepting 闸仍生效——scope 已关
+    /// 拒发任何新工作（含脱管的）。
+    ///
+    /// 用途边界：仅限明确要求活得比 scope 久的背景任务（日志 flush/指标上报形），
+    /// 泄漏排查与停机契约都不覆盖它，须自行持 JoinHandle 等待或让任务自终止。
+    /// 「只是不想等」不是用它的理由——[`Self::spawn_tracked`] 的 [`Spawned`]
+    /// Drop 已不 abort，等净面还覆盖它。
+    pub fn spawn_detached<T>(
+        &self,
+        fut: impl Future<Output = T> + Send + 'static,
+    ) -> Result<tokio::task::JoinHandle<T>, ScopeClosed>
+    where
+        T: Send + 'static,
+    {
+        // 闸核验同 tracked 的原子 RMW 口径（close 并发下 spawn 的线性化点）；
+        // 不进锁——detached 不与 abort_all 串行（语义上就不被 shutdown 覆及）。
+        if self
+            .accepting
+            .compare_exchange(true, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(ScopeClosed);
+        }
+        // 本仓唯一 `tokio::spawn` 直调点：spawn_detached 本身就是「显式脱管口」的
+        // API 落点（armor 定案双命名），accepting 闸核验在同函数体内——脱管不经
+        // 生命周期集是它的语义而非漏管。clippy.toml disallowed 清单以本 allow 为
+        // 唯一豁免，新增直调点仍应被闸拦下。
+        #[allow(clippy::disallowed_methods)] // 唯一合法脱管口：本函数=闸本体
+        Ok(tokio::spawn(fut))
     }
 
     /// fx 域停机三段一次收拢：① close（accepting 闸关，拒新 spawn）→
@@ -401,7 +481,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_join_passes_value_ok() {
         let scope = FxScope::new();
-        let handle = scope.spawn(async { 41 + 1 }).unwrap();
+        let handle = scope.spawn_tracked(async { 41 + 1 }).unwrap();
         assert_eq!(handle.join().await, Ok(42));
         expect_idle(&scope);
     }
@@ -411,7 +491,7 @@ mod tests {
     async fn abort_yields_cancelled() {
         let scope = FxScope::new();
         let handle = scope
-            .spawn(async {
+            .spawn_tracked(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 1
             })
@@ -426,12 +506,14 @@ mod tests {
     #[tokio::test]
     async fn panic_maps_to_panicked_with_message() {
         let scope = FxScope::new();
-        let handle = scope.spawn(async { panic!("boom-42") }).unwrap();
+        let handle = scope.spawn_tracked(async { panic!("boom-42") }).unwrap();
         assert_eq!(
             handle.join().await,
             Err(TaskError::Panicked("boom-42".to_owned()))
         );
-        let handle = scope.spawn(async { std::panic::panic_any(7_i32) }).unwrap();
+        let handle = scope
+            .spawn_tracked(async { std::panic::panic_any(7_i32) })
+            .unwrap();
         assert_eq!(
             handle.join().await,
             Err(TaskError::Panicked("non-string panic payload".to_owned()))
@@ -444,7 +526,7 @@ mod tests {
     async fn join_timeout_aborts_and_reports_timed_out() {
         let scope = FxScope::new();
         let handle = scope
-            .spawn(async {
+            .spawn_tracked(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 1
             })
@@ -461,12 +543,12 @@ mod tests {
     #[tokio::test]
     async fn close_rejects_new_spawns_but_allows_in_flight() {
         let scope = FxScope::new();
-        let handle = scope.spawn(async { 5 }).unwrap();
+        let handle = scope.spawn_tracked(async { 5 }).unwrap();
         scope.close();
         assert!(scope.is_closed());
-        assert!(matches!(scope.spawn(async { 6 }), Err(ScopeClosed)));
+        assert!(matches!(scope.spawn_tracked(async { 6 }), Err(ScopeClosed)));
         assert_eq!(handle.join().await, Ok(5)); // 在途放行
-        assert!(matches!(scope.spawn(async { 7 }), Err(ScopeClosed))); // 幂等仍拒
+        assert!(matches!(scope.spawn_tracked(async { 7 }), Err(ScopeClosed))); // 幂等仍拒
     }
 
     /// ⑥shutdown 等净（in_flight==0）+ shutdown_timeout 超时路径 Err(TimedOut)。
@@ -479,7 +561,7 @@ mod tests {
     async fn shutdown_drains_and_shutdown_timeout_reports_timed_out() {
         let scope = FxScope::new();
         for i in 0..4u32 {
-            scope.spawn(async move { i }).unwrap();
+            scope.spawn_tracked(async move { i }).unwrap();
         }
         scope.shutdown().await;
         expect_idle(&scope);
@@ -493,7 +575,7 @@ mod tests {
         let holding_task = Arc::clone(&holding);
         let stop_task = Arc::clone(&stop);
         let spinner = scope
-            .spawn(async move {
+            .spawn_tracked(async move {
                 while !stop_task.load(Ordering::Relaxed) {
                     if hold_task.load(Ordering::Relaxed) {
                         holding_task.store(true, Ordering::Relaxed); // 已进 poll 无 await 点，abort 只能等让渡
@@ -547,7 +629,7 @@ mod tests {
             let peak = Arc::clone(&peak);
             handles.push(
                 scope
-                    .spawn(async move {
+                    .spawn_tracked(async move {
                         let now = live.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(now, Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_secs(10)).await;
@@ -566,11 +648,11 @@ mod tests {
         // permit 随 abort 回收：满载 1 槽，堵死在 Notify；排队的任务在 abort 后放行。
         let scope = FxScope::new().with_concurrency(1);
         let blocker = scope
-            .spawn(async {
+            .spawn_tracked(async {
                 tokio::sync::Notify::default().notified().await;
             })
             .unwrap();
-        let queued = scope.spawn(async { 99u8 }).unwrap();
+        let queued = scope.spawn_tracked(async { 99u8 }).unwrap();
         assert!(!queued.is_finished()); // 卡在 acquire，未执行
         blocker.abort();
         assert_eq!(queued.join().await, Ok(99));
@@ -584,7 +666,7 @@ mod tests {
         let scope = FxScope::new();
         let ran_task = Arc::clone(&ran);
         let handle = scope
-            .spawn(async move {
+            .spawn_tracked(async move {
                 ran_task.fetch_add(1, Ordering::SeqCst);
             })
             .unwrap();
@@ -623,10 +705,10 @@ mod tests {
             let runner = Arc::clone(&scope);
             outers.push(
                 caller
-                    .spawn(async move {
+                    .spawn_tracked(async move {
                         let mut acc = 0u32;
                         for _ in 0..16 {
-                            let inner = runner.spawn(async { 3u32 }).unwrap();
+                            let inner = runner.spawn_tracked(async { 3u32 }).unwrap();
                             acc += inner.join().await.unwrap_or(0);
                         }
                         acc
@@ -656,7 +738,7 @@ mod tests {
         let hold_task = Arc::clone(&hold);
         let holding_task = Arc::clone(&holding);
         let handle = scope
-            .spawn(async move {
+            .spawn_tracked(async move {
                 loop {
                     if hold_task.load(Ordering::Relaxed) {
                         holding_task.store(true, Ordering::Relaxed); // 已进 poll 无 await 点，abort 只能等让渡
@@ -688,5 +770,104 @@ mod tests {
         // 观测窗，见 ⑥）——有界让渡等真实归零。
         wait_idle(&scope).await;
         expect_idle(&scope); // abort 即刻回收（FlightGuard Drop）——零 sleep、事件化
+    }
+
+    /// ⑪两套 drop 语义·tracked 侧：scope drop ⇒ 生命周期集（JoinSet）drop ⇒ 全组
+    /// abort——abort 使 future 被 drop，Drop 哨兵置位（armor 表
+    /// tracked_drop_aborts_all）。
+    #[tokio::test]
+    async fn tracked_drop_aborts_all() {
+        struct AbortLatch(Arc<AtomicBool>);
+        impl Drop for AbortLatch {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let aborted = Arc::new(AtomicBool::new(false));
+        let scope = FxScope::new();
+        {
+            let latch = AbortLatch(Arc::clone(&aborted));
+            scope
+                .spawn_tracked(async move {
+                    let _latch = latch; // future 被 drop（abort）即置位
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                })
+                .unwrap();
+        }
+        drop(scope); // JoinSet drop = abort 全部
+
+        // abort 异步生效：有界实钟轮询等哨兵（同 wait_idle 惯例，禁纯让渡——CI 抢占实证）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !aborted.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tracked task not aborted after scope drop"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// ⑫两套 drop 语义·detached 侧：shutdown 只等生命周期集——detached 任务不被
+    /// 等待也不被中止，shutdown 返回后仍活到完成（armor 表
+    /// detached_outlives_scope_documented）。
+    #[tokio::test]
+    async fn detached_outlives_scope_documented() {
+        let started = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let scope = FxScope::new();
+        let (started_task, done_task) = (Arc::clone(&started), Arc::clone(&done));
+        let release_task = Arc::clone(&release);
+        let handle = scope
+            .spawn_detached(async move {
+                started_task.store(true, Ordering::Release);
+                release_task.notified().await; // 等 release 信号（可控完成时刻）
+                done_task.store(true, Ordering::Release);
+            })
+            .unwrap();
+        // 握手：任务已启动并挂进 notified（此后 shutdown 返回时必然未终局）。
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        // tracked 面空集 ⇒ shutdown 等净即时返回；detached 不被等待、不被中止。
+        scope.shutdown().await;
+        assert!(
+            !handle.is_finished(),
+            "shutdown must not wait/abort detached tasks"
+        );
+        // detach 后任务照跑：放行并等其完成（返回面=裸 JoinHandle，可直接 await）。
+        release.notify_one();
+        handle.await.expect("detached task runs to completion");
+        assert!(done.load(Ordering::Acquire));
+    }
+
+    /// ⑬文档范式①标准写法的运行版（issue#1-5 验收场景）：外部 sync 句柄
+    /// Arc 化 move 进 future——多任务并发写共享账本，join 后断言汇总。
+    #[tokio::test]
+    async fn arc_handle_borrowed_across_tasks() {
+        use std::collections::HashMap;
+        let ledger: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        let scope = FxScope::new();
+        let mut handles = Vec::new();
+        for k in 0..8u32 {
+            let task_ledger = Arc::clone(&ledger); // 持外部句柄须先 Arc 化 move 进 future
+            handles.push(
+                scope
+                    .spawn_tracked(async move {
+                        // std Mutex 短临界区（无 await 持锁）：sync 句柄直接借用
+                        task_ledger.lock().expect("poisoned").insert(k, k * k);
+                    })
+                    .unwrap(),
+            );
+        }
+        for handle in handles {
+            handle.join().await.expect("task ok");
+        }
+        expect_idle(&scope);
+        let map = ledger.lock().expect("poisoned");
+        assert_eq!(map.len(), 8);
+        for k in 0..8u32 {
+            assert_eq!(map[&k], k * k);
+        }
     }
 }

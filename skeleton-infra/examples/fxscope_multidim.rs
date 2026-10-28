@@ -111,11 +111,11 @@ fn dim1_allocs() {
         let delta = rt.block_on(async {
             let scope = FxScope::new();
             for _ in 0..100 {
-                scope.spawn(async {}).unwrap();
+                scope.spawn_tracked(async {}).unwrap();
             }
             let before = CountingAllocator::live_allocs();
             for _ in 0..n {
-                scope.spawn(async {}).unwrap();
+                scope.spawn_tracked(async {}).unwrap();
             }
             CountingAllocator::live_allocs() - before
         });
@@ -137,7 +137,7 @@ fn dim1_allocs() {
             for _ in 0..100 {
                 let dc = Arc::clone(&done);
                 scope
-                    .spawn(async move {
+                    .spawn_tracked(async move {
                         dc.fetch_add(1, Ordering::Relaxed);
                     })
                     .unwrap();
@@ -146,7 +146,7 @@ fn dim1_allocs() {
             for _ in 0..n {
                 let dc = Arc::clone(&done);
                 scope
-                    .spawn(async move {
+                    .spawn_tracked(async move {
                         dc.fetch_add(1, Ordering::Relaxed);
                     })
                     .unwrap();
@@ -172,11 +172,11 @@ fn dim1_allocs() {
         let delta = rt.block_on(async {
             let scope = FxScope::new().with_concurrency(8);
             for _ in 0..100 {
-                scope.spawn(async {}).unwrap();
+                scope.spawn_tracked(async {}).unwrap();
             }
             let before = CountingAllocator::live_allocs();
             for _ in 0..n {
-                scope.spawn(async {}).unwrap();
+                scope.spawn_tracked(async {}).unwrap();
             }
             CountingAllocator::live_allocs() - before
         });
@@ -199,7 +199,7 @@ fn dim1_allocs() {
             let notify = Arc::new(tokio::sync::Notify::new());
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             let holder = scope
-                .spawn({
+                .spawn_tracked({
                     let notify = Arc::clone(&notify);
                     async move {
                         tx.send(()).unwrap(); // 已被 poll ⇒ permit 已在其手
@@ -212,7 +212,7 @@ fn dim1_allocs() {
             for _ in 0..n {
                 let d = Arc::clone(&done);
                 scope
-                    .spawn(async move {
+                    .spawn_tracked(async move {
                         d.fetch_add(1, Ordering::Relaxed);
                     })
                     .unwrap();
@@ -253,7 +253,7 @@ fn dim1_allocs() {
                 let warm = Arc::new(FxScope::new());
                 for _ in 0..100 {
                     let d = Arc::clone(&done);
-                    warm.spawn(async move {
+                    warm.spawn_tracked(async move {
                         d.fetch_add(1, Ordering::Relaxed);
                     })
                     .unwrap();
@@ -270,7 +270,7 @@ fn dim1_allocs() {
             for _ in 0..n {
                 let d = Arc::clone(&done);
                 scope
-                    .spawn(async move {
+                    .spawn_tracked(async move {
                         d.fetch_add(1, Ordering::Relaxed);
                     })
                     .unwrap();
@@ -299,7 +299,7 @@ fn dim2_latency_distribution() {
         for _ in 0..200 {
             let d = Arc::clone(&done);
             scope
-                .spawn(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
+                .spawn_tracked(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
                 .unwrap();
         }
         let mut expected = done.load(Ordering::Acquire);
@@ -312,7 +312,7 @@ fn dim2_latency_distribution() {
             let d = Arc::clone(&done);
             let t0 = Instant::now();
             scope
-                .spawn(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
+                .spawn_tracked(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
                 .unwrap();
             expected += 1;
             while done.load(Ordering::Acquire) < expected {
@@ -346,7 +346,7 @@ fn dim2b_uncontended_roundtrip() {
         for _ in 0..200 {
             let d = Arc::clone(&done);
             scope
-                .spawn(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
+                .spawn_tracked(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
                 .unwrap();
         }
         let mut expected = done.load(Ordering::Acquire);
@@ -359,7 +359,7 @@ fn dim2b_uncontended_roundtrip() {
             let d = Arc::clone(&done);
             let t0 = Instant::now();
             scope
-                .spawn(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
+                .spawn_tracked(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
                 .unwrap();
             expected += 1;
             while done.load(Ordering::Acquire) < expected {
@@ -393,7 +393,7 @@ fn dim3_spawn_curve(handle: &tokio::runtime::Handle) {
             for _ in 0..2000 {
                 let d = Arc::clone(&done);
                 scope
-                    .spawn(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
+                    .spawn_tracked(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
                     .unwrap();
             }
             let mut spins = 0u64;
@@ -428,7 +428,7 @@ fn dim3_spawn_curve(handle: &tokio::runtime::Handle) {
                                 for _ in 0..per {
                                     let d = Arc::clone(&done);
                                     scope
-                                        .spawn(async move {
+                                        .spawn_tracked(async move {
                                             black_box(d.fetch_add(1, Ordering::Relaxed))
                                         })
                                         .unwrap();
@@ -651,7 +651,7 @@ fn dim5_shutdown() {
             let scope = FxScope::new();
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             let h = scope
-                .spawn({
+                .spawn_tracked({
                     let notify = Arc::clone(&notify);
                     async move {
                         tx.send(()).unwrap();
@@ -685,7 +685,7 @@ fn dim5_shutdown() {
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             let done = Arc::new(AtomicU64::new(0));
             let h = scope
-                .spawn({
+                .spawn_tracked({
                     let done = Arc::clone(&done);
                     async move {
                         tx.send(()).unwrap();
@@ -735,7 +735,7 @@ fn dim5_shutdown() {
             for _ in 0..n {
                 let d = Arc::clone(&done);
                 scope
-                    .spawn(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
+                    .spawn_tracked(async move { black_box(d.fetch_add(1, Ordering::Relaxed)) })
                     .unwrap();
             }
             wait_until(Duration::from_secs(10), || done.load(Ordering::Acquire) >= n);
@@ -758,7 +758,7 @@ fn dim5_shutdown() {
             for _ in 0..n {
                 let (notify, parked) = (Arc::clone(&notify), Arc::clone(&parked));
                 scope
-                    .spawn(async move {
+                    .spawn_tracked(async move {
                         parked.fetch_add(1, Ordering::Relaxed);
                         notify.notified().await;
                     })
@@ -784,7 +784,7 @@ fn dim5_shutdown() {
                 let scope = Arc::new(FxScope::new());
                 let (tx, rx) = std::sync::mpsc::channel::<()>();
                 scope
-                    .spawn(async move {
+                    .spawn_tracked(async move {
                         tx.send(()).unwrap(); // 已被 poll ⇒ 正在自旋
                         let end = Instant::now() + Duration::from_millis(30);
                         while Instant::now() < end {

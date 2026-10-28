@@ -136,7 +136,7 @@ fn fxscope_spawn_join(c: &mut Criterion) {
         // 基线含每迭代一次 block_on 进出开销（current_thread 亚 µs 级）
         b.iter(|| {
             rt.block_on(async {
-                let handle = scope.spawn(async { 1u8 }).expect("scope open");
+                let handle = scope.spawn_tracked(async { 1u8 }).expect("scope open");
                 handle.join().await.expect("task ok")
             })
         })

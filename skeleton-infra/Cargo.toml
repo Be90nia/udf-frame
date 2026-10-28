@@ -109,8 +109,8 @@ await_holding_lock = "deny"
 await_holding_refcell_ref = "deny"
 large_types_passed_by_value = "warn"
 # disallowed_methods 属 restriction 组（默认 allow），不显式启用则 clippy.toml
-# 的 tokio::spawn 禁令恒惰性——「效果只经 FxScope 唯一口」这一约束落地的必要
-# 一行；本 crate 现零裸 spawn 调用点，闸启用即净。
+# 的 tokio::spawn 禁令恒惰性——「效果只经 FxScope 命名口（tracked/detached）」
+# 这一约束落地的必要一行；本 crate 直调点仅 spawn_detached 内的闸内 allow 豁免。
 disallowed_methods = "warn"
 
 # 端到端小例：五件套+combine+TestStore+fx/journal 解释器标准形

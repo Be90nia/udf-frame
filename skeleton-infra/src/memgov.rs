@@ -4,6 +4,7 @@
 //! `#[cfg(feature = "memgov")] pub mod memgov;` 接线。
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -47,6 +48,11 @@ impl std::error::Error for BoundError {}
 
 /// 有界注册表：上限+策略必填（无默认无界构造——构造签名层类型强制，不经约定自觉）。
 /// 迭代恒升序确定序；缓存形态别名 BoundedCache=本类型（文档级别名，不另造类型）。
+///
+/// Clone=深拷贝（值容器语义，非共享句柄）：map/上限/策略逐字段完整拷贝，克隆体与
+/// 原件的容量语义、确定序互不影响。运行期只读共享由调用方外包 `Arc<BoundedRegistry>`
+/// ——本件不内嵌 Arc（与 `get_mut`/`insert` 的 `&mut self` 结构性冲突）。
+#[derive(Clone)]
 pub struct BoundedRegistry<K: Ord, V> {
     map: BTreeMap<K, V>,
     max: usize,
@@ -87,9 +93,34 @@ impl<K: Ord, V> BoundedRegistry<K, V> {
         Ok(())
     }
 
-    /// 读侧（键不存在=`None`，不 panic）。
-    pub fn get(&self, k: &K) -> Option<&V> {
+    /// 读侧（键不存在=`None`，不 panic）。`Q` 为键的借用形（`K: Borrow<Q>`，
+    /// 如 `String` 键用 `&str` 查找）——热路径零分配；借用形与 owned 形走同一个
+    /// `Ord` 实现，查找结果恒一致（单一序同源，禁第二套比较）。
+    pub fn get<Q>(&self, k: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         self.map.get(k)
+    }
+
+    /// 可变读侧（只回值面）。键存于 BTreeMap 节点内部，对调用方类型级不可达——
+    /// 值面怎么改都伤不了表序（键序被改写=std 定义的结构性逻辑错误，此处杜绝）。
+    ///
+    /// ```compile_fail
+    /// # use skeleton_infra::memgov::{BoundedRegistry, Eviction};
+    /// fn tamper_key<K: Ord, V>(reg: &mut BoundedRegistry<K, V>, k: &K) {
+    ///     if let Some(v) = reg.get_mut(k) {
+    ///         let _key_face: &mut K = v; // get_mut 只回 &mut V：键面不可达
+    ///     }
+    /// }
+    /// ```
+    pub fn get_mut<Q>(&mut self, k: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.map.get_mut(k)
     }
 
     /// 摘除并返回值（登记面收缩的唯一口）。
@@ -773,5 +804,100 @@ mod tests {
     #[should_panic(expected = "max == 0 is a bug")]
     fn bounded_zero_capacity_panics_fail_fast() {
         let _ = BoundedRegistry::<u32, u32>::new(0, Eviction::Reject);
+    }
+
+    /// cqb① Borrow 泛型查找：借用形（`&str`）与 owned 形（`String`）同结果，
+    /// 命中/未命中两态 parity（armor：借用/owned 同源单一 `Ord`——Windows
+    /// EnvKey 式 Eq/Ord 分裂在此结构性不可表达）。
+    #[test]
+    fn borrow_lookup_matches_owned_lookup() {
+        let mut reg: BoundedRegistry<String, u8> = BoundedRegistry::new(4, Eviction::Reject);
+        reg.insert("alpha".to_owned(), 1).expect("within capacity");
+        reg.insert("beta".to_owned(), 2).expect("within capacity");
+        assert_eq!(reg.get("alpha"), Some(&1));
+        assert_eq!(reg.get("zeta"), None);
+        assert_eq!(reg.get(&"alpha".to_owned()), Some(&1));
+        assert_eq!(reg.get(&"zeta".to_owned()), None);
+    }
+
+    /// cqb② get_mut 值面改动不伤表序（armor：键面类型级不可达，编译面钉在
+    /// get_mut 文档 compile_fail doctest；本测为运行时面——V 内键镜像字段
+    /// 随便改写，迭代序与查找只由 K 决定）。
+    #[test]
+    fn mutation_cannot_affect_ordering() {
+        let mut reg: BoundedRegistry<u32, (u32, &'static str)> =
+            BoundedRegistry::new(4, Eviction::Reject);
+        reg.insert(2, (2, "two")).expect("within capacity");
+        reg.insert(1, (1, "one")).expect("within capacity");
+        reg.insert(3, (3, "three")).expect("within capacity");
+        if let Some(v) = reg.get_mut(&2) {
+            v.0 = 999; // V.0 是键的镜像副本，改它动不了表序
+        }
+        let keys: Vec<_> = reg.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![1, 2, 3]);
+        assert_eq!(reg.get(&2), Some(&(999, "two")));
+    }
+
+    /// cqb③ get_mut 借用形可变读侧：值就地更新、owned 读可见；未命中=`None`。
+    #[test]
+    fn borrow_mut_lookup_updates_value_in_place() {
+        let mut reg: BoundedRegistry<String, u32> = BoundedRegistry::new(4, Eviction::Reject);
+        reg.insert("counter".to_owned(), 1)
+            .expect("within capacity");
+        if let Some(v) = reg.get_mut("counter") {
+            *v += 1;
+        }
+        assert_eq!(reg.get("counter"), Some(&2));
+        assert_eq!(reg.get_mut("missing"), None);
+    }
+
+    /// cqb④ Clone=深拷贝（PM 改判：Registry 是值容器非生成器句柄）：克隆体与
+    /// 原件后续变更互不可见。
+    #[test]
+    fn clone_is_deep_copy_independent() {
+        let mut reg = BoundedRegistry::new(4, Eviction::Reject);
+        reg.insert(1, "a").expect("within capacity");
+        reg.insert(2, "b").expect("within capacity");
+        let mut copy = reg.clone();
+        reg.insert(3, "c").expect("within capacity");
+        assert_eq!(copy.get(&3), None);
+        assert_eq!(copy.len(), 2);
+        copy.remove(&1);
+        assert_eq!(reg.get(&1), Some(&"a"));
+        assert_eq!(reg.len(), 3, "克隆体的 remove 不回流原件（原件已含 3 键）");
+    }
+
+    /// cqb⑤ Clone 后容量语义逐句柄保持（armor：map/上限/策略同住一个值同拷，
+    /// 无「上限存句柄字段」的漂移面）：克隆体满容仍 fail-closed、淘汰独立演进、
+    /// 迭代确定序同原件。
+    #[test]
+    fn clone_preserves_capacity_limit() {
+        let mut rej = BoundedRegistry::new(2, Eviction::Reject);
+        rej.insert(1, "a").expect("within capacity");
+        rej.insert(2, "b").expect("within capacity");
+        let mut rej_copy = rej.clone();
+        assert_eq!(rej_copy.capacity(), 2);
+        assert!(
+            rej_copy.insert(3, "c").is_err(),
+            "clone keeps Reject fail-closed at capacity"
+        );
+        assert_eq!(rej_copy.len(), 2);
+
+        let mut evict = BoundedRegistry::new(2, Eviction::EvictOldest);
+        evict.insert(1, "a").expect("within capacity");
+        evict.insert(2, "b").expect("within capacity");
+        let mut evict_copy = evict.clone();
+        evict_copy
+            .insert(3, "c")
+            .expect("eviction still works on clone");
+        assert_eq!(evict_copy.get(&1), None);
+        assert_eq!(
+            evict.get(&1),
+            Some(&"a"),
+            "clone eviction does not touch source"
+        );
+
+        let keys: Vec<_> = rej_copy.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![1, 2], "clone keeps ascending iteration order");
     }
 }

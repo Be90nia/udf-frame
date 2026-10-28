@@ -7,7 +7,13 @@
 //! ⑤ 丢弃计数可读（失败 sink 自计数 + registry 总和跨通道求和）；
 //! ⑥ 掩码唯一布点（set_secrets 后各通道写前统一过 mask_secrets）；
 //! ⑦ PerChannelPathResolver + ChannelFileSink：每通道独立子目录真落盘，
-//!    行格式与 LineFormat 同形，内容互不污染。
+//!    行格式与 LineFormat 同形，内容互不污染；
+//! ⑧ 每通道独立 level 同进程互不干扰（general=warn 拒 info、access=info
+//!    收 info 对表）——armor `channel_a_off_channel_b_still_on`；
+//! ⑨ set_level 动态改级立即生效（槽位 AtomicU8 写路径，天然免疫 tracing
+//!    callsite interest 缓存失效；收/放两向）——armor
+//!    `dynamic_level_change_takes_effect`；
+//! ⑩ 逐通道丢弃读数（dropped(channel)：注册=自计数，未注册=None）。
 //!
 //! 本文件零全局单例依赖（ChannelRegistry 为普通值），测试可并行。
 
@@ -306,6 +312,84 @@ fn per_channel_file_sinks_land_in_their_own_subdirectories() {
     let general_content = read_single_log_file(&resolver.channel_root(Channel::General));
     assert!(!general_content.contains("hello-access"));
     assert!(!general_content.contains("hello-dns"));
+}
+
+// ⑧ 两通道不同 level 同进程互不干扰：general=Warn 拒 Info、access=Info 收
+//    Info——armor `channel_a_off_channel_b_still_on`（通道 A 收紧不拦通道 B；
+//    过滤在 registry 槽位面，非 sink 层全局拦截）。
+#[test]
+fn channel_a_off_channel_b_still_on() {
+    let registry = ChannelRegistry::new();
+    let general = Arc::new(CaptureSink::new(Channel::General, log::LevelFilter::Warn));
+    let access = Arc::new(CaptureSink::new(Channel::Access, log::LevelFilter::Info));
+    registry.register(general.clone()).expect("general 首注");
+    registry.register(access.clone()).expect("access 首注");
+
+    registry.emit(Channel::General, log::Level::Info, "app::t", "below-warn");
+    registry.emit(Channel::Access, log::Level::Info, "app::t", "at-info");
+
+    assert!(general.lines().is_empty(), "general=Warn 必须拒 Info");
+    assert_eq!(
+        access.lines(),
+        vec!["INFO app::t at-info"],
+        "access=Info 不受 general 收紧影响"
+    );
+    assert_eq!(registry.dropped_total(), 0, "级别过滤不计丢弃");
+}
+
+// ⑨ 动态改级立即生效（armor `dynamic_level_change_takes_effect`）：槽位
+//    AtomicU8 写路径比较，不经 tracing 订阅者层——无 callsite interest
+//    缓存可失效，改级后第一条 emit 即按新级别判定（收/放两向；sink 自带
+//    level 字段不再参与运行期判定，registry 槽位值是唯一权威）。
+#[test]
+fn dynamic_level_change_takes_effect() {
+    let registry = ChannelRegistry::new();
+    let access = Arc::new(CaptureSink::new(Channel::Access, log::LevelFilter::Info));
+    registry.register(access.clone()).expect("access 首注");
+
+    registry.emit(Channel::Access, log::Level::Info, "app::t", "initial");
+    assert_eq!(access.lines(), vec!["INFO app::t initial"]);
+
+    registry.set_level(Channel::Access, log::LevelFilter::Warn);
+    registry.emit(Channel::Access, log::Level::Info, "app::t", "tightened");
+    assert_eq!(
+        access.lines(),
+        vec!["INFO app::t initial"],
+        "收紧后 Info 立即被滤（原行不动）"
+    );
+
+    registry.set_level(Channel::Access, log::LevelFilter::Debug);
+    registry.emit(Channel::Access, log::Level::Debug, "app::t", "loosened");
+    assert_eq!(
+        access.lines(),
+        vec!["INFO app::t initial", "DEBUG app::t loosened"],
+        "放宽后 Debug 立即放行"
+    );
+    assert_eq!(registry.dropped_total(), 0, "级别过滤不计丢弃");
+}
+
+// ⑩ 逐通道丢弃读数：dropped(channel) 各槽位独立可读；未注册通道=None
+//    （无 sink 即无记账方，不伪造 0）；dropped_total 求和语义不变。
+#[test]
+fn per_channel_drop_counts_are_readable_per_slot() {
+    let registry = ChannelRegistry::new();
+    let bad = Arc::new(CaptureSink::failing(Channel::Access));
+    let good = Arc::new(CaptureSink::new(Channel::General, log::LevelFilter::Trace));
+    registry.register(bad.clone()).expect("access 首注");
+    registry.register(good.clone()).expect("general 首注");
+
+    registry.emit(Channel::Access, log::Level::Error, "app::t", "lost-1");
+    registry.emit(Channel::Access, log::Level::Error, "app::t", "lost-2");
+    registry.emit(Channel::General, log::Level::Error, "app::t", "kept");
+
+    assert_eq!(
+        registry.dropped(Channel::Access),
+        Some(2),
+        "access 写失败自计数"
+    );
+    assert_eq!(registry.dropped(Channel::General), Some(0), "general 未丢");
+    assert_eq!(registry.dropped(Channel::Dns), None, "未注册=无记账方");
+    assert_eq!(registry.dropped_total(), 2, "总和=逐通道之和，语义不变");
 }
 
 /// 目录内恰一个按日滚动日志文件，读出内容（day_file_name 为私有面，集成侧

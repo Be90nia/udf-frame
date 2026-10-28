@@ -136,7 +136,7 @@ where
     A: Send + 'static,
     Op: Send + 'static,
 {
-    /// 每次效果转发出队一脚本，经 scope.spawn 执行（对齐点：回灌调用=
+    /// 每次效果转发出队一脚本，经 scope.spawn_tracked 执行（对齐点：回灌调用=
     /// `ActionSender::dispatch` 公开方法；Panic/Never 在任务内展开）。
     fn run(&mut self, _effect: Effect<A, Op>, back: &ActionSender<A>) {
         let Some(script) = self.scripts.pop_front() else {
@@ -146,7 +146,7 @@ where
         let back = back.clone();
         let spawned = self
             .scope
-            .spawn(async move {
+            .spawn_tracked(async move {
                 match script {
                     Script::Emit(a) => {
                         // 回灌即环闭合；false=store 已关（契约显式拒绝语义，采用方断言面）。

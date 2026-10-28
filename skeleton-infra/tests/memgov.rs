@@ -202,6 +202,41 @@ fn realloc_grow_and_shrink_track_live_bytes() {
     assert_eq!(CountingAllocator::live_bytes(), base.1, "全释放回基线");
 }
 
+/// cqb⑥ Borrow 泛型查找热路径零分配（armor 性能锚：借用查找禁退化成
+/// `to_string` 分配查找——含分配路径实测 10×+ 慢）：借用形 get/get_mut
+/// 查找窗 live/total 双平。live 净额对「即用即还」恒 0，total 面抓临时
+/// 分配 churn——两面对账才是真零分配（口径同 total_allocs 文档）。
+#[test]
+fn borrow_lookup_allocates_nothing() {
+    let _serial = serial();
+    let mut reg: BoundedRegistry<String, u32> = BoundedRegistry::new(4, Eviction::Reject);
+    reg.insert("alpha".to_owned(), 1).expect("within capacity");
+    settle();
+    let base = (
+        CountingAllocator::live_allocs(),
+        CountingAllocator::live_bytes(),
+        CountingAllocator::total_allocs(),
+    );
+
+    for _ in 0..16 {
+        assert_eq!(reg.get("alpha"), Some(&1));
+        assert_eq!(reg.get("zeta"), None);
+        assert!(reg.get_mut("alpha").is_some());
+    }
+
+    assert_eq!(
+        CountingAllocator::live_allocs(),
+        base.0,
+        "借用形查找必须零新增分配"
+    );
+    assert_eq!(CountingAllocator::live_bytes(), base.1);
+    assert_eq!(
+        CountingAllocator::total_allocs(),
+        base.2,
+        "total 面抓即用即还型临时分配（to_string 退化即红）"
+    );
+}
+
 /// skeleton store 分配契约的黑盒孪生（skeleton lib 白盒测的边界测量面）。
 /// skeleton 依赖走 testing feature 门；--all-features 下激活。
 #[cfg(feature = "testing")]

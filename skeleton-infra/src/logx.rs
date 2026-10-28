@@ -50,12 +50,22 @@
 //!
 //! 多通道扇出面（P1-10-a 前置件，拍板 2026-10-23；`log` feature）：固定三
 //! 通道 [`Channel`]（general/access/dns，封闭枚举=非法通道名在类型层不可
-//! 能）→ 每通道独立 sink（一通道一 sink 禁串扰）+ 独立 level（低于通道级
-//! 在 registry 即滤，不计丢弃）+ 重复注册 fail-visible（原 sink 不动）+
-//! [`ChannelRegistry`] 零分配扇出（未注册通道静默：不输出/不 panic/不分配/
-//! 不计数）+ 掩码唯一布点（`set_secrets`，写前统一过 [`mask_secrets`]）+
-//! 每通道独立落点（[`PerChannelPathResolver`] 通道子目录 +
-//! [`ChannelFileSink`] 组合件）。
+//! 能）→ 每通道独立 sink（一通道一 sink 禁串扰）+ 独立 level（槽位
+//! AtomicU8 写路径比较：低于通道级在 registry 即滤，不计丢弃；
+//! [`ChannelRegistry::set_level`] 运行期原子改写）+ 重复注册 fail-visible
+//!（原 sink 不动）+ [`ChannelRegistry`] 零分配扇出（未注册通道静默：不输出/
+//! 不 panic/不分配/不计数）+ 掩码唯一布点（`set_secrets`，写前统一过
+//! [`mask_secrets`]）+ 每通道独立落点（[`PerChannelPathResolver`] 通道子目录
+//! + [`ChannelFileSink`] 组合件）。
+//!
+//! 通道动态级 armor 红线（域 ⑥ 调研，`docs/research/consumer-feedback-
+//! pitfalls.md`；tracing#2874/#2400 实锤）：禁 with_default 长驻、禁运行期
+//! 全局换装 subscriber——callsite interest 缓存的失效竞态是结构性风险。
+//! 本件通道级过滤在 registry 写路径（槽位 AtomicU8 比较），不在
+//! subscriber/callsite 层：动态改级天然免疫缓存失效，下一 emit 即按新级别
+//! 判定（无需重评 callsite）。两态显式：每条 emit 判定=投递或静默，静默
+//! 不计丢弃；投递写失败由 sink 自计数（[`ChannelRegistry::dropped`]/
+//! [`ChannelRegistry::dropped_total`] 可对账）。
 
 use skeleton::logpath::LogPathResolver;
 
@@ -548,14 +558,17 @@ impl std::error::Error for ChannelError {}
 ///
 /// 失败记账契约：[`ChannelSink::write`] 失败=丢一行，**由 sink 自计数**
 /// （[`ChannelSink::dropped_lines`]）——registry 无从知晓单次写成败（write
-/// 返回 `()`），记账下沉到唯一知道成败的一方。低于 [`ChannelSink::level`]
-/// 的过滤发生在 registry（事件根本不到 sink），**不**计丢弃。实现禁 panic
+/// 返回 `()`），记账下沉到唯一知道成败的一方。低于槽位级别的过滤发生在
+/// registry（事件根本不到 sink；级别注册时取 [`Self::level`] 初值、运行期
+/// [`ChannelRegistry::set_level`] 可改），**不**计丢弃。实现禁 panic
 ///（日志失败拖垮业务是反模式，同 [`FileSink`] 软失败面纪律）。
 #[cfg(feature = "log")]
 pub trait ChannelSink: Send + Sync + 'static {
     /// 本 sink 承载的通道（注册时由此定槽位）。
     fn channel(&self) -> Channel;
-    /// 本通道独立级别下限（低于此级别的消息在 registry 即被过滤，不计丢弃）。
+    /// 本通道独立级别下限的**注册初值**：register 时写入槽位 AtomicU8，此后
+    /// 运行期判定只看槽位值（[`ChannelRegistry::set_level`] 可改写），本方法
+    /// 不参与 emit 过滤路径（低于槽位级别的消息在 registry 即被滤，不计丢弃）。
     fn level(&self) -> log::LevelFilter;
     /// 写一条；失败=丢一行（sink 自计数 [`Self::dropped_lines`]，禁 panic）。
     fn write(&self, level: log::Level, target: &str, message: &str);
@@ -563,10 +576,40 @@ pub trait ChannelSink: Send + Sync + 'static {
     fn dropped_lines(&self) -> u64;
 }
 
+/// `log::LevelFilter` → 槽位原子存储的严重度秩（Off=0…Trace=5）。穷尽
+/// match 而非判别式强转：不依赖 `repr` 布局，上游加枚举臂=编译错。
+#[cfg(feature = "log")]
+fn level_filter_rank(level: log::LevelFilter) -> u8 {
+    match level {
+        log::LevelFilter::Off => 0,
+        log::LevelFilter::Error => 1,
+        log::LevelFilter::Warn => 2,
+        log::LevelFilter::Info => 3,
+        log::LevelFilter::Debug => 4,
+        log::LevelFilter::Trace => 5,
+    }
+}
+
+/// `log::Level` → 事件严重度秩（Error=1…Trace=5，与 [`level_filter_rank`]
+/// 同序同刻度：emit 比较「事件秩 > 槽位秩」即滤，与原
+/// `level > sink.level()` 交叉比较语义逐值一致）。
+#[cfg(feature = "log")]
+fn level_rank(level: log::Level) -> u8 {
+    match level {
+        log::Level::Error => 1,
+        log::Level::Warn => 2,
+        log::Level::Info => 3,
+        log::Level::Debug => 4,
+        log::Level::Trace => 5,
+    }
+}
+
 /// 多通道注册表：通道 → sink 一对一（固定三槽位，登记一次后零分配扇出）。
 ///
 /// 并发面：每槽位独立 `RwLock`——register 只锁一个槽（互不阻塞），emit 读锁 +
-/// `Arc` 克隆后锁外写 sink（锁内无 IO）。毒锁复用 [`FileSink`] 纪律
+/// `Arc` 克隆后锁外写 sink（锁内无 IO）。级别面无锁：每槽位独立 `AtomicU8`，
+/// `set_level` 原子写、emit 原子读比较，不参与槽位 `RwLock`。毒锁复用
+/// [`FileSink`] 纪律
 ///（`into_inner` 继续：日志面禁毒锁放大业务故障）。无注销面——注册表面向
 /// 进程生命期的装配期使用（同全局 logger 单次初始化纪律）。
 ///
@@ -597,6 +640,11 @@ pub trait ChannelSink: Send + Sync + 'static {
 pub struct ChannelRegistry {
     /// 槽位按 `Channel` 判别式索引（General=0/Access=1/Dns=2）。
     slots: [std::sync::RwLock<Option<std::sync::Arc<dyn ChannelSink>>>; 3],
+    /// 槽位级别下限：u8 严重度秩（Off=0…Trace=5）。register 以
+    /// `sink.level()` 初始化（初值 0 在未注册期不可观测——emit 先查槽位
+    /// None 即静默）；`set_level` 运行期原子改写；emit 写路径直接 load
+    /// 比较（不经 sink、不经 tracing 层）。
+    levels: [std::sync::atomic::AtomicU8; 3],
     /// 密钥掩码表（空=透传零分配）；Arc 快照读，emit 锁外掩码。
     secrets: std::sync::RwLock<std::sync::Arc<Vec<String>>>,
 }
@@ -607,24 +655,42 @@ impl ChannelRegistry {
     pub fn new() -> Self {
         Self {
             slots: std::array::from_fn(|_| std::sync::RwLock::new(None)),
+            levels: std::array::from_fn(|_| std::sync::atomic::AtomicU8::new(0)),
             secrets: std::sync::RwLock::new(std::sync::Arc::new(Vec::new())),
         }
     }
 
     /// 注册通道 sink（槽位由 [`ChannelSink::channel`] 定）。同通道已有
-    /// sink=`Err`（fail-visible，原 sink 不动）。
+    /// sink=`Err`（fail-visible，原 sink 不动）。槽位级别以 `sink.level()`
+    /// 初始化（构造期 level 配置入口）——装配顺序=先 register 后
+    /// [`ChannelRegistry::set_level`]（register 会以 sink 初值覆盖槽位级）。
     pub fn register(&self, sink: std::sync::Arc<dyn ChannelSink>) -> Result<(), ChannelError> {
-        let slot = &self.slots[sink.channel() as usize];
+        let channel = sink.channel();
+        let slot = &self.slots[channel as usize];
         let mut guard = slot
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.is_some() {
-            return Err(ChannelError::AlreadyRegistered {
-                channel: sink.channel(),
-            });
+            return Err(ChannelError::AlreadyRegistered { channel });
         }
+        self.levels[channel as usize].store(
+            level_filter_rank(sink.level()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         *guard = Some(sink);
         Ok(())
+    }
+
+    /// 运行期改写通道级别下限：原子写（无锁、不经 tracing 订阅者层），下一条
+    /// emit 即按新级别判定——写路径比较天然免疫 callsite interest 缓存失效
+    /// 竞态（armor 红线见模块文档）。未注册通道可写，但 register 会以 sink
+    /// 初值覆盖（改级置于 register 之后）。低频配置面：emit 热路径只做一次
+    /// 原子 load 比较，禁把改级当热路径开关频繁翻转。
+    pub fn set_level(&self, channel: Channel, level: log::LevelFilter) {
+        self.levels[channel as usize].store(
+            level_filter_rank(level),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// 配置密钥掩码表：此后所有通道写前统一过 [`mask_secrets`]（唯一布点，
@@ -637,7 +703,9 @@ impl ChannelRegistry {
     }
 
     /// 扇出一条：未注册通道=静默返回（不输出/不 panic/不分配/不计数）；
-    /// 低于本通道 level=过滤（不计数）；命中=掩码（如配置）后交 sink 写。
+    /// 低于本通道槽位级别=过滤（不计数；AtomicU8 写路径比较，注册初值=
+    /// `sink.level()`、[`Self::set_level`] 运行期可改）；命中=掩码（如配置）
+    /// 后交 sink 写。
     pub fn emit(&self, channel: Channel, level: log::Level, target: &str, message: &str) {
         let sink = {
             let slot = &self.slots[channel as usize];
@@ -645,7 +713,9 @@ impl ChannelRegistry {
             match guard.as_ref() {
                 None => return,
                 Some(sink) => {
-                    if level > sink.level() {
+                    let gate =
+                        self.levels[channel as usize].load(std::sync::atomic::Ordering::Relaxed);
+                    if level_rank(level) > gate {
                         return;
                     }
                     std::sync::Arc::clone(sink)
@@ -666,7 +736,17 @@ impl ChannelRegistry {
         }
     }
 
-    /// 全部通道丢弃计数总和（写失败口径；级别过滤/未注册静默不在内）。
+    /// 单通道丢弃计数（写失败口径；级别过滤/未注册静默不在内）。未注册
+    /// 通道=`None`（无 sink 即无记账方，不伪造 0）。
+    pub fn dropped(&self, channel: Channel) -> Option<u64> {
+        let guard = self.slots[channel as usize]
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.as_ref().map(|sink| sink.dropped_lines())
+    }
+
+    /// 全部通道丢弃计数总和（写失败口径；级别过滤/未注册静默不在内；=
+    /// [`Self::dropped`] 三通道之和）。
     pub fn dropped_total(&self) -> u64 {
         self.slots.iter().fold(0u64, |acc, slot| {
             let guard = slot.read().unwrap_or_else(|poisoned| poisoned.into_inner());
