@@ -8,6 +8,10 @@
 //! 零依赖纪律（同 journal.rs/text.rs 先例）：`thiserror::Error` 派生
 //! 以手写同形 `Display`/`Error` impl 落地（错误文案与派生形态逐字一致）；
 //! 引入 thiserror 依赖时统一换回派生。
+//!
+//! log-embed 埋点（级别规范：异常路径=warn）：任务 panic 且句柄已被丢
+//! （结果无处投递）=warn 一行，target `skeleton::fx`。宏无订阅者时 no-op
+//! ——不 panic/不锁/不阻塞，logx 未初始化即静默退让（tracing 语义）。
 
 use std::any::Any;
 use std::fmt;
@@ -167,8 +171,8 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 }
 
 /// 任务包装体：permit-in-future（abort 连带回收 permit）→ catch_unwind 归一
-/// → oneshot 发送。接收端已亡（Spawned drop/abort）= 结果无处投递即弃，任务本体仍归
-/// 生命周期集托管。
+/// → oneshot 发送。接收端已亡（Spawned drop/abort）= 结果无处投递即弃（panic
+/// 结果留一行 warn 痕防静默丢失，见模块头注），任务本体仍归生命周期集托管。
 async fn task_body<T, F>(
     sem: Option<Arc<Semaphore>>,
     fut: F,
@@ -192,7 +196,18 @@ async fn task_body<T, F>(
         Ok(value) => Ok(value),
         Err(payload) => Err(TaskError::Panicked(panic_message(payload))),
     };
-    let _ = tx.send(result);
+    // panic 结果遇接收端已亡（句柄被丢）=无人消费——留一行 warn 痕（tracing
+    // 无订阅者时 no-op；msg 为 send 失败带回的原 String，零新增分配面）。
+    // Ok/Cancelled 无人接属设计内（JoinSet Drop 兜底），不埋。宏关（默认）=
+    // 原句静默发送，零增量。双层 Err：send 失败带回值 + 任务结果为 Panicked。
+    let send_outcome = tx.send(result);
+    #[cfg(feature = "log-embed")]
+    if let Err(Err(TaskError::Panicked(msg))) = send_outcome {
+        embed_event!(warn, target: "skeleton::fx", msg = msg.as_str(),
+            "managed task panicked; handle dropped before join");
+    }
+    #[cfg(not(feature = "log-embed"))]
+    let _ = send_outcome;
 }
 
 /// 托管 scope：内部 = `Mutex<JoinSet<()>>`（生命周期集，短临界区零 await）+ AtomicBool

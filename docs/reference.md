@@ -28,7 +28,7 @@
 | `log-fs` | 零依赖 | — | `logx` 文件落盘面：密钥掩码/路径解析（契约 `LogPathResolver` 住 `skeleton::logpath`）/`FileSink` 按日滚动——单开即可用文件日志 |
 | `log` | `log-fs` + log, tracing, tracing-subscriber, tracing-log | — | `logx` 门面绑定层：init 系（EnvFilter/双 sink）+ `FileSinkWriter` |
 | `tracing` | `runtime` + tracing, tracing-subscriber | — | `tracingx`：审计事件流 → tracing 桥 |
-| `log-embed` | tracing | — | 埋点：skeleton-infra=shutdown 一域 6 点；std-ext 自有同款 feature=七域 41 点（合计八域 47；默认关=宏消除零依赖零开销） |
+| `log-embed` | tracing | — | 埋点：skeleton-infra=shutdown 一域 6 + fx 一域 1 = 7 点；std-ext 自有同款 feature=七域 35 点（合计九域 42；默认关=宏消除零依赖零开销） |
 | `compose` | — | — | `combine`/`combine!` 父子分片组合器 |
 | `config-json` | serde, serde_json | — | `ConfigFile` 分层装配 + 原子保存（serde_json::Value 统一值面） |
 | `config-toml` | `config-json` + toml | — | `load_toml`/`save_toml` + `file_layer_toml`（TOML↔值面翻译） |
@@ -74,7 +74,7 @@
 | tracing | `tracing` | `tracingx`：审计事件流 → tracing 桥 | [`tracingx`](#tracingx--tracing-桥) |
 | compose | `compose` | `combine`/`combine!` 父子分片组合器 | [`compose`](#compose--父子分片组合器) |
 | view | `view` | `ViewBridge` 语言无关视图桥（投影/意图/双编码矩阵/水位/未知标签跳过） | [`view`](#view--语言无关视图桥) |
-| log-embed | `log-embed` | 八域 41 埋点规范（target/级别/字段纪律） | [`log-embed`](#log-embed--埋点规范) |
+| log-embed | `log-embed` | 九域 42 埋点规范（target/级别/字段纪律） | [`log-embed`](#log-embed--埋点规范) |
 
 ---
 
@@ -1977,7 +1977,7 @@ impl ViewBridge<S, A, M, I, J, R> {
 
 **feature**：`log-embed`（绑 tracing；**默认不开启**——埋点宏展开为空、tracing 依赖不进树，cargo tree 零 tracing 证明；`tracingx`/`logx` 桥不受本 feature 影响）。
 
-八域 41 调用点，覆盖 scheduler/ratelimit/retry/backoff/fsx/cache/shutdown/iter。纪律（lib.rs `embed_event!` 注）：
+九域 42 调用点，覆盖 scheduler/ratelimit/retry/backoff/fsx/cache/shutdown/iter/fx。纪律（lib.rs `embed_event!` 注）：
 
 - **只埋行为决策点**（register/cancel/fire/裁决/拒绝/等待分段），禁埋纯计算路径（`backoff_delay` 的 debug 入参事件是派单契约显式点）。
 - **字段化禁格式化**：字段只收数值/布尔/静态串，禁 format!/Display。
@@ -1996,6 +1996,7 @@ impl ViewBridge<S, A, M, I, J, R> {
 | cache | `skeleton::cache::{evict,purge}` | evict（kind=ttl/ttl_sweep/capacity，key 指纹/僵尸数/LRU 序）=debug（真回收才发）；purge=info（回收数/残留） | 混合 |
 | shutdown | `skeleton::shutdown::{registry,run,report}` | 注册成功/逐组件开始/终态 Stopped/整体报告=info；TimedOut/Failed=warn | 混合 |
 | iter | `skeleton::iter::process_results` | 首 Err 短路=warn（pos=已产出 Ok 数，0 起）；next/fold 双通路各一点 | warn |
+| fx | `skeleton::fx` | 托管任务 panic 归一为 `Panicked` 后若句柄已被丢（结果无人消费）=warn（msg=panic 文案）；`Ok`/`Cancelled` 无人接属设计内，不埋 | warn |
 
 target 规范：域=`skeleton::<domain>`，子流程=`skeleton::<domain>::<phase>`——EnvFilter `skeleton::retry=debug` 按流程开，`skeleton=info` 按域开。键身份以 `DefaultHasher`（定长种子）指纹承载（跨 Rust 版本不承诺稳定，仅进程内日志关联）。开启方式：`--features log-embed` + 宿主 tracing 订阅（见 [`logx`](#logx--日志门面) 的 RUST_LOG 姿势）。
 
@@ -2005,7 +2006,7 @@ target 规范：域=`skeleton::<domain>`，子流程=`skeleton::<domain>::<phase
 
 | 组合 | 形态 | 说明 |
 |---|---|---|
-| `full` | 一键全开 | 本 crate 13 子开关并集（等价本 crate `--all-features`）；采用方默认心智入口——「不懂就 full」，子开关=进阶裁剪。std-ext 七域 41 埋点由其自有 `log-embed` 承载（ADR 0005 否决跨 crate 强制耦合）；workspace 全量=两 crate 各自 `--all-features` |
+| `full` | 一键全开 | 本 crate 13 子开关并集（等价本 crate `--all-features`）；采用方默认心智入口——「不懂就 full」，子开关=进阶裁剪。std-ext 七域 35 埋点由其自有 `log-embed` 承载（ADR 0005 否决跨 crate 强制耦合）；workspace 全量=两 crate 各自 `--all-features` |
 | `--no-default-features` | 纯生态件面 | 常驻 14 域（行为件面；十三域零门常驻、本体纯 std；`json` 域与凭据级 `RandomId`（`random` 门）按需显式开）+ memgov 可独立（`--features memgov`） |
 | 默认 | runtime + pool | pool 连带 memgov；SyncStore/PoolBase/ThreadPool 可用 |
 | `log-fs` 单开 | log-fs 面零三方 | 文件日志可用（mask_secrets/DefaultPathResolver/FileSink），不拉 tracing 四件套；std-ext 常驻依赖（及其 `json` 域 `serde_json`）仍在树内 |

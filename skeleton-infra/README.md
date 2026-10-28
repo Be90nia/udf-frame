@@ -22,7 +22,7 @@
 | `log-fs` | `logx` | 文件落盘面（纯 std 零三方：`log-fs` 面自身口径，crate 树见下方零依赖口径段）：密钥掩码 + `DefaultPathResolver` 双构建默认根（debug=编译期锚/release=`~/.<项目>/log`；契约 `LogPathResolver` 住 `skeleton::logpath`）+ `FileSink` 按日滚动追加 |
 | `log` | `logx` | 门面绑定层（=`log-fs`+log/tracing/tracing-subscriber/tracing-log）：`init_tracing_from_env`（EnvFilter）+ `init_with_file` console/file 双 sink + `FileSinkWriter` |
 | `tracing` | `tracingx` | 审计事件流 → tracing 桥 |
-| `log-embed` | `shutdown` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 调用点）：注册/逐组件开始/终态（Stopped/TimedOut/Failed）/整体报告（target `skeleton::<domain>[::<phase>]`，级别=正常流转 debug/异常 warn/终态 info；默认关=宏消除零依赖零开销）。批 5-1/5-2 起其余七域 35 调用点由 `std-ext` 自有同款 feature 承载（宏同款文本作用域副本） |
+| `log-embed` | `shutdown` + `fx` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 + fx 一域 1 = 7 调用点）：shutdown 注册/逐组件开始/终态（Stopped/TimedOut/Failed）/整体报告；fx 托管任务 panic 且句柄已被丢（结果无人消费）=warn，msg=panic 文案（target `skeleton::<domain>[::<phase>]`，级别=正常流转 debug/异常 warn/终态 info；默认关=宏消除零依赖零开销）。批 5-1/5-2 起其余七域 35 调用点由 `std-ext` 自有同款 feature 承载（宏同款文本作用域副本） |
 | `compose` | `compose` | `combine`/`combine!` 父子分片组合器（镜头+路由+效果上提，宏一行装配） |
 
 零依赖口径：`cargo tree -p udf-skeleton-infra -e normal`——默认 feature 下仅

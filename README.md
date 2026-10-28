@@ -70,7 +70,7 @@ udf-skeleton-infra = { path = "<UDF_ROOT>/skeleton-infra" }
 | `log-fs` | `logx` 文件落盘面（纯 std 零三方：`log-fs` 面自身口径；crate 树见下方 `cargo tree` 段——默认树零三方）：密钥掩码 + 路径解析（契约 `LogPathResolver` 住 `skeleton::logpath`；`DefaultPathResolver` debug=编译期锚**仅框架自身 dogfood 用**——采用方 debug 态必须注入自有 resolver）+ `FileSink` 按日滚动 |
 | `log` | `logx` 门面绑定层（=`log-fs`+log+tracing+tracing-subscriber+tracing-log）：init 系（`init_tracing_from_env`/`init_with_file` console+file 双 sink） |
 | `tracing` | `tracingx`：审计事件流 → tracing 桥 |
-| `log-embed` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 调用点；`std-ext` 自有同款 feature：七域 35 调用点；合计八域 41，target `skeleton::<domain>[::<phase>]`，级别规范见各模块头注；默认关=宏消除，tracing 不进树） |
+| `log-embed` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 + fx 一域 1 = 7 调用点；`std-ext` 自有同款 feature：七域 35 调用点；合计九域 42，target `skeleton::<domain>[::<phase>]`，级别规范见各模块头注；默认关=宏消除，tracing 不进树） |
 | （常驻，零 feature） | **std-ext 十四域**（`text` `encode` `hash` `iter` `backoff` `fsx` `paths` `clock` `retry` `scheduler` `ratelimit` `cache` `id` `json`；十三域零门常驻、本体纯 std；`json` 域门控 `json` feature）。逐域职责见 `std-ext` crate 文档与 `docs/reference.md` 域索引）+ 本 crate `shutdown`（行为件面；时间源/配置/日志路径契约已下沉 `skeleton::clock`/`skeleton::config`/`skeleton::logpath`） |
 
 `cargo tree -p udf-std-ext -e normal`：仅 `skeleton`（workspace 路径依赖）——零三方；开 `json` 门时 `serde_json` 子树按需进树。`cargo tree -p udf-skeleton-infra -e normal`：默认 feature 下仅 skeleton + std-ext（workspace 路径依赖）——同样零三方。

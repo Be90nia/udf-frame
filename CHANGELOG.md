@@ -12,6 +12,7 @@
 - **logx**：每通道独立 level（写路径 AtomicU8 原子过滤，`set_level` 运行期即时生效——结构性免疫 tracing callsite interest 缓存坑，tracing#2874/#2400）+ 逐通道丢弃计数读数 `dropped(channel)`。
 - **FxScope**：`spawn` 更名 `spawn_tracked` + 新增 `spawn_detached`（显式脱管口，不计 in_flight、不被 shutdown 等待；全仓唯一 tokio::spawn allow 豁免）+ 文档范式（Arc 化标准写法/cancel-safe 清单/LocalSet 边界/两套 drop 语义对照）。
 - **通知面异步化**（ADR 0008 案 C 两档并存）：`skeleton::notify`（`NotifySink` 宿主投递口 + `Notify<S>` 登记面，不扩 Store 六方法）+ SyncStore 实现（排空环内 O(1) 版本投递、先于同步回调；state_version 零异步订阅者不自增）+ `notify_published()` 读侧。锚：无订阅 dispatch 77→78.4ns（±10ns 容忍内）；50ms 慢消费者隔离实证 ~172ns。既有通知/审计/回灌测试零改动。
+- **fx 域埋点**（`skeleton-infra`）：托管任务 panic 归一为 `Panicked` 后，若句柄已被丢（结果无人消费）留一行 warn 痕——target `skeleton::fx`、msg=panic 文案，消除「panic 结果静默丢失」；`Ok`/`Cancelled` 无人接属设计内不埋；`log-embed` 默认关=原静默语义零增量。埋点面口径：infra 七点（shutdown 6 + fx 1）+ std-ext 七域 35 点 = 九域 42 点。
 - 六域 armor 逐坑一测（调研：外部踩坑调研（本地留存，未入库）——外部踩坑面/性能模式/生态先例，T1/T2 出处全覆盖）。
 
 ### Changed（retry 默认 jitter + FxScope spawn 双命名，破坏性）

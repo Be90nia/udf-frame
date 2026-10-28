@@ -48,7 +48,7 @@ log = ["log-fs", "dep:log", "dep:tracing", "dep:tracing-subscriber", "dep:tracin
 # tracing：骨架审计事件流 → tracing 桥。tokio/log 先例形态——feature 门控依赖，
 # 桥在审计值面（crate::audit）上消费。
 tracing = ["runtime", "dep:tracing", "dep:tracing-subscriber"]
-# log-embed：行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 调用点；
+# log-embed：行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 + fx 一域 1 = 7 调用点；
 # target 规范 skeleton::<domain>[::<phase>]，级别规范见各模块头注）。
 # scheduler/ratelimit/retry/cache 四域 26 调用点随批 5-2 拆至 std-ext（其自有
 # log-embed feature 承载，宏同款副本；连同批 5-1 三域 9 点合计 35）。默认
