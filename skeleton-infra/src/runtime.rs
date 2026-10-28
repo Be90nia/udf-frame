@@ -3,8 +3,8 @@
 //! [`SyncStore`]：契约 trait `skeleton::Store` 的 std-only 参考实现（单写者
 //! 队列 + 快照广播 + 同步排空环）。契约承诺（同步排空/快照一致性/订阅/停机闸/
 //! fail-visible/回灌有界）见 `skeleton::Store` 类型文档；本模块承载兑现承诺的
-//! 机器：CoW 快照落位、锁消融排空环、回灌深度预算、本地订阅档、审计事件流
-//! 发射点（值面在 [`crate::audit`]）与取证八读数。
+//! 机器：CoW 快照落位、锁消融排空环、回灌深度预算、本地订阅档、异步信号
+//! 通知档（ADR 0008）、审计事件流发射点（值面在 [`crate::audit`]）与取证八读数。
 //!
 //! std-only：`runtime` feature 零三方依赖（cargo tree 证明口径见 crate 文档）。
 
@@ -14,6 +14,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use skeleton::notify::{Notify, NotifySink};
 use skeleton::{
     ActionSender, Effect, EffectBuf, EffectRuntime, Infallible, Reducer, Restore, Store,
     Subscription,
@@ -26,10 +27,12 @@ use crate::audit::{AuditEvent, AuditEventKind, AuditSink, AuditTicket};
 // 原路不变）。
 mod audit_emit;
 mod local_subs;
+mod notify;
 
 use audit_emit::{audit_emit, audit_enqueued};
 pub use local_subs::LocalSubscription;
 use local_subs::{local_notify, next_local_sub_id};
+use notify::{notify_async, NotifySinkSlot};
 
 /// std Mutex 取锁：中毒 = 持锁方已 panic、状态不可信——按 fail-fast 纪律传播
 /// panic，禁静默吞掉毒锁继续跑。（crate 内共享：testing 域 TestStore 同纪律取锁。）
@@ -145,6 +148,20 @@ struct StoreInner<S, A, Op> {
     /// 本地订阅闸（[`SyncStore::subscribe_local`]）：零本地订阅时通知路径一次
     /// relaxed 读即短路，不触达任何线程本地表。只作闸，不作精确计数读侧。
     local_subs: Arc<AtomicUsize>,
+    /// 异步投递口注册表（ADR 0008）：表存 Weak、票据 Drop 经共享句柄即时摘表
+    /// （与 `subs` 同构）；槽位与投递机制在 `notify` 子模块。
+    notify_sinks: Arc<Mutex<Vec<Weak<NotifySinkSlot>>>>,
+    /// 异步订阅闸（门控快路径，投递段一次 Acquire load 即返）：零异步订阅者时
+    /// `state_version` 不自增——77ns 无订阅锚的守卫。`NotifySinkSlot::alive`
+    /// 裁决保证摘除（panic 摘除 / 票据 Drop 两路竞争）只回落一次。
+    notify_subs: Arc<AtomicUsize>,
+    /// 状态版本水位（ADR 0008 §5.2 门控语义）：仅在异步订阅在册的落位拍自增
+    /// （版本号 = 状态代数），无人订阅期间冻结、增减订不回退。经 publish 出站，
+    /// 无独立读侧（本 ADR 唯一新读侧是 `notify_published`）。
+    state_version: AtomicU64,
+    /// 异步投递累计次数（成功投递逐口逐拍 +1，成本可见）。读侧
+    /// [`SyncStore::notify_published`]。
+    notify_published: AtomicU64,
     /// store 身份号（本地订阅在注册线程 TLS 表中的键）：全局单调，进程内唯一。
     store_id: u64,
     /// 单写者排空守卫（确定性：同序 action 序列恒同终态；重入回灌只入队）
@@ -213,12 +230,25 @@ struct StoreInner<S, A, Op> {
 /// | [`Self::dispatch`] | 恒 no-op（签名不引入 Err） | 计入 [`Self::rejected_after_close`] |
 /// | [`ActionSender::dispatch`] | 返回 `false`（显式拒绝，`#[must_use]` 兜底） | 同一计数 |
 /// | [`Self::subscribe`] / [`Self::subscribe_local`] | 照常登记、票据照常注销，但闭门后永无 dispatch 触发——通知静默（已知取舍，见下） | 计入 [`Self::subscriptions_after_close`]；`subscriber_count` 仍可查 |
+/// | [`Notify::subscribe_notify`] | 同上行：登记照常、闭门后永无落位拍——信号静默 | 计入 [`Self::subscriptions_after_close`] |
 ///
 /// dispatch 的静默 no-op 与 sender dispatch 的显式 `false` 是**保签名**与**停机显式化**
 /// 之间的显式取舍：dispatch 面向动作源（不感染调用面），sender dispatch 面向异步回灌
 /// （停机窗必须可观测）；两者闭门后共用同一拒绝计数，无观测死角。闭门
 /// subscribe 照常登记是「票据即注销」模型的自然推论——通知静默可经
 /// `subscriber_count` 交叉查证（已知语义，非缺陷）。
+///
+/// # 订阅面三档（ADR 0008）
+///
+/// - **跨线程同步**：[`Self::subscribe`]——回调在 dispatch 线程同步执行，需 `Send`；
+/// - **本地线程亲和**：[`Self::subscribe_local`]——免 `Send`，只在注册线程触发；
+/// - **异步信号**：[`Notify::subscribe_notify`]——投递口每拍收一个单调版本号
+///   （水位信号，非事件流），消费侧见版本即 [`Store::snapshot`] 拉取现态。
+///
+/// 投递序：**异步先行、同步回调随后**（异步投递排在通知段开头，同步档内部
+/// 既有顺序不动）。**异步档不救同步档**：慢同步订阅者的耗时照常计入 dispatch；
+/// 慢消费者靠投递口内自备通道/工作线程解耦（O(1) 是宿主契约义务，框架无法
+/// 检测也无法阻止阻塞）。
 ///
 /// # Panic 契约
 ///
@@ -476,6 +506,76 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
     }
 }
 
+/// 异步（信号式）通知档的登记面实现（ADR 0008）：与 [`Store`] 正交的独立端口
+/// ——「六方法即全契约」纪律不因此扩员。语义细则（版本号水位/门控/失败面）见
+/// `skeleton::notify` 模块文档；投递在排空环通知段、同步回调**之前**（异步档
+/// 不救同步档：同步订阅者耗时照常计入 dispatch）。
+impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Notify<S>
+    for SyncStore<S, A, Op>
+{
+    /// 登记投递口（信号式异步档）。载荷 = 单调状态版本号：在册期间逐拍 +1、
+    /// 无人订阅期间冻结、增减订不回退；消费侧见版本变化即 [`Store::snapshot`]
+    /// 拉取现态，版本跳跃 = 中间拍被合并（重取现态自愈，撕裂判定依据）。
+    ///
+    /// 失败面（复用既有读侧，ADR §5.5，不造第二套）：投递口 panic ⇒
+    /// `catch_unwind` 捕获 + fail-closed 摘除 + [`Self::subscriber_panics`] /
+    /// [`Self::subscriber_panic_last_cause`] 留痕（同订阅回调纪律）；闭门后
+    /// 登记照常、永不发信号 ⇒ [`Self::subscriptions_after_close`]；投递成本 ⇒
+    /// [`Self::notify_published`]。投递口 O(1) 是宿主契约义务（
+    /// `skeleton::notify::NotifySink` 文档），框架无法检测也无法阻止阻塞
+    /// ——重活请在投递口内自备通道/工作线程移出。
+    ///
+    /// # Examples
+    ///
+    /// 合并式投递口挂载后，dispatch 每拍投递一位版本号（水位从 1 起步）；
+    /// 成本读侧同步累计：
+    ///
+    /// ```
+    /// use skeleton::notify::{Notify, NotifySink};
+    /// use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+    /// use skeleton_infra::runtime::SyncStore;
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    /// use std::sync::Arc;
+    ///
+    /// struct Counter;
+    /// impl Reducer for Counter {
+    ///     type State = u64; type Action = u64; type Op = Infallible;
+    ///     fn initial(&self) -> u64 { 0 }
+    ///     fn reduce(&self, s: &u64, a: u64, _out: &mut EffectBuf<u64, Infallible>) -> u64 { s + a }
+    /// }
+    ///
+    /// #[derive(Clone)]
+    /// struct Latest(Arc<AtomicU64>);
+    /// impl NotifySink for Latest {
+    ///     fn publish(&self, version: u64) { self.0.store(version, Ordering::Relaxed); }
+    /// }
+    ///
+    /// let store = SyncStore::new(Counter, NoFx);
+    /// let sink = Latest(Arc::new(AtomicU64::new(0)));
+    /// let _ticket = store.subscribe_notify(sink.clone()); // 绑定持有，Drop 才注销
+    /// store.dispatch(7);
+    /// assert_eq!(sink.0.load(Ordering::Relaxed), 1); // 首拍版本 = 1
+    /// store.dispatch(2);
+    /// assert_eq!(*store.snapshot(), 9);
+    /// assert_eq!(store.notify_published(), 2);
+    /// # store.close();
+    /// ```
+    fn subscribe_notify(&self, sink: impl NotifySink) -> Subscription<S> {
+        // 闭门登记显形（与 subscribe 同一纪律）：登记照常生效，但闭门后
+        // 排空环不再产生落位拍——永无信号。
+        if self.is_closed() {
+            self.inner
+                .subscriptions_after_close
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        notify::register(
+            &self.inner.notify_sinks,
+            &self.inner.notify_subs,
+            Box::new(sink),
+        )
+    }
+}
+
 impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> SyncStore<S, A, Op> {
     /// 装配最小运转环：`root` 是**根** Reducer（[`Reducer::initial`] 产出完整根
     /// 状态），`fx` 是效果解释器（核心只转发，永不解释）。
@@ -624,6 +724,10 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             }),
             subs_version: Arc::new(AtomicUsize::new(0)),
             local_subs: Arc::new(AtomicUsize::new(0)),
+            notify_sinks: Arc::new(Mutex::new(Vec::new())),
+            notify_subs: Arc::new(AtomicUsize::new(0)),
+            state_version: AtomicU64::new(0),
+            notify_published: AtomicU64::new(0),
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             draining: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -760,6 +864,14 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 拒绝，并数会污染拒绝语义（闭门对照见类型文档）。
     pub fn subscriptions_after_close(&self) -> u64 {
         self.inner.subscriptions_after_close.load(Ordering::SeqCst)
+    }
+
+    /// 异步投递累计次数（ADR 0008 唯一新增读侧，成本可见）：投递口成功收到
+    /// 信号的累计次数——逐口逐拍累计（panic 被摘除的投递不计；闭门/票 Drop 后
+    /// 不再产生）。乘以单次投递成本即异步档对 dispatch 的总税额，是投递口
+    /// 「O(1)」契约义务的核对依据。只读。
+    pub fn notify_published(&self) -> u64 {
+        self.inner.notify_published.load(Ordering::Acquire)
     }
 
     /// 解释器 panic 毒锁恢复计数（fail-visible 上浮）。每次 into_inner 恢复自增 = 此前恰
@@ -1049,7 +1161,7 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // 快照落位（消融：原「再锁 state 再 Arc::clone」的快照预取一对锁+一对
         // 引用计数整对删除）：快照即 `next` 本体。零订阅稳态把 `next` 直接移入
         // state（省 clone 对）；有订阅者才 clone 留本体给回调。管线序：
-        // reduce→快照替换→效果转发→通知。
+        // reduce→快照替换→效果转发→通知（异步投递先行、同步回调随后）。
         // SAFETY: 持排空权（DrainGuard armed 区间）；通知段仅在排空权下进入，
         // 独占访问成立，见 DrainExclusive 安全纪要
         let cache = unsafe { inner.notify_cache.get_mut() };
@@ -1077,6 +1189,10 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         };
         // 转发环（禁吞语义见 helper 文档）：Emit 回灌入队、Run/Cancel 交解释器。
         forward_effects(inner, buf, feedback_depth);
+        // 异步投递段（ADR 0008）：排在同步回调之前——否则同步档慢订阅者会把
+        // 异步消费者的可见延迟一并拖后。投递只发版本号：O(1)、门控短路
+        // （零异步订阅者一次 Acquire load 即返）、锁外调用宿主代码。
+        notify_async(inner);
         // 通知段（本地先行、跨线程随后；返回当拍是否有订阅者收到快照）。
         let snapshot_notified = notify_snapshot_consumers(inner, cache, &notified_next);
         // 通知节点（R1-2）：只在当拍确有订阅者收到快照时记录——零订阅者的

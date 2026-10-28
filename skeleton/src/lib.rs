@@ -1,8 +1,9 @@
 //! 最小单向数据流（UDF / Elm 式架构）骨架——**契约层**。
 //!
 //! 本 crate 只承载「约束后面代码长法的形状」：trait（谁变形 / 谁解释 / 谁存储 /
-//! 谁呈现 / 谁持久化 / 什么算一个 store）、数据词汇（Effect/EffectBuf/EffectId/ActionSender/
-//! Subscription/NoFx）与语义契约文本（各 trait 文档中的承诺）。零
+//! 谁呈现 / 谁持久化 / 谁发异步变更信号 / 什么算一个 store）、数据词汇
+//! （Effect/EffectBuf/EffectId/ActionSender/Subscription/NoFx）与语义契约文本
+//! （各 trait 文档中的承诺）。零
 //! `[dependencies]`——核心无 IO/运行时依赖，reducer「禁 IO」从评审约束升级为
 //! 编译期不可能。
 //!
@@ -23,6 +24,7 @@
 //! | 谁变形 | [`Reducer::reduce`]（纯函数：状态进出，效果写 [`EffectBuf`]） |
 //! | 谁存储 | [`Store`]（[`Store::snapshot`] 取值语义快照） |
 //! | 谁消费 | [`Driver::render`] 下行呈现；[`Subscription`] 订阅票据收变更通知 |
+//! | 谁异步收变更信号 | [`notify::NotifySink`] 投递口收单调版本号水位（[`notify::Notify`] 登记面；见版本拉取现态，合并合法、丢拍可检出） |
 //! | 谁呈现给 UI | [`view::ViewMap`] 投影 + [`view::IntentMap`] 意图翻译（语言无关出站/入站；参考实现 `skeleton_infra::view::ViewBridge`） |
 //! | 效果从哪出 | [`Effect::Run`] 描述值 → [`EffectRuntime::run`] 解释，经 [`ActionSender`] 回灌闭环 |
 //! | 谁持久化 | [`JournalPort`] 端口（后端自换；参考实现 `skeleton_infra::journal::JsonlJournal`） |
@@ -73,6 +75,7 @@
 pub mod clock;
 pub mod config;
 pub mod logpath;
+pub mod notify;
 pub mod parse;
 pub mod pool;
 pub mod view;
