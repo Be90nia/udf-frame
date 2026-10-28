@@ -216,6 +216,31 @@ impl EffectId {
 /// 跨 crate 的 match 必须带通配臂（同 crate 豁免），采用方在编译期被强制
 /// 面对「未知效果形态」的分支而非静默漏配（纪律同 [`parse`](crate::parse)
 /// 词表，F-07 封口）。
+///
+/// 下游穷尽 match 被编译期拒绝（doctest 即下游 crate 视角编译验证，纪律同
+/// [`EffectId`] 的元组构造封口）：
+///
+/// ```compile_fail
+/// use skeleton::Effect;
+/// match Effect::<u8>::Emit(1) {
+///     Effect::Emit(_) => {}
+///     Effect::Run { .. } => {}
+///     Effect::Cancel { .. } => {}
+/// } // ERROR E0004: non-exhaustive patterns，`_` 臂缺失
+/// ```
+///
+/// 带通配臂即放行，且已知变体照常命中自身臂：
+///
+/// ```
+/// use skeleton::Effect;
+/// let described = match Effect::<u8>::Emit(7) {
+///     Effect::Emit(a) => format!("emit {a}"),
+///     Effect::Run { id, .. } => format!("run {}", id.get()),
+///     Effect::Cancel { id } => format!("cancel {}", id.get()),
+///     _ => String::from("future variant"),
+/// };
+/// assert_eq!(described, "emit 7");
+/// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Effect<A, Op = Infallible> {
@@ -626,6 +651,30 @@ pub trait JournalPort<A> {
 /// crate 的 match 必须带通配臂（同 crate 豁免），恢复方在编译期被强制面对
 /// 「未知恢复形态」的分支（fail-closed）而非静默漏配（纪律同 [`Effect`]，
 /// F-07 封口）。
+///
+/// 下游穷尽 match 被编译期拒绝（doctest 即下游 crate 视角编译验证）：
+///
+/// ```compile_fail
+/// use skeleton::Restore;
+/// match Restore::<u8, u8>::Empty {
+///     Restore::Empty => {}
+///     Restore::FromInitial(_) => {}
+///     Restore::FromSnapshot(_, _) => {}
+/// } // ERROR E0004: non-exhaustive patterns，`_` 臂缺失
+/// ```
+///
+/// 带通配臂即放行，且已知变体照常命中自身臂：
+///
+/// ```
+/// use skeleton::Restore;
+/// let described = match Restore::<u8, u8>::FromInitial(vec![1, 2]) {
+///     Restore::Empty => String::from("empty"),
+///     Restore::FromInitial(actions) => format!("initial {}", actions.len()),
+///     Restore::FromSnapshot(_, actions) => format!("snapshot {}", actions.len()),
+///     _ => String::from("future variant"),
+/// };
+/// assert_eq!(described, "initial 2");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Restore<A, S> {
