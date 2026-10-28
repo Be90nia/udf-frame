@@ -19,6 +19,12 @@
 - fx：`FxScope::spawn` → `spawn_tracked`（语义显名）；调用点全仓机械迁移（42 处）。
 - （破坏性直迁：0.1.0 未发布无外部采用方，按 ADR 0005 先例无 shim。）
 
+### Changed（fail-visible 封口：静默行为显形四件 + 契约词表封口，破坏性）
+- `skeleton`：`EffectId` 构造封口——`EffectId(pub u64)` → 私字段 + `pub const fn new(u64)` / `get()`（std `NonZeroU64` 同形），裸元组构造由 compile_fail doctest 冻结；id 唯一性纪律（store 内全局唯一、多效果域不重叠区间）入文档。**破坏性**：`EffectId(id)` → `EffectId::new(id)`。
+- `skeleton`：`Effect` / `Restore` 加 `#[non_exhaustive]`（与 `parse` 词表同口径，ADR 0007 协同）——跨 crate match 编译期强制带通配臂面对未知变体；`skeleton-infra` 内 7 处 match 站点按 fail-closed 语义补臂（panic 带因 / `unreachable!` 带因）。
+- `skeleton-infra`：静默行为显形四件（对齐 `subscriber_panics` 计数先例）——`Combine::route_misses()`（combine 路由 miss 不再零计数）；`SyncStore::local_missed_notifications()`（跨线程 dispatch 下本地订阅零触达可观测）；`SyncStore::try_subscribe`（闭门后显式 `Err(StoreClosed)`，旧 `subscribe` 照常登记并计入闭门计数）；`SyncStore::audit_preempted()`（审计事件流二次订阅的静默覆盖留痕）。另 `SyncStore::cancel_unknown_id()`：Cancel 指向从未发出的 Run id 计数留痕（不拦截——迟到 Cancel 属合法时序，核心无生命周期面无法区分漂移）。
+- 依据：`reports/2026-10-27-udf-architecture-audit.md` F-04/07/08/09/10/13（B/C 桶残余清零）。
+
 ### Changed（combine 分片作根编译期拒绝：Fragment/Reducer 契约拆分，破坏性）
 - `skeleton` 新增 `Fragment` trait（reduce-only 状态分片契约）+ blanket `impl<T: Reducer> Fragment for T`（每个根都是合法子件）；`Reducer` 语义收窄为**根契约**（initial+reduce，trait 本体与既有 `impl Reducer` 零变化）。
 - `combine`/`combine!` 产物 `Combine<…>` 由 `impl Reducer` 改为 `impl Fragment`：分片作根（`SyncStore::new(分片, …)`）从「装配期 panic」升级为 **E0277 编译期拒绝**（`#[diagnostic::on_unimplemented]` 错误信息自带「分片≠根」修复指引）；`combine` 的子件 bound 由 `Reducer` 放宽为 `Fragment`（完整 Feature 经 blanket 仍可作子件）。随拆分删除误用 panic 与三处孤儿 `#[track_caller]`；两处分片误用 panic 测试由 compile_fail doctest 接替。决策依据 ADR 0009。（**破坏性直迁**：0.1.0 未发布无外部采用方，按 ADR 0005 先例无 shim。）
