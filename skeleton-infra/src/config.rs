@@ -29,7 +29,7 @@
 //! serde_json journal 先例形态，toml 仅 config-toml 可达）。形状拍板点：
 //! reports/2026-10-17-config-port.md、reports/2026-10-17-config-file.md。
 
-#[cfg(feature = "config-json")]
+#[cfg(feature = "config-toml")]
 use std::fmt;
 #[cfg(feature = "config-json")]
 use std::marker::PhantomData;

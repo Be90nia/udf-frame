@@ -565,8 +565,8 @@ pub trait ChannelSink: Send + Sync + 'static {
 
 /// 多通道注册表：通道 → sink 一对一（固定三槽位，登记一次后零分配扇出）。
 ///
-/// 并发面：每槽位独立 `RwLock`——register 只锁一个槽（互不阻塞），emit 读锁
-/// + `Arc` 克隆后锁外写 sink（锁内无 IO）。毒锁复用 [`FileSink`] 纪律
+/// 并发面：每槽位独立 `RwLock`——register 只锁一个槽（互不阻塞），emit 读锁 +
+/// `Arc` 克隆后锁外写 sink（锁内无 IO）。毒锁复用 [`FileSink`] 纪律
 ///（`into_inner` 继续：日志面禁毒锁放大业务故障）。无注销面——注册表面向
 /// 进程生命期的装配期使用（同全局 logger 单次初始化纪律）。
 ///

@@ -24,8 +24,10 @@ static EVENTS: AtomicUsize = AtomicUsize::new(0);
 /// 不再依赖串行（旧版全局计数被同二进制并发分配污染，实测 5 跑 2 红，
 /// 已根治）。
 ///
-/// CI 口径（ci.yml）不变：「paths_alloc serial」单列步 `--test-threads=1`，
-/// 并行步以 `--skip anchors --skip verbatim` 隔离本文件。本机复跑同口径：
+/// CI 口径（ci.yml）：本文件在 std-ext 主测试步内**并行整跑**（不再按名字
+/// `--skip` 隔离——并行污染根因已根治），另有 `paths_alloc serial` 单列步
+/// 以 `--test-threads=1` 再跑一次作双保险。本机复跑口径：
+/// `cargo test -p udf-std-ext`（全量并行）与
 /// `cargo test -p udf-std-ext --test paths_alloc -- --test-threads=1`。
 static SERIAL: Mutex<()> = Mutex::new(());
 
