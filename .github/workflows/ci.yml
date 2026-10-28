@@ -35,12 +35,24 @@ jobs:
       - name: Test skeleton
         run: cargo test -p udf-skeleton
 
-      # std-ext 十三常驻域（批 5-2 拆分后新增步）：默认树零依赖域行为面。
-      # paths_alloc 文件内事件计数器被 libtest 主线程分配污染（同进程并行，
-      # 实测 5 跑 2 红）——本步 --skip 隔离其测试，serial 步单列 --test-threads=1。
-      # 新增该文件测试时务必命中 anchors/verbatim 二 skip 之一。
+      # std-ext 十四域（批 5-2 拆分后新增步）：默认树行为面。
+      # 全量跑（不再 --skip）：paths_alloc 计数锚的并行污染根因已在 fe5728a
+      # 根治（计数窗加 IN_WINDOW 线程归属门——只有窗内本线程的分配计入，
+      # libtest 主线程/并发测试线程的分配不进窗），并行整跑免疫；此前
+      # `--skip anchors --skip verbatim` 是按名字字面量匹配，连带把
+      # hash 的 XXH64 官方向量锚、paths 的 Windows verbatim 路径语义测试、
+      # scheduler 的 every_anchors_* 等 13 个真实测试一起屏蔽（hollow gate）。
+      # paths_alloc 另有独立串行步（下方）作双保险。
       - name: Test std-ext
-        run: cargo test -p udf-std-ext -- --skip anchors --skip verbatim
+        run: cargo test -p udf-std-ext
+
+      # std-ext 门控面（hollow gate 闭合）：默认 feature 步跑不到被
+      # `#![cfg(feature = ...)]` 门控的测试文件——log-embed 埋点断言
+      # （tests/log_embed.rs 整文件门控）35 条在默认面从未执行（实测：
+      # 默认面 350 条 / all-features 385 条，差 35 逐条属该文件）。单列
+      # all-features 步，使门控面在 CI 真跑。
+      - name: Test std-ext (all features)
+        run: cargo test -p udf-std-ext --all-features
 
       # infra 六域 feature 矩阵闸：--workspace 只跑 default=[]（P12 零 feature 面），
       # memgov/journal/log/tokio/testing 全在盲区，单列 all-features 步防漏
@@ -58,9 +70,10 @@ jobs:
       - name: LeakGuard serial (memgov)
         run: cargo test -p udf-skeleton-infra --features memgov --test memgov -- --test-threads=1
 
-      # paths_alloc 事件计数串行闸（终验波 B1）：文件内 Mutex 只串行本文件，
-      # 其他测试线程的分配仍进全局事件计数——主线程窗口污染=并行 flake
-      # （本机 5 跑 2 红、单线程恒绿），CI 确定口径=独立步 --test-threads=1。
+      # paths_alloc 事件计数串行闸（终验波 B1）：分配锚逐字背书 doc 声明，
+      # 单线程口径最稳（--test-threads=1）。并行污染根因已在 fe5728a 根治
+      # （计数窗加 IN_WINDOW 线程归属门，并行整跑免疫），本步保留作双保险：
+      # 主步（上方）已全量跑该文件，本步以单线程再跑一次，两条路径均绿才算过。
       # 批 5-2 拆分后该测试文件居 std-ext（原指 skeleton-infra 已无此目标）。
       - name: paths_alloc serial
         run: cargo test -p udf-std-ext --test paths_alloc -- --test-threads=1
@@ -70,7 +83,16 @@ jobs:
       - name: Bench compile gate
         run: cargo bench -p udf-skeleton-infra --all-features --no-run && cargo bench -p udf-skeleton --no-run
 
-      # 记录级：升级 -D warnings 前需先清零存量告警。
-      # --all-features --all-targets 必带：P12 零 default feature，裸 clippy=空心闸
+      # clippy 闸（udf-frame-iop）：存量告警已清零（波 2 实测 exit 0），落
+      # -D warnings 防回潮。--all-features --all-targets 必带：P12 零 default
+      # feature，裸 clippy=空心闸
       - name: Clippy
-        run: cargo clippy --workspace --all-features --all-targets
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+      # 单切片 clippy 步（udf-frame-iop）：cfg 门挂错 feature 的 unused import
+      # 只有单开该 feature 才爆，--all-features 掩盖单 feature 面，双组合各一
+      - name: Clippy infra (config-json only)
+        run: cargo clippy -p udf-skeleton-infra --no-default-features --features config-json -- -D warnings
+
+      - name: Clippy infra (config-toml only)
+        run: cargo clippy -p udf-skeleton-infra --no-default-features --features config-toml -- -D warnings
