@@ -15,4 +15,5 @@ verify/
 /.claude/
 /.codex/
 /.agents/
+/AGENTS.md
 /CLAUDE.md
