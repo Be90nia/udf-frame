@@ -70,7 +70,7 @@ impl Reducer for PanicRunFeature {
             // 配方：解释器对 Effect::Run 先记录后 panic!
             DemoAction::Run1 => {
                 out.push(Effect::Run {
-                    id: EffectId(1),
+                    id: EffectId::new(1),
                     op: BoomOp::Boom,
                 });
                 s + 1
@@ -255,7 +255,7 @@ impl Reducer for TrioFeature {
             TrioAction::EmitRunEmit => {
                 out.push(Effect::Emit(TrioAction::Noop));
                 out.push(Effect::Run {
-                    id: EffectId(2),
+                    id: EffectId::new(2),
                     op: BoomOp::Boom,
                 });
                 out.push(Effect::Emit(TrioAction::Inc));
@@ -363,7 +363,7 @@ impl Reducer for LoopbackFeature {
         match a {
             LoopbackAction::Spin => {
                 out.push(Effect::Run {
-                    id: EffectId(9),
+                    id: EffectId::new(9),
                     op: LoopbackOp::Spin,
                 });
                 *s

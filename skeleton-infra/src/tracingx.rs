@@ -185,7 +185,7 @@ mod tests {
         }
         fn reduce(&self, s: &u32, _: Tick, out: &mut EffectBuf<Tick, DrillOp>) -> u32 {
             out.push(Effect::Run {
-                id: skeleton::EffectId(1),
+                id: skeleton::EffectId::new(1),
                 op: DrillOp::Run,
             });
             s + 1

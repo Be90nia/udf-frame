@@ -118,12 +118,60 @@ pub trait Reducer {
 /// 效果句柄：reducer 按语义指派（同义恒同值），解释器寻址用（[`Effect::Cancel`]）。
 /// 值语义小句柄（Copy+Eq+Hash）：效果断言、`HashMap`/`HashSet` 键等宿主寻址表
 /// 都用值比对。
+///
+/// # 受控构造
+///
+/// 内部值私有：裸元组语法 `EffectId(n)` 编译期不可用，构造唯一入口是
+/// [`EffectId::new`]，解释器读值走 [`EffectId::get`]——id 的产生点在代码里
+/// 可 grep 可审计，不再有「任何整数随手当句柄」的裸通道。
+///
+/// # 唯一性纪律
+///
+/// 一个 store 内 id **全局唯一**：reducer 侧自持单调计数器（State 承载），
+/// 多效果域（如 timer 与 http）用不重叠的 id 区间或语义派生值——各自从 0
+/// 计数必撞 id，撞车后 [`Effect::Cancel`] 取消错对象且现象是「另一个效果莫名
+/// 被取消」，极难定位。撞车的运行期观测面：参考实现 `SyncStore` 的
+/// `cancel_unknown_id` 读侧（`Cancel` 引用从未发出的 `Run` id 即计数留痕）。
+///
+/// 裸元组构造已封死（doctest 即外部 crate 视角编译验证）：
+///
+/// ```compile_fail
+/// use skeleton::EffectId;
+/// let _id = EffectId(1); // 字段私有：元组构造器不存在
+/// ```
+///
+/// 受控构造与读值：
+///
+/// ```
+/// use skeleton::EffectId;
+/// let id = EffectId::new(7);
+/// assert_eq!(id.get(), 7);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EffectId(pub u64);
+pub struct EffectId(u64);
+
+impl EffectId {
+    /// 受控构造入口。唯一性纪律（store 内全局唯一、多效果域用不重叠区间）
+    /// 见类型文档——构造可审计，纪律靠此文档与读侧计数共同守。
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// 读侧：解释器寻址表取键用（std `NonZeroU64::get` 同形纪律）。
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// Effect：纯描述值。解释器（宿主适配层）执行后经回灌通道把 Action 重入 store（环闭合）。
 /// Debug 供测试替身的断言失败消息如实回放实际效果。
+///
+/// 词表按真实采用面渐进扩：`#[non_exhaustive]` 使加变体属非破坏演进——
+/// 跨 crate 的 match 必须带通配臂（同 crate 豁免），采用方在编译期被强制
+/// 面对「未知效果形态」的分支而非静默漏配（纪律同 [`parse`](crate::parse)
+/// 词表，F-07 封口）。
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Effect<A, Op = Infallible> {
     /// 零副作用回灌：环闭合/表单回写的唯一形态。
     /// 账本语义：Emit 派生动作由 store 核心直接回灌入队（不经解释器，无挂点
@@ -391,7 +439,7 @@ pub trait Driver<S, A> {
 /// |---|---|---|
 /// | [`Self::dispatch`] | 恒 no-op（签名不引入 Err） | 计入实现方拒绝计数 |
 /// | [`ActionSender::dispatch`] | 返回 `false`（显式拒绝，`#[must_use]` 兜底） | 同一计数 |
-/// | [`Self::subscribe`] | 照常登记、票据照常注销，但闭门后永无 dispatch 触发——通知静默（已知取舍） | 计入实现方「闭门登记」计数 |
+/// | [`Self::subscribe`] | 照常登记、票据照常注销，但闭门后永无 dispatch 触发——通知静默（已知取舍；显式拒绝面用实现方 `try_subscribe`） | 计入实现方「闭门登记」计数 |
 ///
 /// dispatch 的静默 no-op 与 sender 的显式 `false` 是**保签名**与**停机显式化**
 /// 之间的显式取舍：dispatch 面向动作源（不感染调用面），sender 面向异步回灌
@@ -527,7 +575,13 @@ pub trait JournalPort<A> {
 }
 
 /// 恢复点三态（互斥态进类型，无双 `Option` 同义形）。
+///
+/// 词表按真实采用面渐进扩：`#[non_exhaustive]` 使加态属非破坏演进——跨
+/// crate 的 match 必须带通配臂（同 crate 豁免），恢复方在编译期被强制面对
+/// 「未知恢复形态」的分支（fail-closed）而非静默漏配（纪律同 [`Effect`]，
+/// F-07 封口）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Restore<A, S> {
     /// 空账本：取 [`Reducer::initial`]，零 apply。
     Empty,

@@ -68,10 +68,18 @@ fn infallible_op_structurally_excludes_run() {
             Effect::Emit(a) => Some(a),
             Effect::Run { op, .. } => match op {}, // Infallible 无值：不可达分支零成本消除
             Effect::Cancel { .. } => None,
+            // Effect 词表 non_exhaustive（跨 crate match 须通配）：未知新变体
+            // fail-closed 崩溃带因，禁静默当「非 Emit」吞掉
+            other => panic!("skeleton::Effect 新增变体未适配 unwrap_emitted: {other:?}"),
         }
     }
     assert_eq!(unwrap_emitted(Effect::Emit("x")), Some("x"));
-    assert_eq!(unwrap_emitted(Effect::Cancel { id: EffectId(0) }), None);
+    assert_eq!(
+        unwrap_emitted(Effect::Cancel {
+            id: EffectId::new(0)
+        }),
+        None
+    );
 }
 
 /// 环闭合最小语义：Emit 回灌重入队列被排空（0.3 完整环时序的核心骨架）。
@@ -136,15 +144,15 @@ fn reducer_effects_forward_in_push_order() {
         }
         fn reduce(&self, s: &u32, _: Burst, out: &mut EffectBuf<Burst, u32>) -> u32 {
             out.push(Effect::Run {
-                id: EffectId(1),
+                id: EffectId::new(1),
                 op: 1,
             });
             out.push(Effect::Run {
-                id: EffectId(2),
+                id: EffectId::new(2),
                 op: 2,
             });
             out.push(Effect::Run {
-                id: EffectId(3),
+                id: EffectId::new(3),
                 op: 3,
             });
             s + 1

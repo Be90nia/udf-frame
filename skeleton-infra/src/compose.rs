@@ -6,6 +6,7 @@
 //! 表达式生成六闭包，见下）。
 
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use skeleton::{Effect, EffectBuf, Reducer};
 
@@ -14,6 +15,7 @@ use skeleton::{Effect, EffectBuf, Reducer};
 /// - `get`/`set`：父状态内子切片的读写镜头
 /// - `wrap`/`unwrap`：子 action 上浮 / 父 action 下沉路由；`unwrap` 返回
 ///   `None` = 本层不路由，状态克隆原样返回、零效果（父层分支自理）。
+///   miss 不再纯静默：每次计入 [`Combine::route_misses`]（读侧留痕，语义不变）。
 ///   子效果里的 `Emit(CA)` 由核心经 `wrap` 自动上浮为 `Emit(PA)`——`lift_fx`
 ///   只会收到 `Run`/`Cancel` 两形（词表上提与 action 上浮分工，参数零死位）
 /// - `lift_fx`：子效果词表到父词表的显式上提（同形出参：写父 `out`）
@@ -119,6 +121,7 @@ where
         unwrap,
         child,
         lift_fx,
+        route_miss: AtomicU64::new(0),
         _slices: PhantomData,
     }
 }
@@ -250,7 +253,23 @@ pub struct Combine<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L> {
     unwrap: U,
     child: C,
     lift_fx: L,
+    /// 路由 miss 计数（读侧 [`Combine::route_misses`]）：`unwrap` 返 `None`
+    /// 即 +1——miss 语义不变（状态克隆原样返回、零效果），只从「吞了没人
+    /// 知道」变「吞了几次看得见」。miss 路径专属，命中路径零开销。
+    route_miss: AtomicU64,
     _slices: PhantomData<(PS, PA, PO, CS, CA, CO)>,
+}
+
+impl<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L> Combine<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L> {
+    /// 路由 miss 读侧：`unwrap` 闭包返回 `None` 的累计次数（`Relaxed` 单调
+    /// 计数）。非零读数 = 父层把本分片不认识的 action 送进了本分片——
+    /// 「父层自理」走父分支不会到达分片，读数持续增长即路由配置 bug 显形
+    /// （对照：路由 miss 与「本层不路由」共享同一 `None`，计数是唯一区分
+    /// 线索）。计数随 `Combine` 实例：宏产物按调用重建则计数随新实例清零，
+    /// 需要跨 dispatch 累计就把分片装配一次持有（闭包全 ZST，持有零成本）。
+    pub fn route_misses(&self) -> u64 {
+        self.route_miss.load(Ordering::Relaxed)
+    }
 }
 
 impl<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L> Reducer
@@ -279,6 +298,8 @@ where
 
     fn reduce(&self, state: &PS, action: PA, out: &mut EffectBuf<PA, PO>) -> PS {
         let Some(child_action) = (self.unwrap)(&action) else {
+            // miss 留痕（读侧 route_misses）：语义不变——状态克隆原样返回、零效果
+            self.route_miss.fetch_add(1, Ordering::Relaxed);
             return state.clone();
         };
         // 子效果缓冲：Vec::new 空态零分配，子 action 实际产效果时才分配一次

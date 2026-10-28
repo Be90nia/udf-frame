@@ -79,20 +79,24 @@ fn local_sub_unregister(store_id: u64, sub_id: u64) {
     });
 }
 
-/// 触发本线程登记的某 store 全部本地订阅；返回 (panic 摘除数, 最近一次成因
-/// 摘要)（调用方计入 `subscriber_panics` + 留痕 `subscriber_panic_last_cause`，
-/// 摘除即从此不再触发——fail-closed）。回调内重入
-/// dispatch 只入队即返（排空权互斥），不会重入本函数，RefCell 不可重入
-/// 借用天然满足。通知序 = 登记序（确定性）。
-pub(super) fn local_notify(store_id: u64, state: &dyn std::any::Any) -> (u64, Option<String>) {
+/// 触发本线程登记的某 store 全部本地订阅；返回 (命中数, panic 摘除数,
+/// 最近一次成因摘要)。命中数 = 本线程表内该 store 的登记笔数（含本轮被摘除
+/// 的毒回调）——闸>0 而命中=0 即本线程 dispatch 未触达任何本地订阅（跨线程
+/// miss，调用方计入 `local_missed` 留痕）。摘除数计入 `subscriber_panics` +
+/// 留痕 `subscriber_panic_last_cause`，摘除即从此不再触发——fail-closed。
+/// 回调内重入 dispatch 只入队即返（排空权互斥），不会重入本函数，RefCell
+/// 不可重入借用天然满足。通知序 = 登记序（确定性）。
+pub(super) fn local_notify(store_id: u64, state: &dyn std::any::Any) -> (u64, u64, Option<String>) {
     LOCAL_SUBS.with(|table| {
         let mut table = table.borrow_mut();
+        let mut matched = 0u64;
         let mut dead = Vec::new();
         let mut last_cause = None;
         for entry in table.iter_mut() {
             if entry.store_id != store_id {
                 continue;
             }
+            matched += 1;
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| entry.notify.notify(state))) {
                 dead.push(entry.sub_id);
                 last_cause = Some(panic_cause_summary(&*payload));
@@ -102,7 +106,7 @@ pub(super) fn local_notify(store_id: u64, state: &dyn std::any::Any) -> (u64, Op
         if !dead.is_empty() {
             table.retain(|e| e.store_id != store_id || !dead.contains(&e.sub_id));
         }
-        (removed, last_cause)
+        (matched, removed, last_cause)
     })
 }
 

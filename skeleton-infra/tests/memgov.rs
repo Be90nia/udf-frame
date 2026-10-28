@@ -263,7 +263,9 @@ mod skeleton_alloc_twin {
         }
         fn reduce(&self, s: &u32, _: Bump, out: &mut EffectBuf<Bump, Infallible>) -> u32 {
             // 恒产一条 Cancel 效果：把效果缓冲的复用面一并纳入测量
-            out.push(Effect::Cancel { id: EffectId(1) });
+            out.push(Effect::Cancel {
+                id: EffectId::new(1),
+            });
             s.wrapping_add(1)
         }
     }

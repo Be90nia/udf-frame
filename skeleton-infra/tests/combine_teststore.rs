@@ -56,7 +56,7 @@ impl Reducer for ChildFeature {
         match a {
             ChildAction::Inc => {
                 out.push(Effect::Run {
-                    id: EffectId(1),
+                    id: EffectId::new(1),
                     op: ChildOp::Notify,
                 });
                 ChildState { count: s.count + 1 }
@@ -109,6 +109,9 @@ fn parent_child_fragment() -> impl Reducer<State = ParentState, Action = ParentA
             // Emit 不达 lift_fx（核心经 wrap 上浮）；穷尽性占位
             Effect::Emit(_) => {}
             Effect::Cancel { id } => out.push(Effect::Cancel { id }),
+            // Effect 词表 non_exhaustive（跨 crate match 须通配）：未知新变体
+            // fail-closed 崩溃带因，禁静默丢弃效果
+            other => unreachable!("skeleton::Effect 新增变体未适配 lift_fx: {other:?}"),
         },
     )
 }
@@ -135,7 +138,9 @@ impl Reducer for ParentFeature {
         match a {
             ParentAction::Child(_) => parent_child_fragment().reduce(s, a, out),
             ParentAction::Finish => {
-                out.push(Effect::Cancel { id: EffectId(9) });
+                out.push(Effect::Cancel {
+                    id: EffectId::new(9),
+                });
                 ParentState {
                     done: true,
                     ..s.clone()
@@ -161,7 +166,7 @@ fn combine_routes_child_action_and_lifts_effect() {
         "子 action 经 unwrap 路由 → set 写回子切片"
     );
     ts.receive(ExpectedEffect::Run {
-        id: Some(EffectId(1)),
+        id: Some(EffectId::new(1)),
         op: ParentOp::ChildNotify,
     });
 }
@@ -177,11 +182,11 @@ fn combine_unrouted_action_leaves_child_slice() {
     assert!(ts.state().done, "父自有分支自理");
     // FIFO：先清第一条 send 的子效果，再验父自有 Cancel
     ts.receive(ExpectedEffect::Run {
-        id: Some(EffectId(1)),
+        id: Some(EffectId::new(1)),
         op: ParentOp::ChildNotify,
     });
     ts.receive(ExpectedEffect::Cancel {
-        id: Some(EffectId(9)),
+        id: Some(EffectId::new(9)),
     });
 }
 
@@ -212,6 +217,9 @@ fn macro_fragment() -> impl Reducer<State = ParentState, Action = ParentAction, 
             }
             Effect::Emit(_) => {}
             Effect::Cancel { id } => out.push(Effect::Cancel { id }),
+            // Effect 词表 non_exhaustive（跨 crate match 须通配）：未知新变体
+            // fail-closed 崩溃带因，禁静默丢弃效果
+            other => unreachable!("skeleton::Effect 新增变体未适配 lift_fx: {other:?}"),
         },
     )
 }
@@ -329,7 +337,7 @@ fn teststore_receive_id_mismatch_panics() {
     let mut ts = TestStore::new(ParentFeature);
     ts.dispatch(ParentAction::Child(ChildAction::Inc));
     ts.receive(ExpectedEffect::Run {
-        id: Some(EffectId(2)),
+        id: Some(EffectId::new(2)),
         op: ParentOp::ChildNotify,
     });
 }

@@ -77,7 +77,7 @@ impl Reducer for TallyFeature {
         match a {
             TallyAct::Increment(n) => {
                 out.push(Effect::Run {
-                    id: EffectId(s.count + n),
+                    id: EffectId::new(s.count + n),
                     op: TallyFx::Notify(n),
                 });
                 TallyState {
@@ -113,6 +113,9 @@ fn make_fragment() -> impl Reducer<State = Board, Action = BoardAct, Op = BoardF
                 op: BoardFx::Tally(op),
             }),
             Effect::Cancel { id } => out.push(Effect::Cancel { id }),
+            // Effect 词表 non_exhaustive（跨 crate match 须通配）：未知新变体
+            // fail-closed 崩溃带因，禁静默丢弃效果
+            other => unreachable!("skeleton::Effect 新增变体未适配 lift_fx: {other:?}"),
         },
     )
 }
@@ -177,6 +180,9 @@ impl EffectRuntime<BoardAct, BoardFx> for HostRuntime {
             Effect::Cancel { .. } => return, // 本例无在途取消语义
             // Emit 由核心折叠入队，永不进入解释器转发路径
             Effect::Emit(_) => unreachable!("Emit never reaches the interpreter"),
+            // Effect 词表 non_exhaustive（跨 crate match 须通配）：未知新变体
+            // fail-closed 崩溃带因——解释器不懂的效果形态不能静默吞
+            other => unreachable!("skeleton::Effect 新增变体未适配 HostRuntime: {other:?}"),
         };
         let back = back.clone();
         let journal = self.journal.clone();

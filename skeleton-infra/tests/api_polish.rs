@@ -14,7 +14,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+use skeleton::{
+    ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Infallible, NoFx, Reducer, Store as _,
+};
 use skeleton_infra::compose::{combine, Combine};
 use skeleton_infra::runtime::SyncStore as Store;
 
@@ -236,10 +238,86 @@ fn subscribe_local_panic_removal_is_counted() {
 fn effect_id_keys_hash_maps() {
     use std::collections::HashMap;
     let mut inflight: HashMap<skeleton::EffectId, &'static str> = HashMap::new();
-    inflight.insert(skeleton::EffectId(1), "timer");
-    inflight.insert(skeleton::EffectId(2), "http");
-    assert_eq!(inflight.get(&skeleton::EffectId(1)), Some(&"timer"));
+    inflight.insert(skeleton::EffectId::new(1), "timer");
+    inflight.insert(skeleton::EffectId::new(2), "http");
+    assert_eq!(inflight.get(&skeleton::EffectId::new(1)), Some(&"timer"));
     assert_eq!(inflight.len(), 2);
+}
+
+// ── EffectId 封口与 Cancel 寻址校验 ─────────────────────────────────────
+
+/// 受控构造落地：本文件即外部 crate 视角（tests/ 独立编译），`EffectId::new`
+/// 构造 + `get` 读值 + Copy/Eq 值语义照旧。裸元组 `EffectId(1)` 编译红的负向
+/// 断言由 lib.rs `EffectId` 文档的 `compile_fail` doctest 承载（lint 契约同
+/// `send` 之 `#[must_use]` 先例，运行时断言无法表达语法封口）。
+#[test]
+fn effect_id_constructs_only_via_new() {
+    let id = skeleton::EffectId::new(42);
+    assert_eq!(id.get(), 42);
+    let copy = id;
+    assert_eq!(id, copy, "值语义小句柄承诺不变");
+}
+
+/// Cancel 寻址校验（F-08 撞车观测面）：`Cancel` 引用从未发出的 `Run` id 计数
+/// 留痕、引用已发出 id 不计数——撞车/打错/时序 bug 从静默变可观测。校验在
+/// 核心转发环（解释器之前），空转解释器即可驱动。
+#[test]
+fn cancel_unknown_id_counts_dangling_addressing() {
+    enum Msg {
+        Run1,
+        Cancel1,
+        Cancel9,
+    }
+    struct RunCancelFeature;
+    impl Reducer for RunCancelFeature {
+        type State = u32;
+        type Action = Msg;
+        type Op = ();
+        fn initial(&self) -> u32 {
+            0
+        }
+        fn reduce(&self, s: &u32, a: Msg, out: &mut EffectBuf<Msg, ()>) -> u32 {
+            match a {
+                Msg::Run1 => {
+                    out.push(Effect::Run {
+                        id: EffectId::new(1),
+                        op: (),
+                    });
+                    s + 1
+                }
+                Msg::Cancel1 => {
+                    out.push(Effect::Cancel {
+                        id: EffectId::new(1),
+                    });
+                    *s
+                }
+                Msg::Cancel9 => {
+                    out.push(Effect::Cancel {
+                        id: EffectId::new(9),
+                    });
+                    *s
+                }
+            }
+        }
+    }
+    struct Sink;
+    impl EffectRuntime<Msg, ()> for Sink {
+        fn run(&mut self, _: Effect<Msg, ()>, _: &ActionSender<Msg>) {}
+    }
+
+    let store = Store::new(RunCancelFeature, Sink);
+    assert_eq!(store.cancel_unknown_id(), 0);
+    store.dispatch(Msg::Cancel9);
+    assert_eq!(
+        store.cancel_unknown_id(),
+        1,
+        "从未发出的 id 9 被 Cancel：计数留痕"
+    );
+    store.dispatch(Msg::Run1);
+    store.dispatch(Msg::Cancel1);
+    assert_eq!(store.cancel_unknown_id(), 1, "已发出 id 1 的 Cancel 不计数");
+    store.dispatch(Msg::Cancel9);
+    assert_eq!(store.cancel_unknown_id(), 2, "dangling Cancel 累计");
 }
 
 // ── 订阅回调 panic 的成因摘要留痕 ──────────────────────────────────────

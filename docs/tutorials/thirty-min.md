@@ -461,7 +461,7 @@ impl Reducer for BoardFeature {
                         if to == Column::Done {
                             // 描述式副作用离场：解释器执行后回灌 DoneNotified
                             out.push(Effect::Run {
-                                id: EffectId(id),
+                                id: EffectId::new(id),
                                 op: Fx::DoneReached {
                                     id,
                                     title: t.title.clone(),

@@ -44,7 +44,7 @@ impl skeleton::Reducer for Producer {
 
     fn reduce(&self, s: &Hits, _a: Act, out: &mut skeleton::EffectBuf<Act, Beep>) -> Hits {
         out.push(Effect::Run {
-            id: skeleton::EffectId(s.0 + 1),
+            id: skeleton::EffectId::new(s.0 + 1),
             op: Beep::One,
         });
         Hits(s.0 + 1)

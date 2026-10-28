@@ -4,7 +4,7 @@
 
 use std::convert::Infallible;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
 use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
@@ -35,7 +35,9 @@ impl Reducer for Counter {
         match a {
             Msg::Bump => s + 1,
             Msg::Ping => {
-                out.push(Effect::Cancel { id: EffectId(1) });
+                out.push(Effect::Cancel {
+                    id: EffectId::new(1),
+                });
                 s + 1
             }
             Msg::Bonus => s + 10,
@@ -92,7 +94,9 @@ impl Reducer for Child {
                 s + 1
             }
             ChildAct::Abort => {
-                out.push(Effect::Cancel { id: EffectId(9) });
+                out.push(Effect::Cancel {
+                    id: EffectId::new(9),
+                });
                 s + 1
             }
         }
@@ -116,6 +120,9 @@ fn fragment() -> impl Reducer<State = ParentState, Action = ParentAct, Op = Pare
             Effect::Cancel { id } => out.push(Effect::Cancel { id }),
             // Emit 由核心经 wrap 上浮，到不了 lift_fx——到达即核心分支断裂（fail-visible）
             Effect::Emit(_) => unreachable!("Emit 必须经核心 wrap 上浮，不经 lift_fx"),
+            // Effect 词表 non_exhaustive（跨 crate match 须通配）：未知新变体
+            // fail-closed 崩溃带因，禁静默丢弃效果
+            other => unreachable!("skeleton::Effect 新增变体未适配 lift_fx: {other:?}"),
         },
     )
 }
@@ -188,7 +195,7 @@ fn combine_child_cancel_lifts_through_lift_fx() {
     });
     ts.dispatch(ParentAct::Child(ChildAct::Abort));
     ts.receive(ExpectedEffect::Cancel {
-        id: Some(EffectId(9)),
+        id: Some(EffectId::new(9)),
     });
     assert_eq!(ts.state().child, 1, "子切片照常迁移（Cancel 上提不改迁移）");
 }
@@ -382,4 +389,187 @@ fn closed_gate_dispatch_leaves_rejected_audit_scene() {
         3,
         "审计事件与拒绝计数同一触发点对账"
     );
+}
+
+// ── 静默面显形四件（对齐 subscriber_panics 先例：计数+读侧+一测一档）──────
+
+/// F-04：路由 miss（`unwrap` 返 `None`）不再纯静默——状态克隆原样返回的
+/// 语义不变，但每次 miss 计入 `route_misses()`。「父层送错地方」与「父层
+/// 自理」共享同一 `None`，计数是唯一区分线索。变异检出：miss 分支丢计数→
+/// 断言 2 红；命中路径误计数→断言 4 红。
+#[test]
+fn combine_route_miss_is_counted_not_silent() {
+    #[derive(Clone, Debug, PartialEq)]
+    struct S {
+        child: u32,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum A {
+        Child(u32),
+        Unrouted,
+    }
+
+    struct ChildAdd;
+
+    impl Reducer for ChildAdd {
+        type State = u32;
+        type Action = u32;
+        type Op = Infallible;
+        fn initial(&self) -> u32 {
+            0
+        }
+        fn reduce(&self, s: &u32, a: u32, _out: &mut EffectBuf<u32, Infallible>) -> u32 {
+            s + a
+        }
+    }
+
+    // 分片装配一次持有（计数随实例：按调用重建则读数随新实例清零）
+    let frag = skeleton_infra::combine!(ChildAdd, S.child, A::Child);
+    let s0 = S { child: 0 };
+    let mut out: EffectBuf<A, Infallible> = EffectBuf::new();
+
+    // miss：Unrouted 不在 unwrap 词表——状态原样克隆、零效果、计数 +1
+    let s1 = frag.reduce(&s0, A::Unrouted, &mut out);
+    assert_eq!(s1, s0, "miss 语义不变：状态克隆原样返回");
+    assert_eq!(frag.route_misses(), 1, "路由 miss 必须显式留痕");
+
+    // 命中：正常下沉路由，计数不动
+    let s2 = frag.reduce(&s1, A::Child(5), &mut out);
+    assert_eq!(s2.child, 5);
+    assert_eq!(frag.route_misses(), 1, "命中路径不计数");
+}
+
+/// F-09：本地订阅只在注册线程触发（语义不变），但跨线程 dispatch 的 miss
+/// 不再零信号：闸>0 而 dispatch 线程表查无登记即计入
+/// `local_missed_notifications()`——宿主据此发现「本地档挂在了非 dispatch
+/// 线程」。变异检出：miss 分支丢计数→断言 3 红；本地触发语义被误改→
+/// 断言 1/末断言红。
+#[test]
+fn local_subscription_misses_are_counted_on_cross_thread_dispatch() {
+    let store = Arc::new(Store::new(Counter, NoFx));
+    let hits = Arc::new(AtomicU64::new(0));
+
+    // 基线：注册线程自 dispatch 正常触发，miss 零计
+    let h = Arc::clone(&hits);
+    let ticket = store.subscribe_local(move |_| {
+        h.fetch_add(1, Ordering::SeqCst);
+    });
+    store.dispatch(Msg::Bump);
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "注册线程 dispatch 必触发");
+    assert_eq!(store.local_missed_notifications(), 0);
+    drop(ticket);
+
+    // 跨线程：A 线程持有本地订阅，主线程 dispatch → 零触发 + miss 显形
+    let (registered_tx, registered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let h = Arc::clone(&hits);
+    let store_for_a = Arc::clone(&store);
+    let handle = std::thread::spawn(move || {
+        let h = Arc::clone(&h);
+        let _ticket = store_for_a.subscribe_local(move |_| {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        registered_tx.send(()).expect("注册信号");
+        release_rx.recv().expect("释放信号");
+        store_for_a.dispatch(Msg::Bump); // 注册线程自 dispatch：本地档照常触发
+    });
+    registered_rx.recv().expect("等待 A 线程登记完成");
+    store.dispatch(Msg::Bump);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "他线程 dispatch 不触达本地订阅（语义不变）"
+    );
+    assert_eq!(
+        store.local_missed_notifications(),
+        1,
+        "跨线程 dispatch 的 miss 必须显式留痕"
+    );
+    release_tx.send(()).expect("放行 A 线程");
+    handle.join().expect("A 线程不得 panic");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "注册线程自 dispatch 照常触发"
+    );
+    assert_eq!(
+        store.local_missed_notifications(),
+        1,
+        "命中线程的 dispatch 不误计 miss"
+    );
+}
+
+/// F-10：`try_subscribe` 闭门显式 Err——停机序写反（先 close 后 subscribe）
+/// 在调用点显形；Err 路径登记未发生，`subscriptions_after_close` 保持
+/// 「已登记死订阅」口径不掺水；旧 `subscribe` 保持签名 + 计数面（迁移期
+/// 不静默）。变异检出：Err 路径误登记/误计数→断言 3 红；旧面计数丢失→
+/// 末断言红。
+#[test]
+fn try_subscribe_after_close_is_explicit_err() {
+    use skeleton_infra::runtime::StoreClosed;
+
+    let store = Store::new(Counter, NoFx);
+    let (tx, rx) = mpsc::channel();
+    let ticket = store
+        .try_subscribe(move |_| {
+            tx.send(()).expect("通知信号");
+        })
+        .expect("未闭门登记必成功");
+    store.dispatch(Msg::Bump);
+    rx.recv().expect("订阅者必须收到通知");
+    assert_eq!(store.subscriptions_after_close(), 0);
+
+    store.close();
+    assert!(
+        matches!(store.try_subscribe(|_| {}), Err(StoreClosed)),
+        "闭门后 try_subscribe 必须显式 Err"
+    );
+    assert_eq!(
+        store.subscriptions_after_close(),
+        0,
+        "Err 路径登记未发生，死订阅计数不掺水"
+    );
+
+    // 旧面（迁移期兼容）：照常登记 + 计数，不静默
+    let _late = store.subscribe(|_| {});
+    assert_eq!(store.subscriptions_after_close(), 1, "旧面闭门登记照常计数");
+    drop(ticket);
+    drop(_late);
+}
+
+/// F-13：审计事件流单槽二次订阅显形——覆盖语义不变（仍是唯一订阅点），
+/// 但覆盖留痕 `audit_preempted()`，「tracing 桥被自定义消费者静默顶掉」
+/// 从此可查。变异检出：覆盖丢计数→断言 3 红；前订未被终止（误改多槽）→
+/// 断言 4 红；新流未接通→断言 5 红。
+#[test]
+fn second_event_stream_subscription_preempts_and_leaves_trace() {
+    let store = Store::new(Counter, NoFx);
+    let first_hits = Arc::new(AtomicU64::new(0));
+    let h = Arc::clone(&first_hits);
+    let first = store.subscribe_events(16, move |_| {
+        h.fetch_add(1, Ordering::SeqCst);
+    });
+    assert_eq!(store.audit_preempted(), 0, "首订无覆盖");
+    store.dispatch(Msg::Bump);
+    let before = first_hits.load(Ordering::SeqCst);
+    assert!(before > 0, "首订正常收事件");
+
+    let _second = store.subscribe_events(16, |_| {});
+    assert_eq!(store.audit_preempted(), 1, "二次订阅覆盖前订必须显式留痕");
+
+    store.dispatch(Msg::Bump);
+    assert_eq!(
+        first_hits.load(Ordering::SeqCst),
+        before,
+        "被覆盖的前订不再收到事件（单槽语义不变）"
+    );
+    assert!(!store.take_events().is_empty(), "新订阅的事件流照常接通");
+    assert_eq!(
+        store.audit_preempted(),
+        1,
+        "覆盖一次计一次，后续 dispatch 不误计"
+    );
+    drop(first);
+    drop(_second);
 }

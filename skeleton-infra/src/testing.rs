@@ -68,7 +68,7 @@ pub enum Script<A, Op> {
 ///     fn reduce(&self, s: &i32, a: Act, out: &mut EffectBuf<Act, ()>) -> i32 {
 ///         match a {
 ///             Act::Start => {
-///                 out.push(Effect::Run { id: EffectId(0), op: () });
+///                 out.push(Effect::Run { id: EffectId::new(0), op: () });
 ///                 *s
 ///             }
 ///             Act::Bump => s + 1,
@@ -374,7 +374,12 @@ mod tests {
         let (scope, store, back) = fixture();
         let mut rt = ScriptedRuntime::<Act, Infallible>::new(Arc::clone(&scope));
         rt.feed([Script::Emit(Act::Bump)]);
-        rt.run(Effect::Cancel { id: EffectId(0) }, &back);
+        rt.run(
+            Effect::Cancel {
+                id: EffectId::new(0),
+            },
+            &back,
+        );
         let handle = rt.handles.pop().expect("Emit 脚本必须产出任务");
         assert_eq!(handle.join().await, Ok(()));
         assert_eq!(*store.snapshot(), 1, "回灌 Action 必须推进 store");
@@ -387,7 +392,12 @@ mod tests {
         let (scope, _store, back) = fixture();
         let mut rt = ScriptedRuntime::<Act, Infallible>::new(Arc::clone(&scope));
         rt.feed([Script::Panic("scripted-boom")]);
-        rt.run(Effect::Cancel { id: EffectId(1) }, &back);
+        rt.run(
+            Effect::Cancel {
+                id: EffectId::new(1),
+            },
+            &back,
+        );
         let handle = rt.handles.pop().unwrap();
         assert_eq!(
             handle.join().await,
@@ -403,7 +413,12 @@ mod tests {
         let (scope, _store, back) = fixture();
         let mut rt = ScriptedRuntime::<Act, Infallible>::new(Arc::clone(&scope));
         rt.feed([Script::Never]);
-        rt.run(Effect::Cancel { id: EffectId(2) }, &back);
+        rt.run(
+            Effect::Cancel {
+                id: EffectId::new(2),
+            },
+            &back,
+        );
         assert_eq!(scope.in_flight(), 1);
         let handle = rt.handles.pop().unwrap();
         handle.abort();
@@ -417,7 +432,12 @@ mod tests {
     fn exhausted_scripts_are_noop() {
         let (scope, _store, back) = fixture();
         let mut rt = ScriptedRuntime::<Act, Infallible>::new(Arc::clone(&scope));
-        rt.run(Effect::Cancel { id: EffectId(3) }, &back);
+        rt.run(
+            Effect::Cancel {
+                id: EffectId::new(3),
+            },
+            &back,
+        );
         assert_eq!(scope.in_flight(), 0);
         assert!(rt.handles.is_empty());
         expect_idle(&scope);
@@ -433,9 +453,24 @@ mod tests {
             Script::Never,
             Script::Panic("third"),
         ]);
-        rt.run(Effect::Cancel { id: EffectId(4) }, &back);
-        rt.run(Effect::Cancel { id: EffectId(5) }, &back);
-        rt.run(Effect::Cancel { id: EffectId(6) }, &back);
+        rt.run(
+            Effect::Cancel {
+                id: EffectId::new(4),
+            },
+            &back,
+        );
+        rt.run(
+            Effect::Cancel {
+                id: EffectId::new(5),
+            },
+            &back,
+        );
+        rt.run(
+            Effect::Cancel {
+                id: EffectId::new(6),
+            },
+            &back,
+        );
         let mut handles = std::mem::take(&mut rt.handles);
         assert_eq!(handles.len(), 3);
         assert_eq!(handles.remove(0).join().await, Ok(())); // 首脚本=Emit：回灌落地
@@ -459,8 +494,18 @@ mod tests {
         let (fxscope_scope, store, back) = fixture();
         let mut rt = ScriptedRuntime::<Act, u8>::new(Arc::clone(&fxscope_scope));
         rt.feed([Script::Run(7u8), Script::Run(9u8)]);
-        rt.run(Effect::Cancel { id: EffectId(1) }, &back);
-        rt.run(Effect::Cancel { id: EffectId(2) }, &back);
+        rt.run(
+            Effect::Cancel {
+                id: EffectId::new(1),
+            },
+            &back,
+        );
+        rt.run(
+            Effect::Cancel {
+                id: EffectId::new(2),
+            },
+            &back,
+        );
         let mut handles = std::mem::take(&mut rt.handles);
         assert_eq!(handles.len(), 2, "两条 Run 脚本各产一个任务");
         assert_eq!(handles.remove(0).join().await, Ok(()));

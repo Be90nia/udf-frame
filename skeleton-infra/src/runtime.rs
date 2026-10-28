@@ -9,7 +9,7 @@
 //! std-only：`runtime` feature 零三方依赖（cargo tree 证明口径见 crate 文档）。
 
 use std::cell::{Cell, UnsafeCell};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -148,6 +148,10 @@ struct StoreInner<S, A, Op> {
     /// 本地订阅闸（[`SyncStore::subscribe_local`]）：零本地订阅时通知路径一次
     /// relaxed 读即短路，不触达任何线程本地表。只作闸，不作精确计数读侧。
     local_subs: Arc<AtomicUsize>,
+    /// 本地订阅跨线程 miss 计数（读侧 [`SyncStore::local_missed_notifications`]）：
+    /// 通知段闸>0 但本线程表查无该 store 登记即 +1——「本地档挂注册线程、
+    /// dispatch 来自他线程」的显形。
+    local_missed: AtomicU64,
     /// 异步投递口注册表（ADR 0008）：表存 Weak、票据 Drop 经共享句柄即时摘表
     /// （与 `subs` 同构）；槽位与投递机制在 `notify` 子模块。
     notify_sinks: Arc<Mutex<Vec<Weak<NotifySinkSlot>>>>,
@@ -193,6 +197,14 @@ struct StoreInner<S, A, Op> {
     /// 回灌深度预算触发计数：单任排空连续回灌超 [`FEEDBACK_DEPTH_BUDGET`]
     /// 即停排+自增。读侧 [`SyncStore::feedback_budget_exceeded`]。
     feedback_exceeded: AtomicU64,
+    /// Cancel 寻址校验：本 store 见过的 `Run` id 登记（reducer 发出即记，
+    /// 摘除不可行——Run 的自然完成核心不可见，见 `SyncStore::cancel_unknown_id`
+    /// 文档）。只在 Cancel/Run 效果流经转发环时触达，零效果路径零开销。
+    run_ids: Mutex<HashSet<u64>>,
+    /// Cancel 寻址校验计数：`Effect::Cancel` 引用从未发出的 `Run` id 即 +1
+    /// （id 纪律漂移的直接证据：打错数字、撞车后引用了他域 id、Cancel 早于
+    /// Run 的时序 bug）。读侧 [`SyncStore::cancel_unknown_id`]。
+    cancel_unknown_id: AtomicU64,
     /// Emit 回灌累计重入计数：`Effect::Emit` 永不
     /// 进效果转发路径（回环以 Action 重入队列），本计数供 [`TestStore::receive`]
     /// 空队列时如实归因「本轮产过 N 个回灌 Emit」——区别于「真没产效果」。
@@ -209,6 +221,10 @@ struct StoreInner<S, A, Op> {
     audit_seq: AtomicU64,
     /// 审计订阅代次计数器（票据 Drop 对账键，防旧票据误杀后继订阅流）。
     audit_gen: AtomicU64,
+    /// 审计事件流前订被覆盖计数（读侧 [`SyncStore::audit_preempted`]）：
+    /// `subscribe_events` 落槽时槽内已有订阅即 +1——单槽二次订阅静默杀掉
+    /// 前订的显形。
+    audit_preempted: AtomicU64,
     /// 测试专用：在途 dispatch 计数。0=无任何
     /// dispatch 在执行，此刻「draining=false 且队列非空」即孤儿 action（无人
     /// 排空、无人即将排空）。push 方先 +1 再入队、返回前 -1，使监视线程可用
@@ -230,6 +246,7 @@ struct StoreInner<S, A, Op> {
 /// | [`Self::dispatch`] | 恒 no-op（签名不引入 Err） | 计入 [`Self::rejected_after_close`] |
 /// | [`ActionSender::dispatch`] | 返回 `false`（显式拒绝，`#[must_use]` 兜底） | 同一计数 |
 /// | [`Self::subscribe`] / [`Self::subscribe_local`] | 照常登记、票据照常注销，但闭门后永无 dispatch 触发——通知静默（已知取舍，见下） | 计入 [`Self::subscriptions_after_close`]；`subscriber_count` 仍可查 |
+/// | [`Self::try_subscribe`] | 返回 `Err(StoreClosed)`——显式拒绝、不登记（推荐停机序主路径） | 返回值即信号；登记未发生，[`Self::subscriptions_after_close`] 不计 |
 /// | [`Notify::subscribe_notify`] | 同上行：登记照常、闭门后永无落位拍——信号静默 | 计入 [`Self::subscriptions_after_close`] |
 ///
 /// dispatch 的静默 no-op 与 sender dispatch 的显式 `false` 是**保签名**与**停机显式化**
@@ -263,6 +280,20 @@ struct StoreInner<S, A, Op> {
 pub struct SyncStore<S, A, Op = Infallible> {
     inner: Arc<StoreInner<S, A, Op>>,
 }
+
+/// 停机闸已闭：订阅登记窗口已关（[`SyncStore::try_subscribe`] 的显式失败面）。
+/// 与 [`crate::fx::ScopeClosed`]、`RegisterError::Closed` 同族停机语义——
+/// 框架其余停机入口全都显式失败，本类型补齐 subscribe 面的缺口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreClosed;
+
+impl std::fmt::Display for StoreClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("store closed for new subscriptions (accepting gate)")
+    }
+}
+
+impl std::error::Error for StoreClosed {}
 
 /// 回灌深度预算（const 64）：单任排空内连续处理的回灌链深度上限。
 /// 有界链（Undo→Replay、表单回写）深度个位数；自指回灌环（reducer 恒 Emit
@@ -453,6 +484,10 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
     /// store.dispatch(1);
     /// store.close();
     /// ```
+    ///
+    /// 停机序推荐走 [`SyncStore::try_subscribe`]（闭门显式 `Err`，见其文档）；
+    /// 本方法保留签名作迁移期兼容面——闭门登记照常 + 计数
+    /// （[`SyncStore::subscriptions_after_close`]），不静默。
     fn subscribe(&self, f: impl FnMut(&S) + Send + 'static) -> Subscription<S> {
         // 闭门登记显形（登记照常生效，但永无通知——见类型文档对照表）
         if self.is_closed() {
@@ -620,7 +655,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ///     type Op = Op;
     ///     fn initial(&self) -> u32 { 0 }
     ///     fn reduce(&self, s: &u32, _a: u32, out: &mut EffectBuf<u32, Op>) -> u32 {
-    ///         out.push(Effect::Run { id: EffectId(1), op: Op::Ping });
+    ///         out.push(Effect::Run { id: EffectId::new(1), op: Op::Ping });
     ///         *s
     ///     }
     /// }
@@ -708,6 +743,13 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             Restore::FromInitial(actions) => (root.initial(), actions),
             // 快照态直入：不经 initial（快照即真相），增量留给下方 dispatch 重放
             Restore::FromSnapshot(state, actions) => (state, actions),
+            // Restore 词表 non_exhaustive（跨 crate match 须通配）：未知恢复
+            // 形态 fail-closed 崩溃带因——恢复语义核心不懂的态不能静默当
+            // Empty/FromInitial 处理（吞掉快照或重放即状态损坏）
+            _ => panic!(
+                "skeleton::Restore 新增变体未适配：SyncStore::restore_from 无法 \
+                 解释该恢复形态（fail-closed），须在实现侧补臂定义其播种语义"
+            ),
         };
         // new_cyclic：back 缓存句柄持 Weak 指回 inner，环构造一步完成
         let inner = Arc::new_cyclic(|weak| StoreInner {
@@ -724,6 +766,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             }),
             subs_version: Arc::new(AtomicUsize::new(0)),
             local_subs: Arc::new(AtomicUsize::new(0)),
+            local_missed: AtomicU64::new(0),
             notify_sinks: Arc::new(Mutex::new(Vec::new())),
             notify_subs: Arc::new(AtomicUsize::new(0)),
             state_version: AtomicU64::new(0),
@@ -739,10 +782,13 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             reducer_panics: AtomicU64::new(0),
             feedback_exceeded: AtomicU64::new(0),
             feedback_emitted: AtomicU64::new(0),
+            run_ids: Mutex::new(HashSet::new()),
+            cancel_unknown_id: AtomicU64::new(0),
             audit_gate: Arc::new(AtomicBool::new(false)),
             audit: Arc::new(Mutex::new(None)),
             audit_seq: AtomicU64::new(0),
             audit_gen: AtomicU64::new(0),
+            audit_preempted: AtomicU64::new(0),
             #[cfg(test)]
             in_flight: AtomicUsize::new(0),
         });
@@ -755,9 +801,48 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         store
     }
 
+    /// 登记跨线程订阅，闭门显式拒绝（推荐停机序主路径）：登记路径与
+    /// [`Store::subscribe`] 完全一致，唯 `close()` 之后返回 `Err(StoreClosed)`
+    /// 而非登记一张永不触发的死票据——停机序写反（先 close 后 subscribe）
+    /// 在调用点即显形。与 `ActionSender::dispatch` 的显式 `false`、
+    /// [`crate::fx::FxScope::spawn_tracked`] 的 `Err(ScopeClosed)` 同族：其余
+    /// 停机入口全都显式失败，本方法补齐 subscribe 面的缺口。
+    ///
+    /// 旧 [`Store::subscribe`] 保持签名不变（迁移期兼容面）：照常登记 +
+    /// [`Self::subscriptions_after_close`] 计数，不静默。Err 路径登记未发生，
+    /// 不计入任何计数（返回值即信号，`subscriptions_after_close` 保持
+    /// 「已登记的死订阅笔数」口径不掺水）。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+    /// # use skeleton_infra::runtime::{StoreClosed, SyncStore};
+    /// # struct Counter;
+    /// # impl Reducer for Counter {
+    /// #     type State = u32; type Action = u32; type Op = Infallible;
+    /// #     fn initial(&self) -> u32 { 0 }
+    /// #     fn reduce(&self, s: &u32, a: u32, _out: &mut EffectBuf<u32, Infallible>) -> u32 { s + a }
+    /// # }
+    /// let store = SyncStore::new(Counter, NoFx);
+    /// let ticket = store.try_subscribe(|_| {}).expect("未闭门登记必成功");
+    /// store.close();
+    /// assert!(matches!(store.try_subscribe(|_| {}), Err(StoreClosed)));
+    /// drop(ticket);
+    /// ```
+    pub fn try_subscribe(
+        &self,
+        f: impl FnMut(&S) + Send + 'static,
+    ) -> Result<Subscription<S>, StoreClosed> {
+        if self.is_closed() {
+            return Err(StoreClosed);
+        }
+        Ok(self.subscribe(f))
+    }
+
     /// 单线程订阅：回调免 `Send` 约束——闭包体内可用 `Rc`/`RefCell` 等线程
     /// 本地设施（跨线程档逼着采用方 `Arc<AtomicU64>`/`Mutex` 的痛点在此收口）。
-    /// 与 [`Self::subscribe`] 的三点差异：
+    /// 与 [`Self::subscribe`] 的四点差异：
     ///
     /// 1. **只在注册线程触发**：本地回调登记在注册线程的 thread-local 表，
     ///    store 侧从不持有闭包。他线程 dispatch 不触达本地订阅（其线程表中
@@ -767,6 +852,9 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 3. **不计入 [`Self::subscriber_count`]**（该计数只看跨线程订阅）；回调
     ///    panic 与跨线程订阅同一纪律：fail-closed 摘除 + [`Self::subscriber_panics`]
     ///    计数。
+    /// 4. **跨线程 miss 显形**：他线程 dispatch 不触达本档——每次「闸>0 而
+    ///    dispatch 线程表查无本 store 登记」计入 [`Self::local_missed_notifications`]
+    ///    （「挂错档」检测；触发语义不变，只留痕）。
     ///
     /// 两 API 的关系：`subscribe` 是跨线程档（回调需 `Send`，槽位 `Mutex`
     /// 串行化）；本 API 是单线程档（回调免 `Send`，线程亲和即安全依据）。
@@ -866,6 +954,27 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         self.inner.subscriptions_after_close.load(Ordering::SeqCst)
     }
 
+    /// 本地订阅跨线程 miss 计数（fail-visible 读侧）：dispatch 通知段「本地
+    /// 订阅闸>0 但 dispatch 线程的 TLS 表查无本 store 登记」即 +1——本地订阅
+    /// 挂在 A 线程、dispatch 来自 B 线程时，A 的订阅者收不到 B 的任何 dispatch
+    /// 通知（触发语义不变，只从「零触发零信号」变「miss 几次看得见」）。
+    /// 非零读数 = 本地档挂在非 dispatch 线程（「挂错档」）：改用
+    /// [`Self::subscribe`] 跨线程档，或把 dispatch 收敛到注册线程。口径按
+    /// dispatch 时点的闸快照：票据注销与闸回落之间的瞬态窗可能多计一次
+    /// （无害偏粗）。
+    pub fn local_missed_notifications(&self) -> u64 {
+        self.inner.local_missed.load(Ordering::Relaxed)
+    }
+
+    /// 审计事件流前订被覆盖计数（fail-visible 读侧）：[`Self::subscribe_events`]
+    /// 落槽时槽内已有订阅即 +1——单槽二次订阅会终止前订的事件流（典型：
+    /// 框架自带 tracing 桥被自定义消费者顶掉且无任何信号），本计数让覆盖
+    /// 显形。旧票据 Drop 照常安全（代次对账不误杀后继流），但其事件流已被
+    /// 覆盖终止。
+    pub fn audit_preempted(&self) -> u64 {
+        self.inner.audit_preempted.load(Ordering::Relaxed)
+    }
+
     /// 异步投递累计次数（ADR 0008 唯一新增读侧，成本可见）：投递口成功收到
     /// 信号的累计次数——逐口逐拍累计（panic 被摘除的投递不计；闭门/票 Drop 后
     /// 不再产生）。乘以单次投递成本即异步档对 dispatch 的总税额，是投递口
@@ -907,6 +1016,18 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         self.inner.feedback_exceeded.load(Ordering::SeqCst)
     }
 
+    /// Cancel 寻址校验读数：[`Effect::Cancel`](skeleton::Effect::Cancel) 引用
+    /// 从未发出的 `Run` id 的累计次数（转发环留痕，只计数不拦截——迟到
+    /// Cancel 是合法时序，见 `StoreInner::cancel_unknown_id` 文档）。
+    ///
+    /// 非零读数 = id 纪律漂移的直接证据：Cancel 打错数字、多效果域撞 id 后
+    /// 引用了他域 id、或 Cancel 早于 Run 的时序 bug。持续上升的读数需在
+    /// reducer 侧修 id 指派（唯一性纪律见 [`EffectId`](skeleton::EffectId)
+    /// 文档）。
+    pub fn cancel_unknown_id(&self) -> u64 {
+        self.inner.cancel_unknown_id.load(Ordering::SeqCst)
+    }
+
     /// Emit 回灌累计重入计数（crate 内读侧：testing 域 TestStore 归因用，
     /// 零公共面增量）。
     #[cfg(feature = "testing")]
@@ -915,7 +1036,8 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     }
 
     /// 唯一订阅点：开启审计事件流。默认关闭零开销；
-    /// 本调用是事件流的唯一开关（再次订阅覆盖前订，单槽）。
+    /// 本调用是事件流的唯一开关（再次订阅覆盖前订，单槽；覆盖留痕
+    /// [`Self::audit_preempted`]——前订被终止从此可查）。
     ///
     /// - `capacity`：有界环容量（0 视作 1）。溢出丢最旧——最新生命周期优先；
     ///   丢失无新计数，`seq` 空洞即显式证据（见 [`AuditEvent`]）。
@@ -984,12 +1106,21 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ) -> AuditTicket {
         let gen = self.inner.audit_gen.fetch_add(1, Ordering::AcqRel) + 1;
         let cap = capacity.max(1);
-        *lock(&self.inner.audit) = Some(AuditSink {
-            ring: VecDeque::with_capacity(cap),
-            cap,
-            gen,
-            notify: Some(Box::new(on_event)),
-        });
+        {
+            let mut guard = lock(&self.inner.audit);
+            // 前订被覆盖留痕（读侧 audit_preempted）：单槽二次订阅会终止前订
+            // 的事件流（典型：tracing 桥被自定义消费者顶掉），覆盖必须显形——
+            // 语义不变（仍覆盖），只留痕。
+            if guard.is_some() {
+                self.inner.audit_preempted.fetch_add(1, Ordering::Relaxed);
+            }
+            *guard = Some(AuditSink {
+                ring: VecDeque::with_capacity(cap),
+                cap,
+                gen,
+                notify: Some(Box::new(on_event)),
+            });
+        }
         self.inner.audit_gate.store(true, Ordering::Release);
         AuditTicket {
             gate: Arc::clone(&self.inner.audit_gate),
@@ -1248,6 +1379,25 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                 );
             }
             effect => {
+                // Cancel 寻址校验（fail-visible 留痕，不改转发语义）：
+                // Run 发出即登记 id；Cancel 引用未见过的 id 只计数不拦截——
+                // 拦截（panic/丢弃）会把「Cancel 语义由解释器自证」的契约
+                // （EffectRuntime 责任边界注）改写成核心语义：迟到 Cancel
+                // （Run 已自然完成）是合法时序，核心无生命周期汇报面，无法
+                // 区分「迟到」与「漂移」。读数 = SyncStore::cancel_unknown_id。
+                match &effect {
+                    Effect::Run { id, .. } => {
+                        lock(&inner.run_ids).insert(id.get());
+                    }
+                    // guard 形态（clippy collapsible_match）：Cancel 命中已见
+                    // id 时落 `_`，与未知新变体同路——均无需留痕
+                    Effect::Cancel { id } if !lock(&inner.run_ids).contains(&id.get()) => {
+                        inner.cancel_unknown_id.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Effect 词表 non_exhaustive（跨 crate match 须通配）：
+                    // 未知新变体与寻址校验无关，原样落下方解释器转发
+                    _ => {}
+                }
                 // 解释器 panic 毒化 runtime 锁，此后每个产效果 dispatch
                 // 恒 panic（半砖：reduce 照常执行、状态持续前进，效果路径
                 // 原地无恢复 API）。修法 = PoisonError into_inner 恢复守卫 +
@@ -1297,7 +1447,13 @@ fn notify_snapshot_consumers<
     let local_notified = inner.local_subs.load(Ordering::Relaxed) > 0;
     if local_notified {
         let snapshot = Arc::clone(&lock(&inner.state));
-        let (poisoned, cause) = local_notify(inner.store_id, &*snapshot);
+        let (matched, poisoned, cause) = local_notify(inner.store_id, &*snapshot);
+        // 跨线程 miss 留痕（读侧 local_missed_notifications）：闸>0 说明有线程
+        // 持有本地订阅，本线程表却查无该 store——本拍 dispatch 到不了任何
+        // 本地订阅（触发语义不变，只从「零触发零信号」变「miss 看得见」）。
+        if matched == 0 {
+            inner.local_missed.fetch_add(1, Ordering::Relaxed);
+        }
         if poisoned > 0 {
             inner
                 .subscriber_panics

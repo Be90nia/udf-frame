@@ -46,7 +46,7 @@ impl Reducer for NotifyFeature {
     }
     fn reduce(&self, s: &u32, _: Msg, out: &mut EffectBuf<Msg, u8>) -> u32 {
         out.push(Effect::Run {
-            id: EffectId(1),
+            id: EffectId::new(1),
             op: 7,
         });
         s + 1
