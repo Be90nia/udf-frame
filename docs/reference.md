@@ -110,6 +110,9 @@ where S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
     pub fn subscriber_panics(&self) -> u64;
     pub fn subscriber_panic_last_cause(&self) -> Option<String>;
     pub fn subscriptions_after_close(&self) -> u64;
+    pub fn local_missed_notifications(&self) -> u64;
+    pub fn audit_preempted(&self) -> u64;
+    pub fn cancel_unknown_id(&self) -> u64;
     pub fn runtime_panic_count(&self) -> u64;
     pub fn reducer_panic_count(&self) -> u64;
     pub fn feedback_budget_exceeded(&self) -> u64;
@@ -137,12 +140,22 @@ where S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
 |---|---|---|
 | `dispatch` | 恒 no-op（签名不引入 Err） | 计入 `rejected_after_close` |
 | `ActionSender::dispatch` | 返回 `false`（`#[must_use]` 兜底） | 同一计数 |
-| `subscribe` / `subscribe_local` | 照常登记、票据照常注销，但永无触发——通知静默（已知取舍） | 计入 `subscriptions_after_close`；`subscriber_count` 可交叉查证 |
+| `subscribe` / `subscribe_local` | 照常登记、票据照常注销，但永无触发——通知静默（已知取舍；需要显式拒绝面时用 `try_subscribe`，闭门后返回 `Err(StoreClosed)`） | 计入 `subscriptions_after_close`；`subscriber_count` 可交叉查证 |
 
 ### 订阅双档
 
 - `subscribe`（跨线程档）：回调需 `Send`，槽位 Mutex 串行化；返回 `Subscription<S>`（`#[must_use]`，Drop=注销即时摘表，无「一拍滞后」）。
 - `subscribe_local`（单线程档）：回调免 `Send`（可用 Rc/RefCell），只在注册线程触发，免锁免原子量；返回 `LocalSubscription`（`#[must_use]`，`!Send + !Sync`——线程亲和的类型化表达）。同一 dispatch 内通知序：本地订阅先行，跨线程随后（确定性）。
+
+### 可观测计数面（fail-visible，对齐 `subscriber_panics` 先例）
+
+| 读数 | 何时的静默面 | 形态 |
+|---|---|---|
+| `try_subscribe` | 闭门后登记成功但永不触发 | 显式 `Err(StoreClosed)`（旧 `subscribe` 保留，闭门登记仍计入 `subscriptions_after_close`） |
+| `local_missed_notifications` | 跨线程 dispatch 时本地订阅零触达 | 累计计数（读侧；命中路径零分支零开销） |
+| `audit_preempted` | 审计事件流二次订阅静默覆盖前订 | 累计计数（`subscribe_events` 覆盖旧槽前留痕） |
+| `cancel_unknown_id` | `Effect::Cancel` 指向从未发出的 `Run` id | 累计计数（不拦截——迟到 Cancel 属合法时序，核心无生命周期汇报面无法区分漂移；id 唯一性由采用方纪律保证） |
+| `Combine::route_misses` | `combine` 路由 miss 静默吞 action | 累计计数（分片装配一次持有，读侧无锁无原子量之外成本） |
 
 ### Panic 契约
 
