@@ -67,3 +67,13 @@ large_types_passed_by_value = "warn"
 # roundtrip），dev-dep only——零依赖证明不受影响（批 5-2 随 clock 域自
 # skeleton-infra 迁入）。
 humantime = "2"
+# criterion：bench 目标底座（与 skeleton-infra 同版本；dev-dep 只进开发依赖树，
+# 消费方零依赖证明不受影响）。
+criterion = "0.5"
+
+# bench 三组（cache get/insert、retry_async 首试、RandomId v4）。RandomId 组在
+# random feature 关闭时空转——不设 required-features，否则默认 feature 集的
+# `cargo bench -p udf-std-ext` 会整目标跳过（hollow gate）。
+[[bench]]
+name = "std_ext"
+harness = false

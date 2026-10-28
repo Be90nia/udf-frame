@@ -8,10 +8,13 @@
 //! `cargo bench -p udf-skeleton-infra --all-features --bench infra`
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use serde::{Deserialize, Serialize};
 
+use skeleton::notify::{Notify as _, NotifySink};
 use skeleton::{Effect, Store as _};
 use skeleton_infra::fx::FxScope;
 use skeleton_infra::memgov::CountingAllocator;
@@ -143,10 +146,134 @@ fn fxscope_spawn_join(c: &mut Criterion) {
     });
 }
 
+// ---- dispatch 每拍：命中 vs Cancel(unknown id) ----
+//
+// 对照 PerfProbe（`verify/perf-probe/` 的 `dispatch` 组，同机同树）：criterion
+// 默认采样口径取数，与 probe 的 7 轮中位量级可比、绝对值随机器/负载漂移。
+// 本机实测（i9-9900K@3.60GHz / Win 10.0.26200，criterion 默认采样中位）：
+//   hit ≈ 82.0 ns/拍；cancel_unknown_id ≈ 114.8 ns/拍（差 ~33 ns = run_ids
+//   查表 + miss 留痕）。两臂之差即效果转发路径的每拍成本。
+
+/// 命中热路径：零效果、（下方 notify 组里另有零订阅/1 订阅两臂）。
+struct Hit;
+
+impl skeleton::Reducer for Hit {
+    type State = u64;
+    type Action = u64;
+    type Op = Beep;
+
+    fn initial(&self) -> u64 {
+        0
+    }
+
+    fn reduce(&self, s: &u64, _a: u64, _out: &mut skeleton::EffectBuf<u64, Beep>) -> u64 {
+        s + 1
+    }
+}
+
+/// Cancel 每拍：未知 id ⇒ 每次 dispatch 走 run_ids 查表 + miss 留痕路径。
+struct CancelEachBeat;
+
+impl skeleton::Reducer for CancelEachBeat {
+    type State = u64;
+    type Action = u64;
+    type Op = Beep;
+
+    fn initial(&self) -> u64 {
+        0
+    }
+
+    fn reduce(&self, s: &u64, _a: u64, out: &mut skeleton::EffectBuf<u64, Beep>) -> u64 {
+        out.push(Effect::Cancel {
+            id: skeleton::EffectId::new(999),
+        });
+        s + 1
+    }
+}
+
+/// 空解释器（`Hit`/`CancelEachBeat` 的动作域）。
+struct NullFx;
+
+impl skeleton::EffectRuntime<u64, Beep> for NullFx {
+    fn run(&mut self, _effect: Effect<u64, Beep>, _back: &skeleton::ActionSender<u64>) {}
+}
+
+/// 投递口：只落一个原子（O(1) 契约的最省形态，不引入测量噪声）。
+struct Latest(Arc<AtomicU64>);
+
+impl NotifySink for Latest {
+    fn publish(&self, version: u64) {
+        self.0.store(version, Ordering::Relaxed);
+    }
+}
+
+fn dispatch_per_beat(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dispatch_per_beat");
+
+    let hit = SyncStore::new(Hit, NullFx);
+    for _ in 0..1_000u64 {
+        hit.dispatch(0); // 预热：队列/缓冲到稳态容量
+    }
+    group.bench_function("hit", |b| b.iter(|| hit.dispatch(black_box(0))));
+    hit.close();
+
+    let cancel = SyncStore::new(CancelEachBeat, NullFx);
+    for _ in 0..1_000u64 {
+        cancel.dispatch(0);
+    }
+    group.bench_function("cancel_unknown_id", |b| {
+        b.iter(|| cancel.dispatch(black_box(0)))
+    });
+    cancel.close();
+
+    group.finish();
+}
+
+// ---- notify 异步档：0 / 1 订阅者 ----
+//
+// 对照 PerfProbe（`verify/perf-probe/` 的 `notify` 组）：零异步订阅者 = 一次
+// Acquire load 即返（与命中同量级）；1 订阅者 = 表锁收集 + 锁外 publish，
+// 增量即投递成本。**分配面**：修复（2026-10-28）前每拍 `collect` 新建 Vec，
+// total = 1.00 alloc/拍——下方预算闸钉住「有订阅者稳态零净分配」。
+// 本机实测（同机同树，criterion 默认采样中位）：no_subscriber ≈ 86.0 ns/拍
+// （= 命中 + 一次门控 load）；one_subscriber ≈ 114.5 ns/拍（增量 ~28 ns =
+// 表锁收集 + publish）。
+fn notify_dispatch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("notify_dispatch");
+
+    let none = SyncStore::new(Hit, NullFx);
+    for _ in 0..1_000u64 {
+        none.dispatch(0);
+    }
+    group.bench_function("no_subscriber", |b| b.iter(|| none.dispatch(black_box(0))));
+    none.close();
+
+    let one = SyncStore::new(Hit, NullFx);
+    let seen = Arc::new(AtomicU64::new(0));
+    let _ticket = one.subscribe_notify(Latest(Arc::clone(&seen)));
+    for _ in 0..1_000u64 {
+        one.dispatch(0); // 预热：收集缓冲首撞容量（此后跨拍复用）
+    }
+    let before = CountingAllocator::live_allocs();
+    one.dispatch(black_box(0));
+    assert_eq!(
+        CountingAllocator::live_allocs() - before,
+        0,
+        "1 订阅者稳态 dispatch 出现净分配：收集缓冲复用退化了"
+    );
+    group.bench_function("one_subscriber", |b| b.iter(|| one.dispatch(black_box(0))));
+    drop(_ticket);
+    one.close();
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     fxscope_spawn_join,
     journal_append_line,
-    effect_steady_state
+    effect_steady_state,
+    dispatch_per_beat,
+    notify_dispatch
 );
 criterion_main!(benches);

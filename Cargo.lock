@@ -736,6 +736,7 @@ dependencies = [
 name = "udf-std-ext"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "getrandom",
  "humantime",
  "serde_json",

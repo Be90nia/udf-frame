@@ -135,9 +135,8 @@ jobs:
       # 真跑 bench。continue-on-error：性能步失败不终止后续产出
       # （判据/环境抖动 ≠ 代码错；此处的正确性由 ci.yml 负责）。
       # 守卫：目标清单里该 crate 标 NONE（无 bench 目标）→ 如实标注并跳过，
-      # 不假装跑了（本仓当前 udf-skeleton / udf-std-ext 即属此列——它们只有
-      # examples，无 [[bench]] 目标；唯一的 bench 目标是 udf-skeleton-infra
-      # 的 infra）。匹配不锚行尾：清单由 tee 写出，行尾可能是 CRLF。
+      # 不假装跑了（2026-10-28 起 udf-std-ext 已有 [[bench]] 目标 std_ext；
+      # udf-skeleton 仍只有 examples）。匹配不锚行尾：清单由 tee 写出，行尾可能是 CRLF。
       - name: Run bench - udf-skeleton-infra
         continue-on-error: true
         run: |
