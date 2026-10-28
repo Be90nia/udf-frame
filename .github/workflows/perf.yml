@@ -160,7 +160,23 @@ jobs:
         run: |
           mkdir -p perf-out
           python3 - <<'PY'
-          import json, os, pathlib, sys
+          import json, os, pathlib, platform, subprocess, sys
+
+          # CPU 型号入档：基线对比只在同型号 CPU 间告警——不同代际 runner 的
+          # 绝对值天然不同（同代码 81ns↔120ns 属常态），互比 = 假回归告警。
+          def cpu_model():
+              try:
+                  if os.path.exists("/proc/cpuinfo"):
+                      for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
+                          if "model name" in line:
+                              return line.split(":", 1)[1].strip()
+                  if sys.platform == "darwin":
+                      return subprocess.check_output(
+                          ["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+              except Exception as exc:
+                  print(f"::debug::cpu model detect failed: {exc}")
+              return platform.processor() or "unknown"
+          cpu = cpu_model()
 
           root = pathlib.Path("target/criterion")
           # 只采信「本轮产出」的估计：缓存恢复回来的上一轮 new/estimates.json
@@ -203,8 +219,10 @@ jobs:
           bp = pathlib.Path("perf-baseline/summary.json")
           if bp.exists():
               baseline = json.loads(bp.read_text())
+          base_cpu = baseline.get("_meta", {}).get("cpu")
+          same_cpu = (not base_cpu) or (base_cpu == cpu)
 
-          lines = ["# bench 摘要（${{ matrix.os }}）", ""]
+          lines = ["# bench 摘要（${{ matrix.os }} · CPU: " + cpu + "）", ""]
           lines.append("| bench | median | mean | vs 上次基线 |")
           lines.append("|---|---|---|---|")
           regressions = []
@@ -214,14 +232,20 @@ jobs:
               base = baseline.get(b)
               if base and cur:
                   delta = (cur - base) / base * 100.0
-                  note = f"{delta:+.1f}%"
-                  if delta > 10.0:
-                      note += " ⚠️ 回归>10%"
-                      regressions.append((b, delta))
+                  if same_cpu:
+                      note = f"{delta:+.1f}%"
+                      if delta > 10.0:
+                          note += " ⚠️ 回归>10%"
+                          regressions.append((b, delta))
+                  else:
+                      # 跨 CPU 型号：绝对值不可比，只记录不告警（防 runner 换代际假回归）
+                      note = f"{delta:+.1f}%（基线 CPU 不同：{base_cpu} → {cpu}，仅记录）"
               else:
                   note = "（无基线）"
               lines.append(f"| {b} | {r['median']} | {r['mean']} | {note} |")
           lines.append("")
+          if not same_cpu:
+              lines.append(f"> ℹ️ 基线 CPU 型号不同（{base_cpu} → {cpu}）：本轮对比仅记录，不产生回归告警；下轮起以本机为新基线。")
           if regressions:
               lines.append("> ⚠️ 回归超 10%（仅告警，不改退出码）：" +
                            ", ".join(f"{b} {d:+.1f}%" for b, d in regressions))
@@ -234,8 +258,10 @@ jobs:
           # 本轮值写回基线目录：cache 步骤在 job 结束时把该目录存成下一轮基线
           # （key 含 run_id → 每次一份新缓存；下次 restore-keys 取最近一份）。
           pathlib.Path("perf-baseline").mkdir(parents=True, exist_ok=True)
+          payload = {"_meta": {"cpu": cpu}}
+          payload.update(current)
           pathlib.Path("perf-baseline/summary.json").write_text(
-              json.dumps(current, indent=2, sort_keys=True))
+              json.dumps(payload, indent=2, sort_keys=True))
           print("\n".join(lines))
           with open(os.environ.get("GITHUB_STEP_SUMMARY", "perf-out/summary.md"), "a", encoding="utf-8") as fh:
               fh.write("\n".join(lines) + "\n")
