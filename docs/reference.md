@@ -739,6 +739,7 @@ pub fn format_duration(d: Duration) -> String;
 
 ```rust
 pub fn format_rfc3339(time: SystemTime) -> String;               // 恒 Z 后缀、T 大写
+pub fn format_rfc3339_seconds(time: SystemTime) -> String;       // 整秒定宽形，恒 20 字节（issue#3）
 pub fn parse_rfc3339(s: &str) -> Result<SystemTime, TimeParseError>;       // 严格档
 pub fn parse_rfc3339_weak(s: &str) -> Result<SystemTime, TimeParseError>;  // 宽容档
 
@@ -751,6 +752,7 @@ pub enum TimeParseError {
 ```
 
 - `format_rfc3339`：小数秒如实最小位（纳秒为零输出整秒，否则 9 位去尾零）；表示域 = current era `[0000-01-01T00:00:00Z, 9999-12-31T23:59:59.999999999Z]`，越界 fail-closed panic。
+- `format_rfc3339_seconds`（issue#3 整秒定宽形）：恒 `YYYY-MM-DDTHH:MM:SSZ` 20 字节，亚秒截断（向过去取整，与 parse >9 位截断同向）；字节稳定——同秒任意亚秒恒同一字节序列（追加型日志/账本换芯面）；定宽 ⇒ 全 era 字典序==时间序（无「同 frac 位数」前提）。表示域/越界 panic 语义同 `format_rfc3339`。
 - `parse_rfc3339`（严格档）：§5.6 ABNF 全集——`T`/`t`、`Z`/`z`、`±HH:MM`（强制冒号）；闰秒 `:60` RFC 合法但 std SystemTime 不计闰秒——fail-closed 拒（humantime 同输入静默截到 `:59`，本域不做）；>9 位小数秒截断；偏移换算越 era 报 `OutOfRange`。错误优先序：结构 → 数字 → 值域 → 闰秒（`at`=出错字节偏移）。
 - `parse_rfc3339_weak`（宽容档/人输面）：另收空格代 `T`、无冒号偏移 `±HHMM`、缺偏移=UTC。值域语义恒同 strict。
 

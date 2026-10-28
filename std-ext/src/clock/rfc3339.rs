@@ -75,7 +75,9 @@ impl std::error::Error for TimeParseError {}
 ///
 /// 排序限定（审计 F8）：「字符串序==时间序」仅在**同 frac 位数**下成立
 /// （R20 性质前提）；最小尾零形不保证同秒字典序——`.52Z` < `.5Z`（'2' <
-/// 'Z'）而时间序相反。需字符串序比较的采用方自保证等长 frac（或先解析）。
+/// 'Z'）而时间序相反。需字符串序比较的采用方自保证等长 frac（或先解析），
+/// 或改用整秒定宽形 [`format_rfc3339_seconds`]（无 frac ⇒ 全 era 字典序
+/// ==时间序）。
 ///
 /// # Examples
 ///
@@ -95,25 +97,8 @@ impl std::error::Error for TimeParseError {}
 #[must_use]
 pub fn format_rfc3339(time: SystemTime) -> String {
     let (secs, nanos) = unix_parts(time);
-    let days = secs.div_euclid(86_400);
-    let secs_of_day = u32::try_from(secs.rem_euclid(86_400)).expect("rem_euclid 恒 [0, 86399]");
-    let (year, month, day) = civil_from_days(days);
-    if !(0..=9_999).contains(&year) {
-        panic!("RFC 3339 表示域（0000-9999）外的时间无法格式化：year {year}");
-    }
-
     let mut out = String::with_capacity(30); // 整秒 20 / 满 frac 30 字节
-    push_padded(&mut out, year as u64, 4);
-    out.push('-');
-    push_padded(&mut out, u64::from(month), 2);
-    out.push('-');
-    push_padded(&mut out, u64::from(day), 2);
-    out.push('T');
-    push_padded(&mut out, u64::from(secs_of_day / 3_600), 2);
-    out.push(':');
-    push_padded(&mut out, u64::from(secs_of_day % 3_600 / 60), 2);
-    out.push(':');
-    push_padded(&mut out, u64::from(secs_of_day % 60), 2);
+    push_datetime_secs(&mut out, secs);
     if nanos != 0 {
         out.push('.');
         // 9 位逐位写，尾零裁剪（nanos != 0 恒有非零位，last 有界）。
@@ -131,6 +116,46 @@ pub fn format_rfc3339(time: SystemTime) -> String {
             out.push(c as char); // digits 恒 ASCII 数字
         }
     }
+    out.push('Z');
+    out
+}
+
+/// 格式化为 RFC 3339 UTC **整秒定宽形**：恒 `YYYY-MM-DDTHH:MM:SSZ`，20 字节
+/// 定宽、`T` 大写、恒 `Z`。亚秒截断——向过去取整（同秒内任意亚秒同落本秒；
+/// epoch 前 `-0.5s` → `1969-12-31T23:59:59Z` 而非跨入 1970，与
+/// [`parse_rfc3339`] 对 >9 位小数的截断同向）。表示域/越界 fail-closed
+/// panic 与 [`format_rfc3339`] 同。
+///
+/// 字节稳定契约（GitHub issue#3，追加型日志/账本）：同一逻辑时刻（同秒内
+/// 任意亚秒）恒产出同一字节序列，不随 [`format_rfc3339`] 最小尾零形的
+/// frac 位演化漂移——消费方可按 20 字节定宽自持二进制布局/换芯。
+///
+/// 排序性质（审计 F8 升级）：定宽 20 字节 ⇒ **全 era 字典序==时间序**，无
+/// [`format_rfc3339`] 最小尾零形的「同 frac 位数」前提。
+///
+/// # Examples
+///
+/// ```
+/// use std::time::{Duration, SystemTime};
+/// use std_ext::clock::rfc3339::format_rfc3339_seconds;
+///
+/// let epoch = SystemTime::UNIX_EPOCH;
+/// assert_eq!(format_rfc3339_seconds(epoch), "1970-01-01T00:00:00Z");
+/// // 同一秒的两种亚秒输入 → 同一输出（字节稳定实证）。
+/// let frac = epoch + Duration::new(482_196_050, 520_000_000);
+/// let max = epoch + Duration::new(482_196_050, 999_999_999);
+/// assert_eq!(format_rfc3339_seconds(frac), "1985-04-12T23:20:50Z");
+/// assert_eq!(format_rfc3339_seconds(frac), format_rfc3339_seconds(max));
+/// ```
+///
+/// # Panics
+///
+/// 时间越出 current era（年 < 0000 或 > 9999）。
+#[must_use]
+pub fn format_rfc3339_seconds(time: SystemTime) -> String {
+    let (secs, _) = unix_parts(time);
+    let mut out = String::with_capacity(20);
+    push_datetime_secs(&mut out, secs);
     out.push('Z');
     out
 }
@@ -333,6 +358,29 @@ fn unix_parts(time: SystemTime) -> (i64, u32) {
             }
         }
     }
+}
+
+/// 共享日期时间段写入（双 format 单源，禁拷贝链——审计 F6.1 教训）：
+/// `YYYY-MM-DDTHH:MM:SS` 恒 20 字节定宽；era 越界 fail-closed panic
+///（文案是 r17/S5 的 `should_panic` 断言锚，不可改）。
+fn push_datetime_secs(out: &mut String, secs: i64) {
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = u32::try_from(secs.rem_euclid(86_400)).expect("rem_euclid 恒 [0, 86399]");
+    let (year, month, day) = civil_from_days(days);
+    if !(0..=9_999).contains(&year) {
+        panic!("RFC 3339 表示域（0000-9999）外的时间无法格式化：year {year}");
+    }
+    push_padded(out, year as u64, 4);
+    out.push('-');
+    push_padded(out, u64::from(month), 2);
+    out.push('-');
+    push_padded(out, u64::from(day), 2);
+    out.push('T');
+    push_padded(out, u64::from(secs_of_day / 3_600), 2);
+    out.push(':');
+    push_padded(out, u64::from(secs_of_day % 3_600 / 60), 2);
+    out.push(':');
+    push_padded(out, u64::from(secs_of_day % 60), 2);
 }
 
 /// 两字符十进制（`at`/`at+1` 必 ASCII 数字，否则带位报错）。
@@ -819,5 +867,107 @@ mod tests {
             sb < sa,
             "同秒 frac 前缀：字符串序与时间序相反（'2' < 'Z'）——R20 前提域钉死"
         );
+    }
+
+    // —— 整秒定宽形 format_rfc3339_seconds（GitHub issue#3 / bd udf-frame-wg4：
+    // 追加型日志/账本需要字节稳定的时间戳）——
+
+    // S1 字节稳定：同一秒的三种亚秒输入（0 / .52s / .999999999s）输出逐字节
+    // 相等，恒 20 字节定宽恒 `Z`。
+    #[test]
+    fn s1_byte_stable_same_second() {
+        let whole = format_rfc3339_seconds(t(1_000_000_000, 0));
+        let mid = format_rfc3339_seconds(t(1_000_000_000, 520_000_000));
+        let max = format_rfc3339_seconds(t(1_000_000_000, 999_999_999));
+        assert_eq!(whole, "2001-09-09T01:46:40Z");
+        assert_eq!(mid, whole);
+        assert_eq!(max, whole);
+        assert_eq!(whole.len(), 20);
+    }
+
+    // S2 roundtrip：parse(整秒形) == 截断后时刻（含 epoch 前负秒/亚秒样本；
+    // 亚秒统一 100ns 整倍数——Windows std 表示层粒度，见 r7 armor）。
+    #[test]
+    fn s2_roundtrip_truncated_instant() {
+        // 截断方向 = 向过去取整：epoch 前 -0.5s 落 1969-12-31T23:59:59Z，
+        // 不跨入 1970-01-01T00:00:00Z。
+        assert_eq!(
+            format_rfc3339_seconds(t(-1, 500_000_000)),
+            "1969-12-31T23:59:59Z"
+        );
+        for (secs, nanos) in [
+            (0, 0),
+            (0, 999_999_900),
+            (-1, 0),
+            (-1, 999_999_900),
+            (-2, 500_000_000),
+            (482_196_050, 520_000_000),
+            (1_000_000_000, 999_999_900),
+            (ERA_MAX_SECS, 999_999_900),
+        ] {
+            let s = format_rfc3339_seconds(t(secs, nanos));
+            assert_eq!(parse_rfc3339(&s), Ok(t(secs, 0)), "{s}");
+        }
+    }
+
+    // S3 排序性质：定宽 20 字节 ⇒ 输出字符串字典序升序（升序时刻采样，含
+    // 负秒跨秒样本；ERA_MIN 端见 S4/r6——Windows 构造期不可达）。
+    #[test]
+    fn s3_lexicographic_ordering_full_era() {
+        let secs = [
+            -86_400,
+            -1,
+            0,
+            1,
+            59,
+            60,
+            86_399,
+            86_400,
+            482_196_050,
+            1_000_000_000,
+            1_700_000_000,
+            2_500_000_000,
+            ERA_MAX_SECS,
+        ];
+        let stamps: Vec<String> = secs
+            .iter()
+            .map(|&s| format_rfc3339_seconds(t(s, 0)))
+            .collect();
+        for s in &stamps {
+            assert_eq!(s.len(), 20, "{s}");
+        }
+        assert!(stamps.windows(2).all(|w| w[0] < w[1]), "{stamps:?}");
+    }
+
+    // S4 era 两端不 panic 且形态正确（截断后整秒仍在表示域内）。
+    // Windows armor 同 r6：FILETIME 1601 起算，ERA_MIN 端构造期不可达。
+    #[test]
+    fn s4_era_boundary_shapes() {
+        assert_eq!(
+            format_rfc3339_seconds(t(ERA_MAX_SECS, 0)),
+            "9999-12-31T23:59:59Z"
+        );
+        assert_eq!(
+            format_rfc3339_seconds(t(ERA_MAX_SECS, 999_999_900)),
+            "9999-12-31T23:59:59Z"
+        );
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(
+                format_rfc3339_seconds(t(ERA_MIN_SECS, 0)),
+                "0000-01-01T00:00:00Z"
+            );
+            assert_eq!(
+                format_rfc3339_seconds(t(ERA_MIN_SECS, 999_999_900)),
+                "0000-01-01T00:00:00Z"
+            );
+        }
+    }
+
+    // S5 表示域越界 fail-closed panic 与 format_rfc3339 同款（r17 先例）。
+    #[test]
+    #[should_panic(expected = "RFC 3339 表示域")]
+    fn s5_out_of_era_panics_like_full_format() {
+        let _ = format_rfc3339_seconds(t(ERA_MAX_SECS + 1, 0)); // 10000-01-01T00:00:00Z
     }
 }

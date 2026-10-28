@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Added（整秒定宽形 `format_rfc3339_seconds`：账本字节稳定时间戳，2026-10-28；GitHub issue#3）
+- `std-ext/clock::rfc3339` 新增 `format_rfc3339_seconds(SystemTime) -> String`：恒 `YYYY-MM-DDTHH:MM:SSZ` 20 字节定宽，亚秒截断（向过去取整，与 parse 对 >9 位小数的截断同向）；字节稳定契约——同秒任意亚秒恒同一字节序列，消费方追加型日志/账本 4 处自持格式化可换芯；排序性质升级为全 era 字典序==时间序（定宽，无 `format_rfc3339` 的「同 frac 位数」前提）。实现与 `format_rfc3339` 共享单源日期时间写入核（审计 F6.1 禁拷贝链）；既有 `format_rfc3339`/parse 语义与断言零改动，表示域/越界 fail-closed panic 同款。
+
 ### Added（消费方反馈六件套 + 通知面异步化，2026-10-28；GitHub issue#1 / ADR 0008）
 - **BoundedRegistry**（memgov）：`get<Q: Borrow<Q>>` 零分配泛型查找、`get_mut`（只回值面——键面类型级不可达，compile_fail doctest 钉死）、`Clone`（deep-copy 值容器；运行期只读共享用 `Arc<BoundedRegistry>` 外包）。
 - **retry**：`retry_async`/`retry_if_async` + `AsyncSleeper` 注入式异步面（零运行时依赖，下游 tokio 自接线）；同步/异步同 policy 同语义（对照测试钉死）；取消安全（sleep 内联 await，future drop 即全停）。
