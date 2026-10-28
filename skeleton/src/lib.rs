@@ -23,6 +23,7 @@
 //! | 谁变形 | [`Reducer::reduce`]（纯函数：状态进出，效果写 [`EffectBuf`]） |
 //! | 谁存储 | [`Store`]（[`Store::snapshot`] 取值语义快照） |
 //! | 谁消费 | [`Driver::render`] 下行呈现；[`Subscription`] 订阅票据收变更通知 |
+//! | 谁呈现给 UI | [`view::ViewMap`] 投影 + [`view::IntentMap`] 意图翻译（语言无关出站/入站；参考实现 `skeleton_infra::view::ViewBridge`） |
 //! | 效果从哪出 | [`Effect::Run`] 描述值 → [`EffectRuntime::run`] 解释，经 [`ActionSender`] 回灌闭环 |
 //! | 谁持久化 | [`JournalPort`] 端口（后端自换；参考实现 `skeleton_infra::journal::JsonlJournal`） |
 //!
@@ -74,6 +75,7 @@ pub mod config;
 pub mod logpath;
 pub mod parse;
 pub mod pool;
+pub mod view;
 
 pub use std::convert::Infallible;
 use std::sync::Arc;

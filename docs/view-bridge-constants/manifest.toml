@@ -1,0 +1,19 @@
+# ViewBridge 命名工件真源（M3，ADR 0006 / 规格 §3.6 末段）——手维护单一清单。
+# 改动后必须重跑生成器并入库生成物（禁构建期生成，禁 proc-macro）：
+#   cargo run -p udf-skeleton-infra --example view_constants_gen
+# CI 一致性断言（只比对不写，diff 非空 = 红）：
+#   cargo run -p udf-skeleton-infra --example view_constants_gen -- --check
+# 常量值与清单逐字一致（不做大小写变换——变换正是漂移来源）。
+# 清单只覆盖绑定路径 + 载荷字段名 + kind 编号；嵌套层级由采用方自定。
+
+protocol_version = 1
+
+[[binding]]
+path = "/count"
+kind = 1
+fields = []
+
+[[binding]]
+path = "/derived/remaining"
+kind = 2
+fields = ["remaining"]
