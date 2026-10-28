@@ -15,7 +15,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use std_ext::paths::{cache_dir, config_dir, data_dir, home_dir, normalize_lexical, simplify};
+#[cfg(windows)]
+use std_ext::paths::{cache_dir, data_dir};
+use std_ext::paths::{config_dir, home_dir, normalize_lexical, simplify};
 
 static EVENTS: AtomicUsize = AtomicUsize::new(0);
 
@@ -245,7 +247,7 @@ fn xdg_unix_alloc_anchors_match_doc() {
     black_box(home_dir()); // 预热
     black_box(config_dir());
     std::env::set_var("XDG_CONFIG_HOME", "/xdg-alloc/cfg");
-    assert_eq!(allocs(|| config_dir()), 6, "XDG 绝对值臂 6 次");
+    assert_eq!(allocs(config_dir), 6, "XDG 绝对值臂 6 次");
     std::env::remove_var("XDG_CONFIG_HOME");
-    assert_eq!(allocs(|| config_dir()), 7, "默认臂 7 次");
+    assert_eq!(allocs(config_dir), 7, "默认臂 7 次");
 }

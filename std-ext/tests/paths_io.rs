@@ -4,7 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
-use std_ext::paths::{canonicalize_compat, ensure_inside, CaseStrategy};
+use std_ext::paths::canonicalize_compat;
+#[cfg(windows)]
+use std_ext::paths::{ensure_inside, CaseStrategy};
 
 /// 工作区内临时目录 RAII 守卫（进程 id 隔离并发；Drop 清树）。
 struct TempDirGuard(PathBuf);
