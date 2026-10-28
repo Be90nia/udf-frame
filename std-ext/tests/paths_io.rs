@@ -4,7 +4,11 @@
 
 use std::path::{Path, PathBuf};
 
-use std_ext::paths::{canonicalize_compat, ensure_inside, CaseStrategy};
+use std_ext::paths::canonicalize_compat;
+// containment 断言面仅 Windows 端到端用例用（verbatim 路径基准判定）——
+// Unix 面未使用，按平台导入，否则 Unix 面 clippy 报 unused import。
+#[cfg(windows)]
+use std_ext::paths::{ensure_inside, CaseStrategy};
 
 /// 工作区内临时目录 RAII 守卫（进程 id 隔离并发；Drop 清树）。
 struct TempDirGuard(PathBuf);
