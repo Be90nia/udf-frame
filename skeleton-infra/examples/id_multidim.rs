@@ -19,7 +19,7 @@
 //!    chunk 换真实毫秒（真睡），MockClock 臂每 chunk 虚拟 advance；
 //! ⑤ black_box 防 LLVM 消除；每个锚三连跑取中位。
 //!
-//! 报告：reports/2026-10-17-id.md（agentwiki 根）。
+//! 报告：id 域性能锚（本地留存，未入库）。
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;

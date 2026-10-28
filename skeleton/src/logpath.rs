@@ -1,7 +1,6 @@
 //! 日志根目录解析契约：文件日志落点的可替换端口。
 //!
-//! 自 `skeleton-infra::logx` 下沉（批 1 契约真下沉，2026-10-18；ADR
-//! `docs/adr/0001-contract-sink.md`）：宿主对默认落点不满（如开发态想锚定
+//! 自 `skeleton-infra::logx` 下沉（批 1 契约真下沉，2026-10-18；ADR 0001）：宿主对默认落点不满（如开发态想锚定
 //! 采方自己工程根）时实现本 trait 注入 `skeleton_infra::logx::init_with_file`。
 //! 默认实现 `DefaultPathResolver`（debug=编译期锚 / release=`.<project>/log`）
 //! 是行为件，留在 `skeleton_infra::logx`（`log-fs` feature）。

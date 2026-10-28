@@ -3,7 +3,7 @@
 //! UDF 骨架基础设施层：契约实现（`skeleton::Store` 的参考实现）+ 生态标准件
 //! 绑定 + 防坑门面。契约（trait 与数据词汇）在 [`skeleton`]，本 crate 兑现。
 //!
-//! 批 5-1/5-2 物理拆分（ADR `docs/adr/0004-std-ext-split.md`）：十四域中的
+//! 批 5-1/5-2 物理拆分（ADR 0004）：十四域中的
 //! 十三域零门常驻（纯 std）已迁至子 crate `std-ext`（第十四条 `json` 域随迁、
 //! 门控 `json` feature，见 ADR 0007）——批 5-1 六叶子域 `text`/`encode`/`hash`/
 //! `iter`/`backoff`/`fsx` + 批 5-2 七域 `paths`/`clock`/`retry`/`scheduler`/

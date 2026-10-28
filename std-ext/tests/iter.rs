@@ -1,6 +1,6 @@
 //! iter 域 log-embed 埋点集成测试：`process_results` 首 Err 短路 → warn（首
 //! Err 位置 pos 入字段，0 起）。next/fold 双通路各一事件点；其余纯组合子面
-//! 零埋点（收窄声明：无行为决策面，见 reports/2026-10-17-log-embed-b.md）。
+//! 零埋点（收窄声明：无行为决策面，见 log-embed 埋点 b（本地留存，未入库））。
 #![cfg(feature = "log-embed")]
 
 #[path = "common/log_capture.rs"]

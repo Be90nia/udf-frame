@@ -1,8 +1,7 @@
 //! 配置文件装配面：分层装配（default→file→层叠合并→load）+ 原子保存 + TOML
 //! 翻译捷径（行为件）。
 //!
-//! 契约已下沉 `skeleton::config`（批 1 契约真下沉，2026-10-18；ADR
-//! `docs/adr/0001-contract-sink.md`）：[`ConfigPort`](skeleton::config::ConfigPort)/
+//! 契约已下沉 `skeleton::config`（批 1 契约真下沉，2026-10-18；ADR 0001）：[`ConfigPort`](skeleton::config::ConfigPort)/
 //! [`EnvSource`](skeleton::config::EnvSource)/[`ConfigError`](skeleton::config::ConfigError)
 //! 住契约层（纯 std 零门），本域只剩 feature 门控行为件——
 //! `config-json` = [`ConfigFile`] 分层装配+原子保存（serde_json::Value 统一
@@ -27,7 +26,7 @@
 //!
 //! 零依赖纪律：`config-json`/`config-toml` 为 optional feature（serde/
 //! serde_json journal 先例形态，toml 仅 config-toml 可达）。形状拍板点：
-//! reports/2026-10-17-config-port.md、reports/2026-10-17-config-file.md。
+//! 配置端口面与配置文件面（本地留存，未入库）。
 
 #[cfg(feature = "config-toml")]
 use std::fmt;
@@ -42,7 +41,7 @@ use skeleton::config::ConfigError;
 // ── ConfigFile：分层装配 + 原子保存（config-json/config-toml feature 面）──
 //
 // 拍板 2026-10-17：配置文件读写=框架一等公民；常驻核心保持零依赖格式盲，
-// 值面/格式捷径挂 feature（报告 reports/2026-10-17-config-file.md）。
+// 值面/格式捷径挂 feature（报告：配置文件面（本地留存，未入库））。
 
 /// 配置文件分层装配面。
 ///

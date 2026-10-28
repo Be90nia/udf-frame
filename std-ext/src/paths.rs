@@ -16,7 +16,7 @@
 //! [`simplify`] 零分配恒返借用；归一/相对化语义必然分配，如实报数）②单次
 //! ns 锚③输入规模梯度 16/128/4096（单线程域，以梯度代线程曲线）；④并发
 //! 曲线⑤锁⑥内存水位⑦伪共享=n/a（无锁无线程面）。采集器
-//! `examples/paths_multidim.rs`，报告 reports/2026-10-16-b1-paths.md。
+//! `examples/paths_multidim.rs`，报告：paths 域性能锚（本地留存，未入库）。
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};

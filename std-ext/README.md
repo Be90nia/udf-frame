@@ -14,5 +14,5 @@
 `skeleton-infra`（核+胶水，反向依赖本 crate）。
 
 各域 API 全键参考见 [`docs/reference.md`](../docs/reference.md)；拆分决策与终版
-切面表见 [`docs/adr/0004-std-ext-split.md`](../docs/adr/0004-std-ext-split.md)。
-crate 命名与发布现状见 [`docs/PUBLISHING.md`](../docs/PUBLISHING.md)。
+切面表见 ADR 0004。
+crate 命名与发布现状见发布检查单（本地留存，未入库）。

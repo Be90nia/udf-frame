@@ -1,7 +1,7 @@
 //! 同步任务调度器：延迟（after）/周期（every）任务排程，Clock 注入。
 //!
 //! 常驻零依赖件：纯 std，无 feature 门。**双层形态**（拍板点，论证见
-//! reports/2026-10-16-b3-scheduler.md）：
+//! scheduler 域性能锚（本地留存，未入库））：
 //!
 //! - **确定性内核（线程无关）**：最小堆（`BinaryHeap`+`Reverse`）按注入
 //!   [`Clock`] 的单调面（`now_instant`）排程；[`Scheduler::tick`] 在调用

@@ -6,7 +6,7 @@
 //! 分工：双池本体行为已在 `tests/memory_pool.rs` / `tests/thread_pool.rs` /
 //! `tests/pool_base.rs` 覆盖——本文件只测**组合层**（借还时序/借用超时/包装
 //! 开销），七维性能矩阵不在此重复（见 examples/thread_pool_multidim.rs 等既有
-//! 采集器与 reports/2026-10-16-pool-wave25.md）。
+//! 采集器与线程池性能矩阵（本地留存，未入库））。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, MutexGuard};

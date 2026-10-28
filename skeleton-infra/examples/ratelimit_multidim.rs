@@ -15,7 +15,7 @@
 //! ③ 粗测（std Instant）非 criterion——数字供判级，不供微优化基线；
 //! ④ black_box 防 LLVM 消除；每个锚三连跑取中位。
 //!
-//! 报告：reports/2026-10-16-b3-ratelimit.md（agentwiki 根）。
+//! 报告：ratelimit 域性能锚（本地留存，未入库）。
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;

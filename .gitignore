@@ -17,3 +17,11 @@ verify/
 /.agents/
 /AGENTS.md
 /CLAUDE.md
+
+# 调研/决策/流程类文档不入库（2026-10-28 用户决定：仓库只留面向 API 消费方的文档）
+# 保留：docs/reference.md（API 正典）、docs/view-region-spec.md + 镜像工件、docs/tutorials/
+# 移出：docs/research/（调研底稿）、docs/adr/（决策档案）、docs/PUBLISHING.md（内部流程单）、reports/（审计与对标报告）
+/docs/research/
+/docs/adr/
+/docs/PUBLISHING.md
+/reports/

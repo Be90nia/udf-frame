@@ -42,7 +42,7 @@ impl std::error::Error for DecodeError {}
 ///（Lossy 无错误路径恒 Ok）。
 ///
 /// 性能锚（2026-10-16 批 D 定性，release/std Instant 粗测，详见
-/// reports/2026-10-16-perf-batchd.md）：有效路径恒分配（String 拷贝主导，
+/// 批 D 性能锚（本地留存，未入库））：有效路径恒分配（String 拷贝主导，
 /// 语义必然），~48-71ns @30-130B；Strict 非法路径零分配即返，~7ns
 ///（约有效路径 1/6），Display 文案格式化另计 ~155ns。
 ///
@@ -78,7 +78,7 @@ pub fn decode_bytes(bytes: &[u8], strategy: DecodeStrategy) -> Result<String, De
 ///（切片前边界由 `char_indices` 偏移结构性保证）。
 ///
 /// 性能锚（2026-10-16 批 D 定性，release/std Instant 粗测，详见
-/// reports/2026-10-16-perf-batchd.md；复跑载体 examples/text_multidim.rs，
+/// 批 D 性能锚（本地留存，未入库）；复跑载体 examples/text_multidim.rs，
 /// 2026-10-17 复验）：零分配字符前缀扫描，~10-12ns @30 字符截 16，线性于
 /// 扫描字符数（130 字符截 64 ≈ 34-38ns；越界全扫 64B ≈ 33ns——约 1ns/
 /// 扫描字符）。
@@ -258,7 +258,7 @@ fn convert_case(s: &str, sep: Option<char>, first: WordCase, rest: WordCase) -> 
 /// 其余四向（camel/pascal/kebab/screaming）同内核同复杂度，锚见本条。
 ///
 /// 性能锚（2026-10-16 批 b4 定性，release/std Instant 粗测，详见
-/// reports/2026-10-16-b4-text.md；复跑载体 examples/text_multidim.rs，
+/// text 域性能锚（本地留存，未入库）；复跑载体 examples/text_multidim.rs，
 /// 2026-10-17 复验）：五向 @XMLHttpRequest(14B) ≈165-178ns；snake/pascal
 /// @64B 混合形态 ≈600-700ns（随词数线性，锚绑采集器输入）——两趟词扫描
 /// 线性主导 + 输出一次精确容量分配（`with_capacity` 零扩容）；空输出走
@@ -343,7 +343,7 @@ pub fn to_screaming_snake_case(s: &str) -> String {
 /// `O(m·n)`（格数驱动，与长短侧摆放无关）。
 ///
 /// 性能锚（2026-10-16 批 b4 定性，release/std Instant 粗测，详见
-/// reports/2026-10-16-b4-text.md；复跑载体 examples/text_multidim.rs，
+/// text 域性能锚（本地留存，未入库）；复跑载体 examples/text_multidim.rs，
 /// 2026-10-17 复验）：≈1.1ns/格——100B 对 ≈11.4µs、1KiB 对 ≈1.1ms、
 /// 10KiB 对 ≈113ms（长度梯度=格数线性）；差异内容下 ns/格跨形状持平
 ///（10k×100 / 5k×200 / 1k×1k 全带内，行宽走短侧的结构证据）。观察项：

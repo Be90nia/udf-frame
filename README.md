@@ -101,7 +101,7 @@ udf-std-ext = "0.1.0"   # lib 名 std_ext；use std_ext::{ratelimit, retry, cach
 `ConnectionPool<T>` 只接 `PoolManaged` + `PoolBase` 两件，动态调参/水位线/审计/溢出计数
 全套自动到手——总 203 行，其中管理面 25 行（全一行委托、零逻辑重写）、特化面 95 行，
 约为双池体量的 1/5（MemoryPool 池化段 473 行 / ThreadPool 段 520 行，各含超时、
-调度循环、拒绝策略等机器；实测对表 [reports/2026-10-16-pool-wave3.md](../reports/2026-10-16-pool-wave3.md)）。
+调度循环、拒绝策略等机器；实测对表 线程池第三波性能锚（本地留存，未入库））。
 组合类最小例见 [examples/pooled_thread_pool.rs](skeleton-infra/examples/pooled_thread_pool.rs)：
 
 ```sh
@@ -130,7 +130,7 @@ cargo run -p udf-skeleton-infra --example pooled_thread_pool
 |---|---|
 | target 命名 | `skeleton::<域>`——`::` 分层对齐 EnvFilter 前缀匹配，单域开关=一个前缀指令（既有**非埋点** target：`skeleton::audit`=tracingx 审计桥，与埋点八域互不重叠） |
 | 级别 | 正常流转=debug / 异常=warn / 终态=info |
-| 不埋点 | 纯函数域（paths/clock/encode/hash/iter/config）：无行为决策点，埋点零诊断价值（拍板归档 [reports/2026-10-17-log-embed-c.md](../reports/2026-10-17-log-embed-c.md)） |
+| 不埋点 | 纯函数域（paths/clock/encode/hash/iter/config）：无行为决策点，埋点零诊断价值（拍板归档 log-embed 埋点 c（本地留存，未入库）） |
 
 `init_tracing_from_env` 的默认预设=`<default_level>,skeleton=off`——框架默认静默，宿主日志零打扰；`RUST_LOG` 已设且合法时逐字生效（显式值恒赢预设）。三种开启姿势：
 
@@ -142,9 +142,9 @@ RUST_LOG=skeleton::scheduler=trace cargo run -p udf-skeleton-infra --example qui
 
 `RUST_LOG` 语法非法时 fail-visible：stderr 报非法语法与回退结果，禁静默降级成另一档级别（配置错误必须可见）。
 
-零开销：过滤关闭时 `event!` 只剩一次兴趣判定（无订阅者零输出面）。实测锚（`skeleton-infra/src/tracingx.rs` 模块文档，采集器 `examples/perf_batchc.rs`，报告 [reports/2026-10-16-perf-batchc.md](../reports/2026-10-16-perf-batchc.md)）：审计桥常挂净转译 ~10ns/事件，订阅态 dispatch 全含 ~142ns（无订阅 ~77ns），有订阅者实收再 +~11ns——桥常挂成本集中在宿主订阅者本体。
+零开销：过滤关闭时 `event!` 只剩一次兴趣判定（无订阅者零输出面）。实测锚（`skeleton-infra/src/tracingx.rs` 模块文档，采集器 `examples/perf_batchc.rs`，报告：批 C 性能锚（本地留存，未入库）：审计桥常挂净转译 ~10ns/事件，订阅态 dispatch 全含 ~142ns（无订阅 ~77ns），有订阅者实收再 +~11ns——桥常挂成本集中在宿主订阅者本体。
 
-> **锚口径（诚实化）**：上述 dispatch 锚仅在**小 State** 下成立。外部持有快照时，状态落位走 `Arc::make_mut` 克隆分支——每次 dispatch 额外付一次 `S::clone`（在 state 锁内执行）；实测 1MiB State 约 210µs/dispatch，与 ~80ns 锚差约 2600 倍。State 体量建议控制在数 KiB 级，大状态用分片 + 自选持久化结构；详见 [docs/reference.md](docs/reference.md) runtime 锚段与 [reports/2026-10-27-udf-architecture-audit.md](reports/2026-10-27-udf-architecture-audit.md) F-05。
+> **锚口径（诚实化）**：上述 dispatch 锚仅在**小 State** 下成立。外部持有快照时，状态落位走 `Arc::make_mut` 克隆分支——每次 dispatch 额外付一次 `S::clone`（在 state 锁内执行）；实测 1MiB State 约 210µs/dispatch，与 ~80ns 锚差约 2600 倍。State 体量建议控制在数 KiB 级，大状态用分片 + 自选持久化结构；详见 [docs/reference.md](docs/reference.md) runtime 锚段与架构审计（本地留存，未入库）F-05。
 
 ## 构建与测试
 

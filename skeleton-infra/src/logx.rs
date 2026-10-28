@@ -1,5 +1,4 @@
-//! 日志域两层拆分（批 1 log feature 拆分，2026-10-18；ADR
-//! `docs/adr/0002-log-feature-split.md`）：
+//! 日志域两层拆分（批 1 log feature 拆分，2026-10-18；ADR 0002）：
 //!
 //! - **`log-fs`（纯 std，零三方依赖）**：密钥掩码 [`mask_secrets`] + 文件落盘
 //!   面——路径契约 [`LogPathResolver`](skeleton::logpath::LogPathResolver)
@@ -58,8 +57,7 @@
 //! [`mask_secrets`]）+ 每通道独立落点（[`PerChannelPathResolver`] 通道子目录
 //! + [`ChannelFileSink`] 组合件）。
 //!
-//! 通道动态级 armor 红线（域 ⑥ 调研，`docs/research/consumer-feedback-
-//! pitfalls.md`；tracing#2874/#2400 实锤）：禁 with_default 长驻、禁运行期
+//! 通道动态级 armor 红线（域 ⑥ 调研：外部踩坑调研（本地留存，未入库）；tracing#2874/#2400 实锤）：禁 with_default 长驻、禁运行期
 //! 全局换装 subscriber——callsite interest 缓存的失效竞态是结构性风险。
 //! 本件通道级过滤在 registry 写路径（槽位 AtomicU8 比较），不在
 //! subscriber/callsite 层：动态改级天然免疫缓存失效，下一 emit 即按新级别
@@ -166,7 +164,7 @@ fn to_tracing_filter(level: log::LevelFilter) -> tracing::level_filters::LevelFi
 /// 恒分配一次新 String。
 ///
 /// 性能锚（2026-10-16 批 C 定性，release/std Instant 粗测，详见
-/// reports/2026-10-16-perf-batchc.md）：无命中纯扫描近线性 O(n×m)——4KiB×
+/// 批 C 性能锚（本地留存，未入库））：无命中纯扫描近线性 O(n×m)——4KiB×
 /// 1/8/64 规则 ~0.6/4/85µs，64KiB ~14/67/1175µs（四轮中位）；规则轴 8 条
 /// ~6×、64 条 ~50-156×（分配/缓存压力放大），文本轴 16× 输入比值 ~10-37×
 ///（终轮 13.8-15.6 ≈ 线性）——双轴同向增长、无平方爆点；命中另计每规则

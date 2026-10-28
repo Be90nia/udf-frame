@@ -21,7 +21,7 @@
 //! ④ 粗测（std Instant）非 criterion——数字供判级，不供微优化基线；
 //! ⑤ black_box 防 LLVM 消除；每个锚三连跑取中位（扁平三次调用，无嵌套闭包）。
 //!
-//! 报告：reports/2026-10-16-b4-cache.md（agentwiki 根）。
+//! 报告：cache 域性能锚（本地留存，未入库）。
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;

@@ -1,7 +1,6 @@
 //! 配置装配契约域：类型化配置 + env 覆盖 + fail-visible 校验。
 //!
-//! 自 `skeleton-infra::config` 下沉（批 1 契约真下沉，2026-10-18；ADR
-//! `docs/adr/0001-contract-sink.md`）：[`ConfigPort`]/[`EnvSource`] 是配置域
+//! 自 `skeleton-infra::config` 下沉（批 1 契约真下沉，2026-10-18；ADR 0001）：[`ConfigPort`]/[`EnvSource`] 是配置域
 //! 的规范接口（journal 先例：框架只做规范接口，格式归实现）。实现件
 //! [`StdEnv`]/[`MockEnv`] 随迁（纯 std 零 feature 门）；文件装配面
 //! （`ConfigFile` 分层 + TOML 翻译捷径）是行为件，留在 `skeleton_infra`

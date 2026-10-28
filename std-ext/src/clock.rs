@@ -1,8 +1,7 @@
 //! 时长人读格式化与 RFC 3339 双向（行为件）。
 //!
 //! 常驻零依赖件：纯 std，无 feature 门。时间源契约（`Clock`/`SystemClock`/
-//! `MockClock`）已下沉 `skeleton::clock`（批 1 契约真下沉，2026-10-18；ADR
-//! `docs/adr/0001-contract-sink.md`）——本域保留两个行为面：
+//! `MockClock`）已下沉 `skeleton::clock`（批 1 契约真下沉，2026-10-18；ADR 0001）——本域保留两个行为面：
 //!
 //! - [`format_duration`]：humantime 语义去 calendar 单位（day 及以下）；
 //! - `rfc3339` 子模块：RFC 3339 时间戳双向解析/格式化（恒 UTC）。
@@ -25,7 +24,7 @@ use std::time::Duration;
 /// - `us` 用 ASCII（Windows 控制台 GBK 安全），不输出 `µs`。
 ///
 /// 性能锚（2026-10-16 批 1-b 定性，release/std Instant 粗测，详见
-/// reports/2026-10-16-b1-time.md）：~87-88ns/次与输入量级无关（整数除法
+/// time 域性能锚（本地留存，未入库））：~87-88ns/次与输入量级无关（整数除法
 /// O(1)，无浮点参与）；`Duration::MAX`（44 字符 8 分量）327ns；分配恒
 /// 1 次/调用（返回 String 本体，存活承接口径实测）。
 ///

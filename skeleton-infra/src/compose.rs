@@ -268,7 +268,7 @@ macro_rules! combine {
 /// 匿名 `impl Fragment` 形态做不到。
 ///
 /// 性能锚（2026-10-16 批 C 定性，release/std Instant 粗测，详见
-/// reports/2026-10-16-perf-batchc.md）：组合税个位数 ns——combine! 装配 vs
+/// 批 C 性能锚（本地留存，未入库））：组合税个位数 ns——combine! 装配 vs
 /// 等义手装单 Feature 的 dispatch 全含差值五轮交错中位 ~0-2ns（带 ±5ns）；
 /// 裸 reduce 两臂同折叠至 ~1ns 不可分辨（闭包全 ZST 逐字内联、子
 /// `EffectBuf` 空态零分配）——「零 dyn 零装箱」零额外分配实证。

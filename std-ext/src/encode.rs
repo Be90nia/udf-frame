@@ -1,7 +1,7 @@
 //! 字节↔文本编码转换：hex（Base16）/base64/BOM 剥离/UTF-16。text 域姊妹模块
 //! （同一信任边界哲学：显式策略、非法输入显式 Err 禁静默）。
 //!
-//! 坑面拍板（实现前系统排查，对照表见 reports/2026-10-16-b1-encode.md）：
+//! 坑面拍板（实现前系统排查，对照表见 encode 域性能锚（本地留存，未入库））：
 //!
 //! - 非字母表字符（含空白/NUL）恒 Err：RFC 4648 §3.3「Implementations MUST
 //!   reject the encoded data if it contains characters outside the base
@@ -88,7 +88,7 @@ static HEX_DECODE: [u8; 256] = hex_decode_table();
 /// 编码字节为 hex 文本（Base16）。输出长度恒为输入两倍（RFC §8 无 pad）。
 ///
 /// 性能锚（2026-10-16 批 encode，release/std Instant 粗测，详见
-/// reports/2026-10-16-b1-encode.md）：有效路径恒分配（输出 String，语义必
+/// encode 域性能锚（本地留存，未入库））：有效路径恒分配（输出 String，语义必
 /// 然），~61ns @16B（分配固定开销主导）/ ~1.37µs @1KiB / ~610-720 MiB/s
 /// @≥64KiB；查表主路径无分支。
 ///
@@ -234,7 +234,7 @@ static B64_DECODE_URL_SAFE: [u8; 256] = b64_decode_table(B64_URL_SAFE);
 /// canonical 承诺）。
 ///
 /// 性能锚（2026-10-16 批 encode，release/std Instant 粗测，详见
-/// reports/2026-10-16-b1-encode.md）：有效路径恒分配（输出 String，语义必
+/// encode 域性能锚（本地留存，未入库））：有效路径恒分配（输出 String，语义必
 /// 然），~1.23µs @1KiB（pad/no-pad 无差）/ ~710-800 MiB/s @≥64KiB。
 ///
 /// # Examples
@@ -426,7 +426,7 @@ pub fn base64_decode(s: &str, alphabet: Base64Alphabet) -> Result<Vec<u8>, Base6
 /// （切片操作）。
 ///
 /// 性能锚（2026-10-16 批 encode，release/std Instant 粗测，详见
-/// reports/2026-10-16-b1-encode.md）：零分配，~1.5-1.7ns（输入规模钝感）。
+/// encode 域性能锚（本地留存，未入库））：零分配，~1.5-1.7ns（输入规模钝感）。
 ///
 /// # Examples
 ///
@@ -460,7 +460,7 @@ pub enum UnicodeScheme {
 /// UTF-32）。
 ///
 /// 性能锚（2026-10-16 批 encode，release/std Instant 粗测，详见
-/// reports/2026-10-16-b1-encode.md）：零分配，~1.1ns（输入规模钝感）。
+/// encode 域性能锚（本地留存，未入库））：零分配，~1.1ns（输入规模钝感）。
 ///
 /// # Examples
 ///
@@ -536,7 +536,7 @@ impl std::error::Error for Utf16Error {}
 /// 本函数二选一）。
 ///
 /// 性能锚（2026-10-16 批 encode，release/std Instant 粗测，详见
-/// reports/2026-10-16-b1-encode.md）：恒分配（输出 Vec），~76ns @24 字符。
+/// encode 域性能锚（本地留存，未入库））：恒分配（输出 Vec），~76ns @24 字符。
 ///
 /// # Examples
 ///

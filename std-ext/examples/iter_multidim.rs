@@ -11,11 +11,11 @@
 //!
 //! 口径注（沿 text_multidim 惯例）：
 //! ① **事件计数**（只增不减）——本地 EventCounting 采集器自持，零 feature 门；
-//! ② 锚随 src/iter.rs doc 声明（reports/2026-10-16-iter.md）；粗测
+//! ② 锚随 src/iter.rs doc 声明（iter 域性能锚（本地留存，未入库））；粗测
 //!     （std Instant）非 criterion——数字供判级，不供微优化基线；
 //! ③ black_box 防 LLVM 消除；每个锚三连跑取中位。
 //!
-//! 报告：reports/2026-10-16-iter.md（agentwiki 根）。
+//! 报告：iter 域性能锚（本地留存，未入库）。
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;

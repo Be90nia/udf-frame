@@ -10,13 +10,13 @@ categories = ["rust-patterns"]
 rust-version = "1.87"
 # MSRV 实证（2026-10-18 clippy::incompatible_msrv 全仓扫描）：族内实际用到 is_multiple_of(1.87)/
 # is_none_or(1.82)，最高 1.87；三 crate 同版首发取统一值（skeleton 本体零违规，随族对齐）。
-# repository：待 PM 提供 URL 后补一行（本仓 git remote 未配置；见 docs/PUBLISHING.md §1）
+# repository：待 PM 提供 URL 后补一行（本仓 git remote 未配置；见发布检查单（本地留存，未入库）§1）
 
 # 零依赖纪律：不设 [dependencies]——核心无 IO/运行时依赖，reducer「禁 IO」
 # 从评审约束升级为编译期不可能。serde/async 均为可选演进方向。
 
 # 包名/lib 名分离（PM 拍板 2026-10-18）：发布名 udf-skeleton；lib 名保持 skeleton，
-# `use skeleton::` 零改动（docs/PUBLISHING.md §3）。
+# `use skeleton::` 零改动（发布检查单（本地留存，未入库）§3）。
 [lib]
 name = "skeleton"
 

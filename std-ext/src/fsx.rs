@@ -6,7 +6,7 @@
 //! journal 测试 m16 拍板「不引 tempfile dev-dep，std::fs 手工建删」——手搓临时
 //! 目录即本域的第一消费者。
 //!
-//! 坑面拍板（实现前系统排查，对照表见 reports/2026-10-16-b3-fsx.md）：
+//! 坑面拍板（实现前系统排查，对照表见 fsx 域性能锚（本地留存，未入库））：
 //!
 //! - **symlink 环**（S1 教训：walk 只认 `is_dir` 被穿透）：条目类型恒取
 //!   `read_dir` 的不穿透类型（symlink 即 symlink）；跟随策略显式参数，默认不
@@ -45,7 +45,7 @@
 //! +1/entry 收集缓冲——std 侧 `file_name` 复制等平台内部件不归本域，锚见报告）
 //! ②遍历吞吐（文件数梯度 100/1k/10k）③深度梯度；④并发曲线⑤锁⑥内存水位
 //! ⑦伪共享=n/a（无锁无线程面；IO 吞吐不做平台间绝对值对标，只报本机锚）。
-//! 采集器 `examples/fsx_multidim.rs`，报告 reports/2026-10-16-b3-fsx.md。
+//! 采集器 `examples/fsx_multidim.rs`，报告：fsx 域性能锚（本地留存，未入库）。
 
 use std::fs::{self, FileType, Metadata};
 use std::io;

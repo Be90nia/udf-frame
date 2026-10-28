@@ -1,6 +1,6 @@
 # skeleton-infra / std-ext API 参考
 
-> 权威口径：本文从 `src/*.rs` doc 注释、`tests/` 行为面与 `Cargo.toml` feature 表提取，与源码逐字对表（抽查记录见 `reports/2026-10-17-udf-api-reference.md`）。crate 级文档（`lib.rs`）仍是域典；本文是其展开的检索面。
+> 权威口径：本文从 `src/*.rs` doc 注释、`tests/` 行为面与 `Cargo.toml` feature 表提取，与源码逐字对表（抽查记录见 API 参考抽查（本地留存，未入库））。crate 级文档（`lib.rs`）仍是域典；本文是其展开的检索面。
 >
 > 姊妹 crate [`skeleton`](../skeleton)（零依赖）承载契约 trait 与数据词汇（`Store`/`Reducer`/`Effect`/`EffectRuntime`/`JournalPort`/`PoolManaged`/parse 端口等）；[`std-ext`](../std-ext)（批 5-1/5-2 物理拆分）承载十四个散件域（`text`/`encode`/`hash`/`iter`/`backoff`/`fsx`/`paths`/`clock`/`retry`/`scheduler`/`ratelimit`/`cache`/`id`/`json`——十三域零门常驻、本体纯 std，`json` 域门控 `json` feature）；本 crate（skeleton-infra）兑现契约参考实现与核+胶水件。契约本身（trait 语义承诺）见 skeleton 文档，本文只写实现侧公共 API 与行为契约。
 
@@ -34,7 +34,7 @@
 | `config-toml` | `config-json` + toml | — | `load_toml`/`save_toml` + `file_layer_toml`（TOML↔值面翻译） |
 | `view` | serde_json + `udf-std-ext/json` | — | `view::ViewBridge` 语言无关视图桥（ADR 0006）：契约词汇住 `skeleton::view`（零依赖）；默认树零三方不变 |
 
-> 注（批 1 契约真下沉，2026-10-18；ADR `docs/adr/0001-contract-sink.md`）：`skeleton` 由 optional 转常驻非 optional 依赖（常驻域 cache/id/retry/scheduler 消费 `skeleton::clock` 契约）——workspace path 非三方，`skeleton` 依赖面零三方口径不变。原 `runtime`/`pool`/`journal`/`compose` 的 `dep:skeleton` 叠门随之移除。
+> 注（批 1 契约真下沉，2026-10-18；ADR 0001）：`skeleton` 由 optional 转常驻非 optional 依赖（常驻域 cache/id/retry/scheduler 消费 `skeleton::clock` 契约）——workspace path 非三方，`skeleton` 依赖面零三方口径不变。原 `runtime`/`pool`/`journal`/`compose` 的 `dep:skeleton` 叠门随之移除。
 
 必选组合（`Cargo.toml` required-features 口径）：bench `infra` = `["tokio","journal","memgov","testing"]`；示例 `end_to_end` = `["tokio","journal","testing","compose"]`。 hollow gate 纪律：feature 不全的目标整目标跳过——CI 闸与首跑一律 `--all-features`。
 
@@ -216,7 +216,7 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 - dispatch 热路径锚：`examples/dispatch_profile.rs`（end_to_end_dispatch ≤100ns 契约）；订阅态 dispatch 全含 ~142ns / 无订阅 ~77ns（2026-10-16 批 C）。
 - `subscribe_events` 未订阅 emit 面：一次 Acquire load，零分配零锁（机制断言，audit 域 doc）。
 
-**锚口径（诚实化）**：上述 ns 级 dispatch 锚**仅在小 State 下成立**——锚的测量对象是状态迁移本身的固定开销，不含状态体量的复制成本。`Arc<State>` 是 CoW 快照：外部持有快照时（强计数 ≥2），状态落位走 `Arc::make_mut` 克隆分支，每次 dispatch 额外付一次 `S::clone`（在 state 锁内执行）。审计实测（`reports/2026-10-27-udf-architecture-audit.md` F-05）：
+**锚口径（诚实化）**：上述 ns 级 dispatch 锚**仅在小 State 下成立**——锚的测量对象是状态迁移本身的固定开销，不含状态体量的复制成本。`Arc<State>` 是 CoW 快照：外部持有快照时（强计数 ≥2），状态落位走 `Arc::make_mut` 克隆分支，每次 dispatch 额外付一次 `S::clone`（在 state 锁内执行）。审计实测（架构审计（本地留存，未入库）F-05）：
 
 | 口径 | 实测 |
 |---|---|
@@ -235,7 +235,7 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 
 ## notify — 异步信号式通知（案 C 水位）
 
-**feature**：`runtime`（默认，随 SyncStore）。**依赖面**：契约 `skeleton::notify` 零依赖；实现面零新三方。决策与论证唯一权威 = `docs/adr/0008-async-notify-signal.md`。
+**feature**：`runtime`（默认，随 SyncStore）。**依赖面**：契约 `skeleton::notify` 零依赖；实现面零新三方。决策与论证唯一权威 = ADR 0008（异步通知信号）。
 
 ```rust
 // skeleton::notify（契约层，零依赖）
@@ -700,7 +700,7 @@ assert!(ensure_inside(Path::new("a/b"), Path::new("a/c"), CaseStrategy::CaseSens
 
 ## clock — 时间源
 
-**feature**：常驻，零 feature 门。**依赖面**：纯 std。**批 1 契约真下沉**（2026-10-18；ADR `docs/adr/0001-contract-sink.md`）：时间源契约 `Clock`/`SystemClock`/`MockClock` 现住 `skeleton::clock`（被 scheduler/ratelimit/retry/cache/id 多域消费的核心契约住契约层）；本 crate 的 `clock` 模块只余行为件（时长格式化 + RFC 3339）。
+**feature**：常驻，零 feature 门。**依赖面**：纯 std。**批 1 契约真下沉**（2026-10-18；ADR 0001）：时间源契约 `Clock`/`SystemClock`/`MockClock` 现住 `skeleton::clock`（被 scheduler/ratelimit/retry/cache/id 多域消费的核心契约住契约层）；本 crate 的 `clock` 模块只余行为件（时长格式化 + RFC 3339）。
 
 契约面（`skeleton::clock`）：
 
@@ -1416,7 +1416,7 @@ assert_eq!(v["a"], 1);
 
 ## config — 配置装配
 
-**feature**：文件面挂 `config-json`/`config-toml`。**依赖面**：`config-json` 增 serde/serde_json；`config-toml` 叠加 toml。**批 1 契约真下沉**（2026-10-18；ADR `docs/adr/0001-contract-sink.md`）：配置契约 `EnvSource`/`StdEnv`/`MockEnv`/`ConfigPort`/`ConfigError` 现住 `skeleton::config`（纯 std 零门）；本 crate 的 `config` 模块只余文件行为件（分层装配/原子保存/TOML 翻译）。
+**feature**：文件面挂 `config-json`/`config-toml`。**依赖面**：`config-json` 增 serde/serde_json；`config-toml` 叠加 toml。**批 1 契约真下沉**（2026-10-18；ADR 0001）：配置契约 `EnvSource`/`StdEnv`/`MockEnv`/`ConfigPort`/`ConfigError` 现住 `skeleton::config`（纯 std 零门）；本 crate 的 `config` 模块只余文件行为件（分层装配/原子保存/TOML 翻译）。
 
 ### 覆盖链三层（谁负责什么）
 
@@ -1771,7 +1771,7 @@ assert_eq!(read_port(&boom).unwrap_err(), "mock parse error: bad json");
 
 ## logx — 日志门面
 
-**feature**：两层拆分（批 1，2026-10-18；ADR `docs/adr/0002-log-feature-split.md`）——`log-fs`（纯 std 零三方——域面口径，crate 树见 [§零依赖口径](#零依赖口径)：密钥掩码 + 路径解析 + `FileSink`，单开即可用文件日志）与 `log`（=`log-fs` 叠门 + log + tracing + tracing-subscriber + tracing-log：init 系门面绑定层）。日志根目录契约 `LogPathResolver` 住 `skeleton::logpath`。门面 trait=生态 `log::Log`（不自造）；核心自身永不打日志（核心零依赖，结构性排除）。
+**feature**：两层拆分（批 1，2026-10-18；ADR 0002）——`log-fs`（纯 std 零三方——域面口径，crate 树见 [§零依赖口径](#零依赖口径)：密钥掩码 + 路径解析 + `FileSink`，单开即可用文件日志）与 `log`（=`log-fs` 叠门 + log + tracing + tracing-subscriber + tracing-log：init 系门面绑定层）。日志根目录契约 `LogPathResolver` 住 `skeleton::logpath`。门面 trait=生态 `log::Log`（不自造）；核心自身永不打日志（核心零依赖，结构性排除）。
 
 ```rust
 // ── log-fs 面（纯 std，域面零三方依赖）──

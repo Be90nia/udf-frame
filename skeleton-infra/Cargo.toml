@@ -10,7 +10,7 @@ categories = ["concurrency", "development-tools::testing"]
 rust-version = "1.87"
 # MSRV 实证（2026-10-18 clippy::incompatible_msrv 全仓扫描）：is_multiple_of(1.87，
 # journal/multidim_eval) 等，最高 1.87；三 crate 同版首发取统一值。
-# repository：待 PM 提供 URL 后补一行（本仓 git remote 未配置；见 docs/PUBLISHING.md §1）
+# repository：待 PM 提供 URL 后补一行（本仓 git remote 未配置；见发布检查单（本地留存，未入库）§1）
 
 # default = ["runtime", "pool"]：契约参考实现 SyncStore 随默认 feature 可用（拍板点②）；
 # pool 池化管理组合件同为默认（纯 std+契约词汇，零三方增量，验收命令免 --features
@@ -19,7 +19,7 @@ rust-version = "1.87"
 # 证明口径不变（--no-default-features 下树内亦仅 skeleton 一个非三方节点）。
 # journal 绑 serde/serde_json；tokio 绑 fx。
 # 包名/lib 名分离（PM 拍板 2026-10-18）：发布名 udf-skeleton-infra；lib 名保持
-# skeleton_infra，`use skeleton_infra::` 零改动（docs/PUBLISHING.md §3）。
+# skeleton_infra，`use skeleton_infra::` 零改动（发布检查单（本地留存，未入库）§3）。
 [lib]
 name = "skeleton_infra"
 
@@ -43,7 +43,7 @@ testing = ["tokio", "runtime"]
 # LogPathResolver 住 skeleton::logpath）+ FileSink 按日滚动。单开即可用文件日志。
 log-fs = []
 # log：门面绑定层=log-fs 叠门 + log/tracing/tracing-subscriber/tracing-log 四件
-# （批 1 log feature 拆分，ADR docs/adr/0002-log-feature-split.md）。
+# （批 1 log feature 拆分，ADR 0002）。
 log = ["log-fs", "dep:log", "dep:tracing", "dep:tracing-subscriber", "dep:tracing-log"]
 # tracing：骨架审计事件流 → tracing 桥。tokio/log 先例形态——feature 门控依赖，
 # 桥在审计值面（crate::audit）上消费。
@@ -58,7 +58,7 @@ log-embed = ["dep:tracing"]
 # compose：父子分片组合器（combine!/combine；宏已落地）。只需契约词汇。
 compose = []
 # config-json：配置文件分层读写面（拍板 2026-10-17 配置读写一等公民，报告
-# reports/2026-10-17-config-file.md）。serde_json 为统一值模型（journal 先例
+# 配置文件面（本地留存，未入库））。serde_json 为统一值模型（journal 先例
 # optional 形态）；常驻核心保持零依赖格式盲（ConfigPort 契约不动）。
 config-json = ["dep:serde", "dep:serde_json"]
 # config-toml：TOML 文本 ↔ 统一值面翻译捷径，叠在 config-json 值面上。
@@ -139,7 +139,7 @@ required-features = ["memgov", "pool"]
 
 # 第三池省事度验收示例（调研档 §4.4.3 拍板锚）：ConnectionPool 只接
 # PoolManaged+PoolBase，管理面零重写；特化面/总行数对表
-# reports/2026-10-16-pool-wave3.md。
+# 线程池第三波性能锚（本地留存，未入库）。
 [[example]]
 name = "connection_pool"
 required-features = ["pool"]
@@ -150,7 +150,7 @@ name = "pooled_thread_pool"
 required-features = ["pool"]
 
 # 组合类七维性能矩阵采集器（PooledThreadPool 组合端到端口径 ①-⑦；沿 multidim
-# 模式纯 std，零新依赖；报告 reports/2026-10-16-pool-perf-final.md）。
+# 模式纯 std，零新依赖；报告：线程池性能终稿（本地留存，未入库））。
 [[example]]
 name = "pooled_thread_pool_multidim"
 required-features = ["pool"]
@@ -168,14 +168,14 @@ name = "journal_multidim"
 required-features = ["journal", "memgov"]
 
 # time 域七维性能矩阵采集器（①分配面②now 锚③格式化梯度；④⑤⑥⑦ n/a 纯函数域；
-# 沿 multidim 模式纯 std，零新依赖；报告 reports/2026-10-16-b1-time.md）。
+# 沿 multidim 模式纯 std，零新依赖；报告：time 域性能锚（本地留存，未入库））。
 [[example]]
 name = "time_multidim"
 required-features = ["memgov"]
 
 # ratelimit 域七维性能矩阵采集器（①try_acquire 分配面②ns 锚⑤阻塞延迟分布
 # 虚拟+实测双臂⑥零自旋轮次；③收窄④⑦ n/a 契约明示；沿 time_multidim 模式
-# 纯 std，零新依赖；报告 reports/2026-10-16-b3-ratelimit.md）。
+# 纯 std，零新依赖；报告：ratelimit 域性能锚（本地留存，未入库））。
 [[example]]
 name = "ratelimit_multidim"
 required-features = ["memgov"]
@@ -183,18 +183,18 @@ required-features = ["memgov"]
 # cache 域七维性能矩阵采集器（①get/peek/insert 分配事件面②ns 锚③容量梯度
 # 100/1k/10k；④⑤⑥⑦ n/a 收窄契约明示；沿 fsx_multidim 模式纯 std 零 feature
 # 门（事件计数器采集器自持，不用 memgov 净额计数器——稳态插拔净零不适用）；
-# 报告 reports/2026-10-16-b4-cache.md）。批 5-2 随 cache 域迁至 std-ext/examples/。
+# 报告：cache 域性能锚（本地留存，未入库））。批 5-2 随 cache 域迁至 std-ext/examples/。
 
 # shutdown 域七维性能矩阵采集器（①register 分配面②编排 ns 锚（驱动/克隆/
 # watchdog 三路）③组件数梯度 10/100/1000⑤N=0 延迟分布；④⑥⑦ n/a 收窄契约
-# 明示；沿 multidim 模式纯 std，零新依赖；报告 reports/2026-10-16-b4-shutdown.md）。
+# 明示；沿 multidim 模式纯 std，零新依赖；报告：shutdown 域性能锚（本地留存，未入库））。
 [[example]]
 name = "shutdown_multidim"
 required-features = ["memgov"]
 
 # scheduler 域七维性能矩阵采集器（①注册分配面②注册 ns 锚③1/2/4/8 竞争曲线
 # ④cancel 延迟⑤触发精度双报⑥idle park 零自旋；沿 multidim 模式纯 std，零新
-# 依赖；报告 reports/2026-10-16-b3-scheduler.md。批 1 补注册：此前未列 manifest
+# 依赖；报告：scheduler 域性能锚（本地留存，未入库）。批 1 补注册：此前未列 manifest
 # 走自动发现，--no-default-features 组合下 memgov 缺位即编译炸——hollow gate
 # 纪律要求显式 required-features）。
 [[example]]
@@ -222,7 +222,7 @@ name = "driver_tour"
 required-features = ["runtime"]
 
 # 温域三小件定性锚采集器（批 C：compose 组合税 / tracingx 净转译分离 / logx
-# mask 曲线；沿 multidim 模式纯 std，零新依赖；报告 reports/2026-10-16-perf-batchc.md；
+# mask 曲线；沿 multidim 模式纯 std，零新依赖；报告：批 C 性能锚（本地留存，未入库）；
 # mask_secrets 属 log-fs 面，required-features 取实际用量并集）。
 [[example]]
 name = "perf_batchc"
@@ -238,7 +238,7 @@ required-features = ["log", "memgov"]
 # config/fsx 件一+件二多维锚采集器（atomic_write 分配事件逐路径+ns 梯度+p50/p99 /
 # ConfigFile 分层合并逐路径分配面+合并 ns 梯度 / toml 进出锚；沿 fsx_multidim
 # 模式纯 std 零新依赖，事件计数器自持；required-features 取并集（hollow gate
-# 纪律：CI 闸与首跑一律 --all-features）；报告 reports/2026-10-17-config-file.md）。
+# 纪律：CI 闸与首跑一律 --all-features）；报告：配置文件面（本地留存，未入库））。
 [[example]]
 name = "config_atomic_multidim"
 required-features = ["config-json", "config-toml"]
@@ -247,7 +247,7 @@ required-features = ["config-json", "config-toml"]
 #（SystemClock 端到端 / MockClock 纯算术+锁 双报）③批量梯度 100/1k/10k
 #（MockClock 冻结钟 counter 面）⑤p50/p99 延迟分布 ④⑥⑦ 收窄契约明示
 #（无调参面/std Mutex park 零自旋/单权威 cell 无热点计数面）；沿
-# time_multidim 模式纯 std 零新依赖；报告 reports/2026-10-17-id.md）。
+# time_multidim 模式纯 std 零新依赖；报告：id 域性能锚（本地留存，未入库））。
 [[example]]
 name = "id_multidim"
 required-features = ["memgov"]

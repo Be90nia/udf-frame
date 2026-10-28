@@ -1,7 +1,6 @@
 //! # std-ext
 //!
-//! 常驻生态标准件（批 5-1/5-2 自 skeleton-infra 物理拆出，切面决策见
-//! `udf-frame/docs/adr/0004-std-ext-split.md`）：十四域——十三域零门常驻
+//! 常驻生态标准件（批 5-1/5-2 自 skeleton-infra 物理拆出，切面决策见 ADR 0004）：十四域——十三域零门常驻
 //! （本体纯 std）+ 两道依赖隔离门（依赖形态决策见 ADR 0007）：`json` 域
 //! （`json` feature 引 serde_json——P1-9 拍板，主营仓 xray-conf 上浮）+
 //! `id` 域凭据级 `RandomId` 面（`random` feature 引 getrandom——issue#1-4

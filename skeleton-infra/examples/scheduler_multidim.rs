@@ -16,7 +16,7 @@
 //! ④ worker 精度段是真实时钟面（SystemClock），数字含 OS 调度抖动，供量级
 //!    判级非 SLO 承诺；⑤ black_box 防 LLVM 消除；batch_mean 三连跑取中位。
 //!
-//! 报告：reports/2026-10-16-b3-scheduler.md（agentwiki 根）。
+//! 报告：scheduler 域性能锚（本地留存，未入库）。
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;

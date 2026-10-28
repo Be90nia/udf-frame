@@ -13,7 +13,7 @@
 //! 有界容器族（BTreeMap 序淘汰，`K: Ord`，首键退化语义）；本模块=精确 LRU+
 //! TTL 缓存域（`K: Eq + Hash + Clone`）。memgov `Eviction` 头注「LRU/TTL→moka
 //! 对表，不在此实现」的缺口由本模块兑现（moka 重依赖不采——零依赖纪律；
-//! Guava Cache / moka 语义面对表见 reports/2026-10-16-b4-cache.md）。
+//! Guava Cache / moka 语义面对表见 cache 域性能锚（本地留存，未入库））。
 //!
 //! # O(1) 结构（拍板点：真双向链，非键序退化）
 //!

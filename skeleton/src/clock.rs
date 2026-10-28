@@ -1,7 +1,6 @@
 //! 时间源契约：单调测量面与挂钟展示面的双口分流。
 //!
-//! 自 `skeleton-infra::clock` 下沉（批 1 契约真下沉，2026-10-18；ADR
-//! `docs/adr/0001-contract-sink.md`）：`Clock` 是被 scheduler/ratelimit/retry/
+//! 自 `skeleton-infra::clock` 下沉（批 1 契约真下沉，2026-10-18；ADR 0001）：`Clock` 是被 scheduler/ratelimit/retry/
 //! cache/id 多域消费的核心契约，住契约层与实现同床的架构债在此偿还。实现件
 //! [`SystemClock`]/[`MockClock`] 随迁（纯 std 零 feature 门）；时长人读格式化
 //! 与 RFC 3339 是行为件，住在 `std_ext::clock`（批 5-2 起，原 `skeleton_infra::clock`）。
@@ -101,7 +100,7 @@ impl Clock for SystemClock {
 /// - 后退不可表达（`advance` 入参 `Duration` 无符号）；累计推进溢出
 ///   `Duration` 表示范围 → fail-closed 带因 panic（测试写错了就炸，不静默）；
 /// - 读取成本 ~11-13ns/次（非竞争 `Mutex`+`checked_add`，2026-10-16 粗测，
-///   详见 reports/2026-10-16-b1-time.md；复跑载体 examples/time_multidim.rs，
+///   详见time 域性能锚（本地留存，未入库）；复跑载体 examples/time_multidim.rs，
 ///   2026-10-17 复验 11.3ns）——测试替身语义，非热路径件。注意 TtlCache
 ///   路径净税 ~22ns = 本读 + 过期判定面之和（cache_multidim ②′），勿以
 ///   本锚核缓存路径成本。

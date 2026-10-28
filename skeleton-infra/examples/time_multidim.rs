@@ -1,7 +1,7 @@
 //! time 域七维性能矩阵采集器（收窄声明：①now()/advance/format 分配面 ②now()
 //! ns 锚 ③格式化输入规模梯度；④⑤⑥⑦ n/a——纯函数域+时钟锚，无锁竞争曲线/
 //! 无并发扩展面/无伪共享/无 IO）。2026-10-17 增 RFC3339 双向面（分配/锚/
-//! 长度梯度，humantime dev-dep 对照基线），报告 reports/2026-10-17-rfc3339.md。
+//! 长度梯度，humantime dev-dep 对照基线），报告：RFC3339 格式（本地留存，未入库）。
 //!
 //! 跑法（udf-frame 根）：
 //! ```text
@@ -14,7 +14,7 @@
 //! ③ 粗测（std Instant）非 criterion——数字供判级，不供微优化基线；
 //! ④ black_box 防 LLVM 消除；每个 batch_mean 三连跑取中位。
 //!
-//! 报告：reports/2026-10-16-b1-time.md（agentwiki 根）。
+//! 报告：time 域性能锚（本地留存，未入库）。
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;

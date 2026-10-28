@@ -87,7 +87,7 @@
 //! ```
 //!
 //! # 性能锚（2026-10-17，release/std Instant 粗测，详见
-//! reports/2026-10-17-id.md；复跑载体 examples/id_multidim.rs）
+//! id 域性能锚（本地留存，未入库）；复跑载体 examples/id_multidim.rs）
 //!
 //! - `gen()` 恒零分配（[`Id`] 值面 Copy 无堆；counting allocator 净活断言
 //!   ==0）；
@@ -447,7 +447,7 @@ impl From<getrandom::Error> for RngError {
 /// ```
 ///
 /// # 坑面 armor（每坑一测，见 `tests/id.rs` `v4_random` 段；坑面对表调研
-/// 报告域 4：docs/research/consumer-feedback-pitfalls.md）
+/// 报告域 4：外部踩坑调研（本地留存，未入库））
 ///
 /// | 坑 | 堵法 | 测试名 |
 /// |---|---|---|

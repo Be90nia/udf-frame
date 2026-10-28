@@ -21,7 +21,7 @@
 //! avoid intentional collisions」。对抗性场景（不可信输入的完整性校验）用
 //! 加密摘要（sha2 等按 ADR 引依赖），本域类型不与加密摘要混用。
 //!
-//! # 坑面拍板（实现前系统排查，对照表见 reports/2026-10-16-b2-hash.md）
+//! # 坑面拍板（实现前系统排查，对照表见 hash 域性能锚（本地留存，未入库））
 //!
 //! 1. **std DefaultHasher 跨版本不稳**（std 文档原文：「The internal algorithm
 //!    is not specified, and so it and its hashes should not be relied upon over
@@ -57,7 +57,7 @@
 //! crate（两个算法合计 ~80 行，依赖重量不成比例）。
 //!
 //! 性能锚（2026-10-16 批 hash，release/std Instant 粗测，详见
-//! reports/2026-10-16-b2-hash.md）：见各函数 doc「性能锚」段。
+//! hash 域性能锚（本地留存，未入库））：见各函数 doc「性能锚」段。
 
 use std::io::{self, Read};
 
@@ -89,7 +89,7 @@ fn fnv1a_fold(mut h: u64, bytes: &[u8]) -> u64 {
 /// 零分配。
 ///
 /// 性能锚（2026-10-16 批 hash，release/std Instant 粗测，详见
-/// reports/2026-10-16-b2-hash.md）：零分配（计数分配器 1000 次调用=0 次）；
+/// hash 域性能锚（本地留存，未入库））：零分配（计数分配器 1000 次调用=0 次）；
 /// ~1160-1190 MiB/s @≥1KiB（逐字节乘链，规模钝感）；16B 热缓存 ~5.5ns。
 ///
 /// # Examples
@@ -196,7 +196,7 @@ fn read_u32_le(b: &[u8]) -> u32 {
 /// 历史数据。零分配。
 ///
 /// 性能锚（2026-10-16 批 hash，release/std Instant 粗测，详见
-/// reports/2026-10-16-b2-hash.md）：零分配（计数分配器 1000 次调用=0 次）；
+/// hash 域性能锚（本地留存，未入库））：零分配（计数分配器 1000 次调用=0 次）；
 /// ~17.5 GiB/s @64KiB（**大块 ≥64MiB 受 DRAM 带宽界回落至 ~11-12 GiB/s**，
 /// 非实现缺陷；四通道累加器 ILP；参考实现自报 19.4 GiB/s 同量级）；16B 热缓存 ~4.1ns。
 ///

@@ -12,7 +12,7 @@
 //! ③ 粗测（std Instant）非 criterion——数字供判级，不供微优化基线；
 //! ④ black_box 防 LLVM 消除；每个 batch_mean 三连跑取中位。
 //!
-//! 报告：reports/2026-10-16-perf-batchc.md（agentwiki 根）。
+//! 报告：批 C 性能锚（本地留存，未入库）。
 
 use std::convert::Infallible;
 use std::hint::black_box;

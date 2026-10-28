@@ -1,6 +1,6 @@
 # View Region 线格式规范 v1（跨语言唯一权威）
 
-- 状态：**v1 生效**（ADR 0006 / 规格 `docs/research/mvi-view-bridge-research.md` §3.6 落地件）
+- 状态：**v1 生效**（ADR 0006 / 规格见视图桥调研（本地留存，未入库）§3.6 落地件）
 - 参考实现：Rust 读侧 `skeleton_infra::view::read::RegionReader`（`view` feature）；写侧 `skeleton_infra::view::RegionWriter` + `RegionChannel`
 - 镜像读器：TS 片段 `docs/view-region-reader.ts`（Python/C 按同一语义复刻，各 ~20 行验收线）
 - 信封骨架布局冻结：Header/Index 的字段序、宽度、LE 跨版本冻结——演进只允许动段/项内部（TLV 自描述可跳）、增条目、或整区换代（`protocol_version` 升代 + 新 region 形）

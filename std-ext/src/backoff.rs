@@ -16,7 +16,7 @@ use std::time::Duration;
 /// 结果截到 `max`。禁 jitter（确定性回放要求）。
 ///
 /// 性能锚（2026-10-16 批 D 定性，release/std Instant 粗测，详见
-/// reports/2026-10-16-perf-batchd.md）：纯算术常数级，~3ns/次
+/// 批 D 性能锚（本地留存，未入库））：纯算术常数级，~3ns/次
 ///（`saturating_mul`+`min`，零分配零时钟）。
 ///
 /// # Examples

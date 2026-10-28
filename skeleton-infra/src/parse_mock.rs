@@ -5,7 +5,7 @@
 //! feature 门 `testing`（测试替身域 charter 原地扩容，脚本化模式沿
 //! `testing::ScriptedRuntime`/`Script` 先例；`testing` 连带 `runtime`/`tokio`
 //! 重量=已知取舍，拆轻量 feature 待真实采用方出现——拍板点
-//! reports/2026-10-16-parse-port.md §五.4）。
+//! parse 端口性能锚（本地留存，未入库）§五.4）。
 //!
 //! # 共享形状
 //!

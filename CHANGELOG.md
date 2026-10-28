@@ -12,7 +12,7 @@
 - **logx**：每通道独立 level（写路径 AtomicU8 原子过滤，`set_level` 运行期即时生效——结构性免疫 tracing callsite interest 缓存坑，tracing#2874/#2400）+ 逐通道丢弃计数读数 `dropped(channel)`。
 - **FxScope**：`spawn` 更名 `spawn_tracked` + 新增 `spawn_detached`（显式脱管口，不计 in_flight、不被 shutdown 等待；全仓唯一 tokio::spawn allow 豁免）+ 文档范式（Arc 化标准写法/cancel-safe 清单/LocalSet 边界/两套 drop 语义对照）。
 - **通知面异步化**（ADR 0008 案 C 两档并存）：`skeleton::notify`（`NotifySink` 宿主投递口 + `Notify<S>` 登记面，不扩 Store 六方法）+ SyncStore 实现（排空环内 O(1) 版本投递、先于同步回调；state_version 零异步订阅者不自增）+ `notify_published()` 读侧。锚：无订阅 dispatch 77→78.4ns（±10ns 容忍内）；50ms 慢消费者隔离实证 ~172ns。既有通知/审计/回灌测试零改动。
-- 六域 armor 逐坑一测（调研：`docs/research/consumer-feedback-pitfalls.md`——外部踩坑面/性能模式/生态先例，T1/T2 出处全覆盖）。
+- 六域 armor 逐坑一测（调研：外部踩坑调研（本地留存，未入库）——外部踩坑面/性能模式/生态先例，T1/T2 出处全覆盖）。
 
 ### Changed（retry 默认 jitter + FxScope spawn 双命名，破坏性）
 - retry：退避默认 **full jitter**（禁关——无 jitter 同拍风暴，AWS 一手实测；确定性回放用 `with_jitter` 恒等源）；`with_budget` 红线升级「只配次数不配预算=风暴面」；retry 默认假定操作幂等（文档红线）。
@@ -23,7 +23,7 @@
 - `skeleton`：`EffectId` 构造封口——`EffectId(pub u64)` → 私字段 + `pub const fn new(u64)` / `get()`（std `NonZeroU64` 同形），裸元组构造由 compile_fail doctest 冻结；id 唯一性纪律（store 内全局唯一、多效果域不重叠区间）入文档。**破坏性**：`EffectId(id)` → `EffectId::new(id)`。
 - `skeleton`：`Effect` / `Restore` 加 `#[non_exhaustive]`（与 `parse` 词表同口径，ADR 0007 协同）——跨 crate match 编译期强制带通配臂面对未知变体；`skeleton-infra` 内 7 处 match 站点按 fail-closed 语义补臂（panic 带因 / `unreachable!` 带因）。
 - `skeleton-infra`：静默行为显形四件（对齐 `subscriber_panics` 计数先例）——`Combine::route_misses()`（combine 路由 miss 不再零计数）；`SyncStore::local_missed_notifications()`（跨线程 dispatch 下本地订阅零触达可观测）；`SyncStore::try_subscribe`（闭门后显式 `Err(StoreClosed)`，旧 `subscribe` 照常登记并计入闭门计数）；`SyncStore::audit_preempted()`（审计事件流二次订阅的静默覆盖留痕）。另 `SyncStore::cancel_unknown_id()`：Cancel 指向从未发出的 Run id 计数留痕（不拦截——迟到 Cancel 属合法时序，核心无生命周期面无法区分漂移）。
-- 依据：`reports/2026-10-27-udf-architecture-audit.md` F-04/07/08/09/10/13（B/C 桶残余清零）。
+- 依据：架构审计（本地留存，未入库）F-04/07/08/09/10/13（B/C 桶残余清零）。
 
 ### Changed（combine 分片作根编译期拒绝：Fragment/Reducer 契约拆分，破坏性）
 - `skeleton` 新增 `Fragment` trait（reduce-only 状态分片契约）+ blanket `impl<T: Reducer> Fragment for T`（每个根都是合法子件）；`Reducer` 语义收窄为**根契约**（initial+reduce，trait 本体与既有 `impl Reducer` 零变化）。
@@ -51,22 +51,22 @@
 ## [0.1.0] — 2026-10-18
 
 > 0.1.0 首发准备态：三 crate（`skeleton` / `std-ext` / `skeleton-infra`）同版 0.1.0 首发；
-> 发布检查单与 crate 名冲突处置见 `docs/PUBLISHING.md`。以下为 0.1.0 累计对外可见变更。
+> crate 名冲突处置见发布检查单（本地留存，未入库）。以下为 0.1.0 累计对外可见变更。
 
 ### Changed（批 6A Journal 状态面关联类型化，破坏性）
-- `Journal<A, S>` → `Journal<A>` + `type State`（ADR 0005）：`JsonlJournal` 同步泛型化（`JsonlJournal<A, S>`，`PhantomData<fn() -> (A, S)>` 标记，零布局成本）——构造期一次定型（`JsonlJournal::<A, S>::create(..)`）后方法调用零 turbofish 零 UFCS 零绑定标注。旧世界 `S` 不被方法参数约束，每调用点 E0283 强迫 `Journal::<A, S>::` 全限定 + `MutexGuard` 场景再加 `&mut *guard` 显式 deref（终评三槽点之三），税清零。`skeleton::JournalPort<A, S>` → `JournalPort<A>` + `type State` 同款（`restore` 返回 `Restore<A, Self::State>`）。dyn 焊接面保留：`DynJournal<A, S>` = `dyn Journal<A, State = S>`。（**破坏性**：`JsonlJournal` 具体类型携带 (A, S) 参数，构造点需类型标注；外部实现方在 impl 块补 `type State = S;` 一行。方案对比与三探针证据：`docs/adr/0005-journal-reshape.md`。）
+- `Journal<A, S>` → `Journal<A>` + `type State`（ADR 0005）：`JsonlJournal` 同步泛型化（`JsonlJournal<A, S>`，`PhantomData<fn() -> (A, S)>` 标记，零布局成本）——构造期一次定型（`JsonlJournal::<A, S>::create(..)`）后方法调用零 turbofish 零 UFCS 零绑定标注。旧世界 `S` 不被方法参数约束，每调用点 E0283 强迫 `Journal::<A, S>::` 全限定 + `MutexGuard` 场景再加 `&mut *guard` 显式 deref（终评三槽点之三），税清零。`skeleton::JournalPort<A, S>` → `JournalPort<A>` + `type State` 同款（`restore` 返回 `Restore<A, Self::State>`）。dyn 焊接面保留：`DynJournal<A, S>` = `dyn Journal<A, State = S>`。（**破坏性**：`JsonlJournal` 具体类型携带 (A, S) 参数，构造点需类型标注；外部实现方在 impl 块补 `type State = S;` 一行。方案对比与三探针证据：ADR 0005。）
 - 文档伺候面全撤（E0283 专伺候教行清零）：教程驻足节 UFCS 全限定改为「构造期定型、调用期直呼」；cheatsheet §1 惯用形行与坑 4 重写（新坑=定型账本塞异型 payload 的 E0308）；README 第一天提示同步。教程坑 A 教学指令修正：删 `#[serde(tag)]` 不复现（struct variant 外部 tag 恰好是 object）→ 改为「给 Clear（unit variant）入账」真实命中路径，重跑报错逐字命中。README「只要散件」最小 Cargo.toml 组合示例补齐。埋点宏 `embed_event!` 单源化评估：`#[macro_export]` 单源可行但劣化面更大（公开 API 面+feature 耦合+cfg 复杂度 > 14 行冻结宏同步成本），维持双副本+两侧同步责任注释（ADR 0005 §埋点宏）。
 
 ### Added（批5-2 std-ext 七域迁移收口）
 - std-ext 扩至十三常驻域全量：`paths`/`clock`（含 `clock::rfc3339` 行为件）/`retry`/`scheduler`/`ratelimit`/`cache`/`id` 自 `skeleton-infra` 物理迁入（各域集成测试随迁；自持采集器 `cache_multidim` 迁 std-ext/examples；memgov 依赖的五采集器留守 infra examples 改测 `std_ext::` 面；`humantime` dev-dep 随 RFC3339 对照测试迁 std-ext，infra 侧留守 bench 仍用）（**破坏性**：`skeleton_infra::{paths,clock,retry,scheduler,ratelimit,cache,id}::*` → `std_ext::*`，infra 根再导出同批删除，无 shim）。`log-embed` 对账新基线 41=std-ext 七域 35 + infra shutdown 6。`shutdown` 留守 infra（胶水件反向依赖 `std_ext::scheduler`）。ADR 0004 补终版切面表。
 
 ### Added（批5-1 std-ext 拆分）
-- 新子 crate `std-ext`：六个纯 std 叶子域自 `skeleton-infra` 物理迁入——`text`/`encode`/`hash`/`iter`/`backoff`/`fsx`（含各自内联测试/集成测试/示例/doctest 随域迁移；`log-embed` 埋点三域 9 调用点由 std-ext 自有同名 feature 承载，宏为同款文本作用域副本，target `skeleton::<domain>` 观测契约不变）。分层 `skeleton` ← `std-ext` ← `skeleton-infra`（反向依赖）；`cargo tree -p udf-std-ext` 默认树零三方（**破坏性**：`skeleton_infra::{text,encode,hash,iter,backoff,fsx}::*` → `std_ext::*`，infra 根再导出同批删除，无 shim；见 `docs/adr/0004-std-ext-split.md`）。
+- 新子 crate `std-ext`：六个纯 std 叶子域自 `skeleton-infra` 物理迁入——`text`/`encode`/`hash`/`iter`/`backoff`/`fsx`（含各自内联测试/集成测试/示例/doctest 随域迁移；`log-embed` 埋点三域 9 调用点由 std-ext 自有同名 feature 承载，宏为同款文本作用域副本，target `skeleton::<domain>` 观测契约不变）。分层 `skeleton` ← `std-ext` ← `skeleton-infra`（反向依赖）；`cargo tree -p udf-std-ext` 默认树零三方（**破坏性**：`skeleton_infra::{text,encode,hash,iter,backoff,fsx}::*` → `std_ext::*`，infra 根再导出同批删除，无 shim；见 ADR 0004）。
 
 ### Added（批1A 契约下沉 + log 拆分）
-- 契约层真下沉：`Clock`/`SystemClock`/`MockClock` → `skeleton::clock`；`EnvSource`/`StdEnv`/`MockEnv`/`ConfigPort`/`ConfigError` → `skeleton::config`；`LogPathResolver`（trait）→ `skeleton::logpath`。实现件留 `skeleton-infra`，无 re-export shim（**破坏性**：import 路径迁移，见 `docs/adr/0001-contract-sink.md`）。
-- 新 feature `log-fs`：`logx` 文件落盘面（密钥掩码/路径解析/FileSink，纯 std 零三方依赖）；`log` 变为 `log-fs` + tracing 四件套门面绑定层（见 `docs/adr/0002-log-feature-split.md`）。
-- ADR 三篇落盘：`docs/adr/0001-contract-sink.md`、`0002-log-feature-split.md`、`0003-paths-dunce-xdg.md`（paths 域 dunce/XDG 拍板补档）。
+- 契约层真下沉：`Clock`/`SystemClock`/`MockClock` → `skeleton::clock`；`EnvSource`/`StdEnv`/`MockEnv`/`ConfigPort`/`ConfigError` → `skeleton::config`；`LogPathResolver`（trait）→ `skeleton::logpath`。实现件留 `skeleton-infra`，无 re-export shim（**破坏性**：import 路径迁移，见 ADR 0001）。
+- 新 feature `log-fs`：`logx` 文件落盘面（密钥掩码/路径解析/FileSink，纯 std 零三方依赖）；`log` 变为 `log-fs` + tracing 四件套门面绑定层（见 ADR 0002）。
+- ADR 三篇落盘：ADR 0001、ADR 0002、ADR 0003（paths 域 dunce/XDG 拍板补档）。
 
 ### Changed（批2A API 形状四件，破坏性）
 - `EnvSource::get` → `Result<String, EnvError>`；新增 `EnvError { Missing, NotUnicode(OsString) }`——键存在但值非 Unicode 不再谎报 Missing（`ConfigError` 相应新增 `NotUnicode` 变体）。
@@ -84,4 +84,4 @@
 - 全量 682 passed / 0 failed（`--test-threads=1 --no-fail-fast` 正典口径）；skeleton 契约层 `--no-default-features` 自持绿；clippy `--workspace --all-features --all-targets` 零警告；`cargo fmt --all` 清账。
 
 ### 独立盲测
-- 采用方视角全流程盲测 4.35/5（有限采用）：UDF 核与池化三件值得采用；性能维 5.0（dispatch 80.3ns，契约 ≤100ns 达标）；稳态零分配亲手复现 PASS。报告：`reports/2026-10-17-adopters-blind-eval.md`。
+- 采用方视角全流程盲测 4.35/5（有限采用）：UDF 核与池化三件值得采用；性能维 5.0（dispatch 80.3ns，契约 ≤100ns 达标）；稳态零分配亲手复现 PASS。报告：采用方盲测（本地留存，未入库）。

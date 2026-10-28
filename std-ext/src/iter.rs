@@ -28,7 +28,7 @@
 //! - [`process_results`]：首 `Err` 短路（短路后不再拉底层）；错误经外置
 //!   `&mut Result<(), E>` 回收（itertools 同构）。
 //!
-//! # 坑面拍板（实现前系统排查，对照表见 reports/2026-10-16-iter.md）
+//! # 坑面拍板（实现前系统排查，对照表见 iter 域性能锚（本地留存，未入库））
 //!
 //! 1. **zip 不齐静默截断**（std zip 语义；F25 前半）——[`zip_longest`] 显式
 //!    三态，[`interleave`] 长者尾部追加，双双测试钉死。
@@ -66,7 +66,7 @@
 //! 采用方 `match` 即可）。双端迭代（`DoubleEndedIterator`）不声称（收窄）。
 //!
 //! 常驻零依赖件：纯 std，无 feature 门；全件零分配惰性组合子（collect 时一
-//! 次分配如实）。性能锚见各函数 doc 与 reports/2026-10-16-iter.md。
+//! 次分配如实）。性能锚见各函数 doc 与 iter 域性能锚（本地留存，未入库）。
 //!
 //! log-embed 埋点（收窄声明：**纯函数域，只埋 [`process_results`] 首 Err
 //! 短路点**——warn，首 Err 位置 `pos`（0 起）入字段；next/fold 双通路各一

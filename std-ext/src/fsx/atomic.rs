@@ -1,7 +1,7 @@
 //! 崩溃安全原子写：同目录临时件 → `sync_all` → rename 原子替换。
 //!
 //! 坑面 armor（docs.rs/Win32 事实逐条对表，2026-10-17 核对，tests 钉死；
-//! 对照表见 reports/2026-10-17-config-file.md）：
+//! 对照表见 配置文件面（本地留存，未入库））：
 //!
 //! - **rename 覆盖语义**（std 文档原文核对，纠正「Windows 不能覆盖」旧
 //!   认知）：全平台「replacing the original file if `to` already exists」

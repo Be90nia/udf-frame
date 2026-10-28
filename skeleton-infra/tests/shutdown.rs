@@ -1,4 +1,4 @@
-//! shutdown 域集成测试：坑面红绿（坑|堵法对照表见 reports/2026-10-16-b4-shutdown.md）。
+//! shutdown 域集成测试：坑面红绿（坑|堵法对照表见 shutdown 域性能锚（本地留存，未入库））。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

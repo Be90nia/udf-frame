@@ -1,6 +1,6 @@
 //! paths 域性能七维采集器（单线程 CPU 纯函数域收窄：①分配声明②单次 ns 锚
 //! ③输入规模梯度 16/128/4096；④并发曲线⑤锁⑥内存水位⑦伪共享=n/a——无锁
-//! 无线程面，报告 reports/2026-10-16-b1-paths.md）。
+//! 无线程面，报告：paths 域性能锚（本地留存，未入库））。
 //!
 //! 沿 multidim 模式纯 std，零新依赖。运行：
 //! `cargo run -p udf-skeleton-infra --example paths_multidim --release`
