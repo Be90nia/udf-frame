@@ -15,7 +15,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use skeleton::{
-    ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Infallible, NoFx, Reducer, Store as _,
+    ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Fragment, Infallible, NoFx, Reducer,
+    Store as _,
 };
 use skeleton_infra::compose::{combine, Combine};
 use skeleton_infra::runtime::SyncStore as Store;
@@ -107,20 +108,20 @@ enum ChildAction {
 }
 
 /// 父件以**具名类型注解**持有 combine 产物（12 个闭包/子件参数以 `_` 推断）——
-/// 匿名 `impl Reducer` 时代不可表达，具名化后采用方方可注解与别名。
+/// 匿名 `impl Fragment` 时代不可表达，具名化后采用方方可注解与别名。
 struct Parent<R> {
     shard: R,
 }
 
 impl<R> Reducer for Parent<R>
 where
-    R: Reducer<State = ParentState, Action = ParentAction, Op = Infallible>,
+    R: Fragment<State = ParentState, Action = ParentAction, Op = Infallible>,
 {
     type State = ParentState;
     type Action = ParentAction;
     type Op = Infallible;
     fn initial(&self) -> ParentState {
-        // 分片无合法 initial（恒 panic）：子切片初值由父件显式给出
+        // 分片无 initial（Fragment 是 reduce-only 契约）：子切片初值由父件显式给出
         ParentState { total: 0, child: 0 }
     }
     fn reduce(

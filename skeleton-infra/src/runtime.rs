@@ -615,11 +615,12 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 装配最小运转环：`root` 是**根** Reducer（[`Reducer::initial`] 产出完整根
     /// 状态），`fx` 是效果解释器（核心只转发，永不解释）。
     ///
-    /// 与 `compose` 域的 `combine` 的关系：`combine` 产物是**状态分片不是根**（无合法
-    /// `initial`），不能直接作 `root` 传入——分片作根会在装配首次 `initial()`
-    /// 即 fail-closed panic（组合根误用显式崩溃）。正确用法：父 Feature
-    /// 的 `initial` 显式构造含子切片初值的根状态、`reduce` 内委托分片，父 Feature
-    /// 本体作 `root`（完整形态见 `tests/combine_teststore.rs` 固定装置）。
+    /// 与 `compose` 域的 `combine` 的关系：`combine` 产物是**状态分片不是根**
+    /// （只实现 `Fragment`，无 `initial`），不能作 `root` 传入——分片作根即
+    /// **E0277 编译期拒绝**（`Fragment` ≠ `Reducer`，错误信息自带修复指引）。
+    /// 正确用法：父 Feature 的 `initial` 显式构造含子切片初值的根状态、
+    /// `reduce` 内委托分片，父 Feature 本体作 `root`（完整形态见
+    /// `tests/combine_teststore.rs` 固定装置）。
     ///
     /// 构造即接线：回灌句柄经 `Arc::new_cyclic` 缓存（[`SyncStore::sender`] 克隆复用），
     /// 初始状态 = `root.initial()`；此后 [`SyncStore::dispatch`] / `sender().dispatch` 驱动。
@@ -678,9 +679,6 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// assert_eq!(*seen.lock().unwrap(), vec![Op::Ping]); // 装配后随处可读
     /// # store.close();
     /// ```
-    // `#[track_caller]`：把采用方装配行转发给 `Reducer::initial` 的 panic 位置
-    // （分片误用作根，O 小项）。
-    #[track_caller]
     pub fn new(
         root: impl Reducer<State = S, Action = A, Op = Op> + Send + Sync + 'static,
         fx: impl EffectRuntime<A, Op> + Send + 'static,
@@ -731,7 +729,9 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// assert_eq!(*store.snapshot(), 116);
     /// # store.close();
     /// ```
-    // `#[track_caller]`：同 [`Self::new`]——播种期 `initial()` 的 panic 归采用方装配行。
+    // `#[track_caller]`：播种期 `initial()`（`Restore::Empty`/`FromInitial` 两态）的
+    // panic 归采用方装配行——分片误用作根已在类型层拒绝（E0277），此处兜的是
+    // 用户 `initial` 自身的 panic。
     #[track_caller]
     pub fn restore_from(
         root: impl Reducer<State = S, Action = A, Op = Op> + Send + Sync + 'static,

@@ -12,7 +12,7 @@ action ──▶ Store ──▶ Reducer（纯函数）──▶ 新状态 + 效
 
 | crate | 层 | 内容 | 依赖 |
 |---|---|---|---|
-| [`skeleton`](skeleton) | 契约层 | trait（`Reducer`/`Store`/`EffectRuntime`/`Driver`/`JournalPort`/`PoolManaged`/`JsonPort`/`SqlDialectPort`/`MarkdownPort`）+ 数据词汇（`Effect`/`EffectBuf`/`EffectId`/`ActionSender`/`Subscription`/`NoFx`/`Restore`/`PoolMetrics`/`Json`/`MdTag`/`MdEvent`）+ 语义契约文本 | **零依赖** |
+| [`skeleton`](skeleton) | 契约层 | trait（`Reducer` 根契约 / `Fragment` 分片契约 / `Store`/`EffectRuntime`/`Driver`/`JournalPort`/`PoolManaged`/`JsonPort`/`SqlDialectPort`/`MarkdownPort`）+ 数据词汇（`Effect`/`EffectBuf`/`EffectId`/`ActionSender`/`Subscription`/`NoFx`/`Restore`/`PoolMetrics`/`Json`/`MdTag`/`MdEvent`）+ 语义契约文本 | **零依赖** |
 | [`std-ext`](std-ext) | 散件层 | 十四域（`text`/`encode`/`hash`/`iter`/`backoff`/`fsx`/`paths`/`clock`/`retry`/`scheduler`/`ratelimit`/`cache`/`id`/`json`；十三域零门常驻、本体纯 std，`json` 域门控 `json` feature）+ `log-embed` 埋点（七域 35 调用点） | 默认树：仅 `skeleton`（workspace 路径依赖）——零三方（开 `json` 门时 `serde_json` 子树按需进树） |
 | [`skeleton-infra`](skeleton-infra) | 实现层 | `runtime::SyncStore`（契约参考实现：同步排空环 + 快照广播）+ `audit` 审计事件流 + `pool` 池化管理组合件 + `compose` 组合器 + `view` 语言无关视图桥（ADR 0006）+ `testing` 测试替身（含 `parse_mock` 解析面 mock）+ `shutdown` 停机编排 + 生态绑定（tokio fx / journal / memgov / logx / tracingx / config） | 默认树：仅 `skeleton` + `std-ext`（均 workspace 路径依赖）——零三方 |
 

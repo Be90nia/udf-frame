@@ -19,7 +19,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use skeleton::{EffectBuf, NoFx, Reducer, Store as _};
+use skeleton::{EffectBuf, Fragment, NoFx, Reducer, Store as _};
 use skeleton_infra::runtime::SyncStore as Store;
 use skeleton_infra::{bridge_events_to_tracing, combine, mask_secrets, AuditEvent};
 

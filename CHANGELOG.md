@@ -19,6 +19,11 @@
 - fx：`FxScope::spawn` → `spawn_tracked`（语义显名）；调用点全仓机械迁移（42 处）。
 - （破坏性直迁：0.1.0 未发布无外部采用方，按 ADR 0005 先例无 shim。）
 
+### Changed（combine 分片作根编译期拒绝：Fragment/Reducer 契约拆分，破坏性）
+- `skeleton` 新增 `Fragment` trait（reduce-only 状态分片契约）+ blanket `impl<T: Reducer> Fragment for T`（每个根都是合法子件）；`Reducer` 语义收窄为**根契约**（initial+reduce，trait 本体与既有 `impl Reducer` 零变化）。
+- `combine`/`combine!` 产物 `Combine<…>` 由 `impl Reducer` 改为 `impl Fragment`：分片作根（`SyncStore::new(分片, …)`）从「装配期 panic」升级为 **E0277 编译期拒绝**（`#[diagnostic::on_unimplemented]` 错误信息自带「分片≠根」修复指引）；`combine` 的子件 bound 由 `Reducer` 放宽为 `Fragment`（完整 Feature 经 blanket 仍可作子件）。随拆分删除误用 panic 与三处孤儿 `#[track_caller]`；两处分片误用 panic 测试由 compile_fail doctest 接替。决策依据 ADR 0009。（**破坏性直迁**：0.1.0 未发布无外部采用方，按 ADR 0005 先例无 shim。）
+- **下游迁移说明（combine 分片：作根从 panic 变编译错）**：只写 Feature（`impl Reducer` 含 initial+reduce，`SyncStore::new(feature, fx)` 挂载）**零改动**；持有分片并注解返回类型（`-> impl Reducer<…>` 接 `combine`/`combine!` 产物）改为 `-> impl Fragment<…>`、use 行加 `skeleton::Fragment`（委托调用 `.reduce(...)` 写法不变）；曾把分片传给 `SyncStore::new`/`TestStore::new` 的：此前装配期 panic，现在编译期 E0277 即修复指引——根状态由父 Feature 的 `initial` 显式构造（含子切片初值），父 Feature 本体才是根（`skeleton-infra/tests/combine_teststore.rs` 固定装置为标准形）；少见形态：同文件 import `Fragment` 且直接裸调完整 Feature 的 `.reduce()` 会报 E0034 二义——用 `Reducer::reduce(&feature, …)` 显式分发（框架树内无此形态）。
+
 ### Added（ViewBridge MVP：语言无关视图数据面，ADR 0006 波 3）
 - 契约词汇 `skeleton::view`（零依赖）：`BindingDecl`/`ViewMap<S>`（纯投影 + 缺省哨兵）/`IntentMap<A>` + `PayloadTag` + `PROTOCOL_VERSION`；`ViewMap` 方法集冻结与 bound 永不落领域 `S`（M6 冻结条款入 doc）。
 - 机器 `skeleton_infra::view`（feature `view = ["dep:serde_json", "udf-std-ext/json"]`，ADR 0007 §4.2-5 跨 crate 开门；默认树零三方不变）：`ViewBridge` 纯订阅者挂 SyncStore 通知面（核心零改动）——类型化投影 + 哨兵粗闸/类型 eq 细闸 + latest-wins 折叠 + 版本水位（`PatchBatch.from/to_version`、`Snapshot.version`，桥内单调消费代数与区域头同源）+ 毒化-重同步闭环（投影 panic catch + 计数 + resync 位 ⇒ `snapshot_doc` 收口）+ 可组合双编码矩阵（`JsonEncoder` lazy / `RegionEncoder` eager + `Coverage` + `RegionWriter`/`RegionBacking`/`VecBacking` 固定容量区域通道 v1）+ `Derived`/`Sentinel` L1 记忆化胞。

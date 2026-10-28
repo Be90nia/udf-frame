@@ -232,8 +232,6 @@ fn id_matches(expected: Option<EffectId>, actual: EffectId) -> bool {
 
 impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> TestStore<S, A, Op> {
     /// 以脚本化解释器装配 store：效果不解释、原样回收，等 `receive` 逐条断言。
-    // `#[track_caller]`：分片误用作根的 initial panic 指采用方行（同 [`SyncStore::new`]）。
-    #[track_caller]
     pub fn new(root: impl Reducer<State = S, Action = A, Op = Op> + Send + Sync + 'static) -> Self {
         let effects = Arc::new(Mutex::new(VecDeque::new()));
         let store = SyncStore::new(

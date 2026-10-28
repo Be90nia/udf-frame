@@ -54,7 +54,7 @@
 - **场景：子域有真动作类型、父路由是 tuple variant（`Act::Done(DoneAct)`）** → 宏短形态 → 为什么：一行装配，零样板，组合税个位数 ns。
 - **场景：子动作非 Clone / 路由不是简单变体 / 状态切片是泛型或路径** → 函数形态（或宏显式形态 `wrap:`/`unwrap:`/`lift:`） → 为什么：逃生口，语义与六参逐项对应。
 - **unit variant 路由（子动作 `()`）**：两形态都**不收裸构造器**——函数形态 E0277（`expected a `Fn(_)` closure, found `Act``），宏短形态 E0532（`expected tuple struct or tuple variant`）。修复 = 显式闭包 `|_: ()| Act::Ping`；能设计成 tuple variant 就设计成 tuple variant。
-- 共同红线：产物是**状态分片不是根**——`initial` 恒 panic（fail-closed），根状态由父 Feature 显式构造（含子初值）。
+- 共同红线：产物是**状态分片不是根**——只实现 `Fragment`（reduce-only，无 `initial`），作根 = E0277 编译期拒绝；根状态由父 Feature 显式构造（含子初值）。
 
 ### 5. `subscriber_count()` 口径
 
@@ -62,7 +62,7 @@
 - **闭门后**：`subscribe` 照常登记、计数照涨，但永无通知（已知取舍）——用 `subscriptions_after_close()` 交叉查证「这是闭门后登记的」。
 - 票据 Drop 即注销（`#[must_use]` 拦裸调用），计数读侧同步回落。
 
-## 第一天九坑速查（盲测实测）
+## 第一天十坑速查（盲测实测）
 
 | # | 坑 | 症状（真实报错摘录） | 修法 |
 |---|---|---|---|
@@ -75,6 +75,7 @@
 | 7 | 仓库树内 `cargo new` | 根 workspace 被吸收，`error: current package believes it's in a workspace when it's not` / `multiple workspace roots` | **demo 项目建在仓库外**（教程第 0 步已改 `~/kanban-demo`） |
 | 8 | `Scheduler::every` 注册后永不点火 | 注册 `Ok` 无任何提示，任务零执行 | **注册仅入堆**：生产面 `sched.spawn_worker()`（或确定性测试 `tick()`）才有点火驱动——见 `after`/`every` doc「点火前提」 |
 | 9 | `State` 缺 `Clone` | Store/combine 快照广播处编译错（CoW 快照与 `Snapshot` 广播要求 `S: Clone`） | `#[derive(Clone)]` 补在状态类型上（教程各步状态均已带；自建状态勿漏） |
+| 10 | combine 分片当根挂载 | E0277 `` `Combine<…>` 不是可挂载的根：根契约 `Reducer` 未实现 ``（note：分片是 `Fragment`，没有 `initial`） | 根状态由父 Feature 的 `initial` 显式构造（含子初值）、父 Feature 本体挂载、`reduce` 内委托分片；`-> impl Fragment` 自述「我是子件」 |
 
 ## 一句话心智模型
 

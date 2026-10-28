@@ -1,6 +1,6 @@
 # skeleton — 最小单向数据流（UDF）骨架契约层
 
-`Reducer` / `Store` / `EffectRuntime` / `Driver` 契约 trait + 数据词汇
+`Reducer`（根契约）/ `Fragment`（reduce-only 分片契约）/ `Store` / `EffectRuntime` / `Driver` 契约 trait + 数据词汇
 （`Effect`/`EffectBuf`/`EffectId`/`ActionSender`/`Subscription`/`NoFx`）+ 语义契约文本。
 `pool` 模块承载池化管理基座 `PoolManaged`（调参/读数/审计三挂点，「约定不是锁定」）。
 **零依赖**（tokio/serde 都不进树），纯函数纪律由「核心无 IO 依赖」结构性保证——reducer 想 IO 也编译不过。

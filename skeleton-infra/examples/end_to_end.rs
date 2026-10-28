@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use skeleton::{
-    ActionSender, Driver, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _,
+    ActionSender, Driver, Effect, EffectBuf, EffectId, EffectRuntime, Fragment, Reducer, Store as _,
 };
 use skeleton_infra::compose::combine;
 use skeleton_infra::runtime::SyncStore as Store;
@@ -93,9 +93,9 @@ impl Reducer for TallyFeature {
     }
 }
 
-/// 子切片分片（combine 六参，零 dyn 零装箱）——产物是状态分片不是根：
-/// `initial` 恒 panic（fail-closed），根状态归 [`BoardFeature`] 显式构造。
-fn make_fragment() -> impl Reducer<State = Board, Action = BoardAct, Op = BoardFx> {
+/// 子切片分片（combine 六参，零 dyn 零装箱）——产物只实现 `Fragment`（reduce-only，
+/// 无 `initial`）：根状态归 [`BoardFeature`] 显式构造，分片作根 = E0277。
+fn make_fragment() -> impl Fragment<State = Board, Action = BoardAct, Op = BoardFx> {
     combine(
         |b: &Board| &b.tally,
         |b: &mut Board, t: TallyState| b.tally = t,

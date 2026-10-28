@@ -7,7 +7,9 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
-use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
+use skeleton::{
+    ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Fragment, Reducer, Store as _,
+};
 use skeleton_infra::compose::combine;
 use skeleton_infra::runtime::SyncStore as Store;
 use skeleton_infra::testing::{ExpectedEffect, TestStore};
@@ -103,7 +105,7 @@ impl Reducer for Child {
     }
 }
 
-fn fragment() -> impl Reducer<State = ParentState, Action = ParentAct, Op = ParentOp> {
+fn fragment() -> impl Fragment<State = ParentState, Action = ParentAct, Op = ParentOp> {
     combine(
         |ps: &ParentState| &ps.child,
         |ps: &mut ParentState, child: u32| ps.child = child,
@@ -127,15 +129,15 @@ fn fragment() -> impl Reducer<State = ParentState, Action = ParentAct, Op = Pare
     )
 }
 
-/// 根 Feature：initial 显式构造含子切片初值的完整根状态（combine 产物无合法
-/// initial），reduce 全量委托分片。
+/// 根 Feature：initial 显式构造含子切片初值的完整根状态（分片只实现
+/// `Fragment`：无 initial、不能作根），reduce 全量委托分片。
 struct Root<F> {
     fragment: F,
 }
 
 impl<F> Reducer for Root<F>
 where
-    F: Reducer<State = ParentState, Action = ParentAct, Op = ParentOp>,
+    F: Fragment<State = ParentState, Action = ParentAct, Op = ParentOp>,
 {
     type State = ParentState;
     type Action = ParentAct;

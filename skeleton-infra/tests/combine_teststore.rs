@@ -5,20 +5,11 @@
 //! TestStore 验收形状（send/receive/state + ExpectedEffect）。
 //! tests 先行（TDD）：先有本文件失败用例，再有 lib.rs 实现。
 
-use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer};
+use skeleton::{Effect, EffectBuf, EffectId, Fragment, Reducer};
 use skeleton_infra::compose::combine;
-use skeleton_infra::runtime::SyncStore as Store;
 use skeleton_infra::testing::{ExpectedEffect, TestStore};
 use std::convert::Infallible;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::mpsc::channel;
-
-/// 任意词表的零效果运行时（误用装配探针用：ParentOp ≠ Infallible，NoFx 不适用）。
-struct ProbeNop;
-
-impl<A, Op> EffectRuntime<A, Op> for ProbeNop {
-    fn run(&mut self, _: Effect<A, Op>, _: &ActionSender<A>) {}
-}
 
 // ── 固定装置：父 Feature 委托子切片 ──────────────────────────────────────
 
@@ -85,8 +76,8 @@ enum ParentOp {
 }
 
 /// 子切片分片（组合根显式构造）：get/set 镜头 + wrap/unwrap 路由 + lift_fx 效果上提
-fn parent_child_fragment() -> impl Reducer<State = ParentState, Action = ParentAction, Op = ParentOp>
-{
+fn parent_child_fragment(
+) -> impl Fragment<State = ParentState, Action = ParentAction, Op = ParentOp> {
     combine(
         |ps: &ParentState| &ps.child,
         |ps: &mut ParentState, cs: ChildState| ps.child = cs,
@@ -190,19 +181,10 @@ fn combine_unrouted_action_leaves_child_slice() {
     });
 }
 
-/// 分片非根：combine 产物没有父 initial 工厂，用作根 = 组合根误用，
-/// fail-closed 显式 panic（禁静默空状态）。
-#[test]
-#[should_panic(expected = "状态分片不是根")]
-fn combine_product_is_fragment_initial_panics() {
-    let fragment = parent_child_fragment();
-    let _ = fragment.initial();
-}
-
 // ── combine! 宏：六闭包生成（人体工学验收：变体短形态组合面一行）────────
 
 /// 宏显式形态（有 lift）：与 parent_child_fragment 逐参同义。
-fn macro_fragment() -> impl Reducer<State = ParentState, Action = ParentAction, Op = ParentOp> {
+fn macro_fragment() -> impl Fragment<State = ParentState, Action = ParentAction, Op = ParentOp> {
     skeleton_infra::combine!(
         ChildFeature,
         ParentState.child,
@@ -272,7 +254,7 @@ fn combine_macro_short_form_one_line_assembly() {
         }
     }
 
-    fn short_fragment() -> impl Reducer<State = P, Action = A, Op = Infallible> {
+    fn short_fragment() -> impl Fragment<State = P, Action = A, Op = Infallible> {
         skeleton_infra::combine!(Counter, P.child, A::Child)
     }
 
@@ -435,39 +417,5 @@ fn emit_feedback_receive_message_reports_reenqueued_truthfully() {
     assert!(
         !m.contains("queue empty"),
         "Emit 情形禁再报队列空（文不对题本体）：{m:?}"
-    );
-}
-
-// ── combine 误用 panic 指采用方装配行 ──────────────────────────────────
-
-/// 分片作根的 fail-closed panic 必须指采用方调用行（`#[track_caller]` 链：
-/// `Reducer::initial` 声明 + `Store::new` 转发），禁指库内 panic 站。
-#[test]
-fn combine_misuse_panic_reports_adopter_line() {
-    let (tx, rx) = channel();
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if let Some(loc) = info.location() {
-            let _ = tx.send(loc.to_string());
-        }
-    }));
-    let adopter_line = {
-        let fragment = parent_child_fragment();
-        let mut adopter_line = 0u32;
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            // 动态锚紧邻装配行（track_caller 报告点）——fmt 重排外围不漂移
-            // （FinalWave/格式化双教训：硬编码或固定偏移的行号锚必随重排坏）。
-            adopter_line = line!() + 1;
-            let _ = Store::new(fragment, ProbeNop);
-        }));
-        adopter_line
-    };
-    std::panic::set_hook(prev_hook);
-    let locations: Vec<String> = rx.try_iter().collect();
-    assert!(
-        locations
-            .iter()
-            .any(|l| l.contains(&format!("combine_teststore.rs:{adopter_line}:"))),
-        "分片误用作根的 panic 必须指采用方装配行 combine_teststore.rs:{adopter_line}，实际 {locations:?}"
     );
 }

@@ -127,7 +127,7 @@ where S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
 //   fn is_closed(&self) -> bool;
 ```
 
-装配点：`root` 是**根** Reducer（`initial()` 产出完整根状态）；`fx` 是效果解释器（核心只转发，永不解释）。`combine` 产物是状态分片不是根——分片作根在装配首次 `initial()` 即 fail-closed panic。界不对称（有意）：根 Reducer 要 `Send + Sync`，解释器只要求 `Send`（锁后独占访问，多要 Sync 是白缴的税）。
+装配点：`root` 是**根** Reducer（`initial()` 产出完整根状态）；`fx` 是效果解释器（核心只转发，永不解释）。`combine` 产物是状态分片不是根——分片作根即 E0277 编译期拒绝（`Fragment` ≠ `Reducer`，错误信息经 `on_unimplemented` 自带修复指引）。界不对称（有意）：根 Reducer 要 `Send + Sync`，解释器只要求 `Send`（锁后独占访问，多要 Sync 是白缴的税）。
 
 `restore_from` 播种语义：`Restore::Empty` = `initial()` 零 apply（即 `new`）；`FromInitial(actions)` = 自 initial 起步全量 dispatch 重放；`FromSnapshot(state, actions)` = **快照态直入（不经 initial）**+增量重放。重放走 `dispatch` 而非裸 reduce 是契约：`Effect::Emit` 回灌等派生动作由排空环再生，终态与 live 收敛。
 
@@ -1873,22 +1873,22 @@ store.close();
 pub fn combine<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L>(
     get: G, set: Se, wrap: W, unwrap: U, child: C, lift_fx: L,
 ) -> Combine<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L>
-where /* 12 泛型参具名形态；G/Se=镜头，W/U=路由，C=子 Reducer，L=效果上提 */;
+where /* 12 泛型参具名形态；G/Se=镜头，W/U=路由，C=子 Fragment，L=效果上提 */;
 
 #[macro_export]
 macro_rules! combine { /* 变体短形态 / 显式形态 */ }
 
 pub struct Combine<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L> { /* … */ }
-// impl Reducer for Combine<…>（产物是状态分片不是根：initial 恒 panic）
+// impl Fragment for Combine<…>（只实现分片契约：无 initial，作根 = E0277）
 ```
 
 - 六参语义：`get`/`set`=父状态内子切片的读写镜头；`wrap`/`unwrap`=子 action 上浮 / 父 action 下沉路由（`unwrap` 返回 None=本层不路由，状态克隆原样返回零效果）；`lift_fx`=子效果词表到父词表的显式上提。子效果里的 `Emit(CA)` 由核心经 `wrap` 自动上浮——`lift_fx` 只收 `Run`/`Cancel` 两形。
-- **产物是状态分片不是根**：签名无父状态工厂，`initial` 恒 panic——根状态由父 Feature 的 `initial` 显式构造（含子初值），分片只承载 reduce 委托；用作根=fail-closed 显式崩溃（禁静默空状态）。
+- **产物实现 `Fragment` 不实现 `Reducer`**：分片没有 `initial`——根状态由父 Feature 的 `initial` 显式构造（含子初值），分片只承载 reduce 委托；用作根 = **E0277 编译期拒绝**（`#[diagnostic::on_unimplemented]` 错误信息自带修复指引；禁静默空状态）。子件 bound 相应放宽为 `Fragment`：完整 Feature 经 blanket impl 仍可作子件，分片可嵌分片。
 - `combine!` 两形态：**变体短形态** `combine!(Child, Parent.field, Enum::Variant)` 一体生成 wrap/unwrap（unwrap 自 `&PA` 克隆上浮，要求子 action `Clone`）；`lift` 省略=零效果上提。**显式形态** `wrap:`/`unwrap:`/`lift:` 逐项给（非 Clone 词表与复杂路由的逃生口）。切片表达式限 `状态类型.字段名` 裸段（泛型/路径状态退回 `combine` 显式形态）。
-- 零 dyn 零装箱；采用方可用 `Combine<_, _, …>` 注解持有产物（匿名 `impl Reducer` 形态做不到）。
+- 零 dyn 零装箱；采用方可用 `Combine<_, _, …>` 注解持有产物（匿名 `impl Fragment` 形态做不到）。
 
 ```rust
-use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+use skeleton::{EffectBuf, Fragment, Infallible, NoFx, Reducer, Store as _};
 use skeleton_infra::runtime::SyncStore;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1906,7 +1906,7 @@ impl Reducer for ChildCounter {
     fn reduce(&self, s: &u32, a: u32, _out: &mut EffectBuf<u32, Infallible>) -> u32 { s + a }
 }
 
-fn counter_fragment() -> impl Reducer<State = Parent, Action = PAction, Op = Infallible> {
+fn counter_fragment() -> impl Fragment<State = Parent, Action = PAction, Op = Infallible> {
     skeleton_infra::combine!(ChildCounter, Parent.child, PAction::Child)
 }
 

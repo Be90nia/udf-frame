@@ -698,7 +698,7 @@ append 失败禁回灌（fail-closed 禁静默丢）；③订阅双档的计数�
 `src/main.rs` 整体替换为：
 
 ```rust
-use skeleton::{Effect, EffectBuf, Infallible, NoFx, Reducer, Store as _};
+use skeleton::{Effect, EffectBuf, Fragment, Infallible, NoFx, Reducer, Store as _};
 use skeleton_infra::runtime::SyncStore;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -767,8 +767,9 @@ impl Reducer for DoneFeature {
 
 /// 一行装配：镜头 Workspace.done + 路由 Act::Done。unwrap 自动自 &Act 克隆上浮
 ///（要求 DoneAct: Clone）；lift 省略 = 零效果上提（子 Op 是 Infallible，正好）。
-/// 产物是状态分片不是根：initial 恒 panic，根状态由 WorkspaceFeature 显式构造。
-fn done_fragment() -> impl Reducer<State = Workspace, Action = Act, Op = Infallible> {
+/// 产物实现 `Fragment` 不实现 `Reducer`（分片无 `initial`）：根状态由 WorkspaceFeature
+/// 显式构造；分片作根 = E0277 编译期拒绝。
+fn done_fragment() -> impl Fragment<State = Workspace, Action = Act, Op = Infallible> {
     skeleton_infra::combine!(DoneFeature, Workspace.done, Act::Done)
 }
 
@@ -842,8 +843,8 @@ fn main() {
 终态：Workspace { next_id: 1, todo: [], done: DoneState { archived: [] } }
 ```
 
-**这步教你什么契约**：①`combine!` 产物是**状态分片不是根**——`initial` 恒 panic，
-根状态（含子初值）由父 Feature 显式构造；②Emit 派生动作由核心折叠回灌（不进解释器、
+**这步教你什么契约**：①`combine!` 产物是**状态分片不是根**（只实现 `Fragment`，
+无 `initial`）——分片作根 = E0277 编译期拒绝，根状态（含子初值）由父 Feature 显式构造；②Emit 派生动作由核心折叠回灌（不进解释器、
 不入账本——它是已落盘动作的确定性派生）；③零 dyn 零装箱，组合税个位数 ns。
 
 ### 故意踩坑（真实编译器输出）

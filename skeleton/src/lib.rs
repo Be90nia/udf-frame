@@ -86,8 +86,15 @@ use std::sync::Arc;
 /// State：值语义只读快照的形状约束。契约：禁内部可变性（无 Mutex/Cell 字段）、
 /// 非法状态进类型（互斥态用嵌套 enum，禁 bool 旗子）。
 ///
-/// [`Reducer`] 是一个 Feature 唯一的状态迁移函数：同 `(state, action)` 恒产同
-/// 输出（确定性）；IO 在结构上不可触——本 crate 无 IO 依赖。
+/// **根契约**：[`Reducer`] 是一个 Feature 的唯一状态迁移函数——`initial` 给出
+/// 根状态、`reduce` 同 `(state, action)` 恒产同输出（确定性）；IO 在结构上
+/// 不可触——本 crate 无 IO 依赖。子件（`combine` 产物）只需 [`Fragment`]：
+/// 每个 `Reducer` 都是合法子件（blanket impl），反之不成立——分片无根状态
+/// 工厂，作根 = E0277 编译期拒绝。
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` 不是可挂载的根：根契约 `Reducer` 未实现",
+    note = "combine!/combine 产物是状态分片（`Fragment`）：没有 `initial`，不能作根；根状态由父 Feature 的 `initial` 显式构造（含子切片初值）"
+)]
 pub trait Reducer {
     /// `Clone` 语义（值语义快照的前提）；panic-free 要求由实现方按其锁形态
     /// 声明（见实现方文档）。
@@ -98,12 +105,8 @@ pub trait Reducer {
     /// Rust 稳定版无关联类型缺省，零效果 Feature 显式写 `type Op = Infallible;`。
     type Op;
     /// 根状态构造：完整根状态的唯一合法来源（实现方装配时调用一次）。
-    /// 状态分片（子 Feature 委托件）没有合法实现——根状态由父 Feature 的
-    /// `initial` 显式构造（含子切片初值），分片只承载 reduce 委托。
-    ///
-    /// `#[track_caller]`：装配期 panic（如分片误用作根）经实现方的 `new`
-    /// 转发指采用方装配行，禁指库内 panic 站。
-    #[track_caller]
+    /// 状态分片没有本方法（[`Fragment`] 是 reduce-only 契约）——根状态由父
+    /// Feature 的 `initial` 显式构造（含子切片初值），分片只承载 reduce 委托。
     fn initial(&self) -> Self::State;
     /// 纯函数：禁 IO/时钟/随机/写共享态（结构性：本 crate 无此依赖）。
     /// 效果写入 `out`（写入序 = 转发序），状态经返回值给出（效果出参化）。
@@ -113,6 +116,49 @@ pub trait Reducer {
         action: Self::Action,
         out: &mut EffectBuf<Self::Action, Self::Op>,
     ) -> Self::State;
+}
+
+/// 状态分片：只承载 reduce 委托，无根状态工厂——不能作根挂载（根契约是
+/// [`Reducer`]）。树内唯一非 blanket 实现：`compose` 域 `combine` 的产物。
+///
+/// 每个根都是合法子件（完整 Feature 可作 `combine` 的 child），blanket 单向：
+/// `impl<T: Reducer> Fragment for T`——反向「每个分片都是根」正是本拆分封死
+/// 的错误（分片作根 = E0277）。
+///
+/// 罕见二义：同文件 import 本 trait 与 [`Reducer`] 且裸调**完整 Feature** 的
+/// `.reduce()` 会报 E0034（两个候选）——用 `Reducer::reduce(&feature, …)` 显式
+/// 分发（树内零此形态：直接裸调的都是分片）。
+pub trait Fragment {
+    /// 同 [`Reducer::State`]
+    type State: Clone + Send;
+    /// 同 [`Reducer::Action`]
+    type Action: Send;
+    /// 同 [`Reducer::Op`]
+    type Op;
+    /// 纯函数：禁 IO/时钟/随机/写共享态（结构性：本 crate 无此依赖）。
+    /// 效果写入 `out`（写入序 = 转发序），状态经返回值给出（效果出参化）。
+    fn reduce(
+        &self,
+        state: &Self::State,
+        action: Self::Action,
+        out: &mut EffectBuf<Self::Action, Self::Op>,
+    ) -> Self::State;
+}
+
+/// 每个根都是合法子件。
+impl<T: Reducer> Fragment for T {
+    type State = T::State;
+    type Action = T::Action;
+    type Op = T::Op;
+
+    fn reduce(
+        &self,
+        state: &Self::State,
+        action: Self::Action,
+        out: &mut EffectBuf<Self::Action, Self::Op>,
+    ) -> Self::State {
+        Reducer::reduce(self, state, action, out)
+    }
 }
 
 /// 效果句柄：reducer 按语义指派（同义恒同值），解释器寻址用（[`Effect::Cancel`]）。

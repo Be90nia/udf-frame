@@ -1,14 +1,14 @@
 //! 组合域：父子分片组合器（协作 = 显式结构，字符串路由组合的封死形态）。
 //!
 //! 契约层的组合概念只有一句——「Feature 以显式委托组合：父 reduce 内调子
-//! reduce + 镜头闭包」（[`Reducer`] 的自然用法）；本域是把六参样板收口的
+//! reduce + 镜头闭包」（[`skeleton::Reducer`] 的自然用法）；本域是把六参样板收口的
 //! 便利件：[`combine`] 函数（12 泛型参具名形态）+ [`combine()`] 宏（从切片
 //! 表达式生成六闭包，见下）。
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use skeleton::{Effect, EffectBuf, Reducer};
+use skeleton::{Effect, EffectBuf, Fragment};
 
 /// 组合器：父子分片，协作=显式结构（字符串路由组合的封死形态）。
 ///
@@ -28,7 +28,7 @@ use skeleton::{Effect, EffectBuf, Reducer};
 /// `tests/combine_teststore.rs`）：
 ///
 /// ```
-/// use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+/// use skeleton::{EffectBuf, Fragment, Infallible, NoFx, Reducer, Store as _};
 /// use skeleton_infra::compose::combine;
 /// use skeleton_infra::runtime::SyncStore;
 ///
@@ -54,7 +54,7 @@ use skeleton::{Effect, EffectBuf, Reducer};
 /// }
 ///
 /// /// 子切片分片：get/set 镜头 + wrap/unwrap 路由 + lift_fx 效果上提（12 参具名）
-/// fn counter_fragment() -> impl Reducer<State = Parent, Action = PAction, Op = Infallible> {
+/// fn counter_fragment() -> impl Fragment<State = Parent, Action = PAction, Op = Infallible> {
 ///     combine(
 ///         |p: &Parent| &p.child,                 // get：子切片读镜头
 ///         |p: &mut Parent, c: u32| p.child = c,  // set：子切片写回
@@ -92,10 +92,36 @@ use skeleton::{Effect, EffectBuf, Reducer};
 /// store.close();
 /// ```
 ///
-/// 产物是**状态分片不是根**：签名无父状态工厂，`initial` 恒 panic——根状态
-/// 由父 Feature 的 `initial` 显式构造（含子切片初值），分片只承载 reduce
-/// 委托；用作根 = 组合根误用，fail-closed 显式崩溃（禁静默空状态，
-/// 亦不以 `PS: Default` 界逼「非法状态进类型」的 State 写退化初值）。
+/// 产物实现 [`Fragment`] 不实现 [`skeleton::Reducer`]：分片作根 = **E0277 编译期拒绝**
+/// （错误信息经 `#[diagnostic::on_unimplemented]` 自带修复指引）。根状态由父
+/// Feature 的 `initial` 显式构造（含子切片初值），分片只承载 reduce 委托
+/// （禁静默空状态：不以 `PS: Default` 界逼「非法状态进类型」的 State 写退化初值）。
+///
+/// 分片作根在类型层拒绝（E0277；doctest 即外部 crate 视角编译验证）：
+///
+/// ```compile_fail
+/// use skeleton::{EffectBuf, Infallible, NoFx, Reducer};
+/// use skeleton_infra::runtime::SyncStore;
+///
+/// #[derive(Clone, Debug, PartialEq)]
+/// struct Parent { total: u32, child: u32 }
+///
+/// #[derive(Clone, Debug, PartialEq)]
+/// enum PAction { Child(u32) }
+///
+/// struct ChildCounter;
+///
+/// impl Reducer for ChildCounter {
+///     type State = u32;
+///     type Action = u32;
+///     type Op = Infallible;
+///     fn initial(&self) -> u32 { 0 }
+///     fn reduce(&self, s: &u32, a: u32, _o: &mut EffectBuf<u32>) -> u32 { s + a }
+/// }
+///
+/// let fragment = skeleton_infra::combine!(ChildCounter, Parent.child, PAction::Child);
+/// let _store = SyncStore::new(fragment, NoFx); // E0277：Combine 只实现 Fragment（分片），不实现 Reducer（根契约）
+/// ```
 pub fn combine<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L>(
     get: G,
     set: Se,
@@ -111,7 +137,7 @@ where
     Se: Fn(&mut PS, CS) + 'static,
     W: Fn(CA) -> PA + 'static,
     U: Fn(&PA) -> Option<CA> + 'static,
-    C: Reducer<State = CS, Action = CA, Op = CO>,
+    C: Fragment<State = CS, Action = CA, Op = CO>,
     L: Fn(Effect<CA, CO>, &mut EffectBuf<PA, PO>) + 'static,
 {
     Combine {
@@ -147,7 +173,7 @@ where
 /// 父子分片例与 `tests/combine_teststore.rs`）：
 ///
 /// ```
-/// use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+/// use skeleton::{EffectBuf, Fragment, Infallible, NoFx, Reducer, Store as _};
 /// use skeleton_infra::runtime::SyncStore;
 ///
 /// #[derive(Clone, Debug, PartialEq)]
@@ -168,7 +194,7 @@ where
 ///     }
 /// }
 ///
-/// fn counter_fragment() -> impl Reducer<State = Parent, Action = PAction, Op = Infallible> {
+/// fn counter_fragment() -> impl Fragment<State = Parent, Action = PAction, Op = Infallible> {
 ///     skeleton_infra::combine!(ChildCounter, Parent.child, PAction::Child)
 /// }
 ///
@@ -239,7 +265,7 @@ macro_rules! combine {
 /// [`combine`] 产物（具名类型，字段私有、只经 [`combine`] 构造）：镜头/路由
 /// 闭包 + 子 reducer + 效果上提闭包，零 dyn 零装箱；六个状态/词表参数与六个
 /// 闭包参数经泛型记名——采用方可用 `Combine<_, _, …>` 注解或别名持有产物，
-/// 匿名 `impl Reducer` 形态做不到。
+/// 匿名 `impl Fragment` 形态做不到。
 ///
 /// 性能锚（2026-10-16 批 C 定性，release/std Instant 粗测，详见
 /// reports/2026-10-16-perf-batchc.md）：组合税个位数 ns——combine! 装配 vs
@@ -272,14 +298,14 @@ impl<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L> Combine<PS, PA, PO, CS, CA, CO, 
     }
 }
 
-impl<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L> Reducer
+impl<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L> Fragment
     for Combine<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L>
 where
     G: Fn(&PS) -> &CS,
     Se: Fn(&mut PS, CS),
     W: Fn(CA) -> PA,
     U: Fn(&PA) -> Option<CA>,
-    C: Reducer<State = CS, Action = CA, Op = CO>,
+    C: Fragment<State = CS, Action = CA, Op = CO>,
     L: Fn(Effect<CA, CO>, &mut EffectBuf<PA, PO>),
     PS: Clone + Send,
     PA: Send,
@@ -287,14 +313,6 @@ where
     type State = PS;
     type Action = PA;
     type Op = PO;
-
-    // `#[track_caller]`：与 trait 声明同标——误用 panic 位置指采用方装配行。
-    #[track_caller]
-    fn initial(&self) -> PS {
-        panic!(
-            "combine 产物是状态分片不是根：根状态由父 Feature 的 initial 显式构造（含子切片初值），分片只承载 reduce 委托"
-        );
-    }
 
     fn reduce(&self, state: &PS, action: PA, out: &mut EffectBuf<PA, PO>) -> PS {
         let Some(child_action) = (self.unwrap)(&action) else {
