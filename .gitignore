@@ -9,3 +9,9 @@ verify/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# 本机工具与 bd 数据不入库（2026-10-28 用户决定）
+/.beads/
+/.claude/
+/.codex/
+/CLAUDE.md
