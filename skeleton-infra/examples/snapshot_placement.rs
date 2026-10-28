@@ -285,7 +285,10 @@ fn main() {
     let mut arms = small_arms();
     arms.extend(big_arms());
     println!();
-    println!("{:<24} {:>14} {:>18} {:>20}", "臂", "ns/dispatch", "clones/dispatch", "allocs/dispatch");
+    println!(
+        "{:<24} {:>14} {:>18} {:>20}",
+        "臂", "ns/dispatch", "clones/dispatch", "allocs/dispatch"
+    );
     for a in &arms {
         println!(
             "{:<24} {:>14.1} {:>18.4} {:>20.4}",

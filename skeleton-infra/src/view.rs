@@ -785,9 +785,13 @@ where
             return Ok(BindingId(seen as u32)); // 幂等
         }
         // 装配面配置洞：绑定项不被任何已挂编码器覆盖 ⇒ debug_assert + 计数留痕。
-        let json_cover = notify.json.as_ref().is_some_and(|j| j.covers().covers(path));
-        let region_cover =
-            lock(&notify.region).as_ref().is_some_and(|ch| ch.encoder.covers().covers(path));
+        let json_cover = notify
+            .json
+            .as_ref()
+            .is_some_and(|j| j.covers().covers(path));
+        let region_cover = lock(&notify.region)
+            .as_ref()
+            .is_some_and(|ch| ch.encoder.covers().covers(path));
         if !json_cover && !region_cover {
             notify.assembly_gaps.fetch_add(1, Ordering::Relaxed);
             debug_assert!(
