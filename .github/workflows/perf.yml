@@ -1,0 +1,255 @@
+# udf-frame 跨平台性能 workflow（2026-10-28 新增）
+#
+# 与现有 ci.yml 的关系（为何不进 push / pull_request 闸）：
+# - ci.yml 是**正确性闸**：fmt / test / bench 编译门 / clippy 三道，红即拦。
+#   性能数值是**环境相关量**（共享 runner 抖动、CPU 频率、邻居负载、
+#   macOS 定时任务、Windows Defender 扫描……），同一份代码在不同机器上
+#   波动 10%~30% 属常态。把它塞进 push/PR 闸 = 用不可靠信号判红绿，
+#   结果是开发者学会忽略红灯（告警疲劳），比没有闸更糟。
+# - 因此本 workflow **只在 workflow_dispatch（手动）与 schedule（每日一次，
+#   固定 04:23 UTC——避开整点/半点拥堵时段，CI 队列在高负载时段排队更久）**
+#   触发，产出**数据**（criterion 输出 + bench 摘要 artifact + 基线对比），
+#   不参与任何合并决策。
+# - Rust 版本 pin 1.96.0 与 ci.yml 一致（防工具链漂移让性能数不可比）；
+#   components 含 clippy/rustfmt 与 ci.yml 同款，便于本地复现同一环境。
+# - 矩阵仅 ubuntu-latest + macos-latest：Windows 性能数据本地已有
+#   （本仓库开发机为 Windows，性能基线以本地测量为准），CI 侧不重复消耗。
+#
+# 「性能失败不阻塞」语义（三重保险，任何一处生效即可）：
+# 1. 触发面：不在 push/PR 路径上 → 失败天然不拦合并。
+# 2. bench 执行步 `continue-on-error: true` → bench 自身失败（runner 抖动、
+#    判据过严）只标红该步，不终止后续 artifact / 摘要产出。
+# 3. 基线对比只**告警**（>10% 回归写 warning + step summary），不改退出码。
+#    性能基线漂移属常态，把它做成红灯只会制造随机红。
+#
+# 基线机制（滚动缓存 + artifact 双留存）：
+# - 每次跑完从 criterion 的 estimates.json 抽 median/mean → `perf-out/summary.json`。
+# - 该文件存进 actions/cache（key 含 run_id，每次一份；restore-keys 按
+#   `perf-baseline-<os>-` 前缀取**最近一次**）→ 下次跑时恢复为「上一次基线」，
+#   逐 bench 算 % 变化，回归超阈值写入 step summary 告警。
+# - 同时上传 artifact（criterion 原始输出 + 摘要），供事后取数/离线对比。
+#
+# 与 criterion 自带「change:」对比的关系：criterion 的 change 对比是**同工作区
+# 内**的（`target/criterion/<id>/base` vs `new`），CI 每次全新 runner → base 为空
+# → 永远无对比。故跨轮基线由上面的 summary.json 滚动缓存承担；criterion 的
+# change 行在同 job 内仍有效（本次跑两次即见 change 输出），留作本轮自洽参考。
+
+name: udf-frame perf
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每日一次，04:23 UTC——避开整点（CI 调度高峰）。手动触发不受此限。
+    - cron: "23 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: bench (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.96.0 (pinned, 与 ci.yml 一致)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy, rustfmt
+
+      # 依赖下载缓存：只缓存 cargo registry/git（第三方 crate 源码）。
+      # **不缓存 target/**：bench 的编译产物每次都重编——
+      #   ① target/ 随每个 SHA 生成一份完整副本，几天就把仓库 10GB 缓存配额
+      #      撑爆，反而挤掉真正需要的条目；
+      #   ② 缓存 target/ 会把上一轮的 criterion 输出（base/ 与 new/）一并
+      #      恢复回来，给「本轮产出」的判定引入隐性来源；
+      #   ③ bench 结果必须在本机现测——复用旧二进制测不出当前代码的性能。
+      # 依赖源码命中后，完整 bench 编译约 2~4 分钟，可接受。
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: perf-${{ matrix.os }}-${{ github.sha }}
+          restore-keys: perf-${{ matrix.os }}-
+
+      # 建工作目录：基线目录与产物目录。cache action 本身会在 save 时自建
+      # 路径，但**先建好**可保证 restore 落进已有目录、且后续步骤写文件时
+      # 目录必在（摘要脚本的写入目标）。
+      - name: Prepare workspace directories
+        run: mkdir -p perf-baseline perf-out
+
+      # 上一次基线（滚动缓存）：本步在 step 内 restore、job 结束（post）时
+      # save 同一个 primary key = perf-baseline-<os>-<run_id>。
+      # - primary key 含 run_id ⇒ 每轮一份新条目（本轮不会被判 exact hit 而
+      #   跳过保存）；restore-keys 前缀 `perf-baseline-<os>-` ⇒ 命中最近一份
+      #   旧基线恢复进 `perf-baseline/`。
+      # - 用合并版 actions/cache（而非拆 cache/restore + cache/save 两步）：
+      #   前者自动在 post 阶段用同一 primary key 保存，无需在两步之间传
+      #   outputs 拼 key（拆开时 save 需另配 key/path，易配错导致静默不存）。
+      # - 注：缓存保存失败只是 warning，不会让 job 变红（基线是辅助数据，
+      #   不该因为存不进去就阻断本次性能数据产出）。
+      - name: Cache bench baseline (rolling)
+        uses: actions/cache@v4
+        with:
+          path: perf-baseline
+          key: perf-baseline-${{ matrix.os }}-${{ github.run_id }}
+          restore-keys: perf-baseline-${{ matrix.os }}-
+
+      # bench 可编译门：先确认 bench 目标能编过，再花时间真跑。
+      # （与 ci.yml 的 bench 编译门同一口径；--all-features 防 required-features
+      #  整目标跳过 = hollow gate）
+      - name: Bench compile gate
+        run: cargo bench --workspace --all-features --no-run
+
+      # bench 目标清点：如实标注哪些 crate 根本没有 bench 目标（下方据此跳过，
+      # 不假装跑了）。产物落 perf-out/bench-targets.txt 随 artifact 留存。
+      - name: Detect bench targets per crate
+        run: |
+          mkdir -p perf-out
+          cargo metadata --no-deps --format-version 1 > perf-out/metadata.json
+          python3 - <<'PY' | tee perf-out/bench-targets.txt
+          import json
+          md = json.load(open("perf-out/metadata.json"))
+          for p in sorted(md["packages"], key=lambda x: x["name"]):
+              benches = [t["name"] for t in p["targets"] if "bench" in t["kind"]]
+              # 标记用纯 ASCII 单词（无正则元字符），下方 grep 直接匹配。
+              mark = ",".join(benches) if benches else "NONE"
+              print(f"{p['name']}: {mark}")
+          PY
+
+      # 本轮 bench 起点标记（摘要脚本据此只采信此标记之后产出的估计）。
+      # 作用：把「本轮数据」的判定锚在一次运行的测量窗口内——若将来有人把
+      # target/ 加回缓存，或 bench 中途部分失败留下半套估计，陈旧/半套数据
+      # 都不会被当成本轮完整数据写进基线（陈旧数据冒充新数据 = 静默失败）。
+      - name: Mark bench start (freshness reference)
+        run: |
+          mkdir -p perf-out
+          touch perf-out/.bench-start
+
+      # 真跑 bench。continue-on-error：性能步失败不终止后续产出
+      # （判据/环境抖动 ≠ 代码错；此处的正确性由 ci.yml 负责）。
+      # 守卫：目标清单里该 crate 标 NONE（无 bench 目标）→ 如实标注并跳过，
+      # 不假装跑了（本仓当前 udf-skeleton / udf-std-ext 即属此列——它们只有
+      # examples，无 [[bench]] 目标；唯一的 bench 目标是 udf-skeleton-infra
+      # 的 infra）。匹配不锚行尾：清单由 tee 写出，行尾可能是 CRLF。
+      - name: Run bench - udf-skeleton-infra
+        continue-on-error: true
+        run: |
+          if grep -q '^udf-skeleton-infra: NONE' perf-out/bench-targets.txt; then
+            echo "udf-skeleton-infra: 无 bench 目标 -> 跳过（如实标注）"
+            exit 0
+          fi
+          cargo bench -p udf-skeleton-infra --all-features
+
+      - name: Run bench - udf-std-ext
+        continue-on-error: true
+        run: |
+          if grep -q '^udf-std-ext: NONE' perf-out/bench-targets.txt; then
+            echo "udf-std-ext: 无 bench 目标 -> 跳过（如实标注）"
+            exit 0
+          fi
+          cargo bench -p udf-std-ext --all-features
+
+      # 摘要 + 基线对比：只告警不改退出码（性能漂移常态，不制造随机红）。
+      - name: Summarize bench results and compare with previous baseline
+        run: |
+          mkdir -p perf-out
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+
+          root = pathlib.Path("target/criterion")
+          # 只采信「本轮产出」的估计：缓存恢复回来的上一轮 new/estimates.json
+          # 一律排除（否则陈旧数据冒充本轮数据 = 静默失败）。
+          mark = pathlib.Path("perf-out/.bench-start")
+          fresh_cutoff = mark.stat().st_mtime if mark.exists() else 0.0
+
+          rows = []
+          for est in sorted(root.glob("**/new/estimates.json")):
+              if est.stat().st_mtime <= fresh_cutoff:
+                  print(f"::debug::skip stale estimate {est}")
+                  continue
+              bench = str(est.parent.parent.relative_to(root)).replace(os.sep, "/")
+              d = json.load(open(est))
+              rows.append({
+                  "bench": bench,
+                  "median": d.get("median", {}).get("point_estimate"),
+                  "mean": d.get("mean", {}).get("point_estimate"),
+              })
+
+          if not rows:
+              print("::warning::未采集到本轮 criterion estimates（bench 未运行 / 被跳过 / 失败）")
+              pathlib.Path("perf-out/summary.json").write_text("{}")
+              pathlib.Path("perf-out/summary.md").write_text(
+                  "# bench 摘要\n\n本轮无数据（bench 未产出新估计）——基线保持不变，下轮继续对比上一份有效基线。\n")
+              # 有意不覆写 perf-baseline/summary.json：本轮无数据时保留上一份
+              # 有效基线（基线链不断），cache 步骤会把原样存回下一轮。
+              # 但目录必须存在——cache 步骤要求 path 存在，否则该步报错。
+              if not pathlib.Path("perf-baseline/summary.json").exists():
+                  pathlib.Path("perf-baseline").mkdir(parents=True, exist_ok=True)
+                  pathlib.Path("perf-baseline/summary.json").write_text("{}")
+              sys.exit(0)
+
+          current = {r["bench"]: r["median"] for r in rows if r["median"] is not None}
+          pathlib.Path("perf-out/summary.json").write_text(json.dumps(current, indent=2, sort_keys=True))
+
+          # 先读旧基线（本目录由 cache 步骤从上一轮恢复），比较完再覆写为本轮值
+          # ——job 结束时 cache 步骤会把本目录存成下一轮的基线。
+          baseline = {}
+          bp = pathlib.Path("perf-baseline/summary.json")
+          if bp.exists():
+              baseline = json.loads(bp.read_text())
+
+          lines = ["# bench 摘要（${{ matrix.os }}）", ""]
+          lines.append("| bench | median | mean | vs 上次基线 |")
+          lines.append("|---|---|---|---|")
+          regressions = []
+          for r in rows:
+              b = r["bench"]
+              cur = r["median"]
+              base = baseline.get(b)
+              if base and cur:
+                  delta = (cur - base) / base * 100.0
+                  note = f"{delta:+.1f}%"
+                  if delta > 10.0:
+                      note += " ⚠️ 回归>10%"
+                      regressions.append((b, delta))
+              else:
+                  note = "（无基线）"
+              lines.append(f"| {b} | {r['median']} | {r['mean']} | {note} |")
+          lines.append("")
+          if regressions:
+              lines.append("> ⚠️ 回归超 10%（仅告警，不改退出码）：" +
+                           ", ".join(f"{b} {d:+.1f}%" for b, d in regressions))
+              for b, d in regressions:
+                  print(f"::warning::perf regression {b}: {d:+.1f}% vs 上次基线")
+          else:
+              lines.append("> 无超阈值回归。")
+
+          pathlib.Path("perf-out/summary.md").write_text("\n".join(lines) + "\n")
+          # 本轮值写回基线目录：cache 步骤在 job 结束时把该目录存成下一轮基线
+          # （key 含 run_id → 每次一份新缓存；下次 restore-keys 取最近一份）。
+          pathlib.Path("perf-baseline").mkdir(parents=True, exist_ok=True)
+          pathlib.Path("perf-baseline/summary.json").write_text(
+              json.dumps(current, indent=2, sort_keys=True))
+          print("\n".join(lines))
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", "perf-out/summary.md"), "a", encoding="utf-8") as fh:
+              fh.write("\n".join(lines) + "\n")
+          PY
+
+      # 数据留存：criterion 原始输出 + 摘要 + bench 目标清点。
+      - name: Upload criterion output and bench summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-${{ matrix.os }}-${{ github.run_number }}
+          path: |
+            target/criterion
+            perf-out
+          if-no-files-found: warn
+          retention-days: 30
