@@ -4,6 +4,17 @@
 - 决策人：用户拍板（十三常驻域拆独立子 crate；架构时机窗口逻辑：初期拆便宜）
 - 关联：批 5-2（paths/clock/retry/scheduler/ratelimit/cache/id 七域后续处理）
 
+> **口径修正指针（2026-10-27，PM 加；本 ADR 正文为历史记录不改）**：本文「`std-ext` 零三方」
+> 口径（§零三方口径段、批 5-1/5-2 完成态段）**已被 ADR 0007 收窄并部分纠正**——① `json` 域
+> （2026-10-23 由 P1-9 自 xray-conf 上浮）引 `serde_json` 且为**普通依赖零 feature 常开**，
+> 使 `std-ext` 与 `skeleton-infra` 的默认树「零三方」承诺同时失真；② ADR 0007 决定将 `json`
+> 域门化为 `json` feature（`serde_json` 转 optional），**默认树恢复零三方**，终态措辞以
+> ADR 0007 §3/§4.3 为准（十三域零门常驻 + `json` 域门控）；③ 本文「域可独立取用」的诉求
+> **已由物理拆分闭合**（`std-ext` 拆出即闭合），ADR 0007 实测证伪「未用域拖全部域进二进制」
+> （null 探针与无依赖基线逐字节相同），其口径按 ADR 0007 §2.1 收窄。
+> 决策与论证全文见 `docs/adr/0007-std-ext-packaging-granularity.md`；落地执行见 bd 单
+> `udf-frame-zex`。
+
 ## 背景（盲测槽点）
 
 十三常驻域全部住在 `skeleton-infra` 单 crate：契约实现 + 生态绑定 + 防坑门面 + 散件标准件混居，

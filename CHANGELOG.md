@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+### Added（ViewBridge MVP：语言无关视图数据面，ADR 0006 波 3）
+- 契约词汇 `skeleton::view`（零依赖）：`BindingDecl`/`ViewMap<S>`（纯投影 + 缺省哨兵）/`IntentMap<A>` + `PayloadTag` + `PROTOCOL_VERSION`；`ViewMap` 方法集冻结与 bound 永不落领域 `S`（M6 冻结条款入 doc）。
+- 机器 `skeleton_infra::view`（feature `view = ["dep:serde_json", "udf-std-ext/json"]`，ADR 0007 §4.2-5 跨 crate 开门；默认树零三方不变）：`ViewBridge` 纯订阅者挂 SyncStore 通知面（核心零改动）——类型化投影 + 哨兵粗闸/类型 eq 细闸 + latest-wins 折叠 + 版本水位（`PatchBatch.from/to_version`、`Snapshot.version`，桥内单调消费代数与区域头同源）+ 毒化-重同步闭环（投影 panic catch + 计数 + resync 位 ⇒ `snapshot_doc` 收口）+ 可组合双编码矩阵（`JsonEncoder` lazy / `RegionEncoder` eager + `Coverage` + `RegionWriter`/`RegionBacking`/`VecBacking` 固定容量区域通道 v1）+ `Derived`/`Sentinel` L1 记忆化胞。
+- 读侧参考实现 `view::read`（M2 实现一次）：`RegionReader`（TLV 解段 + 未知 tag 跳过 + `unknown_tags_skipped` 计数 + `needs_resync` 提示）+ `decode_batch`（JSON 通道同款语义）；规范 `docs/view-region-spec.md` v1 + TS 镜像读器 `docs/view-region-reader.ts`。
+- 命名工件链（M3）：真源 `docs/view-bridge-constants/manifest.toml` + 生成器 `examples/view_constants_gen.rs`（零三方纯 std，`--check` CI 断言）+ TS/Python/C 生成物入库；demo `include_str!` 清单逐字对表。
+- 正典验收环 `examples/view_bridge_demo.rs`（矩阵行为/双编码一致性/换区握手/水位自洽/未知标签跳过，断言内嵌）+ 行为面 `tests/view_bridge_test.rs`（毒化闭环/封板/跨线程/闭门）。
+
+### Changed（json 域门化：默认树恢复零三方，破坏性）
+- `std-ext` 的 `json` 域门化为 `json` feature（ADR 0007）：`serde_json` 转 optional（`json = ["dep:serde_json"]`），`json` 域默认不进树——`std-ext` 与 `skeleton-infra` 的默认树**双双恢复零三方**（`cargo tree -p udf-std-ext -e normal` 仅 `skeleton`；`cargo tree -p udf-skeleton-infra -e normal` 仅 skeleton + std-ext，一行可复核）；开 `json` 门时 `serde_json` 及其五子节点（itoa/memchr/serde_core/zmij…）按需进树。域数口径由「十四域零门常驻」改为「**十三域零门常驻 + `json` 域门控**」。（**破坏性**：`std_ext::json` 默认不可用，使用者加 `features = ["json"]`；`pub use serde_json` 再导出经 PM 评审否决，不提供；0.1.0 未发布故无外部采用方迁移面，按 ADR 0005 直迁先例无 shim。）四文档同步终态口径：`README.md` / `docs/reference.md` / `std-ext/README.md` / `skeleton-infra/README.md` 的「除 `json` 域外零三方」过渡态限定（本区块下方 Fixed 首条落下的）全部翻转为终态表述。顺带清零三条 clippy warning：`config.rs` 的 `use std::fmt` 门由 `config-json` 修正到真实消费者门 `config-toml`（单开 config-json 时 unused import）；`logx.rs` 两处 doc list 误判（段落续行行首 `+` 被 markdown 当列表标记）调整断行消除。
+
+### Fixed（对外口径诚实化 + 域数对齐 + CI 门整改）
+- 「零三方」口径修正：`std-ext` 的 `json` 域引 `serde_json` 普通依赖（零 feature 常开，默认树即含 `serde_json` 子树）——此前 `README.md` / `docs/reference.md` / `std-ext/README.md` / `skeleton-infra/README.md` 仍写「零三方」，与实测依赖树矛盾；现四处统一为限定表述「除 `json` 域外零三方」，`skeleton-infra` 默认树随之同口径（`json` 域依赖形态的决策见 ADR 0007）。
+- 域数口径对齐：`std-ext` 为**十四域**（除 `json` 域外各域零门常驻、本体纯 std + `json` 域带 `serde_json`）——`README.md`（crate 表 + 常驻域行 + 「只要散件」段）、`docs/reference.md`（头部 + feature 矩阵 + 域索引 + 速查表）、`skeleton-infra/README.md` 此前写「十三域」且漏 `json`；`docs/reference.md` 补 `## json` 域章节（`JsonMode`/`JsonParseError`/64MiB `MAX_INPUT_BYTES`/`decode`/`decode_str`/`decode_slice`，API 逐字对 `std-ext/src/json.rs`）与域索引 json 行。
+- 性能锚口径诚实化：dispatch 锚（无订阅 ~77ns / 订阅态 ~142ns）此前无适用边界，现补「锚仅在小 State 成立」——外部持有快照时状态落位走 `Arc::make_mut` 克隆分支，每次 dispatch 额外付一次 `S::clone`（锁内），实测 1MiB State ≈210µs/dispatch；`README.md` 埋点规范段 + `docs/reference.md` runtime 锚段同口径（审计报告 F-05）。
+- CI 门整改：`.github/workflows/ci.yml` 的 std-ext 步去掉全局 `--skip anchors --skip verbatim`——该字面量匹配连带屏蔽 13 个真实测试（含 `hash` 的 XXH64 官方向量锚、`paths` 的 Windows verbatim 路径语义测试、`scheduler` 的 every_anchors_* 等），属 hollow gate；并行污染根因已在 fe5728a 根治（计数窗加 IN_WINDOW 线程归属门），主步改全量跑，`paths_alloc serial` 单列步保留作双保险。
+- 孤儿源文件处置：删 `skeleton-infra/src/text.rs`、`skeleton-infra/src/backoff.rs`（ADR 0004 迁移后残留的无 `mod` 声明副本，不参与编译、不产文档，且 backoff 双份实现已漂移——infra 副本无 `log-embed` 埋点）；内容已在 `std-ext`，无 shim 需求。
+
 ## [0.1.0] — 2026-10-18
 
 > 0.1.0 首发准备态：三 crate（`skeleton` / `std-ext` / `skeleton-infra`）同版 0.1.0 首发；

@@ -2,11 +2,15 @@
 
 > 权威口径：本文从 `src/*.rs` doc 注释、`tests/` 行为面与 `Cargo.toml` feature 表提取，与源码逐字对表（抽查记录见 `reports/2026-10-17-udf-api-reference.md`）。crate 级文档（`lib.rs`）仍是域典；本文是其展开的检索面。
 >
-> 姊妹 crate [`skeleton`](../skeleton)（零依赖）承载契约 trait 与数据词汇（`Store`/`Reducer`/`Effect`/`EffectRuntime`/`JournalPort`/`PoolManaged`/parse 端口等）；[`std-ext`](../std-ext)（批 5-1/5-2 物理拆分）承载十三个纯 std 常驻散件域（`text`/`encode`/`hash`/`iter`/`backoff`/`fsx`/`paths`/`clock`/`retry`/`scheduler`/`ratelimit`/`cache`/`id`）；本 crate（skeleton-infra）兑现契约参考实现与核+胶水件。契约本身（trait 语义承诺）见 skeleton 文档，本文只写实现侧公共 API 与行为契约。
+> 姊妹 crate [`skeleton`](../skeleton)（零依赖）承载契约 trait 与数据词汇（`Store`/`Reducer`/`Effect`/`EffectRuntime`/`JournalPort`/`PoolManaged`/parse 端口等）；[`std-ext`](../std-ext)（批 5-1/5-2 物理拆分）承载十四个散件域（`text`/`encode`/`hash`/`iter`/`backoff`/`fsx`/`paths`/`clock`/`retry`/`scheduler`/`ratelimit`/`cache`/`id`/`json`——十三域零门常驻、本体纯 std，`json` 域门控 `json` feature）；本 crate（skeleton-infra）兑现契约参考实现与核+胶水件。契约本身（trait 语义承诺）见 skeleton 文档，本文只写实现侧公共 API 与行为契约。
 
 ## 零依赖口径
 
-`cargo tree -p udf-std-ext -e normal`：仅 `skeleton`（workspace 路径依赖），零三方（`log-embed` 埋点的 optional tracing 默认关不进树）。`cargo tree -p udf-skeleton-infra -e normal`——默认 feature 下仅 `skeleton` + `std-ext`（均 workspace 路径依赖），零三方。各生态 feature 的三方依赖经 feature 门控（serde/tokio/tracing/toml 等），不随默认面进树。
+`cargo tree -p udf-std-ext -e normal`：仅 `skeleton`（workspace 路径依赖）——零三方（开 `json` 门时 `serde_json` 子树按需进树；`log-embed` 埋点的 optional tracing 默认关不进树）。`cargo tree -p udf-skeleton-infra -e normal`——默认 feature 下仅 `skeleton` + `std-ext`（均 workspace 路径依赖）——零三方。各生态 feature 的三方依赖经 feature 门控（serde/tokio/tracing/toml 等），不随默认面进树。
+
+口径说明：`json` 域随 P1-9 自 `xray-conf` 上浮，其 `serde_json` 依赖形态的决策见 ADR 0007。本节只陈述当前实测树。
+
+下文各域标题里的「依赖面 … 零三方」说的是**该域自身代码**不调三方 API（如 `runtime` 域只用 `skeleton` 契约、`pool` 域只用纯 std）；**crate 级默认树**的第三方面以本节实测树为准（默认树零三方，可一行复核）。
 
 ## feature 矩阵
 
@@ -15,7 +19,7 @@
 | `full` | 全部子开关 | — | **一键全开**（tokio 先例）：`features = ["full"]` = 下表全部子开关并集；新手心智入口，子开关=进阶裁剪面 |
 | `runtime` | — | ✅ | `SyncStore`（契约参考实现，std-only）+ `LocalSubscription` + `audit` 审计值面 |
 | `pool` | `memgov` | ✅ | `PoolBase` 管理组合件 + `ThreadPool` + `PooledThreadPool`；连带启用 `memgov` |
-| （常驻，std-ext） | 零依赖 | — | `text` `backoff` `retry` `paths` `clock` `scheduler` `ratelimit` `cache` `fsx` `encode` `id` `iter` `hash` **十三域**（`std-ext` crate；行为件面；时间源/配置/日志路径契约在 `skeleton::clock`/`skeleton::config`/`skeleton::logpath`，批 1 契约真下沉） |
+| （常驻，std-ext） | 十三域零依赖；`json` 域经 `json` feature 门引 `serde_json` | — | `text` `backoff` `retry` `paths` `clock` `scheduler` `ratelimit` `cache` `fsx` `encode` `id` `iter` `hash` `json` **十四域**（`std-ext` crate；行为件面；时间源/配置/日志路径契约在 `skeleton::clock`/`skeleton::config`/`skeleton::logpath`，批 1 契约真下沉；十三域零门常驻，`json` 域门控 `json` feature） |
 | （常驻，本 crate） | 零依赖 | — | `shutdown` 停机编排器（消费 `std_ext::scheduler`） |
 | `memgov` | 零依赖 | — | `CountingAllocator`/`BoundedRegistry`/`LeakGuard`/`MemoryPool` |
 | `journal` | serde, serde_json | — | `JsonlJournal`：`JournalPort` 契约端口参考实现 |
@@ -28,8 +32,9 @@
 | `compose` | — | — | `combine`/`combine!` 父子分片组合器 |
 | `config-json` | serde, serde_json | — | `ConfigFile` 分层装配 + 原子保存（serde_json::Value 统一值面） |
 | `config-toml` | `config-json` + toml | — | `load_toml`/`save_toml` + `file_layer_toml`（TOML↔值面翻译） |
+| `view` | serde_json + `udf-std-ext/json` | — | `view::ViewBridge` 语言无关视图桥（ADR 0006）：契约词汇住 `skeleton::view`（零依赖）；默认树零三方不变 |
 
-> 注（批 1 契约真下沉，2026-10-18；ADR `docs/adr/0001-contract-sink.md`）：`skeleton` 由 optional 转常驻非 optional 依赖（常驻域 cache/id/retry/scheduler 消费 `skeleton::clock` 契约）——workspace path 非三方，零三方口径不变。原 `runtime`/`pool`/`journal`/`compose` 的 `dep:skeleton` 叠门随之移除。
+> 注（批 1 契约真下沉，2026-10-18；ADR `docs/adr/0001-contract-sink.md`）：`skeleton` 由 optional 转常驻非 optional 依赖（常驻域 cache/id/retry/scheduler 消费 `skeleton::clock` 契约）——workspace path 非三方，`skeleton` 依赖面零三方口径不变。原 `runtime`/`pool`/`journal`/`compose` 的 `dep:skeleton` 叠门随之移除。
 
 必选组合（`Cargo.toml` required-features 口径）：bench `infra` = `["tokio","journal","memgov","testing"]`；示例 `end_to_end` = `["tokio","journal","testing","compose"]`。 hollow gate 纪律：feature 不全的目标整目标跳过——CI 闸与首跑一律 `--all-features`。
 
@@ -37,7 +42,7 @@
 
 ## 域索引
 
-> 批 5-1/5-2 物理拆分：下表十三常驻域（text/backoff/retry/paths/clock/scheduler/ratelimit/cache/fsx/encode/id/iter/hash）已迁 `std-ext` crate，模块路径 `std_ext::<domain>`；`shutdown` 留守 skeleton-infra（`skeleton_infra::shutdown`）。各域行内「常驻」= 零 feature 门。
+> 批 5-1/5-2 物理拆分：下表十四常驻域（text/backoff/retry/paths/clock/scheduler/ratelimit/cache/fsx/encode/id/iter/hash/json）已迁 `std-ext` crate，模块路径 `std_ext::<domain>`；`shutdown` 留守 skeleton-infra（`skeleton_infra::shutdown`）。各域行内「常驻」= 零 feature 门（`json` 域例外：门控 `json` feature，见 ADR 0007）。
 
 | 域 | feature 门 | 一行职责 | 模块锚 |
 |---|---|---|---|
@@ -61,19 +66,21 @@
 | iter | 常驻 | 迭代器扩展精选（itertools 语义子集 5 件） | [`iter`](#iter--迭代器扩展) |
 | config | `config-json`/`config-toml` | 配置文件分层装配 + 原子保存 + TOML 翻译（契约在 `skeleton::config`） | [`config`](#config--配置装配) |
 | hash | 常驻 | 冻结稳定摘要（FNV-1a 64 / XXH64） | [`hash`](#hash--稳定摘要) |
+| json | `json`（std-ext 侧门控） | JSON 双模解码（RFC 8259 严格 / 注释容忍）+ 64MiB 输入上限 | [`json`](#json--json-双模解码) |
 | fx | `tokio` | `FxScope` 异步并发托管（唯一合法 spawn 口） | [`fx`](#fx--异步并发托管) |
 | journal | `journal` | `JsonlJournal`：JSONL 追加式真相源 | [`journal`](#journal--追加式账本) |
 | testing | `testing` | `TestStore`/`ScriptedRuntime` + 解析面 mock | [`testing`](#testing--测试替身) |
 | log | `log`（含 `log-fs`） | `logx`：门面绑定（init 系/双 sink）；`log-fs` 单开=密钥掩码/路径解析/文件落盘 | [`logx`](#logx--日志门面) |
 | tracing | `tracing` | `tracingx`：审计事件流 → tracing 桥 | [`tracingx`](#tracingx--tracing-桥) |
 | compose | `compose` | `combine`/`combine!` 父子分片组合器 | [`compose`](#compose--父子分片组合器) |
+| view | `view` | `ViewBridge` 语言无关视图桥（投影/意图/双编码矩阵/水位/未知标签跳过） | [`view`](#view--语言无关视图桥) |
 | log-embed | `log-embed` | 八域 41 埋点规范（target/级别/字段纪律） | [`log-embed`](#log-embed--埋点规范) |
 
 ---
 
 ## runtime — SyncStore 契约参考实现
 
-**feature**：`runtime`（默认）。**依赖面**：仅 `skeleton` 契约 crate（std-only，零三方）。
+**feature**：`runtime`（默认）。**依赖面**：仅 `skeleton` 契约 crate（std-only，域面零三方——crate 树见 [§零依赖口径](#零依赖口径)）。
 
 `SyncStore<S, A, Op = Infallible>` 兑现 `skeleton::Store` 契约：单写者队列 + 同步排空环（dispatch 返回即 idle，同序 action 序列恒同终态）+ CoW 快照广播 + 停机闸 + 回灌深度预算。`Op` 缺省 `Infallible` → `Effect::Run` 不可构造，零效果程序编译期证明无副作用（配 `skeleton::NoFx`）。
 
@@ -196,11 +203,26 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 - dispatch 热路径锚：`examples/dispatch_profile.rs`（end_to_end_dispatch ≤100ns 契约）；订阅态 dispatch 全含 ~142ns / 无订阅 ~77ns（2026-10-16 批 C）。
 - `subscribe_events` 未订阅 emit 面：一次 Acquire load，零分配零锁（机制断言，audit 域 doc）。
 
+**锚口径（诚实化）**：上述 ns 级 dispatch 锚**仅在小 State 下成立**——锚的测量对象是状态迁移本身的固定开销，不含状态体量的复制成本。`Arc<State>` 是 CoW 快照：外部持有快照时（强计数 ≥2），状态落位走 `Arc::make_mut` 克隆分支，每次 dispatch 额外付一次 `S::clone`（在 state 锁内执行）。审计实测（`reports/2026-10-27-udf-architecture-audit.md` F-05）：
+
+| 口径 | 实测 |
+|---|---|
+| 克隆计数 | 每 100 次「读快照 + dispatch」= 200 次 State 克隆；每 100 次纯 dispatch = 100 次 |
+| 深克隆代价 | 1 MiB State（`Vec<[u64;32]>` × 4096）约 210µs/dispatch（release）——与 ~80ns 锚差约 2600 倍 |
+| `Arc` 包裹 State 是否解题 | **不解题**：Arc 包裹与深克隆 State 均为 ~205-210µs/dispatch（比率 1.0x）——reducer 内部照样克隆整个载荷 |
+
+采用方指引：
+
+1. **State 体量**：建议控制在数 KiB 级；大状态用分片 + 自选持久化结构（`compose` 域的父子分片即此路径）。
+2. **持有快照的代价**：长期持有 `snapshot()` 会让后续每次 dispatch 都付一次 State 深克隆（成本随 State 体量线性增长）——快照是「一致性视图」，不是「廉价引用」。
+3. **`Arc<Inner>` 模式**：把大载荷放进 `Arc<Inner>`、State 只持 Arc 句柄——`S::clone` 退化为 Arc 计数克隆。但**仅此不够**：审计实测「Arc 包裹 State」与深克隆 State 比率 1.0x，因为 reducer 内部仍整体克隆载荷；此模式要真正省下深拷贝，reducer 侧须经 `Arc::make_mut` 之类 CoW 路径只克隆被改动的部分（**该用法本仓未实测**，属采用方侧选择，框架不代为保证）。
+4. **`S::clone` 必须 panic-free**：clone 在 state 锁内执行，panic 即毒锁——实例整体报废且状态不可取出（见上文「Panic 契约」）。
+
 ---
 
 ## pool — PoolBase + ThreadPool
 
-**feature**：`pool`（默认，连带 `memgov`）。**依赖面**：纯 std + 契约词汇（`skeleton::pool`），零三方。
+**feature**：`pool`（默认，连带 `memgov`）。**依赖面**：纯 std + 契约词汇（`skeleton::pool`），域面零三方（crate 树见 [§零依赖口径](#零依赖口径)）。
 
 ### PoolBase — 池化管理组合件
 
@@ -1297,6 +1319,46 @@ assert_eq!(xxh64(b"xxhash"), 0x32DD_3895_2C4B_C720);
 
 ---
 
+## json — JSON 双模解码
+
+**feature**：`json`（std-ext 侧门控——显式开 `json` feature，默认关）。**依赖面**：`serde_json`（经 `json` feature 门，开则进树）；其余各域本体纯 std。本域随 P1-9 自 `xray-conf` 上浮，行为面对齐 Go `json_reader` 的 JSONC 语义。
+
+```rust
+pub enum JsonMode { Strict, Tolerant }
+
+pub struct JsonParseError {
+    pub line: u32,      // 1 起；无位置语义为 0
+    pub column: u32,    // 1 起；无位置语义为 0
+    pub message: String,
+}
+
+pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;   // 64 MiB
+
+pub fn decode<R: Read>(reader: R, mode: JsonMode) -> Result<serde_json::Value, JsonParseError>;
+pub fn decode_str(s: &str, mode: JsonMode) -> Result<serde_json::Value, JsonParseError>;
+pub fn decode_slice(s: &[u8], mode: JsonMode) -> Result<serde_json::Value, JsonParseError>;
+```
+
+- `JsonMode::Strict`：serde_json 原生严格解析（RFC 8259）——注释即语法错。
+- `JsonMode::Tolerant`：先剥离 `//` 行注释与 `/* */` 块注释再解析；**字符串字面量内的注释标记保留**（含转义引号后的内容）；未闭合块注释容忍至输入末尾（剥离到末尾后解析）。
+- `MAX_INPUT_BYTES`（64 MiB）：读满即停——reader 路径最多读 `MAX_INPUT_BYTES + 1` 字节即判超限，**超限报错而非截断成功**；`decode_str`/`decode_slice` 超限同样报错。
+- 错误位置：`line`/`column` 1 起（提取自 serde_json）；**无位置语义的失败（读取失败 / 输入超限 / 非 UTF-8）为 0**。
+
+```rust
+use std_ext::json::{decode_str, JsonMode};
+
+let v = decode_str(r#"{"a": 1}"#, JsonMode::Strict).unwrap();
+assert_eq!(v["a"], 1);
+
+// 容忍模式收注释；字符串内注释标记不动
+let v = decode_str("// c\n{ \"a\": 1 }", JsonMode::Tolerant).unwrap();
+assert_eq!(v["a"], 1);
+```
+
+行为断言见 `std-ext/tests/json.rs`（严格拒注释 / 容忍收注释 / 字符串内标记保留 / 转义引号 / 未闭合块注释 / 超限报错非截断 / 行列与 serde_json 一致 / slice 与 reader 一致 / 非法 UTF-8 报无位置错误）。
+
+---
+
 ## config — 配置装配
 
 **feature**：文件面挂 `config-json`/`config-toml`。**依赖面**：`config-json` 增 serde/serde_json；`config-toml` 叠加 toml。**批 1 契约真下沉**（2026-10-18；ADR `docs/adr/0001-contract-sink.md`）：配置契约 `EnvSource`/`StdEnv`/`MockEnv`/`ConfigPort`/`ConfigError` 现住 `skeleton::config`（纯 std 零门）；本 crate 的 `config` 模块只余文件行为件（分层装配/原子保存/TOML 翻译）。
@@ -1654,10 +1716,10 @@ assert_eq!(read_port(&boom).unwrap_err(), "mock parse error: bad json");
 
 ## logx — 日志门面
 
-**feature**：两层拆分（批 1，2026-10-18；ADR `docs/adr/0002-log-feature-split.md`）——`log-fs`（纯 std 零三方：密钥掩码 + 路径解析 + `FileSink`，单开即可用文件日志）与 `log`（=`log-fs` 叠门 + log + tracing + tracing-subscriber + tracing-log：init 系门面绑定层）。日志根目录契约 `LogPathResolver` 住 `skeleton::logpath`。门面 trait=生态 `log::Log`（不自造）；核心自身永不打日志（核心零依赖，结构性排除）。
+**feature**：两层拆分（批 1，2026-10-18；ADR `docs/adr/0002-log-feature-split.md`）——`log-fs`（纯 std 零三方——域面口径，crate 树见 [§零依赖口径](#零依赖口径)：密钥掩码 + 路径解析 + `FileSink`，单开即可用文件日志）与 `log`（=`log-fs` 叠门 + log + tracing + tracing-subscriber + tracing-log：init 系门面绑定层）。日志根目录契约 `LogPathResolver` 住 `skeleton::logpath`。门面 trait=生态 `log::Log`（不自造）；核心自身永不打日志（核心零依赖，结构性排除）。
 
 ```rust
-// ── log-fs 面（纯 std，零三方依赖）──
+// ── log-fs 面（纯 std，域面零三方依赖）──
 pub fn mask_secrets(input: &str, secrets: &[&str]) -> String;
 
 pub struct DefaultPathResolver { /* … */ }
@@ -1831,6 +1893,27 @@ store.close();
 
 ---
 
+## view — 语言无关视图桥
+
+**feature**：`view`（绑 serde_json + `udf-std-ext/json`；ADR 0007 §4.2-5 跨 crate 开门）。**依赖面**：契约词汇住 `skeleton::view`（零依赖）；机器与读侧参考实现住 `skeleton_infra::view`。规范唯一权威 = `docs/view-region-spec.md` v1；命名工件 = `docs/view-bridge-constants/`（manifest 真源 + TS/Py/C 生成物 + CI `--check` 断言）。
+
+```rust
+pub struct ViewBridge<S, A, M, I, J, R> { /* 订阅票据 + 单锁折叠态 + eager 区域通道 */ }
+impl ViewBridge<S, A, M, I, J, R> {
+    pub fn mount<T: Store<State = S, Action = A>>(store: T, map: M, intents: I, encoders: Encoders<J, R>) -> Self;
+    pub fn bind(&self, path: &str) -> Result<BindingId, BindError>;      // 装配期；首通知封板
+    pub fn send_intent(&self, intent: Value) -> Result<bool, IntentError>; // Ok(false) = 闭门
+    pub fn take_patches(&self) -> PatchBatch;   // 水位 (from/to/protocol_version) + resync 位
+    pub fn snapshot_doc(&self) -> Snapshot;     // 现态全量重投影 + 同源版本（快照即交付）
+    pub fn region_version(&self) -> u64;        // 区域头版本（与 to_version 同源）
+    pub fn projection_panics(&self) -> u64;     // 降级显形计数（对齐 subscriber_panics 先例）
+}
+```
+
+要点：桥 = 纯订阅者（票据归桥，Drop = 注销；store 所有权随桥）；版本 = 桥内单调消费代数（同步档，与区域头同源，撕裂结构性不可能）；投影 panic = 毒化唯一残因（catch + 计数 + `resync` 位 ⇒ `snapshot_doc` 收口）；未知标签跳过（读侧 `view::read` 实现一次，TS/Py/C 镜像复刻，禁整区失败）；正典验收环 `examples/view_bridge_demo.rs`，行为面 `tests/view_bridge_test.rs`。
+
+---
+
 ## log-embed — 埋点规范
 
 **feature**：`log-embed`（绑 tracing；**默认不开启**——埋点宏展开为空、tracing 依赖不进树，cargo tree 零 tracing 证明；`tracingx`/`logx` 桥不受本 feature 影响）。
@@ -1864,14 +1947,14 @@ target 规范：域=`skeleton::<domain>`，子流程=`skeleton::<domain>::<phase
 | 组合 | 形态 | 说明 |
 |---|---|---|
 | `full` | 一键全开 | 本 crate 13 子开关并集（等价本 crate `--all-features`）；采用方默认心智入口——「不懂就 full」，子开关=进阶裁剪。std-ext 七域 35 埋点由其自有 `log-embed` 承载（ADR 0005 否决跨 crate 强制耦合）；workspace 全量=两 crate 各自 `--all-features` |
-| `--no-default-features` | 纯生态件面 | 常驻 13 域（行为件面）+ memgov 可独立（`--features memgov`） |
+| `--no-default-features` | 纯生态件面 | 常驻 14 域（行为件面；除 `json` 域外各域零门常驻、本体纯 std + `json` 域 `serde_json`）+ memgov 可独立（`--features memgov`） |
 | 默认 | runtime + pool | pool 连带 memgov；SyncStore/PoolBase/ThreadPool 可用 |
-| `log-fs` 单开 | 零三方 | 文件日志可用（mask_secrets/DefaultPathResolver/FileSink），不拉 tracing 四件套 |
+| `log-fs` 单开 | log-fs 面零三方 | 文件日志可用（mask_secrets/DefaultPathResolver/FileSink），不拉 tracing 四件套；std-ext 常驻依赖（及其 `json` 域 `serde_json`）仍在树内 |
 | testing | tokio + runtime | TestStore/ScriptedRuntime/parse_mock |
 | tracing | runtime + deps | 桥在审计值面上消费 |
 | config-toml | config-json + toml | 值面叠层；toml 仅此 feature 可达 |
 | bench `infra` | tokio+journal+memgov+testing | required-features 并集（hollow gate 纪律） |
 | example `end_to_end` | tokio+journal+testing+compose | 五件套+combine+TestStore+fx/journal 解释器标准形 |
 
-零依赖证明口径：`cargo tree -p udf-skeleton-infra -e normal`（默认 feature 下仅 `skeleton`——workspace path 非三方）；`--no-default-features --features memgov` 仍独立；`--no-default-features --features log-fs` 树内亦仅 `skeleton`。
+零依赖证明口径：`cargo tree -p udf-skeleton-infra -e normal`（默认 feature 下 `skeleton` + `std-ext`，均 workspace path 非三方；std-ext 的 `json` 域带 `serde_json` 普通依赖进树）；`--no-default-features --features memgov` 仍独立；`--no-default-features --features log-fs` 树内同样含 std-ext 及其 `serde_json` 子树。
 

@@ -1,7 +1,8 @@
 # skeleton-infra — UDF 骨架基础设施层
 
 契约实现 + 生态标准件绑定 + 防坑门面。契约（trait 与数据词汇）在姊妹 crate
-[`skeleton`](../skeleton)（零依赖），十三个纯 std 常驻散件域在
+[`skeleton`](../skeleton)（零依赖），十四个散件域（十三域零门常驻、
+本体纯 std，`json` 域门控 `json` feature）在
 [`std-ext`](../std-ext)（批 5-1/5-2 物理拆分），本 crate 兑现契约参考实现与
 核+胶水件。crate 级文档（`lib.rs`）为权威域典，本 README 是浏览器视角的域清单。
 
@@ -18,15 +19,17 @@
 | `journal` | `journal` | `JsonlJournal`：`JournalPort` 契约端口参考实现（JSONL 追加式真相源 + 快照行 + 懒回放；serde 仅此 feature 可达） |
 | `testing` | `testing` | `TestStore` 逐动作断言 + `ScriptedRuntime` 脚本化解释器替身 |
 | `memgov` | `memgov` | `CountingAllocator` 计数分配器 + `BoundedRegistry` 有界注册表（淘汰策略必选）+ `LeakGuard` 泄漏断言 |
-| `log-fs` | `logx` | 文件落盘面（纯 std 零三方）：密钥掩码 + `DefaultPathResolver` 双构建默认根（debug=编译期锚/release=`~/.<项目>/log`；契约 `LogPathResolver` 住 `skeleton::logpath`）+ `FileSink` 按日滚动追加 |
+| `log-fs` | `logx` | 文件落盘面（纯 std 零三方：`log-fs` 面自身口径，crate 树见下方零依赖口径段）：密钥掩码 + `DefaultPathResolver` 双构建默认根（debug=编译期锚/release=`~/.<项目>/log`；契约 `LogPathResolver` 住 `skeleton::logpath`）+ `FileSink` 按日滚动追加 |
 | `log` | `logx` | 门面绑定层（=`log-fs`+log/tracing/tracing-subscriber/tracing-log）：`init_tracing_from_env`（EnvFilter）+ `init_with_file` console/file 双 sink + `FileSinkWriter` |
 | `tracing` | `tracingx` | 审计事件流 → tracing 桥 |
 | `log-embed` | `shutdown` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 调用点）：注册/逐组件开始/终态（Stopped/TimedOut/Failed）/整体报告（target `skeleton::<domain>[::<phase>]`，级别=正常流转 debug/异常 warn/终态 info；默认关=宏消除零依赖零开销）。批 5-1/5-2 起其余七域 35 调用点由 `std-ext` 自有同款 feature 承载（宏同款文本作用域副本） |
 | `compose` | `compose` | `combine`/`combine!` 父子分片组合器（镜头+路由+效果上提，宏一行装配） |
 
 零依赖口径：`cargo tree -p udf-skeleton-infra -e normal`——默认 feature 下仅
-`skeleton` + `std-ext`（workspace 路径依赖），零三方；各生态 feature 的三方依赖经
-feature 门控（serde/tokio/tracing 等），不随默认面进树。
+`skeleton` + `std-ext`（均 workspace 路径依赖）——**真正零三方**（连
+`serde_json` 也不进树：它已随 `std-ext` 的 `json` 域门控 `json` feature）。
+各生态 feature 的三方依赖经 feature 门控（serde/tokio/tracing 等），
+不随默认面进树。
 
 ## 最小示例指引
 
