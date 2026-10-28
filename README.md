@@ -49,7 +49,7 @@ udf-skeleton-infra = { path = "<UDF_ROOT>/skeleton-infra" }
 **串联教程**：[docs/tutorials/thirty-min.md](docs/tutorials/thirty-min.md)——30 分钟走完非零效果路径（journal 持久化 → FxScope 效果作用域 → combine 分片 → TestStore 验收），每块代码真实编译运行过。
 
 **第一天提示**（盲测实测 8 坑的高频五处，全表见 [cheatsheet](docs/tutorials/cheatsheet.md)）：
-- `FxScope::spawn` 需要 tokio reactor 上下文——同步 `main` 直接用会 panic，demo 从 `#[tokio::main]` 起步；
+- `FxScope::spawn_tracked` 需要 tokio reactor 上下文——同步 `main` 直接用会 panic，demo 从 `#[tokio::main]` 起步；
 - `JsonlJournal` 的 payload 必须序列化为 JSON object（enum 记得内部 tag，如 `#[serde(tag = "kind")]`——tag 键任取，`"t"` 是 journal 行 tag 顶层保留键会被拒；unit variant 裸字符串会被拒）；`replay` 前先 `flush`——flush=fsync 掉电真持久（干净 drop 亦有 BufWriter 兜底，真丢数据分界是进程崩溃）；
 - 账本调用惯用形：`JsonlJournal::<A, S>::create(..)` 构造期一次定型，此后全直呼零标注——`j.append_action(&a)`、`MutexGuard` 后 `g.append_action(&a)`、`j.replay()` 返回值全推断；`combine` 两形态都只收 **tuple variant** 构造器（unit variant 路由用显式闭包 `|_: ()| Act::Ping`）；
 - demo 项目**建在 udf-frame 仓库外**——树内 `cargo new` 会被根 workspace 吸收损坏仓库；

@@ -68,7 +68,7 @@
 |---|---|---|---|
 | 1 | journal payload 必须 JSON object | `action/state must serialize to a JSON object for tag flattening` | enum 加 `#[serde(tag = "kind")]`（名字任取，**不能叫 `"t"`**，那是行 tag 保留键：`payload must not contain a top-level "t" key`） |
 | 2 | flush 前读侧空账 | 重放 0 条 | **flush=fsync 掉电真持久**（干净 drop 亦有 BufWriter 兜底写出；真丢数据分界=进程崩溃）：读侧重开/断言/停机前显式 `j.flush()` |
-| 3 | `FxScope::spawn` 无 reactor | `there is no reactor running, must be called from the context of a Tokio 1.x runtime` | 从 `#[tokio::main]` 起步 |
+| 3 | `FxScope::spawn_tracked` 无 reactor | `there is no reactor running, must be called from the context of a Tokio 1.x runtime` | 从 `#[tokio::main]` 起步 |
 | 4 | 往定型账本塞别的动作类型 | E0308 mismatched types（`expected &Act, found &Other`） | `JsonlJournal::<A, S>` 构造期定型：一个账本实例一个 payload 类型；异型动作另开账本或并入同一 enum |
 | 5 | combine 传 unit variant 构造器 | E0277 `expected a `Fn(_)` closure, found `Act`` / E0532 | 显式闭包 `|_: ()| Act::Ping`，或改 tuple variant 路由 |
 | 6 | `subscriber_count` 断言挂 | 本地订阅不在数内 | 口径见上表第 5 对 |

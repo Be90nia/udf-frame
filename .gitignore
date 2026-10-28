@@ -2,6 +2,7 @@
 /target-iso
 target/
 .codebase-memory/
+verify/
 
 # Beads / Dolt files (added by bd init)
 .dolt/

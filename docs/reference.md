@@ -28,7 +28,7 @@
 | `log-fs` | 零依赖 | — | `logx` 文件落盘面：密钥掩码/路径解析（契约 `LogPathResolver` 住 `skeleton::logpath`）/`FileSink` 按日滚动——单开即可用文件日志 |
 | `log` | `log-fs` + log, tracing, tracing-subscriber, tracing-log | — | `logx` 门面绑定层：init 系（EnvFilter/双 sink）+ `FileSinkWriter` |
 | `tracing` | `runtime` + tracing, tracing-subscriber | — | `tracingx`：审计事件流 → tracing 桥 |
-| `log-embed` | tracing | — | 埋点：skeleton-infra=shutdown 一域 6 点；std-ext 自有同款 feature=七域 35 点（合计八域 41；默认关=宏消除零依赖零开销） |
+| `log-embed` | tracing | — | 埋点：skeleton-infra=shutdown 一域 6 点；std-ext 自有同款 feature=七域 41 点（合计八域 47；默认关=宏消除零依赖零开销） |
 | `compose` | — | — | `combine`/`combine!` 父子分片组合器 |
 | `config-json` | serde, serde_json | — | `ConfigFile` 分层装配 + 原子保存（serde_json::Value 统一值面） |
 | `config-toml` | `config-json` + toml | — | `load_toml`/`save_toml` + `file_layer_toml`（TOML↔值面翻译） |
@@ -220,6 +220,33 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 
 ---
 
+## notify — 异步信号式通知（案 C 水位）
+
+**feature**：`runtime`（默认，随 SyncStore）。**依赖面**：契约 `skeleton::notify` 零依赖；实现面零新三方。决策与论证唯一权威 = `docs/adr/0008-async-notify-signal.md`。
+
+```rust
+// skeleton::notify（契约层，零依赖）
+pub trait NotifySink: Send + Sync + 'static {
+    fn publish(&self, version: u64);   // O(1)；允许合并；panic 由框架捕获并摘除（fail-closed）
+}
+pub trait Notify<S> {
+    fn subscribe_notify(&self, sink: impl NotifySink) -> Subscription<S>;  // 票据复用 Subscription，Drop=注销
+}
+// skeleton_infra::runtime：impl<S> Notify<S> for SyncStore<S>
+// 读侧：store.notify_published() -> u64（当前状态版本）
+```
+
+语义（ADR 0008 §2 公理 → §5 落地）：
+
+- 排空环内对异步档只做 **O(1) 版本投递**，绝不执行用户重活；投递序 = 异步投递先于同步回调。
+- 载荷 = 单调状态版本号（**无事件流**——M1 状态化判据）；消费侧按需 `store.snapshot()` 拉取现态。
+- state_version 门控：零异步订阅者不自增（纯同步部署成本 = 一次 Acquire load——无订阅 dispatch 锚 77→78.4ns，±10ns 容忍内）；50ms 慢消费者在途 dispatch 实测 ~172ns（重活若进环应 ~5e7ns，隔离 4 个数量级）。
+- 投递口 panic：框架捕获 + 摘除 + 留痕（fail-closed，对齐订阅回调 panic 先例）。
+- 两档并存：既有 `subscribe`/`subscribe_local` 同步语义一字不改（既有通知/审计/回灌测试零改动实证）。
+- 闭门/注销语义显式（A6），计数面可对账。
+
+行为面：`tests/async_notify.rs`（§5.3 六项断言 + 投递序断言）。
+
 ## pool — PoolBase + ThreadPool
 
 **feature**：`pool`（默认，连带 `memgov`）。**依赖面**：纯 std + 契约词汇（`skeleton::pool`），域面零三方（crate 树见 [§零依赖口径](#零依赖口径)）。
@@ -377,11 +404,14 @@ Drop 兜底尽力而为——**规范用法=测试尾显式 `check()`**/`expect_
 pub enum Eviction { Reject, EvictOldest }
 pub struct BoundError { pub capacity: usize }
 
+#[derive(Clone)]   // deep-copy 值容器（非共享句柄）；运行期只读共享用 Arc<BoundedRegistry> 外包
 pub struct BoundedRegistry<K: Ord, V> { /* BTreeMap + 边界 + 策略 */ }
 impl<K: Ord, V> BoundedRegistry<K, V> {
     pub fn new(max: usize, evict: Eviction) -> Self;   // max==0 panic
     pub fn insert(&mut self, k: K, v: V) -> Result<(), BoundError>;
     pub fn get(&self, k: &K) -> Option<&V>;
+    pub fn get<Q: ?Sized + Ord>(&self, k: &Q) -> Option<&V> where K: Borrow<Q>;  // 零分配查找
+    pub fn get_mut(&mut self, k: &K) -> Option<&mut V>;   // 只回值面：键面类型级不可达（改键破坏确定序）
     pub fn remove(&mut self, k: &K) -> Option<V>;
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
@@ -390,7 +420,7 @@ impl<K: Ord, V> BoundedRegistry<K, V> {
 }
 ```
 
-「上限+策略必填」由构造签名类型强制。已存在 key=覆盖（len 不变，不触发淘汰）；满：Reject→`Err(BoundError)`（原内容不动）/ EvictOldest→先 `pop_first`（首键）再插。K 契约：K 须单调指派（序号/时间戳键）语义=逐最旧；乱序如实退化为 EvictMinKey（不静默补偿）。LRU/TTL 精确语义在 [`cache`](#cache--lruttl-缓存)。
+「上限+策略必填」由构造签名类型强制。已存在 key=覆盖（len 不变，不触发淘汰）；满：Reject→`Err(BoundError)`（原内容不动）/ EvictOldest→先 `pop_first`（首键）再插。`Clone`=deep-copy（map/max/evict 同拷，两句柄独立，容量语义逐句柄保持）。K 契约：K 须单调指派（序号/时间戳键）语义=逐最旧；乱序如实退化为 EvictMinKey（不静默补偿）。LRU/TTL 精确语义在 [`cache`](#cache--lruttl-缓存)。
 
 ### MemoryPool — 内存池特化（pool feature）
 
@@ -519,9 +549,9 @@ assert_eq!(backoff_delay(3, base, Duration::from_millis(250)), Duration::from_mi
 
 ---
 
-## retry — 同步重试编排
+## retry — 同步 + 异步重试编排
 
-**feature**：常驻，零 feature 门。**依赖面**：纯 std。函数 `retry`/`retry_if` **不进 crate 根 re-export**（避免与模块名撞名），调用形 `retry::retry(...)`；类型已 re-export。
+**feature**：常驻，零 feature 门。**依赖面**：纯 std。函数 `retry`/`retry_if`/`retry_async`/`retry_if_async` **不进 crate 根 re-export**（避免与模块名撞名），调用形 `retry::retry(...)`；类型已 re-export。
 
 ```rust
 pub trait Sleeper: Clock {
@@ -533,7 +563,8 @@ pub trait Sleeper: Clock {
 pub struct RetryPolicy { /* max_attempts/base/max_delay/budget */ }
 impl RetryPolicy {
     pub fn new(max_attempts: u32, base: Duration, max_delay: Duration) -> Self; // 详见 Panics
-    pub fn with_budget(mut self, budget: Duration) -> Self;
+    pub fn with_budget(mut self, budget: Duration) -> Self;   // 只配次数不配预算=风暴面（红线）
+    pub fn with_jitter(mut self, j: JitterFn) -> Self;        // 默认 full jitter（禁关）；测试注入恒等源保确定性
 }
 
 pub enum RetryError<E> {
@@ -549,7 +580,18 @@ pub fn retry_if<T, E, F, P, S>(
     op: F, policy: &RetryPolicy, sleeper: &S, retryable: P,
 ) -> Result<T, RetryError<E>>
 where F: FnMut() -> Result<T, E>, P: FnMut(&E) -> bool, S: Sleeper;
+
+pub trait AsyncSleeper { /* sleep(d) -> impl Future<Output = ()> + Send；调用方注入（如 tokio），零运行时依赖 */ }
+
+pub async fn retry_async<T, E, F, Fut, S>(
+    policy: &RetryPolicy, op: F, sleep: S,
+) -> Result<T, RetryError<E>>
+where F: FnMut(u32) -> Fut, Fut: Future<Output = Result<T, E>>, S: AsyncSleeper;
+
+pub async fn retry_if_async<T, E, F, Fut, P, S>( /* 同形 + retryable 判定 */ );
 ```
+
+**红线**（armor 定案）：① jitter 默认 full（禁关——无 jitter 同拍风暴，AWS 一手实测）；② 双闸（次数+预算）缺一即风暴面；③ retry 默认假定操作幂等，非幂等禁入（文档红线，不落类型门）；④ 异步 sleep 内联 await，future drop 即全停（取消安全）。同步/异步同 policy 同语义（对照测试钉死）。
 
 语义契约：
 
@@ -946,7 +988,7 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
 - TTL=逐条 expire-after-write（覆盖重置计时）；`now + ttl` 溢出 panic（fail-closed）。
 - 双界交互：满时**先清过期再逐 LRU 尾**（过期条目永不把活条目挤出去，当清得动时）。
 - 惰性过期：触碰即回收 + `expired` 计数（fail-visible，过期不是静默 None）；`len()`=物理条数（回收前僵尸占容，如实声明）。
-- 时钟只消费单调面；**并发面：单线程 `&mut self`，无内部锁**（并发另批，如实声明）。
+- 时钟只消费单调面；**并发面：单线程 `&mut self` 面 + `SyncLruCache`/`SyncTtlCache` 并发薄包装（`&self`+内部 Mutex，语义与单线程版一致；poison=fail-fast panic 带因；分片留待命中率证据）**。
 - 构造签名类型强制「上限必填」（无默认无界构造，BoundedRegistry 同款）；满插入恒逐 LRU 尾（无 Reject 形）。
 
 ```rust
@@ -1467,7 +1509,7 @@ ConfigFile::save(&cfg, "app.json").unwrap();     // Pretty + 原子写
 
 ## fx — 异步并发托管
 
-**feature**：`tokio`。**依赖面**：tokio（JoinSet/oneshot/watch/time::timeout/Semaphore）；CancellationToken 树/tokio-util 不引入。`tokio::spawn` 直调经 clippy `disallowed_methods` 闸封死——**效果只经 `FxScope` 唯一口**。
+**feature**：`tokio`。**依赖面**：tokio（JoinSet/oneshot/watch/time::timeout/Semaphore）；CancellationToken 树/tokio-util 不引入。`tokio::spawn` 直调经 clippy `disallowed_methods` 闸封死——**效果只经 `FxScope` 命名口**（`spawn_tracked`/`spawn_detached`，后者为闸内唯一 allow 豁免）。
 
 ```rust
 pub struct FxScope { /* Mutex<JoinSet> + accepting 闸 + Semaphore + 取消源/令牌 */ }
@@ -1518,14 +1560,14 @@ pub fn expect_idle(scope: &FxScope);   // in_flight==0 断言（LeakGuard fx 侧
 ```
 
 - 任务结局归一：panic 经 catch_unwind 归一 `TaskError::Panicked(消息)`（payload downcast &str/String，否则哨兵文案）；发送端消亡=Cancelled；join 超时=TimedOut 且任务已 abort（禁留活口）。
-- `spawn` 线性化=锁内原子 RMW 过闸 + 插入与 shutdown 的 abort_all 串行——过闸任务必被 shutdown 覆及。
+- `spawn_tracked` 线性化=锁内原子 RMW 过闸 + 插入与 shutdown 的 abort_all 串行——过闸任务必被 shutdown 覆及。
 - `shutdown_timeout` 超时即返回：剩余集 Drop=abort 兜底（零残留）。
 
 ```rust
 use skeleton_infra::fx::{expect_idle, FxScope};
 
 let scope = FxScope::new();
-let handle = scope.spawn(async { 41 + 1 }).unwrap();
+let handle = scope.spawn_tracked(async { 41 + 1 }).unwrap();
 // assert_eq!(handle.join().await, Ok(42));  // 需 tokio 运行时：见 tests 与 fx.rs doctest
 expect_idle(&scope);
 ```
@@ -1625,7 +1667,7 @@ impl<A, Op> ScriptedRuntime<A, Op> {
     pub fn feed(&mut self, scripts: impl IntoIterator<Item = Script<A, Op>>);  // FIFO 消费
     pub fn scope(&self) -> &Arc<FxScope>;
 }
-// 另实现 EffectRuntime<A, Op>：每次效果转发出队一脚本经 scope.spawn 执行
+// 另实现 EffectRuntime<A, Op>：每次效果转发出队一脚本经 scope.spawn_tracked 执行
 ```
 
 脚本耗尽=no-op（TestStore.receive 超时即自然失败信号）；scope 关闸时 spawn 失败 fail-fast（禁静默丢弃 future）。标准形模板：reducer 出描述式效果 → 按脚本解释 → Emit 经回灌通道闭环保环；取消竞窗测试用 `tokio::time::start_paused`（本件不实现 clock）。
@@ -1946,8 +1988,8 @@ target 规范：域=`skeleton::<domain>`，子流程=`skeleton::<domain>::<phase
 
 | 组合 | 形态 | 说明 |
 |---|---|---|
-| `full` | 一键全开 | 本 crate 13 子开关并集（等价本 crate `--all-features`）；采用方默认心智入口——「不懂就 full」，子开关=进阶裁剪。std-ext 七域 35 埋点由其自有 `log-embed` 承载（ADR 0005 否决跨 crate 强制耦合）；workspace 全量=两 crate 各自 `--all-features` |
-| `--no-default-features` | 纯生态件面 | 常驻 14 域（行为件面；除 `json` 域外各域零门常驻、本体纯 std + `json` 域 `serde_json`）+ memgov 可独立（`--features memgov`） |
+| `full` | 一键全开 | 本 crate 13 子开关并集（等价本 crate `--all-features`）；采用方默认心智入口——「不懂就 full」，子开关=进阶裁剪。std-ext 七域 41 埋点由其自有 `log-embed` 承载（ADR 0005 否决跨 crate 强制耦合）；workspace 全量=两 crate 各自 `--all-features` |
+| `--no-default-features` | 纯生态件面 | 常驻 14 域（行为件面；十三域零门常驻、本体纯 std；`json` 域与凭据级 `RandomId`（`random` 门）按需显式开）+ memgov 可独立（`--features memgov`） |
 | 默认 | runtime + pool | pool 连带 memgov；SyncStore/PoolBase/ThreadPool 可用 |
 | `log-fs` 单开 | log-fs 面零三方 | 文件日志可用（mask_secrets/DefaultPathResolver/FileSink），不拉 tracing 四件套；std-ext 常驻依赖（及其 `json` 域 `serde_json`）仍在树内 |
 | testing | tokio + runtime | TestStore/ScriptedRuntime/parse_mock |

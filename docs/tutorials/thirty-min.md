@@ -509,7 +509,7 @@ impl EffectRuntime<Action, Fx> for HostRuntime {
         let journal = self.journal.clone();
         let handle = self
             .scope
-            .spawn(async move {
+            .spawn_tracked(async move {
                 tokio::time::sleep(Duration::from_millis(5)).await; // 模拟外部 IO
                 // 回灌挂点·先落盘后 apply：append Err ⇒ 禁 send（fail-closed，禁静默丢）
                 let appended = journal
@@ -676,7 +676,7 @@ async fn main() {
 
 ### 故意踩坑（各跑一次，报错为真实输出）
 
-**坑 D：同步 `main` 里 `FxScope::spawn`**——没有 tokio reactor，当场 panic（报错信息
+**坑 D：同步 `main` 里 `FxScope::spawn_tracked`**——没有 tokio reactor，当场 panic（报错信息
 指路清晰，但第一天要先知道入口在 `#[tokio::main]`）：
 
 ```text

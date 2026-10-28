@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### Added（消费方反馈六件套 + 通知面异步化，2026-10-28；GitHub issue#1 / ADR 0008）
+- **BoundedRegistry**（memgov）：`get<Q: Borrow<Q>>` 零分配泛型查找、`get_mut`（只回值面——键面类型级不可达，compile_fail doctest 钉死）、`Clone`（deep-copy 值容器；运行期只读共享用 `Arc<BoundedRegistry>` 外包）。
+- **retry**：`retry_async`/`retry_if_async` + `AsyncSleeper` 注入式异步面（零运行时依赖，下游 tokio 自接线）；同步/异步同 policy 同语义（对照测试钉死）；取消安全（sleep 内联 await，future drop 即全停）。
+- **cache**：`SyncLruCache`/`SyncTtlCache` 并发薄包装（`&self` + 内部 Mutex 短临界区，语义与单线程版一致；poison=fail-fast panic 带因；分片留待命中率证据）。
+- **id**：`RandomId`（UUIDv4 凭据级，OS CSPRNG 直通 fail-closed 禁弱熵回退）——`random = ["dep:getrandom"]` 第三道依赖隔离门，默认树保持零三方；文档双用途口径：v7=排序友好事件 id / v4=凭据。
+- **logx**：每通道独立 level（写路径 AtomicU8 原子过滤，`set_level` 运行期即时生效——结构性免疫 tracing callsite interest 缓存坑，tracing#2874/#2400）+ 逐通道丢弃计数读数 `dropped(channel)`。
+- **FxScope**：`spawn` 更名 `spawn_tracked` + 新增 `spawn_detached`（显式脱管口，不计 in_flight、不被 shutdown 等待；全仓唯一 tokio::spawn allow 豁免）+ 文档范式（Arc 化标准写法/cancel-safe 清单/LocalSet 边界/两套 drop 语义对照）。
+- **通知面异步化**（ADR 0008 案 C 两档并存）：`skeleton::notify`（`NotifySink` 宿主投递口 + `Notify<S>` 登记面，不扩 Store 六方法）+ SyncStore 实现（排空环内 O(1) 版本投递、先于同步回调；state_version 零异步订阅者不自增）+ `notify_published()` 读侧。锚：无订阅 dispatch 77→78.4ns（±10ns 容忍内）；50ms 慢消费者隔离实证 ~172ns。既有通知/审计/回灌测试零改动。
+- 六域 armor 逐坑一测（调研：`docs/research/consumer-feedback-pitfalls.md`——外部踩坑面/性能模式/生态先例，T1/T2 出处全覆盖）。
+
+### Changed（retry 默认 jitter + FxScope spawn 双命名，破坏性）
+- retry：退避默认 **full jitter**（禁关——无 jitter 同拍风暴，AWS 一手实测；确定性回放用 `with_jitter` 恒等源）；`with_budget` 红线升级「只配次数不配预算=风暴面」；retry 默认假定操作幂等（文档红线）。
+- fx：`FxScope::spawn` → `spawn_tracked`（语义显名）；调用点全仓机械迁移（42 处）。
+- （破坏性直迁：0.1.0 未发布无外部采用方，按 ADR 0005 先例无 shim。）
+
 ### Added（ViewBridge MVP：语言无关视图数据面，ADR 0006 波 3）
 - 契约词汇 `skeleton::view`（零依赖）：`BindingDecl`/`ViewMap<S>`（纯投影 + 缺省哨兵）/`IntentMap<A>` + `PayloadTag` + `PROTOCOL_VERSION`；`ViewMap` 方法集冻结与 bound 永不落领域 `S`（M6 冻结条款入 doc）。
 - 机器 `skeleton_infra::view`（feature `view = ["dep:serde_json", "udf-std-ext/json"]`，ADR 0007 §4.2-5 跨 crate 开门；默认树零三方不变）：`ViewBridge` 纯订阅者挂 SyncStore 通知面（核心零改动）——类型化投影 + 哨兵粗闸/类型 eq 细闸 + latest-wins 折叠 + 版本水位（`PatchBatch.from/to_version`、`Snapshot.version`，桥内单调消费代数与区域头同源）+ 毒化-重同步闭环（投影 panic catch + 计数 + resync 位 ⇒ `snapshot_doc` 收口）+ 可组合双编码矩阵（`JsonEncoder` lazy / `RegionEncoder` eager + `Coverage` + `RegionWriter`/`RegionBacking`/`VecBacking` 固定容量区域通道 v1）+ `Derived`/`Sentinel` L1 记忆化胞。
