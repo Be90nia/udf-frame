@@ -28,7 +28,7 @@ default = ["runtime", "pool"]
 # full：一键全开（tokio 先例：default 最小集 + full 合集——采用方心智面收敛为
 # 「不懂就 features = ["full"]」，子开关退为进阶裁剪面）。语义=本表 13 子开关
 # 并集，等价 --all-features 口径；CI 闸与正典跑法维持 --all-features 不变。
-full = ["runtime", "pool", "memgov", "journal", "tokio", "testing", "log-fs", "log", "tracing", "log-embed", "compose", "config-json", "config-toml"]
+full = ["runtime", "pool", "memgov", "journal", "tokio", "testing", "log-fs", "log", "tracing", "log-embed", "compose", "config-json", "config-toml", "view"]
 runtime = []
 # pool 连带 memgov：MemoryPool 特化（memgov 侧）跨 pool+memgov 两域（槽位借还
 # 需 CountingAllocator 域 + PoolManaged 契约域），验收命令免 --features 直跑；
@@ -63,6 +63,11 @@ compose = []
 config-json = ["dep:serde", "dep:serde_json"]
 # config-toml：TOML 文本 ↔ 统一值面翻译捷径，叠在 config-json 值面上。
 config-toml = ["config-json", "dep:toml"]
+# view：语言无关视图桥（ADR 0006）。serde_json 为 wire 统一值模型（journal 先例
+# optional 形态）；入站解码面复用 std-ext json 域（ADR 0007 §4.2-5 跨 crate 开门，
+# 已实测）：开则 serde_json 进 infra 树 + std-ext json 域可用，关则都不进——默认
+# 树仍零三方。契约词汇住 skeleton::view（零依赖）。
+view = ["dep:serde_json", "udf-std-ext/json"]
 
 [dependencies]
 # 契约 crate（workspace path，非三方）：批 1 契约真下沉后 cache/id/retry/scheduler
@@ -246,3 +251,14 @@ required-features = ["config-json", "config-toml"]
 [[example]]
 name = "id_multidim"
 required-features = ["memgov"]
+
+# ViewBridge 正典验收环（ADR 0006）：矩阵行为 + 双编码一致性 + 镜像读取器 +
+# 换区握手 + 水位自洽 + 未知标签跳过 + manifest 逐字对表。SyncStore 走默认
+# runtime feature；required-features 取实际用量并集（hollow-gate 纪律）。
+[[example]]
+name = "view_bridge_demo"
+required-features = ["view", "runtime"]
+
+# M3 命名工件生成器（纯 std 零 feature 门——CI 一致性断言不带 --features 跑）。
+[[example]]
+name = "view_constants_gen"
