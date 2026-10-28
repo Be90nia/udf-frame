@@ -2,7 +2,7 @@
 name = "udf-std-ext"
 version = "0.1.0"
 edition = "2021"
-description = "Ecosystem standard parts split out of skeleton-infra: 14 domains (13 pure-std always-on + json gated behind the `json` feature)"
+description = "Ecosystem standard parts split out of skeleton-infra: 14 domains (13 pure-std always-on + json and random gated behind the `json`/`random` features)"
 license = "MIT"
 readme = "README.md"
 keywords = ["std", "extensions", "cache", "retry", "scheduler"]
@@ -14,9 +14,10 @@ rust-version = "1.87"
 
 # 分层（ADR udf-frame/docs/adr/0004-std-ext-split.md）：skeleton（最底层契约）
 # ← std-ext（本 crate，散件）← skeleton-infra（核+胶水，反向依赖本 crate）。
-# 依赖纪律（ADR 0007 终态，2026-10-27）：十四域 = 十三域零门常驻（本体纯 std）
-# + `json` 域门控（serde_json optional，仅 `json` feature 可达——P1-9 自主仓
-# xray-conf 上浮）；tracing 仅 `log-embed` 埋点 optional（默认关=不进树）。迁移前逐域验证过
+# 依赖纪律（ADR 0007 终态，2026-10-27；random 门 2026-10-28 增补）：十四域 =
+# 十三域零门常驻（本体纯 std）+ `json` 域门控（serde_json optional，仅 `json`
+# feature 可达——P1-9 自主仓 xray-conf 上浮）+ `random` 域面门控（getrandom
+# optional，凭据级 CSPRNG RandomId）；tracing 仅 `log-embed` 埋点 optional（默认关=不进树）。迁移前逐域验证过
 #（text/encode/hash/paths/clock/id 零埋点；iter/backoff/fsx/scheduler/
 # ratelimit/retry/cache 仅 embed_event! 宏调用点；json 无埋点）。
 # 包名/lib 名分离（PM 拍板 2026-10-18）：发布名 udf-std-ext；lib 名保持 std_ext，
@@ -28,12 +29,16 @@ name = "std_ext"
 # json：JSON 双模解码域（serde_json 解析底座）——默认关=serde_json 子树不进树
 # （ADR 0007：依赖隔离门，非粒度门；`dep:` 前缀关闭同名隐式 feature）。
 json = ["dep:serde_json"]
-# log-embed：行为域 tracing 埋点（七域 35 调用点：backoff 1/fsx 6/iter 2/
-# scheduler 11/ratelimit 4/retry 6/cache 5；默认关=宏消除零依赖零开销）。
+# log-embed：行为域 tracing 埋点（七域 41 调用点：backoff 1/fsx 6/iter 2/
+# scheduler 11/ratelimit 4/retry 12/cache 5；默认关=宏消除零依赖零开销）。
 # target 前缀沿用 `skeleton::<domain>[::<phase>]`——观测
 # 契约跨 crate 稳定（EnvFilter 与断言字符串零改动），不随物理 crate 拆分更名。
 # 宏与纪律注为 skeleton-infra lib.rs 同款文本作用域副本（两 crate 各自一份）。
 log-embed = ["dep:tracing"]
+# random：凭据级 CSPRNG id（RandomId/UUIDv4，getrandom 底座）——默认关=
+# getrandom 子树不进树（ADR 0007 同款依赖隔离门，第三道：json/log-embed/
+# random）。熵纪律 armor（fail-closed 禁弱熵回退）见 src/id.rs RandomId 段。
+random = ["dep:getrandom"]
 
 [dependencies]
 # 契约 crate（workspace path，非三方）：scheduler/cache/id/retry/ratelimit 消费
@@ -43,6 +48,12 @@ udf-skeleton = { path = "../skeleton", version = "0.1.0" }
 # feature 可达——默认不编译不进树。版本与主仓 workspace 一致）。
 serde_json = { version = "1", optional = true }
 tracing = { version = "0.1", optional = true }
+# v4 凭据级 id 的 OS CSPRNG 底座（optional，仅 `random` feature 可达——默认
+# 不编译不进树。版本钉 0.3 线：`fill` API 自 0.3 起稳定；0.4 已发布
+#（2026-06）但本批拍板 0.3，升级另行开票。`std` feature 显式开：0.3 线非
+# 默认，缺它则 getrandom::Error 无 std::error::Error impl（RngError 的
+# source 链断头，违反 fail-visible 纪律）。
+getrandom = { version = "0.3", features = ["std"], optional = true }
 
 [lints.clippy]
 # 与 skeleton/skeleton-infra 同款默认集（本 crate 无 async 面，deny 两条为

@@ -39,7 +39,9 @@
 //! | 双界交互 | 满时**先清过期再逐 LRU 尾**（过期条目永不把活条目挤出去，当清得动时） | Guava maintenance 语义的确定性化 |
 //! | 惰性过期 | get/peek 触碰即回收 + `expired` 计数（fail-visible）；`len()`=物理条数（回收前僵尸占容，如实声明）；`purge_expired` 显式清扫 | moka「过期条目暂占容量至 maintenance」的显式化 |
 //! | 时钟 | 只消费单调面 `now_instant`（clock armor #19；回拨结构性排除） | MockClock 后退类型层不可表达 |
-//! | 并发 | **单线程 `&mut self`**（并发另批，本单如实声明，无内部锁） | 契约收窄 |
+//! | 并发 | 单线程面 [`LruCache`]/[`TtlCache`]（`&mut self`）；共享面
+//!   [`SyncLruCache`]/[`SyncTtlCache`]（内部 `Mutex` 短临界区 + 原子计数，
+//!   poison fail-fast，无后台线程） | 契约收窄 + 并发批（issue#1-3）兑现 |
 //!
 //! # Examples
 //!
@@ -76,7 +78,8 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use skeleton::clock::Clock;
@@ -227,21 +230,24 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
     }
 
     /// 插入/覆盖：已存在=更新值+touch（len 不变，不触发淘汰——BoundedRegistry
-    /// 同款语义）；新键满=先逐 LRU 尾再插。
-    fn insert(&mut self, k: K, v: V) {
+    /// 同款语义）；新键满=先逐 LRU 尾再插。返回是否发生容量淘汰（Sync 面原子
+    /// 计数用；单线程面忽略）。
+    fn insert(&mut self, k: K, v: V) -> bool {
         if let Some(&idx) = self.map.get(&k) {
             self.slots[idx as usize].value = Some(v);
             self.move_to_front(idx);
-            return;
+            return false;
         }
+        let mut evicted = false;
         if self.map.len() >= self.cap {
             // 埋点「容量淘汰」：被逐者恒 LRU 尾（order 字段=选择策略留痕）。
-            let _evicted = self.pop_lru();
+            let _evicted_pair = self.pop_lru();
+            evicted = true;
             embed_event!(
                 debug,
                 target: "skeleton::cache::evict",
                 kind = "capacity",
-                key_hash = _evicted.as_ref().map(|(k, _)| key_fingerprint(k)),
+                key_hash = _evicted_pair.as_ref().map(|(k, _)| key_fingerprint(k)),
                 order = "lru_tail",
                 len_at_evict = self.map.len() as u64
             );
@@ -268,6 +274,7 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
         slot.key = Some(k);
         slot.value = Some(v);
         self.push_front(idx);
+        evicted
     }
 
     /// 摘除（返回值；不判过期不 touch——物理面）。
@@ -334,7 +341,7 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
 /// 构造签名类型强制「上限必填」（无默认无界构造，[`crate::memgov::BoundedRegistry`]
 /// 同款纪律）；满插入恒逐 LRU 尾（无 Reject 形——缓存的淘汰本来就是承诺）。
 ///
-/// 并发面：单线程 `&mut self`，无内部锁（并发另批，如实声明）。
+/// 并发面：单线程 `&mut self`，无内部锁；`&self` 共享面见 [`SyncLruCache`]。
 #[derive(Debug)]
 pub struct LruCache<K, V> {
     core: LruCore<K, V>,
@@ -434,7 +441,7 @@ struct TtlEntry<V> {
 /// - 满插入：先清过期（先过期先淘汰），仍满再逐 LRU 尾；
 /// - 时钟只消费 `now_instant` 单调面（挂钟回拨结构性排除）。
 ///
-/// 并发面：单线程 `&mut self`（并发另批，如实声明）。
+/// 并发面：单线程 `&mut self`；`&self` 共享面见 [`SyncTtlCache`]。
 pub struct TtlCache<K, V> {
     clock: Arc<dyn Clock>,
     core: LruCore<K, TtlEntry<V>>,
@@ -626,6 +633,373 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
                 kind = "ttl",
                 key_hash = key_fingerprint(k),
                 expired_total = self.expired
+            );
+        }
+        due
+    }
+}
+
+/// 并发 LRU 缓存（[`LruCache`] 的 `&self` 共享面）：内部 `Mutex<LruCore>` 短
+/// 临界区 + 单一原子计数出处，语义与单线程版逐字一致，仅两处并发面必然差异：
+///
+/// - **取值返 owned**（`V: Clone`）：`&V` 引用不可跨越锁边界——守卫外泄等于把
+///   全局锁交到调用方手里（非重入锁自锁死 + 临界区失控），moka 同款约定；
+///   同理 `iter`/`peek_mut` 引用面不设（诊断面走 [`Debug`]）；
+/// - **poison = fail-fast panic 带因**（拍板）：持锁 panic 后 LRU 链不变量可能
+///   已破，`into_inner` 静默续跑 = 破链读写放大，禁（与 logx 的 `into_inner`
+///   先例区分——cache 不变量耦合度高）。
+///
+/// 计数：命中（get 触碰命中）/淘汰（满插逐尾）各一个 `AtomicU64` 单点，锁内
+/// 无第二套计数；`Relaxed` 序（诊断面，等价性断言由线程 join 同步保证，见
+/// c4v 测试）。淘汰口径：容量满插自动逐出才计；`remove`/`pop_lru` 是显式
+/// 物理面，不计。
+///
+/// 无后台维护线程（moka v0.12 头号变更即删后台线程——不可控调度面与确定性
+/// 测试冲突）；TTL 惰性过期语义见 [`SyncTtlCache`]。
+///
+/// ponytail: 全局单 Mutex 起步（读共享写短临界区）；命中率证据出现再分片
+///（dashmap/moka 分面路线），不预造。
+#[derive(Debug)]
+pub struct SyncLruCache<K, V> {
+    core: Mutex<LruCore<K, V>>,
+    hits: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
+    /// 构造。`cap == 0` 构造期 panic（同 [`LruCache::new`]）。
+    #[must_use]
+    pub fn new(cap: usize) -> Self {
+        Self {
+            core: Mutex::new(LruCore::new(cap)),
+            hits: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+
+    /// 锁入口：poison 即 panic 带因（fail-fast，见类型文档）。
+    fn lock_core(&self) -> MutexGuard<'_, LruCore<K, V>> {
+        self.core.lock().unwrap_or_else(|e| {
+            panic!(
+                "SyncLruCache: 内部锁已 poison（持锁 panic 后 LRU 链不变量可能已破，禁静默续跑）: {e}"
+            )
+        })
+    }
+
+    /// 插入/覆盖。已存在键=更新值+touch（不触发淘汰）；新键满=先逐 LRU 尾
+    /// 再插（计入 [`Self::evictions`]）。
+    pub fn insert(&self, k: K, v: V) {
+        let evicted = self.lock_core().insert(k, v);
+        if evicted {
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 读（**touch**：命中刷新 recency 并计入 [`Self::hits`]）。返 owned
+    ///（引用不可跨锁，moka 同款）；不扰动淘汰序的读面用 [`Self::peek`]。
+    pub fn get(&self, k: &K) -> Option<V>
+    where
+        V: Clone,
+    {
+        let mut g = self.lock_core();
+        let hit = g.get_mut(k).map(|v| v.clone());
+        if hit.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        hit
+    }
+
+    /// 读（不 touch、不计数，纯读面）。
+    #[must_use]
+    pub fn peek(&self, k: &K) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.lock_core().peek(k).cloned()
+    }
+
+    /// 物理存在判定（不 touch）。
+    #[must_use]
+    pub fn contains(&self, k: &K) -> bool {
+        self.lock_core().idx_of(k).is_some()
+    }
+
+    /// 摘除并返回值。
+    #[must_use]
+    pub fn remove(&self, k: &K) -> Option<V> {
+        self.lock_core().remove(k)
+    }
+
+    /// 逐出 LRU 尾（最旧）并返回。
+    #[must_use]
+    pub fn pop_lru(&self) -> Option<(K, V)> {
+        self.lock_core().pop_lru()
+    }
+
+    /// 当前条目数。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lock_core().len()
+    }
+
+    /// 空判定。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lock_core().len() == 0
+    }
+
+    /// 容量上界（构造期定，不变）。
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.lock_core().capacity()
+    }
+
+    /// 累计命中数（get 触碰命中；peek/contains 不计）。
+    #[must_use]
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// 累计容量淘汰数（满插逐尾才计；显式 remove/pop_lru 不计）。
+    #[must_use]
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
+    }
+}
+
+/// 并发 TTL 缓存（[`TtlCache`] 的 `&self` 共享面）：内部 `Mutex<LruCore>` 短
+/// 临界区 + 单一原子计数，语义与单线程版逐字一致（get=touch、peek 不 touch、
+/// 惰性过期 fail-visible、满插先清过期再逐 LRU 尾、无后台维护线程）。差异面
+/// 同 [`SyncLruCache`]：取值返 owned（`V: Clone`）、引用迭代面不设、poison
+/// fail-fast panic 带因；[`Self::expired`] 惰性/清扫计数、[`Self::evictions`]
+/// 满插逐尾计数均为原子单点（锁内无第二套）。
+///
+/// 调用期校验（`ttl == 0`、`now + ttl` 溢出）在**取锁前**完成：调用方 bug 的
+/// fail-closed 不触碰内部不变量，panic 后缓存照常可用（与临界区内 Drop panic
+/// 的 poison 面相区分）。
+pub struct SyncTtlCache<K, V> {
+    clock: Arc<dyn Clock>,
+    core: Mutex<LruCore<K, TtlEntry<V>>>,
+    expired: AtomicU64,
+    hits: AtomicU64,
+    evictions: AtomicU64,
+}
+
+/// 手写 Debug：跳过时钟字段（`dyn Clock` 不可 Debug——注入件非状态），内容面
+/// 按逻辑条目（recency 序，含僵尸）呈现，形态对齐单线程版 [`TtlCache`]。
+impl<K: Eq + Hash + Clone + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug
+    for SyncTtlCache<K, V>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let g = self.lock_core();
+        f.debug_struct("SyncTtlCache")
+            .field("len", &g.len())
+            .field("capacity", &g.capacity())
+            .field("expired", &self.expired.load(Ordering::Relaxed))
+            .field("hits", &self.hits.load(Ordering::Relaxed))
+            .field("evictions", &self.evictions.load(Ordering::Relaxed))
+            .field(
+                "entries",
+                &g.iter().map(|(k, e)| (k, &e.value)).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
+    /// 构造。时钟注入同 [`TtlCache::new`]（生产 [`skeleton::clock::SystemClock`]，
+    /// 测试 [`skeleton::clock::MockClock`]）。`cap == 0` panic。
+    #[must_use]
+    pub fn new(clock: Arc<dyn Clock>, cap: usize) -> Self {
+        Self {
+            clock,
+            core: Mutex::new(LruCore::new(cap)),
+            expired: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        }
+    }
+
+    /// 锁入口：poison 即 panic 带因（fail-fast，见类型文档）。
+    fn lock_core(&self) -> MutexGuard<'_, LruCore<K, TtlEntry<V>>> {
+        self.core.lock().unwrap_or_else(|e| {
+            panic!(
+                "SyncTtlCache: 内部锁已 poison（持锁 panic 后 LRU 链不变量可能已破，禁静默续跑）: {e}"
+            )
+        })
+    }
+
+    /// 插入（逐条 TTL，expire-after-write）。覆盖已存在键=更新值+重置计时+
+    /// touch，不触发淘汰。`ttl == 0` panic、`now + ttl` 溢出 panic（fail-closed，
+    /// 取锁前校验——不投毒）。新键满插：先清过期（计入 [`Self::expired`]），
+    /// 仍满逐 LRU 尾（计入 [`Self::evictions`]）。
+    pub fn insert(&self, k: K, v: V, ttl: Duration) {
+        assert!(
+            !ttl.is_zero(),
+            "TtlCache::insert: ttl == 0 是恒过期条目（调用方 bug，fail-fast）"
+        );
+        let now = self.clock.now_instant();
+        let expires = now.checked_add(ttl).expect(
+            "TtlCache::insert: now + ttl 溢出 Instant 表示范围（fail-closed，clock armor 同款）",
+        );
+        let mut g = self.lock_core();
+        if g.idx_of(&k).is_none() && g.len() >= g.capacity() {
+            // 双界拍板：先过期先淘汰（单次 now 快照判定，确定性），仍满再逐 LRU 尾。
+            let now = self.clock.now_instant();
+            let purged = g.retain(|_, e| e.expires > now);
+            self.expired.fetch_add(purged as u64, Ordering::Relaxed);
+            // 埋点「TTL 过期驱逐（满插清扫）」：真回收才发（僵尸数+触发键指纹）。
+            #[cfg(feature = "log-embed")]
+            if purged > 0 {
+                embed_event!(
+                    debug,
+                    target: "skeleton::cache::evict",
+                    kind = "ttl_sweep",
+                    key_hash = key_fingerprint(&k),
+                    zombies = purged as u64
+                );
+            }
+            if g.len() >= g.capacity() {
+                // 埋点「容量淘汰」（TtlCache 站点）：被逐者恒 LRU 尾。
+                let _evicted = g.pop_lru();
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+                embed_event!(
+                    debug,
+                    target: "skeleton::cache::evict",
+                    kind = "capacity",
+                    key_hash = _evicted.as_ref().map(|(evicted, _)| key_fingerprint(evicted)),
+                    order = "lru_tail",
+                    len_at_evict = g.len() as u64
+                );
+            }
+        }
+        g.insert(k, TtlEntry { expires, value: v });
+    }
+
+    /// 读（touch + 惰性过期 + 命中计数）。过期条目按 miss（不计命中）。
+    pub fn get(&self, k: &K) -> Option<V>
+    where
+        V: Clone,
+    {
+        let now = self.clock.now_instant();
+        let mut g = self.lock_core();
+        if Self::expire_if_due(&mut g, &self.expired, k, now) {
+            return None;
+        }
+        let hit = g.get_mut(k).map(|e| e.value.clone());
+        if hit.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        hit
+    }
+
+    /// 读（不 touch + 惰性过期；无命中计数——纯读面）。
+    #[must_use]
+    pub fn peek(&self, k: &K) -> Option<V>
+    where
+        V: Clone,
+    {
+        let now = self.clock.now_instant();
+        let mut g = self.lock_core();
+        if Self::expire_if_due(&mut g, &self.expired, k, now) {
+            return None;
+        }
+        g.peek(k).map(|e| e.value.clone())
+    }
+
+    /// 物理存在判定（**含僵尸**：过期未回收条目也算在——不 touch 不判定过期）。
+    /// 活性判定走 [`Self::peek`]。
+    #[must_use]
+    pub fn contains(&self, k: &K) -> bool {
+        self.lock_core().idx_of(k).is_some()
+    }
+
+    /// 摘除并返回值（物理面：不判过期）。
+    #[must_use]
+    pub fn remove(&self, k: &K) -> Option<V> {
+        self.lock_core().remove(k).map(|e| e.value)
+    }
+
+    /// 逐出 LRU 尾（最旧；**物理面**：不判过期）。
+    #[must_use]
+    pub fn pop_lru(&self) -> Option<(K, V)> {
+        self.lock_core().pop_lru().map(|(k, e)| (k, e.value))
+    }
+
+    /// 显式清扫全部过期条目（arena 序确定遍历；单次 now 快照判定）。
+    /// 返回回收数，计入 [`Self::expired`]。
+    pub fn purge_expired(&self) -> usize {
+        let now = self.clock.now_instant();
+        let mut g = self.lock_core();
+        let n = g.retain(|_, e| e.expires > now);
+        self.expired.fetch_add(n as u64, Ordering::Relaxed);
+        // 埋点「purge」：显式清扫动作 info（回收数/残留）。
+        embed_event!(
+            info,
+            target: "skeleton::cache::purge",
+            purged = n as u64,
+            len_after = g.len() as u64
+        );
+        n
+    }
+
+    /// 累计惰性/清扫过期回收数（fail-visible：过期不是静默 None）。
+    #[must_use]
+    pub fn expired(&self) -> u64 {
+        self.expired.load(Ordering::Relaxed)
+    }
+
+    /// 物理条数（**含僵尸**——惰性过期语义下如实声明；活性面用读族 API）。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lock_core().len()
+    }
+
+    /// 空判定（物理面）。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lock_core().len() == 0
+    }
+
+    /// 容量上界（构造期定，不变）。
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.lock_core().capacity()
+    }
+
+    /// 累计命中数（get 触碰命中；过期触碰按 miss 不计；peek/contains 不计）。
+    #[must_use]
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// 累计容量淘汰数（满插逐尾才计；显式 remove/pop_lru 不计）。
+    #[must_use]
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
+    }
+
+    /// 惰性过期判定（语义同单线程版 [`TtlCache`]）：到期则回收+计数，返回
+    /// 是否回收。计数走 [`AtomicU64`] 单点（free fn 形：guard 与计数分属
+    /// 结构体字段，借参避免跨字段借用冲突）。
+    fn expire_if_due(
+        g: &mut LruCore<K, TtlEntry<V>>,
+        expired: &AtomicU64,
+        k: &K,
+        now: Instant,
+    ) -> bool {
+        let due = matches!(g.peek_mut(k), Some(e) if e.expires <= now);
+        if due {
+            g.remove(k);
+            expired.fetch_add(1, Ordering::Relaxed);
+            // 埋点「TTL 过期驱逐（惰性单条）」：触碰即回收留痕（键指纹+累计）。
+            #[cfg(feature = "log-embed")]
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "ttl",
+                key_hash = key_fingerprint(k),
+                expired_total = expired.load(Ordering::Relaxed)
             );
         }
         due

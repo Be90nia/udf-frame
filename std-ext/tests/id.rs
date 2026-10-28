@@ -354,3 +354,150 @@ fn burst_uniqueness_under_threads() {
         "2000 并发 id 无一重复（4 线程 < 4096 配额）"
     );
 }
+
+// ---- RandomId（UUIDv4 凭据级，`random` 门：关=本段编译消失、0 测试 exit 0）----
+//
+// 坑面 armor 对表 src/id.rs RandomId 段与调研报告域 4。真实 OS 熵（无虚拟
+// 钟/无替身）——概率断言余量均 ≥1e-10（碰撞面 RFC 9562 §6.7）。
+
+#[cfg(feature = "random")]
+mod v4_random {
+    use std::collections::HashSet;
+
+    use std_ext::id::{IdParseError, RandomId, RngError};
+
+    fn ver(id: RandomId) -> u128 {
+        (id.as_u128() >> 76) & 0xF
+    }
+
+    fn var(id: RandomId) -> u128 {
+        (id.as_u128() >> 62) & 0b11
+    }
+
+    // ---- 布局（RFC 9562 §4.2 逐位对表）----
+
+    #[test]
+    fn layout_matches_rfc9562_v4() {
+        for _ in 0..256 {
+            let id = RandomId::new().expect("os entropy available");
+            assert_eq!(ver(id), 0b0100, "ver=0100");
+            assert_eq!(var(id), 0b10, "var=10xx");
+            // 数值面往返（同 Id 形）。
+            assert_eq!(RandomId::from_u128(id.as_u128()), id);
+        }
+        // 连字形 ver/var nibble 落位（14 位='4'，19 位∈{8,9,a,b}）。
+        let s = RandomId::new().expect("os entropy available").to_string();
+        assert_eq!(s.len(), 36, "8-4-4-4-12 连字形：{s}");
+        assert_eq!(&s[14..15], "4", "version nibble 位置：{s}");
+        assert!(
+            matches!(s.chars().nth(19), Some('8' | '9' | 'a' | 'b')),
+            "variant nibble 位置：{s}"
+        );
+    }
+
+    // ---- 失败通道两态显式（fallback 在本域结构上不存在）----
+
+    #[test]
+    fn rng_failure_fails_closed_no_fallback() {
+        // 编译面钉死：失败通道只能是 Result<_, RngError>——禁 Option 化、
+        // 禁 panic 化、禁降级成功；实现仅 getrandom 一处熵源调用，弱熵回
+        // 退分支不存在。体量反证（弱熵/PID 级序列必撞）见下方唯一性测试。
+        fn two_state<T>(r: Result<T, RngError>) -> Result<T, RngError> {
+            r
+        }
+        let _ = two_state(RandomId::new());
+        let mut buf = [0u8; 16];
+        let _ = two_state(RandomId::fill(&mut buf));
+    }
+
+    // ---- 凭据不可预测面（issue#1-4 验收：连续 1e4 无重复 + 无时间前缀可推）----
+
+    #[test]
+    fn consecutive_ids_unique_10k() {
+        let ids: HashSet<_> = (0..10_000)
+            .map(|_| RandomId::new().expect("os entropy available"))
+            .collect();
+        assert_eq!(
+            ids.len(),
+            10_000,
+            "连续 1e4 枚无一重复（Debian/PID 级弱熵序列在此体量必撞）"
+        );
+    }
+
+    #[test]
+    fn credential_ids_have_no_guessable_fields() {
+        // v7 在前 48bit 面是 unix_ts_ms 时间前缀（单调可推，Netscape 型）；
+        // v4 同位置必须纯随机：16 枚连续 id 前缀两两互异且非单调递增。
+        let ids: Vec<_> = (0..16)
+            .map(|_| RandomId::new().expect("os entropy available"))
+            .collect();
+        let prefix = |id: &RandomId| (id.as_u128() >> 80) as u64;
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(prefix(a), prefix(b), "时间面前缀不得重源/复用");
+            }
+        }
+        let mut asc: Vec<_> = ids.iter().map(prefix).collect();
+        asc.sort_unstable();
+        assert_ne!(
+            ids.iter().map(prefix).collect::<Vec<_>>(),
+            asc,
+            "无单调时间前缀可推（v4=纯随机面，非 v7 时间序）"
+        );
+    }
+
+    // ---- 批量面（armor：批量走一次 fill 大 buffer）----
+
+    #[test]
+    fn batch_fill_single_syscall_path() {
+        // 批量合规路径：1e4 枚 id 的字节一次 fill 取齐（syscall 计数无法进
+        // 程内插桩，单调用结构由 API 形状与测试构造钉死）。
+        const BLOCKS: usize = 10_000;
+        let mut buf = vec![0xAAu8; BLOCKS * 16];
+        RandomId::fill(&mut buf).expect("os entropy available");
+        assert!(buf.iter().any(|&b| b != 0xAA), "buffer 必须被整段覆写");
+        let blocks: HashSet<_> = buf
+            .chunks_exact(16)
+            .map(|c| u128::from_be_bytes(c.try_into().expect("16B 块")))
+            .collect();
+        assert_eq!(
+            blocks.len(),
+            BLOCKS,
+            "1e4 个 16B 块无一重复（弱熵批量必撞）"
+        );
+        // 空 buffer 平凡成功（getrandom 契约边界）。
+        let mut empty: [u8; 0] = [];
+        RandomId::fill(&mut empty).expect("空 buffer 平凡 Ok");
+    }
+
+    // ---- 类型化字符串面（Display / FromStr 与 Id 同款）----
+
+    #[test]
+    fn display_and_fromstr_roundtrip_v4() {
+        for _ in 0..8 {
+            let id = RandomId::new().expect("os entropy available");
+            let s = id.to_string();
+            assert_eq!(s.len(), 36);
+            for (i, c) in s.chars().enumerate() {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    assert_eq!(c, '-', "连字位置：{s}");
+                } else {
+                    assert!(
+                        c.is_ascii_hexdigit() && !c.is_ascii_uppercase(),
+                        "全小写 hex：{s}"
+                    );
+                }
+            }
+            let back: RandomId = s.parse().expect("标准连字形必须可解析");
+            assert_eq!(back, id, "Display/FromStr 双向闭环");
+            let upper: RandomId = s.to_ascii_uppercase().parse().expect("大写 hex 可解析");
+            assert_eq!(upper, id, "hex 位大小写不敏感");
+        }
+        // 形状错误显式 Err（禁静默；Err=IdParseError，与 Id 同一套）。
+        assert_eq!(
+            "not-an-id".parse::<RandomId>(),
+            Err(IdParseError::Shape),
+            "段数/段长不符=Shape"
+        );
+    }
+}

@@ -6,10 +6,11 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use skeleton::clock::{Clock, MockClock, SystemClock};
-use std_ext::cache::{LruCache, TtlCache};
+use std_ext::cache::{LruCache, SyncLruCache, SyncTtlCache, TtlCache};
 
 // ═══ LruCache：LRU 精确语义 ═══
 
@@ -428,6 +429,232 @@ fn ttl_overflow_panics_state_intact() {
     assert_eq!(c.len(), 0, "panic 前未污染容器");
     c.insert("ok", 1, Duration::from_secs(1)); // 容器仍可用
     assert_eq!(c.get(&"ok"), Some(&1));
+}
+
+// ═══ Sync 并发面（bd c4v armor B3）：SyncLruCache / SyncTtlCache ═══
+//
+// 确定性纪律与串行面同源：键域按线程不相交 / 计数定律与交错序无关，使
+// 「N 线程×M 次并发后计数 == 串行定律值」可精确断言而非概率性容忍。
+
+// ---- armor B3①：读写共享面并发（Mutex 短临界区，无死锁无撕裂）----
+
+#[test]
+fn read_path_concurrent_with_write() {
+    const THREADS: u64 = 8;
+    const OPS: u64 = 256;
+    let c = Arc::new(SyncLruCache::new((THREADS * OPS) as usize)); // 容量≥键域：无淘汰干扰
+    thread::scope(|s| {
+        for t in 0..THREADS {
+            let c = c.clone();
+            s.spawn(move || {
+                for i in 0..OPS {
+                    let k = t * OPS + i; // 键域不相交 → 每 op 结果与交错序无关
+                    c.insert(k, i);
+                    assert_eq!(c.get(&k), Some(i), "自键插入后必命中");
+                    assert_eq!(c.get(&(k + THREADS * OPS)), None, "恒缺键必 miss");
+                }
+            });
+        }
+    });
+    // 串行等价（验收口径）：同 op 序列单线程重放 → 条目数逐位相等；
+    // 命中数定律值 = 每线程 OPS 次（自键先插后读，恒缺键永 miss，与序无关）。
+    let mut ser = LruCache::new((THREADS * OPS) as usize);
+    for t in 0..THREADS {
+        for i in 0..OPS {
+            let k = t * OPS + i;
+            ser.insert(k, i);
+            assert_eq!(ser.get(&k), Some(&i));
+        }
+    }
+    assert_eq!(c.len(), ser.len(), "并发条目数与串行等价");
+    assert_eq!(c.hits(), THREADS * OPS, "命中计数与串行口径等价");
+    assert_eq!(c.evictions(), 0);
+}
+
+// ---- armor B3③：命中/淘汰单一原子出处，并发口径==串行口径 ----
+
+#[test]
+fn hit_eviction_counters_single_source() {
+    const THREADS: u64 = 8;
+    const OPS: u64 = 256;
+    // ① 淘汰面（顺序无关定律）：新键满插恒逐一条 → evictions = 插入数 - cap，
+    //    条目守恒 len + evictions == 总插入数（单一出处的自洽面）。
+    let cap = 1024usize;
+    let par = Arc::new(SyncLruCache::new(cap));
+    thread::scope(|s| {
+        for t in 0..THREADS {
+            let par = par.clone();
+            s.spawn(move || {
+                for i in 0..OPS {
+                    par.insert(t * OPS + i, i);
+                }
+            });
+        }
+    });
+    let mut ser = LruCache::new(cap);
+    for k in 0..THREADS * OPS {
+        ser.insert(k, k % OPS);
+    }
+    assert_eq!(par.len(), ser.len(), "条目数与串行等价");
+    assert_eq!(par.evictions(), THREADS * OPS - cap as u64, "淘汰定律值");
+    assert_eq!(
+        par.len() + par.evictions() as usize,
+        (THREADS * OPS) as usize,
+        "单一出处守恒：条目+淘汰==总插入"
+    );
+}
+
+// ---- armor B3②：TTL 惰性 + 容量硬上界 + 显式维护入口，无后台线程 ----
+
+#[test]
+fn expired_entries_bounded_by_capacity_and_maintenance() {
+    const THREADS: u64 = 8;
+    const OPS: u64 = 64;
+    let cap = 64usize;
+    let clock = Arc::new(MockClock::new());
+    let c = Arc::new(SyncTtlCache::new(clock.clone(), cap));
+    thread::scope(|s| {
+        for t in 0..THREADS {
+            let c = c.clone();
+            s.spawn(move || {
+                for i in 0..OPS {
+                    // 冻结钟下永不过期：满插逐 LRU 尾（淘汰定律照常成立）
+                    c.insert(t * OPS + i, i, Duration::from_secs(3600));
+                }
+            });
+        }
+    });
+    assert_eq!(c.len(), cap, "容量硬上界：超容量并发插入后物理条数钉在 cap");
+    assert_eq!(c.evictions(), THREADS * OPS - cap as u64);
+    // 显式维护入口（purge_expired）：时间越过全部 TTL → 清扫归零（fail-visible）
+    clock.advance(Duration::from_secs(7200));
+    assert_eq!(c.purge_expired(), cap);
+    assert_eq!(c.expired(), cap as u64);
+    assert_eq!(c.len(), 0);
+    assert!(c.is_empty());
+}
+
+// ---- armor B3④：poison = fail-fast panic 带因（拍板：禁静默续跑）----
+
+#[test]
+fn poisoned_lock_fails_visible() {
+    // Drop 炸弹：被逐值在临界区内析构 panic → poison。armed 标志保证只有
+    // 被逐的旧值起爆（新值随 unwind 再爆 = double panic abort，测试自身躲开）。
+    struct Boom(bool);
+    impl Drop for Boom {
+        fn drop(&mut self) {
+            if self.0 {
+                panic!("boom inside lock");
+            }
+        }
+    }
+
+    let c = SyncLruCache::new(1);
+    c.insert("a", Boom(true));
+    let r = catch_unwind(AssertUnwindSafe(|| c.insert("b", Boom(false))));
+    assert!(r.is_err(), "持锁 panic 应原样爆出");
+    let r = catch_unwind(AssertUnwindSafe(|| c.len()));
+    assert!(r.is_err(), "poison 后任何访问必须 fail-fast，禁静默续跑");
+    let msg = r
+        .unwrap_err()
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(msg.contains("poison"), "poison panic 必须带因: {msg:?}");
+
+    // TtlCache 同一 poison 面（独立锁路径）：机制逐字一致。
+    let clock = Arc::new(MockClock::new());
+    let t = SyncTtlCache::new(clock, 1);
+    t.insert("a", Boom(true), Duration::from_secs(1));
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        t.insert("b", Boom(false), Duration::from_secs(1));
+    }));
+    assert!(r.is_err(), "TtlCache 持锁 panic 应原样爆出");
+    let r = catch_unwind(AssertUnwindSafe(|| t.len()));
+    assert!(r.is_err(), "TtlCache poison 后访问必须 fail-fast");
+}
+
+// ---- 调用期校验在取锁前：fail-closed 不投毒（与 poison 面区分）----
+
+#[test]
+fn sync_ttl_invalid_ttl_panics_without_poison() {
+    let clock = Arc::new(MockClock::new());
+    let c = SyncTtlCache::<&str, i32>::new(clock, 2);
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        c.insert("k", 1, Duration::ZERO);
+    }));
+    assert!(r.is_err(), "ttl==0 fail-fast（同单线程版）");
+    assert_eq!(c.len(), 0, "panic 前未污染容器");
+    c.insert("k", 1, Duration::from_secs(1)); // 未投毒：照常可用
+    assert_eq!(c.get(&"k"), Some(1));
+}
+
+// ---- armor B3⑤：get 过期按 miss（TOCTOU 面永不为 hit）----
+
+#[test]
+fn expired_entry_never_returned_as_hit() {
+    let clock = Arc::new(MockClock::new());
+    let c = SyncTtlCache::new(clock.clone(), 4);
+    c.insert("k", 1, Duration::from_millis(100));
+    assert_eq!(c.get(&"k"), Some(1));
+    assert_eq!(c.hits(), 1);
+    clock.advance(Duration::from_millis(150));
+    assert_eq!(c.get(&"k"), None, "过期条目永不为 hit");
+    assert_eq!(c.hits(), 1, "过期触碰按 miss，命中计数不动");
+    assert_eq!(c.expired(), 1, "惰性回收 fail-visible 计数");
+}
+
+// ---- 验收：TTL 过期语义与单线程版一致（同一 MockClock 时间线逐点对表）----
+
+#[test]
+fn sync_ttl_semantics_parity_with_serial() {
+    // Clock: Send+Sync 使同一 Arc<dyn Clock> 可同时注入串行/并发两面：
+    // 同一时间线，逐点断言两面可观测结果一致。
+    let clock = Arc::new(MockClock::new());
+    let mut ser = TtlCache::new(clock.clone(), 2);
+    let syn = SyncTtlCache::new(clock.clone(), 2);
+
+    ser.insert("a", 1, Duration::from_millis(100));
+    syn.insert("a", 1, Duration::from_millis(100));
+    clock.advance(Duration::from_millis(99));
+    assert_eq!(ser.get(&"a"), Some(&1));
+    assert_eq!(syn.get(&"a"), Some(1), "到期前（99<100）活：两面一致");
+
+    ser.insert("b", 2, Duration::from_millis(100));
+    syn.insert("b", 2, Duration::from_millis(100));
+    clock.advance(Duration::from_millis(1)); // t=100：a 恰到期（<=now 判过期）
+    assert_eq!(ser.get(&"a"), None);
+    assert_eq!(syn.get(&"a"), None, "恰到期惰性回收：两面一致");
+    assert_eq!(ser.expired(), 1);
+    assert_eq!(syn.expired(), 1);
+
+    clock.advance(Duration::from_millis(100)); // t=200：b 到期
+    assert_eq!(ser.get(&"b"), None);
+    assert_eq!(syn.get(&"b"), None);
+    // 覆盖重置计时（expire-after-write）：僵尸键重写复活
+    ser.insert("b", 20, Duration::from_millis(100));
+    syn.insert("b", 20, Duration::from_millis(100));
+    clock.advance(Duration::from_millis(99));
+    assert_eq!(ser.get(&"b"), Some(&20));
+    assert_eq!(syn.get(&"b"), Some(20), "覆盖重置计时：两面一致");
+
+    ser.insert("d", 4, Duration::from_millis(100)); // cap=2：b+d 满
+    syn.insert("d", 4, Duration::from_millis(100));
+    clock.advance(Duration::from_millis(200)); // t=499：b/d 双僵尸（惰性驻留）
+    assert_eq!(ser.len(), 2, "僵尸占容如实声明");
+    assert_eq!(syn.len(), 2);
+    ser.insert("c", 3, Duration::from_millis(100)); // 满插：先清过期再插
+    syn.insert("c", 3, Duration::from_millis(100));
+    assert_eq!(ser.len(), 1);
+    assert_eq!(syn.len(), 1, "满插清扫僵尸：两面一致");
+    assert_eq!(ser.get(&"b"), None);
+    assert_eq!(syn.get(&"b"), None);
+    assert_eq!(ser.get(&"c"), Some(&3));
+    assert_eq!(syn.get(&"c"), Some(3));
+    assert_eq!(ser.expired(), 4); // a、b 惰性各 1 + 满插清扫 b/d 共 2
+    assert_eq!(syn.expired(), 4, "过期计数与串行等价");
+    assert_eq!(ser.purge_expired(), 0);
+    assert_eq!(syn.purge_expired(), 0, "活键不被清扫：两面一致");
 }
 
 // ── log-embed 埋点（cache 事件点红绿；键身份以 DefaultHasher 定长种子指纹

@@ -637,7 +637,8 @@ fn retry_stop_verdicts_are_info() {
     // 预算耗尽：带 elapsed 字段（退避线性 100+200=300ms 越过 150ms 预算，
     // 第 3 次失败后停）。
     let policy3 = RetryPolicy::new(10, Duration::from_millis(100), Duration::from_secs(10))
-        .with_budget(Duration::from_millis(150));
+        .with_budget(Duration::from_millis(150))
+        .with_jitter(|d| d); // bd 514 授权边界：恒等源保 elapsed_ms 确定断言
     let res3 = retry_if(|| Err::<u32, &str>("e"), &policy3, &clock, |_| true);
     assert!(res3.is_err());
     cap.assert_event(

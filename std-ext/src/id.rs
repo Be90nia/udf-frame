@@ -1,6 +1,8 @@
 //! UUIDv7 确定性变体：时间有序 id 生成（RFC 9562 §5.7 布局逐位对表）。
 //!
-//! 常驻零依赖件：纯 std，无 feature 门。时间面复用 [`skeleton::clock`] 挂钟面
+//! 主体常驻零依赖：纯 std，无 feature 门；唯一例外是 `random` 门后的凭据
+//! 级 `RandomId`（UUIDv4，getrandom 底座，默认关=不进树，见文件尾段）。
+//! 时间面复用 [`skeleton::clock`] 挂钟面
 //!（`now_system` → 48bit `unix_ts_ms`），机器指纹由采用方注入（推荐
 //! [`std_ext::hash::stable64`] 派生，本域不绑定派生方式）。
 //!
@@ -371,4 +373,151 @@ fn assemble(ms: u64, counter: u16, fingerprint: u64) -> u128 {
         | (u128::from(counter) << 64)
         | (0b10u128 << 62)
         | u128::from(fingerprint & MASK62)
+}
+
+// ── RandomId（UUIDv4 凭据级，`random` feature 门：关=本段整体编译消失）──
+//
+// 选型分野：v7 [`Id`] = 排序友好事件 id（时间面前缀可推、同指纹严格递增）；
+// `RandomId` = 凭据/令牌（不可预测优先，无序无结构）。
+
+/// OS CSPRNG 不可用（[`getrandom::Error`] 直通；两态显式，禁自造「降级成
+/// 功」——Netscape/Debian/Android 三事故全是弱熵回退产物）。
+#[cfg(feature = "random")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RngError(getrandom::Error);
+
+#[cfg(feature = "random")]
+impl fmt::Display for RngError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "os csprng unavailable: {}", self.0)
+    }
+}
+
+#[cfg(feature = "random")]
+impl std::error::Error for RngError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[cfg(feature = "random")]
+impl From<getrandom::Error> for RngError {
+    fn from(e: getrandom::Error) -> Self {
+        Self(e)
+    }
+}
+
+/// 凭据级随机 id（UUIDv4，RFC 9562 §4.2）：除 `ver=0100`/`var=10` 位面外
+/// 122 位纯随机（OS CSPRNG 直通），无时间/PID 等任何可推明文面。与时间
+/// 有序的 [`Id`]（v7）选型：要排序/事件时间线 → [`Id`]；要不可预测（凭
+/// 据、令牌、secret 关联号）→ 本类型。
+///
+/// # 红线
+///
+/// - **凭据 id 禁时间/PID 位面**：Netscape SSL（1995）、Debian OpenSSL
+///   （2008, CVE-2008-0166）、Android SecureRandom（2013）三事故全是弱熵/
+///   可推熵产物——本类型除 ver/var 位面外无任何结构化字段，也没有非随机
+///   回退路径；
+/// - **失败 fail-closed**：[`RandomId::new`]/[`RandomId::fill`] 直通 OS
+///   CSPRNG，填不满即 [`RngError`]，无任何弱熵回退；
+/// - **阻塞语义**：early-boot（含 VM 冷启）下 OS 熵池可能未就绪，getrandom
+///   恒选阻塞（数秒到一分钟以上）；本域不提供非阻塞选项——怕阻塞就把生
+///   成挪到熵就绪之后，禁换弱熵源；
+/// - **禁池化**：预生成池+复用 = 熵摊薄，一个池泄漏即全体泄漏；批量需求
+///   走 [`RandomId::fill`] 一次取整 buffer（唯一合规性能路径）。
+///
+/// 字符串面/数值面与 [`Id`] 同形：RFC 9562 §5.1 标准连字形
+///（[`std::fmt::Display`] 出 / [`std::str::FromStr`] 入，hex 位大小写不
+/// 敏感）+ [`RandomId::as_u128`]/[`RandomId::from_u128`] 数值面往返。值语
+/// 义（`Copy`）。
+///
+/// # Examples
+///
+/// ```
+/// use std::str::FromStr;
+///
+/// use std_ext::id::RandomId;
+///
+/// let id = RandomId::new().unwrap();
+/// assert_eq!((id.as_u128() >> 76) & 0xF, 4, "ver=0100");
+/// assert_eq!((id.as_u128() >> 62) & 0b11, 0b10, "var=10");
+/// let s = id.to_string();
+/// assert_eq!(s.len(), 36, "8-4-4-4-12 标准连字形：{s}");
+/// assert_eq!(RandomId::from_str(&s).unwrap(), id, "字符串面往返");
+/// ```
+///
+/// # 坑面 armor（每坑一测，见 `tests/id.rs` `v4_random` 段；坑面对表调研
+/// 报告域 4：docs/research/consumer-feedback-pitfalls.md）
+///
+/// | 坑 | 堵法 | 测试名 |
+/// |---|---|---|
+/// | 失败自造弱熵回退（时间戳/PID 兜底） | 只走 OS CSPRNG，Err fail-closed，无 fallback 分支 | `rng_failure_fails_closed_no_fallback`（两态签名钉死）+ 唯一性体量测试反证弱熵 |
+/// | id 位面混入时间/PID → 可预测（Netscape 型） | 122 位纯随机，无明文面 | `credential_ids_have_no_guessable_fields` |
+/// | ver/var 位面写错/端序漂移 | 位面常量集中装配 + §4.2 逐位对表 | `layout_matches_rfc9562_v4` |
+/// | early boot 阻塞语义未声明 | 本节红线（getrandom 恒选阻塞） | 文档红线（无测试，同 v7 表先例） |
+/// | 批量场景 N 次 syscall | `fill` 一次取整 buffer | `batch_fill_single_syscall_path` |
+///
+/// 不采纳：`fast-rng` 类加速（安全面禁换非 CSPRNG 熵源）、池化复用（熵摊
+/// 薄）。
+#[cfg(feature = "random")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RandomId(u128);
+
+#[cfg(feature = "random")]
+impl RandomId {
+    /// 生成一枚 v4 随机 id：OS CSPRNG 直通（可能阻塞，见类型红线），失败
+    /// 即 [`RngError`]——无任何弱熵回退。
+    pub fn new() -> Result<Self, RngError> {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes)?;
+        Ok(Self(assemble_v4(bytes)))
+    }
+
+    /// 批量面：一次 OS CSPRNG 调用填满 `dest`（N 枚 id = 一次 `16·N` 字节
+    /// fill，禁 N 次单枚调用，禁预生成池）。`dest` 两态落地：`Ok` 全填；
+    /// `Err` 按 getrandom 契约视为已消费，禁读。
+    pub fn fill(dest: &mut [u8]) -> Result<(), RngError> {
+        Ok(getrandom::fill(dest)?)
+    }
+
+    /// 数值面（持久化编码/位面诊断用；位布局见类型文档）。
+    #[must_use]
+    pub const fn as_u128(self) -> u128 {
+        self.0
+    }
+
+    /// 自数值面装配（回放/跨进程迁移侧用；形状不校验——数值面是透明
+    /// 载体，位语义归消费方）。
+    #[must_use]
+    pub const fn from_u128(value: u128) -> Self {
+        Self(value)
+    }
+}
+
+#[cfg(feature = "random")]
+impl fmt::Display for RandomId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // 字符串面与 Id 同机械（§5.1 连字形与版本位面无关），禁第二份实现。
+        fmt::Display::fmt(&Id::from_u128(self.0), f)
+    }
+}
+
+#[cfg(feature = "random")]
+impl std::str::FromStr for RandomId {
+    type Err = IdParseError;
+
+    /// 解析 RFC 9562 §5.1 标准连字形（同 [`Id`]：hex 大小写不敏感、段数/
+    /// 段长逐位对表 8-4-4-4-12、形状不校验 ver/var 位）。
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        <Id as std::str::FromStr>::from_str(s).map(|id| Self(id.as_u128()))
+    }
+}
+
+/// RFC 9562 §4.2 位面装配：ver=0100/var=10 常量集中在此（禁散落，同 v7
+/// `assemble` 先例）；其余 122 位 = OS CSPRNG 原样，无任何结构化明文。
+#[cfg(feature = "random")]
+fn assemble_v4(mut bytes: [u8; 16]) -> u128 {
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    u128::from_be_bytes(bytes)
 }
