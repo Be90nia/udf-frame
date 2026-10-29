@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### Added（`skeleton::lint` 配置后处理阶段编排：TypeId 键注册表 + 锁外执行，2026-10-29；GitHub issue#4）
+- `skeleton::lint`（零依赖、零 feature 门、**零领域类型**）：`LintStage<C>`（`name()` + `run(&mut C)`，`Send + Sync` 硬约束）/ `LintError`（私有字段 + `new` 受控构造，`stage` 归属由编排器补，已带归属的不覆盖）/ `register_stage` / `clear_stages` / `registered_stages`（`#[must_use]`，诊断读数）/ `post_process`；全 `C: 'static`（`TypeId` 键，借用型配置**编译期**拒绝——`compile_fail,E0310` doctest 钉死）。
+- 语义：注册序执行（名单同序）；首个 `Err` 短路（已发生的改写保留）；空表 `Ok(())`；阶段拿 `&mut C` **可改写**；不同 `C` 表隔离；阶段在注册表**锁外**执行——体内可 `register_stage`、可递归 `post_process`（快照语义：本次注册下次生效；同类型递归合法但无防护，阶段自设终止条件）；阶段 panic 原样传播（不 `catch_unwind`、不吞）。
+- 析构纪律：清场时被移除槽位的**阶段 `Drop` 在锁外执行**（`lock(..).remove(..)` 的链式写法会把返回值析构拖进锁内——两步式 `let removed = …; drop(removed);`），负向对照测试（阶段 `Drop` 内重入注册 → 若锁内析构即 5s 超时判败）钉死。
+- 内存/性能：槽位 `Arc<Vec<Arc<dyn LintStage<C>>>>`，改写走注册期 `Arc::make_mut` ⇒ `post_process` 稳态**零堆分配**（事件计数锚 `tests/lint_alloc.rs` 0/1/3 阶段各 1000 拍断言 0 事件 + example dim1 补 5 阶段；均带仪器自检）；release 实测 0 阶段 **17.0ns** / 1 阶段 **28.0ns** / 5 阶段 **38.3ns**，每阶段边际 **2.28–2.67ns**（1→1000 阶段近线性，漂移 17%），~20µs 级阶段 4 线程 **4.12x**（锁不持在执行期）。
+- 锁策略实测裁决：读路径 `RwLock` 读锁（vs `Mutex` 同口径：空表 4 线程 0.21x→0.30x，未争用 ns 持平）——**采用 RwLock**；无阶段多线程空转吞吐（4 线程 ~0.30x）登记为结构性上限（全局注册表一次共享读锁 + 一次原子自增，绝对成本 ~百 ns 级，调用点 = 配置装载一次），规避路写在收窄声明。`Mutex` 前值留档 `verify/2026-10-29-lint-lock-showdown/`（含可回滚 `lint.rs.mutex.bak`），非当前树可复跑。
+- 锁中毒：锁内只做 map 查找 / `Arc` 克隆 / `Vec` 追加 / 槽位移除（**含析构在内的用户代码一律锁外**）⇒ `PoisonError::into_inner` 恢复有真毒化测试覆盖（`lint::tests::registry_recovers_from_a_poisoned_lock`）。
+- 外部踩坑对表（模块 doc armor 11 条）：锁内跑用户回调=真死锁（tauri-apps/plugins-workspace#3394）/ 每拍 clone 整表=每拍一次分配（`global_registry` 形态 + 本仓 `notify` 前例）/ `TypeId` 仅进程内有效禁持久化 / 全局态与 libtest 并行线程隔离（每测试私有 newtype `C`）/ 锁中毒不报废注册表 / 错误阶段归属 / 快照可见性 / inventory-linkme 链接期注册顺序不可控 / 锁类型实测选出。
+- 收窄：无单点卸载（整表 `clear_stages`，单点撤销自带 `Arc` 句柄+开关位）、无优先级/依赖排序（只有注册序）、`name()` 不校验唯一。
+- 验证：`tests/lint.rs` 19 测试（五条语义 + 重入注册/递归/panic/类型隔离/并发执行/并发注册/清场/清场不取消在飞那拍/析构重入/析构 panic，每测试私有 newtype 可并行）+ `tests/lint_alloc.rs` 4 测试（含仪器自检，计数与门同为本线程 TLS）+ `examples/lint_multidim.rs` 七维采集器（单批读数原文 `verify/2026-10-29-lint-fix-round/example.txt`）；外部 crate 视角 `verify/consumer-sim` 编译+运行绿（反例 `LintError` 裸构造 → E0451 具鉴别力）。
+
 ### Added（整秒定宽形 `format_rfc3339_seconds`：账本字节稳定时间戳，2026-10-28；GitHub issue#3）
 - `std-ext/clock::rfc3339` 新增 `format_rfc3339_seconds(SystemTime) -> String`：恒 `YYYY-MM-DDTHH:MM:SSZ` 20 字节定宽，亚秒截断（向过去取整，与 parse 对 >9 位小数的截断同向）；字节稳定契约——同秒任意亚秒恒同一字节序列，消费方追加型日志/账本 4 处自持格式化可换芯；排序性质升级为全 era 字典序==时间序（定宽，无 `format_rfc3339` 的「同 frac 位数」前提）。实现与 `format_rfc3339` 共享单源日期时间写入核（审计 F6.1 禁拷贝链）；既有 `format_rfc3339`/parse 语义与断言零改动，表示域/越界 fail-closed panic 同款。
 

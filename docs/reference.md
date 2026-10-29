@@ -1522,6 +1522,123 @@ ConfigFile::save(&cfg, "app.json").unwrap();     // Pretty + 原子写
 
 ---
 
+## lint — 配置后处理阶段编排
+
+**feature**：常驻，零 feature 门。**依赖面**：纯 std。住契约层（`skeleton::lint`）：消费形态是「拿到配置结构体后跑校验」，无 IO / 无线程池 / 无计时器——采用方单开 `udf-skeleton` 即可用，不必为配置校验把运行时拖进依赖树（判据同 `skeleton::config`）。
+
+### 契约面
+
+```rust
+pub trait LintStage<C>: Send + Sync {
+    fn name(&self) -> &'static str;                        // 诊断名单 + 错误归属
+    fn run(&self, cfg: &mut C) -> Result<(), LintError>;   // 锁外执行；可改写 cfg
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LintError { /* stage: Option<&'static str>, message: String */ }
+impl LintError {
+    pub fn new(message: impl Into<String>) -> Self;        // stage 由编排器补齐
+    pub fn stage(&self) -> Option<&'static str>;
+    pub fn message(&self) -> &str;
+}
+impl std::fmt::Display for LintError {}                    // "{stage}: {message}" / "{message}"
+impl std::error::Error for LintError {}
+
+pub fn register_stage<C: 'static>(stage: Arc<dyn LintStage<C>>);
+pub fn clear_stages<C: 'static>();                             // 槽位立即出表；阶段对象随最后一份在飞快照析构（锁外）
+#[must_use]
+pub fn registered_stages<C: 'static>() -> Vec<&'static str>;   // 注册序，重复名原样保留（诊断面）
+pub fn post_process<C: 'static>(cfg: &mut C) -> Result<(), LintError>;
+```
+
+一次调用的四步：查表（`REGISTRY` 未初始化 → 直接 `Ok`，连锁都不碰）→ 快照（读锁内 `get` + `Arc::clone`，仅原子自增，随即放锁）→ 锁外按注册序执行 → 首个 `Err` 短路并补归属。
+
+### 语义契约（`tests/lint.rs` 逐条钉死）
+
+| 语义 | 测试 |
+|---|---|
+| 空表 → `Ok(())`；注册表未初始化连锁都不碰 | `empty_registry_is_ok` |
+| 按注册序执行；名单同序；重复名原样（无去重、不校验唯一性） | `stages_run_in_registration_order` / `duplicate_names_are_reported_verbatim` |
+| 首个 `Err` 短路（后续不跑，已发生的改动保留） | `first_error_short_circuits_and_keeps_prior_mutations` |
+| 阶段可改写配置（`&mut C`，不只校验） | `stages_can_rewrite_config` |
+| 类型隔离（不同 `C` 的阶段表互不可见） | `registries_are_isolated_per_config_type` |
+| 错误归属：`stage` 为空则补失败阶段名；`Display` = `"stage: message"` | `orchestrator_fills_missing_stage_attribution` |
+| 已带归属不覆盖（嵌套 `post_process` 的错误不被外层顶替） | `nested_error_keeps_its_own_stage_attribution` |
+| 阶段体内注册 = 下一拍才生效（快照语义），且不死锁 | `reentrant_registration_is_snapshot_scoped` |
+| 阶段体内可递归 `post_process` 其他类型 | `stage_can_recursively_post_process_other_types` |
+| 阶段 panic 原样传播；注册表与全局锁不受影响 | `stage_panic_propagates_and_registry_survives` |
+| 阶段**不被独占锁串行化**（barrier：两线程同时在场；覆盖 `RwLock` 读侧并行，**不**鉴别「锁外执行」——读锁共享，锁持在快照期也凑得齐） | `stages_are_not_serialized_by_an_exclusive_lock` |
+| 阶段 `Drop` 可重入注册表（= 锁外析构的鉴别证据：体内要拿写锁） | `stage_drop_can_reenter_registry` |
+| 阶段 `Drop` 内 panic 原样传播，注册表仍可读写 | `stage_drop_panic_leaves_registry_usable` |
+| 锁中毒恢复（持写 guard 时 panic 真毒化 → `into_inner` 后仍可读写） | `lint.rs` 内 `#[cfg(test)] mod tests::registry_recovers_from_a_poisoned_lock` |
+| 同类型递归合法但无防护（终止条件由阶段自设） | `same_type_recursion_is_allowed_and_self_limited` |
+| `clear_stages` 不取消在飞那一拍；下一拍不再执行该阶段 | `clear_stages_does_not_cancel_the_in_flight_tick` |
+| 并发 `post_process`（4 线程 × 200 拍，各自实例）全成功 | `concurrent_post_process_over_distinct_configs` |
+| 8 线程并发注册不丢阶段 | `concurrent_registration_keeps_every_stage` |
+| `clear_stages` 后名单空、不再跑阶段、幂等 | `clear_stages_empties_registry_and_stops_running` |
+
+### 坑面 armor（生态事实 → 处置，11 条，doc 与测试双处声明）
+
+| 生态事实 | 本件处置 |
+|---|---|
+| 锁内跑用户回调 = 真实死锁（tauri-apps/plugins-workspace#3394；std `Mutex`/`RwLock` 皆非重入） | 锁内只做 `get` + `Arc::clone`，快照后放锁；阶段可在体内注册 / 递归调用。鉴别证据 = 体内要拿锁的那两条（`reentrant_registration_is_snapshot_scoped` / `stage_drop_can_reenter_registry`） |
+| **`Drop` 也是用户代码**（析构可再入锁 → 语句临时量逆序析构会把最后一个阶段的 `Drop` 拖进写锁内） | `clear_stages` 两步式：`remove` 的返回值出锁后再 `drop`（`stage_drop_can_reenter_registry`）；`Drop` 内 panic 原样传播不污染注册表（`stage_drop_panic_leaves_registry_usable`） |
+| 每次调用 clone 整表（生态 `get_cloned`）→ 每拍一次堆分配（本仓 `notify` 曾因每拍 `collect` 被修，CHANGELOG 5753834） | 槽位存 `Arc<Vec<..>>`，改写走 `Arc::make_mut`（COW 只在**注册期**、且只在有在飞快照时克隆）；`post_process` 只原子自增 → 稳态零堆分配 |
+| `TypeId` 要求 `'static`，且跨编译单元不稳定（std 文档） | 全部入口 `C: 'static`；**键仅进程内有效**（禁持久化 / 跨进程）；借用型 `C` 由 `compile_fail` doctest 钉住编译期拒绝 |
+| 全局可变状态 + 并行测试线程 = flaky（Rust Internals「Global Registration」；`serial_test` 存在即证据） | 测试隔离靠**不同 `C` 类型**（每测试私有 newtype）+ 同类型内 `clear_stages`，测试仍并行跑 |
+| 锁中毒让注册表永久不可用（生态 `global_registry` 直接返回 `LockError` = 静默退化） | `lock().unwrap_or_else(PoisonError::into_inner)` 恢复（锁内无可撕裂状态）；真毒化覆盖在 crate 内 `lint::tests::registry_recovers_from_a_poisoned_lock`（公开 API 造不出毒化），doc 写明理由 |
+| 错误只带 message → 排障不知哪个阶段 | `LintError.stage` 由编排器按失败阶段 `name()` 补；已带归属不覆盖 |
+| 运行期注册的可见性未写明 → 使用方以为立即生效 | 文档 + `reentrant_registration_is_snapshot_scoped` 双处声明「快照语义」 |
+| 编译期/链接期注册（inventory / linkme）需 `#[ctor]` 式构造，链接序不可控、无运行期动态注册 | 选运行期注册表（`OnceLock` + `RwLock`）；代价 = 每拍一次全局读锁 + 一次原子自增 |
+| 锁类型（`Mutex` vs `RwLock`）不是口味 | 实测选出 `RwLock`（快照走共享读锁、注册/清场走独占写锁）；对照与前值留档 `verify/2026-10-29-lint-lock-showdown/`（前值**非当前树可复跑**），见下「锁策略对决」 |
+| 阶段 panic | 不 `catch_unwind`、不吞——原样传播；锁不在执行期持有故不毒化全局态 |
+
+`OnceLock` 而非 `LazyLock`：需要「从未注册」这个**可区分状态**——`post_process` 走 `REGISTRY.get() == None` 直接返回，连锁都不碰（快路径零成本）。
+
+### 收窄声明
+
+- 无卸载语义：只能整表 `clear_stages`（单点撤销请自带 `Arc` 句柄 + 开关位）。
+- 无优先级 / 分组 / 依赖排序：唯一顺序 = 注册序。
+- **同类型递归无防护**：阶段体内 `post_process::<C>` 合法（不死锁）但会重跑本阶段，终止条件由阶段自设（无界递归 = 栈溢出，不是 `Err`）。
+- `name()` 不做唯一性校验：重复名合法，排障按注册序列数位。
+- 注册表自身线程安全；**`C` 不必 `Send`**——跨线程并发时由调用方保证各自 `&mut C` 独占。
+- **无阶段时的多线程吞吐是显式登记的上限**：读路径 = 一次全局读锁 + 一次原子自增（~17 ns/拍，本批 17.0），0 阶段 4 线程只有 ~0.30x（全局锁争用退化）。高吞吐采用方两条路：①各自 config 类型分槽（表按 `TypeId` 天然隔离，不同 `C` 不争同一把锁）；②每拍不必重复 lint（配置装载一次跑一次）。**不提供** per-线程表缓存 / generation 计数器：TLS 缓存会让旧快照滞留每线程，内存维度受损，而调用点是配置装载期冷路径。
+
+### 实测（**单批运行**：2026-10-29，本机 16 逻辑核，Windows 10 x64 / rustc 1.96.0；`cargo run --release -p udf-skeleton --example lint_multidim`；std `Instant` 粗测）
+
+口径：**一次干净运行**，原文留档 `verify/2026-10-29-lint-fix-round/example.txt`——本表所有数字以该文件为准。粗测数字供判级、不供微基线；跨批次比较前先看漂移量级（同机同 example 正常波动 10%~30%）。
+
+| 维度 | 读数（`RwLock` 版） |
+|---|---|
+| 稳态分配事件（0 / 1 / 3 / 5 阶段，100k 拍窗内计数） | 全档 **0.00 事件/次**（阶段命中 0 / 100k / 300k / 500k，证明阶段真跑到而非空表假零） |
+| `post_process` ns/次 | 空表 **17.0**、1 阶段 **28.0**、5 阶段 **38.3** |
+| `register_stage` ns/次（`Arc` 构造在计时外） | 39.1（写锁路径，不受读侧改造影响） |
+| `registered_stages`（10k 名，含名单 `Vec` 分配，诊断面） | **~24–52 µs**（本批 49.6；含 10k 名 `Vec` 分配，**方差大，不供微基线**） |
+| 规模梯度 1 / 10 / 100 / 1000 阶段 | 28.0 / 49.7 / 254.9 / 2656.2 ns/次；**边际 2.41 → 2.28 → 2.67 ns/阶段（10→100 段 vs 100→1000 段漂移 17%，近线性）** |
+| 并发吞吐（~20 µs 计算阶段，锁成本 <1%） | 1 / 2 / 4 线程 = 1.00x / 2.06x / **4.12x**（锁不持在阶段执行期 → 用户代码真并行） |
+| 并发吞吐（空阶段，30 ns 级任务） | 1 → 4 线程退化到 **0.30x**（32.8 → 9.98 Mops/s；2 线程 0.32x）：**每拍一次全局读锁的已知争用上限**——用「稳态零分配 + 锁外执行」换来的取舍；高吞吐两条路见「收窄声明」末条 |
+| panic 后可用性 | panic 传播到调用方；清场后一次正常调用 29.2 ns，注册表未被毒化 |
+
+分配锚回归（事件计数，窗内本线程）：`tests/lint_alloc.rs` —— 1 阶段 / 3 阶段 / 零注册三类各 1000 拍断言 **0 事件**，另带仪器自检（窗内 `Vec::with_capacity` 必须计 1，防「分配器没挂上」的假绿）；门上计数与门**同为本线程 TLS**（跨线程互不污染），故连跑 10 次无需串行闸。
+
+### 锁策略对决（Mutex vs RwLock，2026-10-29）
+
+判据：**未争用 ns 锚**（0/1/5 阶段）变化 ≤10% **且** 空阶段 4 线程吞吐明显更好 → 取 `RwLock`；否则保留 `Mutex`。
+
+**前值出处（可复现性如实声明）**：`Mutex` 侧数字取自对决记录 `verify/2026-10-29-lint-lock-showdown/`（含 `lint.rs.mutex.bak` = Mutex 版完整源码、`example-rwlock-final.txt` = 当次 RwLock 版输出、`README.md` = 取值范围与结论），**非当前树可复跑**——当前树只有 `RwLock` 版，直接复跑只能得到后值；要重现前值须先 `cp verify/2026-10-29-lint-lock-showdown/lint.rs.mutex.bak skeleton/src/lint.rs`。
+
+| 维度 | `Mutex`（前，取自对决记录） | `RwLock`（后；括号内为本批单批读数） | 结论 |
+|---|---|---|---|
+| 空阶段 4 线程 | 0.21x | **0.27~0.31x**（本批 0.30x） | **+25%~27%，明显更好** |
+| `post_process` 0 阶段 | 17.3~17.4 ns | 17.1 ns（本批 17.0） | 略好 |
+| `post_process` 1 阶段 | 28.2~30.6 ns | 29.3 ns（本批 28.0） | +3.2%（<10%） |
+| `post_process` 5 阶段 | 37.6~37.8 ns | 37.9 ns（本批 38.3） | 持平 |
+| 计算阶段 4 线程 | 3.88~3.96x | 3.89~4.11x（本批 4.12x） | 持平 |
+
+结论：**采用 `RwLock`**（快照走共享读锁、注册/清场走独占写锁，毒化恢复两侧同走 `PoisonError::into_inner`）。2 线程仍退化、4 线程改善有限——因为瓶颈不是「读互斥」而是**同一缓存行上的原子 RMW 争用**，这是全局注册表的结构性上限，不是锁类型的锅；再往上要么分槽要么不每拍 lint。
+
+---
+
 ## fx — 异步并发托管
 
 **feature**：`tokio`。**依赖面**：tokio（JoinSet/oneshot/watch/time::timeout/Semaphore）；CancellationToken 树/tokio-util 不引入。`tokio::spawn` 直调经 clippy `disallowed_methods` 闸封死——**效果只经 `FxScope` 命名口**（`spawn_tracked`/`spawn_detached`，后者为闸内唯一 allow 豁免）。
