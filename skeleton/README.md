@@ -80,3 +80,11 @@ fn main() {
 cargo run -p udf-skeleton-infra --features tokio,journal,testing,compose --example end_to_end
 cargo run --release -p udf-skeleton-infra --features memgov,testing --example multidim_eval
 ```
+
+## 配置 lint 阶段编排（`skeleton::lint`，本 crate 自带示例）
+
+`register_stage` 按配置类型登记 `LintStage<C>`（`name` + `run(&mut C)`），`post_process` 快照阶段表后**在锁外**按注册序跑完、首个 `Err` 短路并由编排器补齐阶段归属；空表 `Ok`，不同 `C` 互不可见，稳态每拍零堆分配。
+
+```sh
+cargo run --release -p udf-skeleton --example lint_multidim
+```
