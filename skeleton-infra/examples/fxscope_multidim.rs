@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use skeleton_infra::fx::{cancel_pair, FxScope, TaskError};
+use skeleton_infra::fx::{cancel_pair, FxScope};
 use skeleton_infra::memgov::CountingAllocator;
 
 #[global_allocator]
@@ -740,7 +740,7 @@ fn dim5_shutdown() {
             }
             wait_until(Duration::from_secs(10), || done.load(Ordering::Acquire) >= n);
             let t0 = Instant::now();
-            scope.shutdown().await;
+            let _ = scope.shutdown().await;
             let d = t0.elapsed();
             println!(
                 "⑤停机d shutdown排空已完结: {:.1}µs 总计 / {:.0}ns每条目（10k 完结条目 join_next 收割）",
@@ -766,7 +766,7 @@ fn dim5_shutdown() {
             }
             wait_until(Duration::from_secs(5), || parked.load(Ordering::Relaxed) >= n);
             let t0 = Instant::now();
-            scope.shutdown().await;
+            let _ = scope.shutdown().await;
             let d = t0.elapsed();
             println!(
                 "⑤停机e shutdown中止在途: {}µs（100 park 任务 close+abort_all+收割, in_flight={}）",
@@ -796,7 +796,7 @@ fn dim5_shutdown() {
                 let t0 = Instant::now();
                 let r = scope.shutdown_timeout(Duration::from_millis(5)).await;
                 elapsed_ms.push(t0.elapsed().as_millis());
-                if r == Err(TaskError::TimedOut) {
+                if r.timed_out > 0 {
                     hit += 1;
                 }
                 // 自旋任务 30ms 后自然终局；留出收尾再进下一轮。

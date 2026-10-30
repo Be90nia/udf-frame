@@ -12,6 +12,10 @@
 //! log-embed 埋点（级别规范：异常路径=warn）：任务 panic 且句柄已被丢
 //! （结果无处投递）=warn 一行，target `skeleton::fx`。宏无订阅者时 no-op
 //! ——不 panic/不锁/不阻塞，logx 未初始化即静默退让（tracing 语义）。
+//!
+//! 增量收割面（issue#13）：完成条目滞留集合到 [`FxScope::try_reap`] 显式收割；
+//! `shutdown`/`shutdown_timeout` 排空产出 [`ShutdownReport`]（panic 载荷清单 + 超时
+//! 未完成数），panic 载荷 join 与收割双重可见（诊断面语义非 exactly-once）。
 
 use std::any::Any;
 use std::fmt;
@@ -173,11 +177,17 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 /// 任务包装体：permit-in-future（abort 连带回收 permit）→ catch_unwind 归一
 /// → oneshot 发送。接收端已亡（Spawned drop/abort）= 结果无处投递即弃（panic
 /// 结果留一行 warn 痕防静默丢失，见模块头注），任务本体仍归生命周期集托管。
+///
+/// 返回值 = 生命周期集条目载荷（issue#13）：panic 归一为 `Err(Panicked)` 进集合
+/// ——句柄被丢也不丢 panic；[`Spawned::join`] 与 [`FxScope::try_reap`] 双重可见
+/// （同一 panic 两条路都可能报出，诊断面语义非 exactly-once）。其余结局集合面
+/// 统一 `Ok(())`——真实值只走 oneshot 旁路，集合条目仅承载生命周期与 panic 面。
 async fn task_body<T, F>(
     sem: Option<Arc<Semaphore>>,
     fut: F,
     tx: oneshot::Sender<Result<T, TaskError>>,
-) where
+) -> Result<(), TaskError>
+where
     F: Future<Output = T>,
 {
     let _permit = match sem {
@@ -187,7 +197,7 @@ async fn task_body<T, F>(
             // 信号量关闭在本 API 面不存在（从不 close）；显式归 Cancelled 禁吞。
             Err(_) => {
                 let _ = tx.send(Err(TaskError::Cancelled));
-                return;
+                return Ok(());
             }
         },
     };
@@ -196,25 +206,51 @@ async fn task_body<T, F>(
         Ok(value) => Ok(value),
         Err(payload) => Err(TaskError::Panicked(panic_message(payload))),
     };
-    // panic 结果遇接收端已亡（句柄被丢）=无人消费——留一行 warn 痕（tracing
-    // 无订阅者时 no-op；msg 为 send 失败带回的原 String，零新增分配面）。
-    // Ok/Cancelled 无人接属设计内（JoinSet Drop 兜底），不埋。宏关（默认）=
-    // 原句静默发送，零增量。双层 Err：send 失败带回值 + 任务结果为 Panicked。
-    let send_outcome = tx.send(result);
-    #[cfg(feature = "log-embed")]
-    if let Err(Err(TaskError::Panicked(msg))) = send_outcome {
-        embed_event!(warn, target: "skeleton::fx", msg = msg.as_str(),
-            "managed task panicked; handle dropped before join");
+    // panic 载荷双投（issue#13）：oneshot 先行（句柄在 → join 收原值），集合收
+    // clone——句柄被丢也不丢。句柄已亡（send 失败）留一行 warn 痕（tracing 无
+    // 订阅者 no-op；宏关=默认，零增量）。clone 只在 panic 异常路径付一次。
+    match result {
+        Err(te @ TaskError::Panicked(_)) => {
+            let send_outcome = tx.send(Err(te.clone()));
+            #[cfg(feature = "log-embed")]
+            if send_outcome.is_err() {
+                if let TaskError::Panicked(msg) = &te {
+                    embed_event!(warn, target: "skeleton::fx", msg = msg.as_str(),
+                        "managed task panicked; handle dropped before join");
+                }
+            }
+            #[cfg(not(feature = "log-embed"))]
+            {
+                let _ = send_outcome;
+            }
+            Err(te)
+        }
+        result => {
+            let _ = tx.send(result);
+            Ok(())
+        }
     }
-    #[cfg(not(feature = "log-embed"))]
-    let _ = send_outcome;
 }
 
-/// 托管 scope：内部 = `Mutex<JoinSet<()>>`（生命周期集，短临界区零 await）+ AtomicBool
-/// accepting 闸 + `Option<Arc<Semaphore>>` 并发闸 + 取消源/令牌。通过 `Arc<FxScope>` 跨任务
-/// 共享（spawn/join 均 &self）。
+/// 停机排空报告（issue#13 缺口二）：停机排空不再静默丢结果——panic 载荷归集
+/// 返回，超时未完成数显式计数。
+#[must_use]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShutdownReport {
+    /// 排空中收割到的任务 panic 消息（含句柄已被丢的任务——载荷入集合不丢，
+    /// 见 [`FxScope::spawn_tracked`] 的双重可见语义）。
+    pub panicked: Vec<String>,
+    /// 截止时未完成、由剩余集 Drop=abort 兜底中止的任务数（仅
+    /// [`FxScope::shutdown_timeout`] 超时路径 >0；[`FxScope::shutdown`] 恒 0）。
+    pub timed_out: usize,
+}
+
+/// 托管 scope：内部 = `Mutex<JoinSet<Result<(), TaskError>>>`（生命周期集，短临界区
+/// 零 await；条目载荷 = panic 归一面——完成条目滞留至 [`Self::try_reap`] 或停机排空
+/// 显式收割，见 issue#13）+ AtomicBool accepting 闸 + `Option<Arc<Semaphore>>` 并发闸
+/// + 取消源/令牌。通过 `Arc<FxScope>` 跨任务共享（spawn/join 均 &self）。
 pub struct FxScope {
-    set: Mutex<JoinSet<()>>,
+    set: Mutex<JoinSet<Result<(), TaskError>>>,
     accepting: AtomicBool,
     sem: Option<Arc<Semaphore>>,
     in_flight: Arc<AtomicUsize>,
@@ -277,7 +313,7 @@ impl FxScope {
     }
 
     /// 托管 spawn（tracked）：任务进 JoinSet 生命周期集——过闸任务必被停机三段
-    /// 覆盖，scope drop ⇒ 全组 abort。结果走 oneshot 旁路（生命周期集统一产出 ()，
+    /// 覆盖，scope drop ⇒ 全组 abort。结果走 oneshot 旁路（生命周期集条目载 panic 归一面，
     /// 规避 JoinSet 单类型限制）；[`Spawned`] Drop 不 abort（忘 join 也不泄漏，
     /// JoinSet Drop 兜底）。闸关=Err(ScopeClosed)；并发闸不在 spawn 点排队
     /// （permit 在 future 内）。
@@ -346,7 +382,7 @@ impl FxScope {
         // tokio ≥1.53：JoinSet::spawn 直接返回 AbortHandle（旧版 JoinHandle::abort_handle 已废）。
         let abort = set.spawn(async move {
             let _flight = flight; // abort/panic/完成三路必经 drop——归零契约的落点
-            task_body(sem, fut, tx).await;
+            task_body(sem, fut, tx).await
         });
         Ok(Spawned { handle: abort, rx })
     }
@@ -389,24 +425,77 @@ impl FxScope {
     /// ② abort_all（在途任务收取消通知——[`CancelSource`] 协作取消面）→
     /// ③ 等净（join_next 循环至任务集清空）。锁内 abort_all + mem::take(JoinSet)，
     /// take 后的 set 在锁外 await join_next 循环（禁持 std 锁跨 await）。
-    pub async fn shutdown(&self) {
+    ///
+    /// 排空即收割（issue#13）：panic 载荷入 [`ShutdownReport`]，不再静默丢弃；
+    /// abort 条目 = 预期消亡（`Cancelled`），不计入报告。
+    #[must_use = "shutdown 报告含 panic 载荷清单，丢弃即静默丢失（纯收尾用 `let _ =` 显式让渡）"]
+    pub async fn shutdown(&self) -> ShutdownReport {
         let mut set = self.close_and_take();
-        while set.join_next().await.is_some() {}
-    }
-
-    /// 同上+超时：先 close+abort_all，超时回 Err(TimedOut)。abortable 任务零残留
-    /// （剩余集 Drop=abort 兜底）；不可 abort 段依赖自终止契约。
-    pub async fn shutdown_timeout(&self, d: Duration) -> Result<(), TaskError> {
-        let mut set = self.close_and_take();
-        let drain = async { while set.join_next().await.is_some() {} };
-        if tokio::time::timeout(d, drain).await.is_err() {
-            // 超时即返回：set 在此 drop = 剩余任务 abort 兜底（零残留）。
-            return Err(TaskError::TimedOut);
+        let mut report = ShutdownReport::default();
+        while let Some(outcome) = set.join_next().await {
+            if let Ok(Err(TaskError::Panicked(msg))) = outcome {
+                report.panicked.push(msg);
+            }
         }
-        Ok(())
+        report
     }
 
-    fn close_and_take(&self) -> JoinSet<()> {
+    /// 同上+超时：先 close+abort_all；超时不再返回 `Err`，改 [`ShutdownReport`]
+    /// 的 `timed_out > 0` 表达（join_timeout 的 `TimedOut` 单任务面保留）。
+    /// abortable 任务零残留（剩余集 Drop=abort 兜底）；不可 abort 段依赖自终止
+    /// 契约。超时即返前先增量收割已完结条目——panic 载荷不因超时丢失，剩余
+    /// 未完成数计 `timed_out`。
+    pub async fn shutdown_timeout(&self, d: Duration) -> ShutdownReport {
+        let mut set = self.close_and_take();
+        let mut report = ShutdownReport::default();
+        {
+            let drain = async {
+                while let Some(outcome) = set.join_next().await {
+                    if let Ok(Err(TaskError::Panicked(msg))) = outcome {
+                        report.panicked.push(msg);
+                    }
+                }
+            };
+            if tokio::time::timeout(d, drain).await.is_ok() {
+                return report;
+            }
+        }
+        // 超时即返：drain await 窗内已完结者收割（panic 载荷不丢），剩余 = 截止时
+        // 未完成数；下面 set drop = abort 兜底（零残留）。
+        while let Some(outcome) = set.try_join_next() {
+            if let Ok(Err(TaskError::Panicked(msg))) = outcome {
+                report.panicked.push(msg);
+            }
+        }
+        report.timed_out = set.len();
+        report
+    }
+
+    /// 增量收割口（issue#13 缺口一）：锁内同步扫集合中**已完成**条目——正常完成
+    /// 丢弃、panic 载荷归集返回、abort 条目映射 [`TaskError::Cancelled`]。不动
+    /// 在途任务、不改 `in_flight` 计数（FlightGuard 独立计数，与集合条目无关）；
+    /// 空集零分配（`Vec::new`），幂等可反复调。
+    ///
+    /// 锁内禁 await：`try_join_next` 同步不挂起，临界区保持短（与 spawn 同口径）。
+    ///
+    /// 防御分支：包装体自带 catch_unwind，panic 理论到不了 JoinSet 层；若出现
+    /// （包装被绕过/未来改动破坏前提），按载荷映射 [`TaskError::Panicked`] 显式
+    /// 上报，禁静默丢条目。
+    pub fn try_reap(&self) -> Vec<TaskError> {
+        let mut set = lock(&self.set);
+        let mut reaped = Vec::new();
+        while let Some(outcome) = set.try_join_next() {
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(te)) => reaped.push(te),
+                Err(je) if je.is_cancelled() => reaped.push(TaskError::Cancelled),
+                Err(je) => reaped.push(TaskError::Panicked(panic_message(je.into_panic()))),
+            }
+        }
+        reaped
+    }
+
+    fn close_and_take(&self) -> JoinSet<Result<(), TaskError>> {
         self.close();
         let mut set = lock(&self.set);
         set.abort_all();
@@ -420,7 +509,7 @@ impl Default for FxScope {
     }
 }
 
-/// spawn 句柄：结果走 oneshot 旁路（生命周期集统一产出 ()，规避 JoinSet 单类型限制）。
+/// spawn 句柄：结果走 oneshot 旁路（生命周期集条目载 panic 归一面，规避 JoinSet 单类型限制）。
 /// Drop 不 abort——任务归生命周期集托管（忘 join 也不泄漏，JoinSet Drop 兜底）。
 pub struct Spawned<T> {
     handle: AbortHandle,
@@ -566,7 +655,8 @@ mod tests {
         assert!(matches!(scope.spawn_tracked(async { 7 }), Err(ScopeClosed))); // 幂等仍拒
     }
 
-    /// ⑥shutdown 等净（in_flight==0）+ shutdown_timeout 超时路径 Err(TimedOut)。
+    /// ⑥shutdown 等净（in_flight==0，报告零事件）+ shutdown_timeout 超时路径
+    /// report.timed_out>0（超时不再返回 Err——报告形，issue#13）。
     /// 超时路径按「不可 abort 段」语义：abort 只在下一 await 生效，任务 poll 不返回
     /// 则 drain 真超时——需多线程 rt + 实时钟。确定性构造：hold 闸时序由测试持有
     /// ——holding 握手确认任务已滞留 poll（无可让渡 await 点）后才起 50ms 计时，
@@ -578,7 +668,12 @@ mod tests {
         for i in 0..4u32 {
             scope.spawn_tracked(async move { i }).unwrap();
         }
-        scope.shutdown().await;
+        let report = scope.shutdown().await;
+        assert_eq!(
+            report,
+            ShutdownReport::default(),
+            "排空收割：零 panic 零超时"
+        );
         expect_idle(&scope);
 
         use std::time::Instant;
@@ -611,11 +706,15 @@ mod tests {
             tokio::task::yield_now().await;
         }
         let started = Instant::now();
-        assert_eq!(
-            scope.shutdown_timeout(Duration::from_millis(50)).await,
-            Err(TaskError::TimedOut)
+        let report = scope.shutdown_timeout(Duration::from_millis(50)).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "超时必达：提前返回即守卫失效"
         );
-        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(
+            report.timed_out, 1,
+            "超时收割：截止时未完成任务数显式计数（Drop=abort 兜底）"
+        );
         hold.store(false, Ordering::Relaxed); // 放行让渡，abort 在下一 await 点生效
         stop.store(true, Ordering::Relaxed); // 放行自终止，运行时干净退出
         assert_eq!(
@@ -740,7 +839,7 @@ mod tests {
     }
 
     /// 零覆盖 #14：shutdown 超时路径对在途任务的 abort 收割——超时返回
-    /// Err(TimedOut) 后，遗留 JoinSet Drop=abort 兜底；abort 在任务下一 await
+    /// report.timed_out>0 后，遗留 JoinSet Drop=abort 兜底；abort 在任务下一 await
     /// 点生效，join 即收割事件：join=Err(Cancelled) 且 in_flight 归零（旧 ⑥
     /// 只断言超时本身，未直接断言 abort 语义与 join 的组合）。确定性构造同 ⑥：
     /// hold 闸由测试持有（holding 握手确认滞留 poll 后才计时），不用固定 spin 段
@@ -771,10 +870,8 @@ mod tests {
         while !holding.load(Ordering::Relaxed) {
             tokio::task::yield_now().await;
         }
-        assert_eq!(
-            scope.shutdown_timeout(Duration::from_millis(50)).await,
-            Err(TaskError::TimedOut)
-        );
+        let report = scope.shutdown_timeout(Duration::from_millis(50)).await;
+        assert_eq!(report.timed_out, 1, "超时收割：截止时未完成任务数显式计数");
         hold.store(false, Ordering::Relaxed); // 放行让渡，abort 在下一 await 点生效
         assert_eq!(
             handle.join().await,
@@ -845,7 +942,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         // tracked 面空集 ⇒ shutdown 等净即时返回；detached 不被等待、不被中止。
-        scope.shutdown().await;
+        let _ = scope.shutdown().await;
         assert!(
             !handle.is_finished(),
             "shutdown must not wait/abort detached tasks"
@@ -884,5 +981,107 @@ mod tests {
         for k in 0..8u32 {
             assert_eq!(map[&k], k * k);
         }
+    }
+
+    /// 收割·panic 不丢（issue#13 验收①）：panic 任务句柄被丢 → oneshot 旁路
+    /// 无人接，载荷只可能从集合收割——try_reap 返回 Panicked 载荷（「不丢」形态）。
+    #[tokio::test]
+    async fn try_reap_recovers_panicked_payload_with_dropped_handle() {
+        let scope = FxScope::new();
+        {
+            let handle = scope.spawn_tracked(async { panic!("boom-reap") }).unwrap();
+            drop(handle); // 句柄即刻丢：join 面消失，集合面是唯一观测口
+        }
+        wait_idle(&scope).await; // 任务已被 poll 且 panic 落载（FlightGuard 归零）
+        let reaped = scope.try_reap();
+        assert_eq!(reaped.len(), 1, "panic 载荷滞留集合至收割");
+        assert!(
+            matches!(&reaped[0], TaskError::Panicked(msg) if msg.contains("boom-reap")),
+            "载荷含 panic 消息: {reaped:?}"
+        );
+    }
+
+    /// 收割·滞留复现+幂等（issue#13 验收②）：N=100 即刻完成任务 wait_idle 后
+    /// 条目滞留集合（JoinSet 无 len 观测面，滞留可见性经同集 panic 条目钉死：
+    /// 若条目不滞留，panic 载荷早就无处可收）→ try_reap 清空，二次 reap 空且
+    /// 零分配（`Vec::new` 形态，capacity==0 钉死）。
+    #[tokio::test]
+    async fn try_reap_drains_retained_entries_and_is_idempotent() {
+        let scope = FxScope::new();
+        {
+            let handle = scope.spawn_tracked(async { panic!("boom-stay") }).unwrap();
+            drop(handle);
+        }
+        for i in 0..100u32 {
+            scope.spawn_tracked(async move { i }).unwrap();
+        }
+        wait_idle(&scope).await; // 101 条目全部已终局，滞留集合
+        let reaped = scope.try_reap();
+        assert_eq!(
+            reaped.len(),
+            1,
+            "panic 条目滞留至收割（Ok 条目同集一并清空）"
+        );
+        assert!(matches!(&reaped[0], TaskError::Panicked(msg) if msg.contains("boom-stay")));
+        let again = scope.try_reap();
+        assert!(again.is_empty(), "二次收割空（幂等）");
+        assert_eq!(again.capacity(), 0, "空收割零分配（Vec::new 形态）");
+        expect_idle(&scope);
+    }
+
+    /// 停机报告收 panic（issue#13 验收③）：shutdown_timeout 窗口内 panic 的任务
+    /// → report.panicked 含载荷、timed_out==0（窗口内完成，未触发超时）。
+    #[tokio::test]
+    async fn shutdown_timeout_report_collects_panicked_payload() {
+        let scope = FxScope::new();
+        {
+            let handle = scope
+                .spawn_tracked(async { panic!("boom-report") })
+                .unwrap();
+            drop(handle);
+        }
+        wait_idle(&scope).await;
+        let report = scope.shutdown_timeout(Duration::from_secs(1)).await;
+        assert_eq!(
+            report,
+            ShutdownReport {
+                panicked: vec!["boom-report".to_owned()],
+                timed_out: 0,
+            }
+        );
+    }
+
+    /// 收割·在途不动（P1）：try_reap 只扫已完成条目——在途任务不被收割、不受
+    /// 影响，join 照常收值；Ok 条目收割为空（丢弃面）。
+    #[tokio::test(start_paused = true)]
+    async fn try_reap_leaves_inflight_tasks_alone() {
+        let scope = FxScope::new();
+        let handle = scope
+            .spawn_tracked(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                7
+            })
+            .unwrap();
+        assert!(scope.try_reap().is_empty(), "在途任务不被收割");
+        assert!(!handle.is_finished());
+        assert_eq!(handle.join().await, Ok(7), "reap 后在途任务照常完成可 join");
+        assert!(scope.try_reap().is_empty(), "Ok 条目收割为空（丢弃面）");
+        expect_idle(&scope);
+    }
+
+    /// 收割·abort 条目（P1）：abort 在下一 await 点生效后，条目由 try_reap 收割
+    /// 映射 Cancelled（集合面与 join 面同语义）；二次收割空（幂等）。
+    #[tokio::test]
+    async fn try_reap_maps_aborted_entries_to_cancelled() {
+        let scope = FxScope::new();
+        let handle = scope
+            .spawn_tracked(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            })
+            .unwrap();
+        handle.abort();
+        wait_idle(&scope).await; // abort 生效（FlightGuard 归零 = 任务体已 drop）
+        assert_eq!(scope.try_reap(), vec![TaskError::Cancelled]);
+        assert!(scope.try_reap().is_empty(), "二次收割空（幂等）");
     }
 }

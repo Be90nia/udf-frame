@@ -1730,11 +1730,12 @@ impl FxScope {
     pub fn close(&self);                                   // accepting 闸关（拒新，放行在途）；幂等
     pub fn is_closed(&self) -> bool;
     pub fn in_flight(&self) -> usize;                      // 生命周期集未净数（LeakGuard 断言锚）
-    pub fn spawn<T>(&self, fut: impl Future<Output = T> + Send + 'static)
+    pub fn spawn_tracked<T>(&self, fut: impl Future<Output = T> + Send + 'static)
         -> Result<Spawned<T>, ScopeClosed>
     where T: Send + 'static;
-    pub async fn shutdown(&self);                          // 三段：close→abort_all→等净
-    pub async fn shutdown_timeout(&self, d: Duration) -> Result<(), TaskError>;
+    pub fn try_reap(&self) -> Vec<TaskError>;              // 增量收割口：锁内同步扫已完成条目（禁 await）
+    pub async fn shutdown(&self) -> ShutdownReport;        // 三段：close→abort_all→等净+收割
+    pub async fn shutdown_timeout(&self, d: Duration) -> ShutdownReport; // 超时不再是 Err，timed_out>0
 }
 impl Default for FxScope { /* new() */ }
 
@@ -1748,6 +1749,12 @@ impl<T: Send + 'static> Spawned<T> {
 
 pub enum TaskError { Cancelled, Panicked(String), TimedOut }
 pub struct ScopeClosed;   // accepting 闸已关：spawn 拒新（fail-closed 显式）
+
+#[must_use]
+pub struct ShutdownReport {          // 停机排空报告（fx 域自有；与 shutdown 域 coordinator 报告同名不同型）
+    pub panicked: Vec<String>,       // 排空收割的 panic 消息（句柄被丢也不丢）
+    pub timed_out: usize,            // 截止时未完成数（仅 shutdown_timeout 超时路径 >0）
+}
 
 pub struct CancelSource { /* … */ }
 impl CancelSource {
@@ -1770,7 +1777,10 @@ pub fn expect_idle(scope: &FxScope);   // in_flight==0 断言（LeakGuard fx 侧
 
 - 任务结局归一：panic 经 catch_unwind 归一 `TaskError::Panicked(消息)`（payload downcast &str/String，否则哨兵文案）；发送端消亡=Cancelled；join 超时=TimedOut 且任务已 abort（禁留活口）。
 - `spawn_tracked` 线性化=锁内原子 RMW 过闸 + 插入与 shutdown 的 abort_all 串行——过闸任务必被 shutdown 覆及。
-- `shutdown_timeout` 超时即返回：剩余集 Drop=abort 兜底（零残留）。
+- 条目滞留与收割（issue#13）：生命周期集条目不再静默丢弃——panic 载荷进集合（句柄被丢也不丢），**join 与 `try_reap`/停机排空双重可见**（同一 panic 两条路都可能报出，诊断面语义非 exactly-once）；完成条目滞留集合至 `try_reap`（增量收割口：锁内同步 `try_join_next` 扫已完成条目，空集零分配、幂等，不动在途任务、不改 in_flight）或停机排空显式消费。
+- 停机报告：`shutdown` 排空收割 panic 载荷入 `ShutdownReport.panicked`（abort 条目=预期消亡不计入）；`shutdown_timeout` 超时不再返回 `Err`——超时即返前先增量收割已完结条目（panic 载荷不因超时丢失），剩余未完成数计 `timed_out`（剩余集 Drop=abort 兜底，零残留）。
+
+**实测**（单批，Windows 10 x64 / 16 核 / rustc 1.96.0；`cargo run --release -p udf-skeleton-infra --features tokio,memgov --example fxscope_multidim` ⑤停机段；粗测供判级，跨批波动 10–30% 属常态）：shutdown 排空已完结条目 **252ns/条目**（10k 条目 join_next 收割面）；shutdown 中止在途 111µs（100 park 任务 close+abort_all+收割）；`shutdown_timeout` 守卫设定 5ms 中位 7ms、超时命中 3/3（报告形 `timed_out>0` 判定；超出部分=Windows 计时器粒度+传播开销）。
 
 ```rust
 use skeleton_infra::fx::{expect_idle, FxScope};
@@ -1781,7 +1791,7 @@ let handle = scope.spawn_tracked(async { 41 + 1 }).unwrap();
 expect_idle(&scope);
 ```
 
-> 注：`join()` 需在 tokio 运行时内 await；独立可编译片段见 `examples/quickstart.rs` 与 `src/fx.rs` 单元测试（`#[tokio::test]` 五件套：spawn/abort/panic/timeout/close 语义全钉）。
+> 注：`join()` 需在 tokio 运行时内 await；独立可编译片段见 `examples/quickstart.rs` 与 `src/fx.rs` 单元测试（`#[tokio::test]` 十九件：spawn/abort/panic/timeout/close/shutdown 排空/超时收割/`try_reap` 增量收割面语义全钉）。
 
 ---
 

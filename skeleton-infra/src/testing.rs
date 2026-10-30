@@ -92,7 +92,7 @@ pub enum Script<A, Op> {
 ///         tokio::task::yield_now().await;
 ///     }
 ///     assert_eq!(*store.snapshot(), 1, "脚本 Emit 经回灌推进 store");
-///     scope.shutdown().await; // 收尾净空（泄漏断言锚见 fx::expect_idle）
+///     let _ = scope.shutdown().await; // 收尾净空（泄漏断言锚见 fx::expect_idle）
 /// });
 /// # }
 /// ```

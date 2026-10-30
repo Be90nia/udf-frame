@@ -638,7 +638,7 @@ async fn main() {
     assert!(!sent, "sender 显式 false（#[must_use] 兜底）");
     assert_eq!(store.rejected_after_close(), 2, "两入口同一拒绝计数");
 
-    scope.shutdown().await;
+    let _ = scope.shutdown().await; // #[must_use]：纯收尾不读报告，显式让渡
     expect_idle(&scope);
     journal.lock().expect("journal poisoned").flush().expect("flush");
     drop(store); // append 源归零后重开账本

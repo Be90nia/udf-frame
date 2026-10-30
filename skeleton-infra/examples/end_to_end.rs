@@ -282,7 +282,7 @@ async fn runtime_face() {
     store.close();
     store.dispatch(BoardAct::Ping); // 闭门后 no-op
     assert_eq!(store.rejected_after_close(), 1, "fail-visible counter");
-    scope.shutdown().await;
+    let _ = scope.shutdown().await;
     expect_idle(&scope);
     journal
         .lock()
