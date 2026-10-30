@@ -3,6 +3,8 @@
 `Reducer`（根契约）/ `Fragment`（reduce-only 分片契约）/ `Store` / `EffectRuntime` / `Driver` 契约 trait + 数据词汇
 （`Effect`/`EffectBuf`/`EffectId`/`ActionSender`/`Subscription`/`NoFx`）+ 语义契约文本。
 `pool` 模块承载池化管理基座 `PoolManaged`（调参/读数/审计三挂点，「约定不是锁定」）。
+`fields` 模块承载可观测字段值面 `FieldValue`/`FieldBag`（名→值袋：插入序稳定迭代、同名覆盖、
+COW 克隆 O(1)、构造零分配——只做值面，导出归消费方）。
 **零依赖**（tokio/serde 都不进树），纯函数纪律由「核心无 IO 依赖」结构性保证——reducer 想 IO 也编译不过。
 
 本 crate 只承载「约束后面代码长法的形状」：trait 是数据契约，名字即数据流向，
