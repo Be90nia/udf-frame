@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### Added（fx 停机排空不再丢结果：`try_reap` 增量收割口 + `ShutdownReport`，2026-10-30；GitHub issue#13）
+- `FxScope::try_reap(&self) -> Vec<TaskError>`（增量收割口，缺口一）：锁内同步 `try_join_next` 扫已完成条目——正常完成丢弃、panic 载荷归集返回、abort 条目映射 `Cancelled`；空集零分配（`Vec::new`）、幂等；不动在途任务、不改 `in_flight` 计数（FlightGuard 独立计数）。锁内禁 await（`try_join_next` 同步，临界区与 spawn 同口径）。
+- `ShutdownReport { panicked: Vec<String>, timed_out: usize }`（`#[must_use]`，Debug/Clone/Default/PartialEq/Eq）：停机排空报告（fx 域自有；与 `shutdown` 域 coordinator 的同名报告不同型，不经 crate 根 re-export）。
+
+### Changed（fx 停机面：包装条目载 panic 归一面 + 停机返回报告，破坏性；GitHub issue#13）
+- 包装任务 `JoinSet<()>` → `JoinSet<Result<(), TaskError>>`：任务 panic 时先照旧 oneshot 发送（句柄在→join 收），**无论 send 成败都从包装返回 `Err(Panicked)` 入集合**——句柄被丢也不丢 panic。**双重可见**（doc 钉死）：同一 panic 可能同时经 `Spawned::join` 与 `try_reap`/停机排空报出，诊断面语义非 exactly-once。其余结局集合面统一 `Ok(())`（真实值只走 oneshot 旁路）。
+- `shutdown(&self) -> ShutdownReport`（原 `()`）：排空循环收割 panic 载荷入 `panicked`（abort 条目=预期消亡不计入）；`#[must_use]`，纯收尾语句式调用点改 `let _ =` 显式让渡。
+- `shutdown_timeout(&self, d) -> ShutdownReport`（原 `Result<(), TaskError>`）**有意破坏性**：超时不再是 `Err(TimedOut)`，改 `timed_out > 0`（截止时未完成、由剩余集 Drop=abort 兜底中止的任务数）；超时即返前先增量收割已完结条目（panic 载荷不因超时丢失）。`TaskError` 枚举与 `join_timeout` 的 `TimedOut` 面不动。
+- `spawn_tracked` 不加自动收割（issue#13 明确否决：静默丢错误）；`in_flight`/`close`/`is_closed`/`abort`/`expect_idle` 语义零变化；Cargo.toml 零改动（无新依赖）。
+- 调用点全仓机械迁移：fx 内测试（超时断言改报告形，时长断言与 abort 收割语义原样钉死）、`examples/end_to_end.rs`/`examples/fxscope_multidim.rs`（`r == Err(TimedOut)` → `r.timed_out > 0`；语句式收尾 `let _ =`）、`src/testing.rs` doctest、`docs/tutorials/thirty-min.md` 示例同形。（破坏性直迁：0.1.0 未发布，按 ADR 0005 先例无 shim。**下游注记**：vendored 采用方 agentwiki 同步上游时需把语句式 `FxScope::shutdown().await;` 补 `let _ =`——其 bgshell.rs:376、examples/orchestration_recipes.rs:351-352 两处，且其 CI deny warnings；迁移清单已贴 issue#13。）另：reference.md 顺手修正陈旧笔误 `spawn`→`spawn_tracked`（随批 drive-by）。
+
 ### Added（消费方反馈三件：remove 泛形化 + 可观测字段值面 + 分配站点目录，2026-10-30；GitHub issue#8/#7/#6）
 - **BoundedRegistry::remove 泛形化**（memgov，issue#8）：`remove<Q: ?Sized + Ord>(&mut self, k: &Q) where K: Borrow<Q>`——与 `get`/`get_mut` 同款借用纪律，`String` 键以 `&str` 摘除**零堆分配**（事件计数锚：借用形 total 22==22 精确平 + live 只降不增；差分对照临时键路径 ≥1 事件证锚有鉴别力）。零行为变化（纯参数形放宽）；doc 钉三条：与 get 同形单一借用纪律 / `Borrow` 一致性契约（Q 与 K 的 Ord 同源禁第二套比较）/ `insert` 收所有权 vs `get`/`remove` 收借用=有意不对称。
 - **`skeleton::fields` 可观测字段值面**（issue#7，纯值面零依赖零 feature 门）：`FieldValue`（`#[non_exhaustive]` 六变体：Int/Float/Bool/Str/Duration/Count；只 `PartialEq`——Float 的 NaN≠NaN 使其不可作 map 键）+ `FieldBag`（`Arc<Vec<(&'static str, FieldValue)>>`）：插入序稳定迭代、同名 last-wins 原地覆盖（构造即去重）、clone=一次原子自增 O(1)（实测 4 vs 256 字段同量级，≤1.2x）、COW 改写、`new`/`Default` 零堆分配（共享 EMPTY）、merge 覆盖+按 other 序追加。armor 7 条（顺序/覆盖策略显式/浮点 Eq 破坏/COW 语义/名零分配/O(n) 线性扫描/词表 non_exhaustive）；**无 serde/无导出**（值面到此为止，导出格式归消费方自映射）。实测：new/clone/iter 0.00 分配事件；iter 梯度 4/32/256 字段线性。
