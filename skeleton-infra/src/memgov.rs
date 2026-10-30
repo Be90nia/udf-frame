@@ -123,8 +123,33 @@ impl<K: Ord, V> BoundedRegistry<K, V> {
         self.map.get_mut(k)
     }
 
-    /// 摘除并返回值（登记面收缩的唯一口）。
-    pub fn remove(&mut self, k: &K) -> Option<V> {
+    /// 摘除并返回值（登记面收缩的唯一口）。`Q` 形与 [`BoundedRegistry::get`]/
+    /// [`BoundedRegistry::get_mut`] 同款——查询/删除两路同一条借用纪律
+    /// （`K: Borrow<Q>`，`String` 键以 `&str` 摘除），消费方不对同一张表写
+    /// 两套调用形态。
+    ///
+    /// `Borrow` 一致性契约：`Q` 的 `Ord` 必须与 `K` 的 `Ord` 同源（std
+    /// `Borrow` 契约——`K` 与 `Q` 的 `Eq`/`Ord`/`Hash` 实现必须一致，禁第二套
+    /// 比较）；`BTreeMap` 查找键须全序，异源 `Ord` 的摘除结果无定义。
+    ///
+    /// 所有权面有意只 `insert` 一处（插入须构造键，收 owned）；`get`/`remove`
+    /// 全收借用——**有意的不对称**，非疏漏。
+    ///
+    /// 借用查找原地摘除，零分配（锚测 `borrow_remove_allocates_nothing`）：
+    ///
+    /// ```
+    /// # use skeleton_infra::memgov::{BoundedRegistry, Eviction};
+    /// let mut reg: BoundedRegistry<String, u8> =
+    ///     BoundedRegistry::new(4, Eviction::Reject);
+    /// reg.insert("alpha".to_owned(), 1).expect("within capacity");
+    /// assert_eq!(reg.remove("alpha"), Some(1));
+    /// assert_eq!(reg.remove("alpha"), None);
+    /// ```
+    pub fn remove<Q>(&mut self, k: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         self.map.remove(k)
     }
 

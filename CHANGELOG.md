@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Added（消费方反馈三件：remove 泛形化 + 可观测字段值面 + 分配站点目录，2026-10-30；GitHub issue#8/#7/#6）
+- **BoundedRegistry::remove 泛形化**（memgov，issue#8）：`remove<Q: ?Sized + Ord>(&mut self, k: &Q) where K: Borrow<Q>`——与 `get`/`get_mut` 同款借用纪律，`String` 键以 `&str` 摘除**零堆分配**（事件计数锚：借用形 total 22==22 精确平 + live 只降不增；差分对照临时键路径 ≥1 事件证锚有鉴别力）。零行为变化（纯参数形放宽）；doc 钉三条：与 get 同形单一借用纪律 / `Borrow` 一致性契约（Q 与 K 的 Ord 同源禁第二套比较）/ `insert` 收所有权 vs `get`/`remove` 收借用=有意不对称。
+- **`skeleton::fields` 可观测字段值面**（issue#7，纯值面零依赖零 feature 门）：`FieldValue`（`#[non_exhaustive]` 六变体：Int/Float/Bool/Str/Duration/Count；只 `PartialEq`——Float 的 NaN≠NaN 使其不可作 map 键）+ `FieldBag`（`Arc<Vec<(&'static str, FieldValue)>>`）：插入序稳定迭代、同名 last-wins 原地覆盖（构造即去重）、clone=一次原子自增 O(1)（实测 4 vs 256 字段同量级，≤1.2x）、COW 改写、`new`/`Default` 零堆分配（共享 EMPTY）、merge 覆盖+按 other 序追加。armor 7 条（顺序/覆盖策略显式/浮点 Eq 破坏/COW 语义/名零分配/O(n) 线性扫描/词表 non_exhaustive）；**无 serde/无导出**（值面到此为止，导出格式归消费方自映射）。实测：new/clone/iter 0.00 分配事件；iter 梯度 4/32/256 字段线性。
+- **`skeleton_infra::alloc_site` 分配站点目录**（memgov feature，issue#6）：`alloc_sites!` 宏**编译期静态表注册**（每站点 `static` 常量初始化，无 ctor/无惰性；每次宏调用独立成表——测试隔离天然成立）+ `AllocSite::bump/count/set_enabled/reset`（两级开关：全局闸一把切 + 每站点；禁用路径**零写入**不脏缓存行）+ `find(table, name)` 线性查表零分配。armor 8 条：Relaxed 计数序/先全局后站点/**禁用路径零写入**（不脏缓存行）/枚举序=声明序（const 数组）/重名不编译校验（find 取先声明者）/伪共享不预付（升级路径 `#[repr(align(64))]` 登记）/零分配纪律/与 CountingAllocator（进程级）和 log-embed（tracing 埋点）的三口径分工。收窄：不做阈值/上报/序列化/归属映射/自动发现。实测：bump 全开 5.3ns / 关闸 1.6–1.7ns（计数不变=零写入）；find 线性 ~1.5-1.8ns/站点；同站点 4 线程 0.20x（同一 AtomicU64 争用上限，设计口径登记）。
+- 验证：`cargo test --workspace --all-features` **869 passed / 0 failed**；clippy `--workspace --all-features --all-targets -D warnings` 干净；fmt 干净；外部 crate 夹具 `verify/consumer-sim` 新增 fields + alloc_site 消费面（编译+运行绿，反例词表通配臂纪律维持）。
+
 ### Added（`skeleton::lint` 配置后处理阶段编排：TypeId 键注册表 + 锁外执行，2026-10-29；GitHub issue#4）
 - `skeleton::lint`（零依赖、零 feature 门、**零领域类型**）：`LintStage<C>`（`name()` + `run(&mut C)`，`Send + Sync` 硬约束）/ `LintError`（私有字段 + `new` 受控构造，`stage` 归属由编排器补，已带归属的不覆盖）/ `register_stage` / `clear_stages` / `registered_stages`（`#[must_use]`，诊断读数）/ `post_process`；全 `C: 'static`（`TypeId` 键，借用型配置**编译期**拒绝——`compile_fail,E0310` doctest 钉死）。
 - 语义：注册序执行（名单同序）；首个 `Err` 短路（已发生的改写保留）；空表 `Ok(())`；阶段拿 `&mut C` **可改写**；不同 `C` 表隔离；阶段在注册表**锁外**执行——体内可 `register_stage`、可递归 `post_process`（快照语义：本次注册下次生效；同类型递归合法但无防护，阶段自设终止条件）；阶段 panic 原样传播（不 `catch_unwind`、不吞）。

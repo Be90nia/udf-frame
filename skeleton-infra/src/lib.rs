@@ -26,7 +26,7 @@
 //! | `journal` | `journal`：账本（serde/serde_json 仅此 feature 可达） |
 //! | `view` | `view`：语言无关视图桥（ViewMap/IntentMap 机器 + 区域通道 + 读侧参考实现；serde_json/udf-std-ext json 仅此 feature 可达） |
 //! | `testing` | `testing` + `parse_mock`：测试替身（TestStore/脚本化解释器 + 解析面 mock） |
-//! | `memgov` | `memgov`：内存治理 |
+//! | `memgov` | `memgov`：内存治理；`alloc_site`：分配站点目录（编译期静态表 + 每站点原子计数/开关 + 查表零分配） |
 //! | `compose` | `compose`：父子分片组合器 |
 //! | `tracing` | `tracingx`：骨架审计事件流 → tracing 桥 |
 //! | `log-embed` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 + fx 一域 1 = 7 调用点；默认关=宏消除零依赖零开销，target `skeleton::<domain>[::<phase>]`。scheduler/ratelimit/retry/cache 四域 26 调用点随批 5-2、backoff/fsx/iter 三域 9 调用点随批 5-1 拆至 `std-ext`（合计 35），由其自有 `log-embed` feature 承载，宏同款副本） |
@@ -103,6 +103,9 @@ pub mod tracingx;
 
 #[cfg(feature = "memgov")]
 pub mod memgov;
+
+#[cfg(feature = "memgov")]
+pub mod alloc_site;
 
 #[cfg(feature = "pool")]
 pub mod pool;

@@ -242,6 +242,93 @@ fn borrow_lookup_allocates_nothing() {
     );
 }
 
+/// borrow-remove 语义①：`&str` 摘 `String` 键——值正确返回、len 递减、
+/// iter 仍升序确定序（乱序插入后摘中间键断言序）。
+#[test]
+fn borrow_remove_by_str_returns_value_and_shrinks_in_order() {
+    let _serial = serial();
+    let mut reg: BoundedRegistry<String, u32> = BoundedRegistry::new(4, Eviction::Reject);
+    reg.insert("delta".to_owned(), 4).expect("within capacity");
+    reg.insert("alpha".to_owned(), 1).expect("within capacity");
+    reg.insert("charlie".to_owned(), 3)
+        .expect("within capacity");
+    reg.insert("bravo".to_owned(), 2).expect("within capacity");
+
+    assert_eq!(reg.remove("bravo"), Some(2));
+    assert_eq!(reg.len(), 3);
+    let keys: Vec<&str> = reg.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["alpha", "charlie", "delta"]);
+    assert_eq!(reg.remove("alpha"), Some(1));
+    let rest: Vec<&str> = reg.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(rest, ["charlie", "delta"]);
+}
+
+/// borrow-remove 语义②：未命中=`None`（不 panic）；摘除腾位后同键 re-insert
+/// 正常，且满表 Reject 的 fail-closed 语义不被 remove 改写。
+#[test]
+fn remove_missing_is_none_and_reinsert_after_remove_works() {
+    let _serial = serial();
+    let mut reg: BoundedRegistry<String, u8> = BoundedRegistry::new(1, Eviction::Reject);
+    reg.insert("solo".to_owned(), 1).expect("within capacity");
+
+    assert_eq!(reg.remove("ghost"), None);
+    assert_eq!(reg.remove("solo"), Some(1));
+    assert!(reg.is_empty());
+
+    reg.insert("solo".to_owned(), 2).expect("within capacity");
+    assert_eq!(reg.get("solo"), Some(&2));
+    assert!(reg.insert("other".to_owned(), 3).is_err(), "真满仍 Reject");
+}
+
+/// cqb⑦ borrow-remove 零分配锚 + 差分对照：`String` 键表窗内借用形
+/// `remove("key")` 分配事件面（total）精确平——摘除释放节点不进 total；
+/// live 面只降不增（释放 ≥1 个存活分配，证明摘除真发生而非空转）。
+/// 同表临时键路径 `remove(&key.clone())` 必须 ≥1 事件——差分即仪器自检
+/// （证明锚窗内分配可见），借用形省掉的正是这一次分配。与
+/// `borrow_lookup_allocates_nothing` 的口径差异：remove 是结构性收缩，
+/// live 净额方向向下，故 live 面锚上界「不增」而非精确平；total 面才是
+/// 「零分配」的硬断言（同源同仪两面对账）。
+#[test]
+fn borrow_remove_allocates_nothing() {
+    let _serial = serial();
+    let mut reg: BoundedRegistry<String, u32> = BoundedRegistry::new(4, Eviction::Reject);
+    reg.insert("alpha".to_owned(), 1).expect("within capacity");
+    settle();
+    let base = (
+        CountingAllocator::live_allocs(),
+        CountingAllocator::live_bytes(),
+        CountingAllocator::total_allocs(),
+    );
+
+    assert_eq!(reg.remove("alpha"), Some(1));
+    assert!(
+        CountingAllocator::live_allocs() < base.0,
+        "摘除必须释放 ≥1 个存活分配（键缓冲/节点），否则锚空转"
+    );
+    assert!(
+        CountingAllocator::live_bytes() <= base.1,
+        "摘除禁净增存活字节"
+    );
+    assert_eq!(
+        CountingAllocator::total_allocs(),
+        base.2,
+        "total 面：借用摘除零分配事件（禁临时键 churn）"
+    );
+
+    // 差分对照：先回填，再走临时键路径——&key.clone() 构造 owned 临时，窗内
+    // 必须 ≥1 分配事件；0 即仪器不可见/锚空转，红。
+    reg.insert("alpha".to_owned(), 1).expect("within capacity");
+    settle();
+    let diff_base = CountingAllocator::total_allocs();
+    let key = "alpha".to_owned();
+    assert_eq!(reg.remove(&key), Some(1));
+    let diff = CountingAllocator::total_allocs() - diff_base;
+    assert!(
+        diff >= 1,
+        "临时键路径必须 ≥1 分配事件（差分对照+仪器自检），实测 {diff}"
+    );
+}
+
 /// skeleton store 分配契约的黑盒孪生（skeleton lib 白盒测的边界测量面）。
 /// skeleton 依赖走 testing feature 门；--all-features 下激活。
 #[cfg(feature = "testing")]

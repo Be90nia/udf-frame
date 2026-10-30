@@ -18,7 +18,7 @@
 | `tokio` | `fx` | `FxScope` 异步并发托管（JoinSet 生命周期集 + accepting 闸 + 取消令牌；`tokio::spawn` 直调经 clippy 闸封死） |
 | `journal` | `journal` | `JsonlJournal`：`JournalPort` 契约端口参考实现（JSONL 追加式真相源 + 快照行 + 懒回放；serde 仅此 feature 可达） |
 | `testing` | `testing` | `TestStore` 逐动作断言 + `ScriptedRuntime` 脚本化解释器替身 |
-| `memgov` | `memgov` | `CountingAllocator` 计数分配器 + `BoundedRegistry` 有界注册表（淘汰策略必选）+ `LeakGuard` 泄漏断言 |
+| `memgov` | `memgov` | `CountingAllocator` 计数分配器 + `BoundedRegistry` 有界注册表（淘汰策略必选；`get`/`get_mut`/`remove` 同款 `Borrow` 泛形借用查找）+ `LeakGuard` 泄漏断言 + `alloc_site` 分配站点目录（`alloc_sites!` 编译期静态表 + 每站点原子计数/两级开关 + 查表零分配） |
 | `log-fs` | `logx` | 文件落盘面（纯 std 零三方：`log-fs` 面自身口径，crate 树见下方零依赖口径段）：密钥掩码 + `DefaultPathResolver` 双构建默认根（debug=编译期锚/release=`~/.<项目>/log`；契约 `LogPathResolver` 住 `skeleton::logpath`）+ `FileSink` 按日滚动追加 |
 | `log` | `logx` | 门面绑定层（=`log-fs`+log/tracing/tracing-subscriber/tracing-log）：`init_tracing_from_env`（EnvFilter）+ `init_with_file` console/file 双 sink + `FileSinkWriter` |
 | `tracing` | `tracingx` | 审计事件流 → tracing 桥 |

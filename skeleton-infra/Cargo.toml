@@ -252,6 +252,14 @@ required-features = ["config-json", "config-toml"]
 name = "id_multidim"
 required-features = ["memgov"]
 
+# alloc_site 域七维性能矩阵采集器（①分配事件（bump 开/关、find、枚举）②ns 锚
+# （bump 三态/find 双态/枚举）③规模梯度 1/10/100 站点 find④并发吞吐 1/2/4
+# bump 同站点⑤禁用路径零写入证据⑥宏表隔离⑦收窄声明；沿 multidim 模式纯
+# std，零新依赖）。
+[[example]]
+name = "alloc_site_multidim"
+required-features = ["memgov"]
+
 # ViewBridge 正典验收环（ADR 0006）：矩阵行为 + 双编码一致性 + 镜像读取器 +
 # 换区握手 + 水位自洽 + 未知标签跳过 + manifest 逐字对表。SyncStore 走默认
 # runtime feature；required-features 取实际用量并集（hollow-gate 纪律）。

@@ -14,6 +14,9 @@
 //! 启动期编排件：[`lint`]（配置 lint 阶段表——注册期登记，`post_process` 快照后
 //! 锁外按序执行、稳态零堆分配；纯 std 零依赖，采用方不必为配置校验把运行时拖进树）。
 //!
+//! 可观测值面：[`fields`]（一组可观测字段（名+值）的纯值形状——插入序稳定、
+//! 同名覆盖、克隆 O(1)；只做值面，无导出/上报）。
+//!
 //! 可运行的实现（同步排空环、订阅/通知机器、审计事件流、组合器、测试替身）
 //! 在姊妹 crate `skeleton_infra`（仓库内 `skeleton-infra/`——0.1.0 未发布，
 //! docs.rs 页面随首次发布生效；`skeleton_infra::runtime::SyncStore` 等，按
@@ -77,6 +80,7 @@
 
 pub mod clock;
 pub mod config;
+pub mod fields;
 pub mod lint;
 pub mod logpath;
 pub mod notify;

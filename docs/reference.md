@@ -425,7 +425,7 @@ impl<K: Ord, V> BoundedRegistry<K, V> {
     pub fn get(&self, k: &K) -> Option<&V>;
     pub fn get<Q: ?Sized + Ord>(&self, k: &Q) -> Option<&V> where K: Borrow<Q>;  // 零分配查找
     pub fn get_mut(&mut self, k: &K) -> Option<&mut V>;   // 只回值面：键面类型级不可达（改键破坏确定序）
-    pub fn remove(&mut self, k: &K) -> Option<V>;
+    pub fn remove<Q: ?Sized + Ord>(&mut self, k: &Q) -> Option<V> where K: Borrow<Q>;  // 与 get/get_mut 同形借用纪律：String 键以 &str 摘除零分配（issue#8）
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub fn capacity(&self) -> usize;
@@ -483,6 +483,45 @@ assert_eq!(&*again, &[7]);
 drop(again);
 drop(ticket);
 ```
+
+### alloc_site — 分配站点目录（issue#6，2026-10-30）
+
+**feature**：`memgov`。**依赖面**：纯 std。按站点归集资源计数的机制层：**编译期静态表注册**（`alloc_sites!` 宏，常量初始化——无 ctor/无惰性）+ 每站点原子计数/独立开关 + 全局闸一把切 + `&'static str` 查表零分配。
+
+```rust
+pub struct AllocSite { pub name: &'static str }              // count/enabled 私有原子
+impl AllocSite {
+    pub const fn new(name: &'static str) -> Self;            // 手工组表口
+    pub fn bump(&self);                  // 全局开 && 站点开 ⇒ fetch_add(1, Relaxed)；关 ⇒ 零写入
+    pub fn count(&self) -> u64;          // Relaxed load（单调计数器，无跨变量因果需求）
+    pub fn set_enabled(&self, on: bool); // 站点闸：关 ⇒ 旁路，历史计数保留（清零走 reset）
+    pub fn is_enabled(&self) -> bool;
+    pub fn reset(&self);                 // 测试/基准复用
+}
+pub fn set_global_enabled(on: bool);     // 全局闸：默认开，关 ⇒ 所有站点一刀切零写入
+pub fn global_enabled() -> bool;
+pub fn find(table: &'static [&'static AllocSite], name: &str) -> Option<&'static AllocSite>;
+
+#[macro_export] macro_rules! alloc_sites { /* 见下 */ }
+```
+
+宏（站点登记唯一口；每次调用生成**独立**静态表，表间互不干扰——与 `skeleton::lint` 的进程级全局注册表性质相反，测试隔离天然成立）：
+
+```rust
+alloc_sites! {
+    pub static ADOPTER_SITES = {
+        CONN_ACCEPT,      // 生成 pub static CONN_ACCEPT: AllocSite（名字 = stringify!）
+        CONN_RECYCLE,
+    };
+}
+// ADOPTER_SITES: &[&AllocSite]——声明序 = 枚举序（const 数组，编译期定死，跨平台稳定）
+```
+
+**坑面 armor（8 条，`src/alloc_site.rs` doc + `tests/alloc_site.rs` 双处钉死）**：①单调计数器 `Relaxed` 足够（无发布语义对象）②开关检查序先全局后站点（全局关一刀切最廉）③禁用路径**零写入**不脏缓存行（语义是「开关」非「计数为 0」）④枚举序=宏声明序 ⑤同表重名不编译期校验（`find` 返回先声明者，唯一性归采用方）⑥伪共享不预付（独立 static 布局不保证隔离；升级路径 `#[repr(align(64))]` 有证据再上）⑦bump/count/find/枚举全路径零堆分配（事件计数锚 + 仪器自检）⑧与既有面分工：`CountingAllocator`=进程级分配计数、`log-embed`=tracing 埋点不计数——本件是第三口径（按站点的应用层资源计数），不做日志不出指标格式。
+
+**收窄**：不做阈值判定/上报/告警/序列化/站点归属映射/自动发现。
+
+**实测**（单批，Windows 10 x64 / 16 核 / rustc 1.96.0；`cargo run --release -p udf-skeleton-infra --features memgov --example alloc_site_multidim`）：bump 全开 **5.3ns** / 关闸 **1.6–1.7ns**（计数不变=零写入证据）；find 线性 1/10/100 站点 = 5.6/22.0/160.0ns（边际 ~1.5–1.8ns/站点）；同站点 4 线程 bump **0.20x**（同一 `AtomicU64` 争用上限，设计口径登记）；宏表隔离 PASS。
 
 ---
 
@@ -1636,6 +1675,44 @@ pub fn post_process<C: 'static>(cfg: &mut C) -> Result<(), LintError>;
 | 计算阶段 4 线程 | 3.88~3.96x | 3.89~4.11x（本批 4.12x） | 持平 |
 
 结论：**采用 `RwLock`**（快照走共享读锁、注册/清场走独占写锁，毒化恢复两侧同走 `PoisonError::into_inner`）。2 线程仍退化、4 线程改善有限——因为瓶颈不是「读互斥」而是**同一缓存行上的原子 RMW 争用**，这是全局注册表的结构性上限，不是锁类型的锅；再往上要么分槽要么不每拍 lint。
+
+---
+
+## fields — 可观测字段值面
+
+**feature**：常驻，零 feature 门。**依赖面**：纯 std。住契约层（`skeleton::fields`，issue#7，2026-10-30）：只承载「一组可观测字段（名 + 值）」的**纯值形状**——组装观测值交给导出方，无 IO/无运行时/无序列化（判据同 `skeleton::config`/`skeleton::lint`：采用方单开 `udf-skeleton` 即可用）。
+
+### 契约面
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]                       // 跨 crate match 必带通配臂（Effect/Restore 同款纪律，compile_fail doctest 钉死）
+pub enum FieldValue {
+    Int(i64), Float(f64), Bool(bool), Str(String),
+    Duration(std::time::Duration), Count(u64),   // Int=有符号测量值 / Count=无符号单调计数，语义不混用（相等性也按变体区分）
+}
+// 只派生 PartialEq 不派生 Eq/Hash：Float(f64) 的 NaN≠NaN ⇒ 全值相等性不成立，
+// FieldValue 不可作 map 键/集元素（需要键时用字段名 &'static str）。
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldBag { /* Arc<Vec<(&'static str, FieldValue)>>：Arc + COW */ }
+// Default 手写（同 new 走共享 EMPTY）——derive 会每次构造新 Arc（一次堆分配），违背空袋零分配契约
+impl FieldBag {
+    pub fn new() -> Self;   // 零堆分配（进程级共享 EMPTY Arc；Default 手写同走此路——derive 会每次分配）
+    pub fn insert(&mut self, name: &'static str, value: FieldValue);  // 同名覆盖：值换、位置不动（last-wins，构造即去重）
+    pub fn get(&self, name: &str) -> Option<&FieldValue>;
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, &FieldValue)>;  // 插入序 = 稳定可断言
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn merge(&mut self, other: &FieldBag);  // 已有键覆盖（位置不动），新键按 other 序追加
+}
+```
+
+**坑面 armor（7 条，`src/fields.rs` doc + `tests/fields.rs`/`tests/fields_alloc.rs` 双处钉死）**：①`Vec`+set 语义保**插入序**（HashMap 形会丢序）②同名覆盖策略显式：last-wins、原地覆盖、bag 恒无重名 ③浮点只 `PartialEq`（含 NaN 的两 bag 比较恒 false）④`Arc` COW：clone=一次原子自增 O(1)，改写独占时原地、共享时改写者付一次性 O(n) 整表克隆、共享副本不受影响 ⑤字段名 `&'static str`（可观测字段名是编译期常量，tracing 字段先例；String 名逼出每字段一次分配）⑥O(n) 线性 get/insert——观测袋是个位数量级小集合，线性换零哈希表分配（升级路径=排序索引，有大规模袋证据再上）⑦`#[non_exhaustive]` 词表。
+
+**收窄**：无导出/上报/落盘/采样/限流（消费方自映射到 tracing/OTLP/日志等格式）；**无 serde**（契约层零依赖纪律）；无字段名注册表；无日志级别/过滤语义；无并发写（`&mut` 独占；跨线程共享靠 clone 只读）。
+
+**实测**（单批，Windows 10 x64 / 16 核 / rustc 1.96.0；`cargo run --release -p udf-skeleton --example fields_multidim`；粗测供判级，跨批波动 10–30% 属常态）：new/clone/iter/覆盖稳态 **0.00 分配事件**（首插 2 事件如实）；clone 4 vs 256 字段**同量级（7.7–9.2ns，≤1.2x，O(1) 判级）**；iter 梯度 4/32/256 = 2.6/20.5/167.8ns（线性）；COW 首改一次性 O(n)（256 项单批 3.2–6.4µs）→稳态 ~11ns；跨线程 clone 交接 O(1)。
 
 ---
 
