@@ -1,0 +1,1142 @@
+#![cfg(feature = "pool")]
+//! ObjectPool 语义契约端到端：借出四路径（复用/扫片/新建/降级）、reset 两相位
+//! 钩子纪律（含 panic 兜底与 unwind 感知归还）、detach 所有权移交、prune_idle
+//! 老化、resize 三律、审计流、并发账实一致。
+//!
+//! 分工：PoolBase 公共逻辑（校验/水位线/审计环/溢出计数）已在 `tests/pool_base.rs`
+//! 逐件覆盖、审计环抽取件 `PoolAuditSink` 行为随其回归；`MemoryPool` 借还机器
+//! 已在 `tests/memory_pool.rs` 覆盖——本文件只测 `ObjectPool` **特化面**，与基座
+//! 交汇处按端到端断言不复测基座内部。
+
+use std::borrow::Borrow;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use skeleton::pool::{PoolAuditEvent, PoolAuditKind, PoolManaged, PoolMetrics, PoolResizeError};
+use skeleton_infra::objpool::{ObjectPool, ObjectPoolTuning, Pooled, ResetPhase};
+
+// ── 固定装置：析构可观测对象（hot = reset 保留字段，payload = reset 清除字段）──
+
+#[derive(Debug)]
+struct Tracked {
+    hot: u64,
+    payload: Option<&'static str>,
+    live: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl Tracked {
+    fn factory(
+        live: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    ) -> impl Fn() -> Tracked + Send + Sync + 'static {
+        move || {
+            live.fetch_add(1, Ordering::SeqCst);
+            Tracked {
+                hot: 0,
+                payload: None,
+                live: Arc::clone(&live),
+                drops: Arc::clone(&drops),
+            }
+        }
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// 无钩子池装配（每测独立固定装置）。
+fn tracked_pool(
+    max: usize,
+    idle_cap: usize,
+) -> (ObjectPool<Tracked>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let live = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let pool = ObjectPool::new(
+        max,
+        idle_cap,
+        Tracked::factory(Arc::clone(&live), Arc::clone(&drops)),
+    );
+    (pool, live, drops)
+}
+
+/// 带钩子池装配（reset 计数器 + live/drops 一并交还，保证断言读的是同一计数源）。
+fn resettable_pool(
+    reset: impl Fn(&mut Tracked) + Send + Sync + 'static,
+    phase: ResetPhase,
+) -> (
+    ObjectPool<Tracked>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+) {
+    let resets = Arc::new(AtomicUsize::new(0));
+    let live = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let pool = ObjectPool::with_reset(
+        2,
+        2,
+        Tracked::factory(Arc::clone(&live), Arc::clone(&drops)),
+        {
+            let resets = Arc::clone(&resets);
+            move |t: &mut Tracked| {
+                resets.fetch_add(1, Ordering::SeqCst);
+                reset(t);
+            }
+        },
+        phase,
+    );
+    (pool, resets, live, drops)
+}
+
+// ── reset 钩子两相位：保留字段 / 重置字段区分 + 新对象跳过 reset ──────────
+
+#[test]
+fn reset_on_return_restores_fields_keeps_hot_state() {
+    let (p, resets, _live, _drops) = resettable_pool(
+        |t: &mut Tracked| t.payload = None, // 重置字段：脏态清除（hot 不动——保留字段）
+        ResetPhase::OnReturn,
+    );
+
+    let mut g = p.acquire();
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        0,
+        "新构造对象不调 reset（OnReturn 相位同跳）"
+    );
+    g.hot = 42;
+    g.payload = Some("dirty");
+    drop(g); // 归还 → OnReturn reset
+
+    assert_eq!(resets.load(Ordering::SeqCst), 1, "归还路径 reset 恰一次");
+    let m = p.metrics();
+    assert_eq!(m.core.idle, 1, "reset 后留存入 idle");
+    assert_eq!(m.reused, 0);
+    assert_eq!(m.constructed, 1, "复用件不重复构造");
+
+    let g2 = p.acquire();
+    assert_eq!(g2.payload, None, "重置字段：脏态已清除");
+    assert_eq!(g2.hot, 42, "保留字段：热态跨借还保留");
+    let m = p.metrics();
+    assert_eq!(m.reused, 1, "复用计数 +1");
+    drop(g2);
+    assert_eq!(resets.load(Ordering::SeqCst), 2, "第二次归还 reset 恰一次");
+}
+
+#[test]
+fn reset_on_acquire_restores_fields_keeps_hot_state() {
+    let (p, resets, _live, _drops) = resettable_pool(
+        |t: &mut Tracked| t.payload = None, // 重置字段
+        ResetPhase::OnAcquire,
+    );
+
+    let mut g = p.acquire();
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        0,
+        "新构造对象不调 reset（OnAcquire 相位跳过）"
+    );
+    g.hot = 7;
+    g.payload = Some("dirty");
+    drop(g);
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        0,
+        "OnAcquire 相位：归还不调 reset"
+    );
+
+    let g2 = p.acquire();
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        1,
+        "取出时 reset 恰一次（仅复用件）"
+    );
+    assert_eq!(g2.payload, None, "重置字段：取出时清除");
+    assert_eq!(g2.hot, 7, "保留字段：热态跨借还保留");
+    drop(g2);
+    assert_eq!(resets.load(Ordering::SeqCst), 1, "归还路径不调 reset");
+}
+
+#[test]
+fn without_reset_state_persists_across_cycles() {
+    // 对照组：无 reset 钩子（`new`）⇒ 状态跨借还原样保留
+    let (p, _live, _drops) = tracked_pool(2, 2);
+    {
+        let mut g = p.acquire();
+        g.hot = 99;
+        g.payload = Some("keep");
+    }
+    let g = p.acquire();
+    assert_eq!(g.hot, 99, "无 reset：hot 保留");
+    assert_eq!(g.payload, Some("keep"), "无 reset：payload 保留");
+    let m = p.metrics();
+    assert_eq!(m.reused, 1);
+    assert_eq!(m.constructed, 1);
+    drop(g);
+}
+
+// ── 降级直构：宇宙满 ⇒ 不入池宇宙、归还即释放（两独立计数口径）────────────
+
+#[test]
+fn degraded_when_universe_full_released_on_return() {
+    let (p, _live, _drops) = tracked_pool(1, 1);
+    let g1 = p.acquire();
+    let m = p.metrics();
+    assert_eq!(m.constructed, 1);
+    assert_eq!(m.degraded, 0);
+
+    let g2 = p.acquire(); // 宇宙 1 == max 1 ⇒ 降级直构
+    let m = p.metrics();
+    assert_eq!(m.degraded, 1, "宇宙已满 ⇒ 降级直构计数");
+    assert_eq!(
+        m.constructed, 2,
+        "降级直构同时是一次工厂调用（两独立计数各自留痕）"
+    );
+    assert_eq!(m.core.borrowed, 2, "borrowed = 正常 + 降级都在内");
+    assert!(
+        (m.core.watermark - 2.0).abs() < 1e-9,
+        "水位线 = borrowed/max = 2/1 > 1.0（降级如实体现）"
+    );
+
+    drop(g2); // 降级对象归还 ⇒ 直接释放
+    let m = p.metrics();
+    assert_eq!(m.core.idle, 0, "降级对象永不进 idle");
+    assert_eq!(m.core.borrowed, 1);
+    assert_eq!(
+        m.core.dropped_overflow, 0,
+        "降级释放 ≠ 溢出丢弃（两独立计数不得混账）"
+    );
+
+    drop(g1); // 正常对象归还 ⇒ 留存
+    let m = p.metrics();
+    assert_eq!(m.core.idle, 1, "正常对象宇宙记账是另一条路径");
+    assert_eq!(m.core.borrowed, 0);
+    assert!(m.core.idle <= m.core.max, "池宇宙不超 max");
+}
+
+// ── detach：所有权移交调用方，池不钉住（宇宙配额随件回吐）─────────────────
+
+#[test]
+fn detach_hands_ownership_out_pool_does_not_retain() {
+    let (p, live, drops) = tracked_pool(2, 2);
+    let g = p.acquire();
+    assert_eq!(p.metrics().constructed, 1);
+
+    let obj = g.detach();
+    let m = p.metrics();
+    assert_eq!(m.core.borrowed, 0, "detach 即借出数回吐");
+    assert_eq!(m.core.idle, 0, "池不持有 detach 件");
+    drop(obj);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "析构归调用方（最后一个持有者放手即析构）"
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+    assert_eq!(p.metrics().core.idle, 0, "池不回收已移交对象");
+
+    let g2 = p.acquire();
+    let m = p.metrics();
+    assert_eq!(m.constructed, 2, "宇宙已回吐 ⇒ 新建而非降级");
+    assert_eq!(m.degraded, 0);
+    drop(g2);
+}
+
+#[test]
+fn detach_broken_object_does_not_poison_pool() {
+    // 坏对象处置 = detach 带走（r2d2 has_broken / Commons Pool2 invalidateObject
+    // 的调用方判定权）：池宇宙回吐，后续借还路径不受污染。
+    let (p, _live, drops) = tracked_pool(2, 2);
+    let mut g = p.acquire();
+    g.payload = Some("corrupted"); // 视为坏
+    let obj = g.detach();
+    drop(obj);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let m = p.metrics();
+    assert_eq!(m.core.borrowed, 0);
+    assert_eq!(m.core.idle, 0, "坏对象未回池");
+
+    let g2 = p.acquire();
+    let m = p.metrics();
+    assert_eq!(m.constructed, 2, "宇宙回吐 ⇒ 新建");
+    assert_eq!(m.degraded, 0);
+    assert_eq!(m.reused, 0, "reused 计数不受 detach 污染");
+    drop(g2);
+    assert_eq!(p.metrics().core.idle, 1, "后续正常归还照常留存");
+}
+
+// ── 归还丢弃：idle_cap 满 ⇒ 丢弃 + dropped_overflow（Drop 计数观测）────────
+
+#[test]
+fn return_drops_when_idle_cap_full() {
+    let (p, live, drops) = tracked_pool(2, 1);
+    let a = p.acquire();
+    let b = p.acquire();
+    assert_eq!(live.load(Ordering::SeqCst), 2);
+
+    drop(a); // idle 0 < 1 ⇒ 留存
+    let m = p.metrics();
+    assert_eq!(m.core.idle, 1);
+    assert_eq!(live.load(Ordering::SeqCst), 2);
+
+    drop(b); // idle 已满 ⇒ 丢弃
+    let m = p.metrics();
+    assert_eq!(live.load(Ordering::SeqCst), 1, "槽满对象被析构");
+    assert_eq!(drops.load(Ordering::SeqCst), 1, "Drop 计数观测到释放");
+    assert_eq!(m.core.dropped_overflow, 1, "dropped_overflow 计数留痕");
+    assert_eq!(m.core.idle, 1);
+}
+
+// ── prune_idle：按龄释放 + ZERO 全释放 + pruned 计数 ─────────────────────
+
+#[test]
+fn prune_idle_releases_by_age_and_counts() {
+    let (p, live, _drops) = tracked_pool(2, 2);
+    let mut a = p.acquire();
+    a.hot = 1;
+    let mut b = p.acquire(); // 与 a 同时在借 ⇒ 两件独立构造（借用期互不复用）
+    b.hot = 2;
+    drop(a); // idle 1（老）
+    thread::sleep(Duration::from_millis(120));
+    drop(b); // idle 2（新——last_used 晚于 a 约 120ms）
+
+    let pruned = p.prune_idle(Duration::from_millis(50), Instant::now());
+    assert_eq!(pruned, 1, "超龄释放恰一件");
+    let m = p.metrics();
+    assert_eq!(m.pruned, 1, "pruned 计数留痕");
+    assert_eq!(m.core.idle, 1, "未超龄保留");
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+
+    let pruned_again = p.prune_idle(Duration::from_millis(50), Instant::now());
+    assert_eq!(pruned_again, 0, "未超龄不释放");
+    assert_eq!(p.metrics().pruned, 1);
+}
+
+#[test]
+fn prune_zero_age_releases_all_idle() {
+    let (p, live, _drops) = tracked_pool(2, 2);
+    {
+        let _a = p.acquire();
+        let _b = p.acquire();
+    }
+    assert_eq!(p.metrics().core.idle, 2);
+
+    let pruned = p.prune_idle(Duration::ZERO, Instant::now());
+    assert_eq!(pruned, 2, "Duration::ZERO ⇒ 释放全部 idle");
+    let m = p.metrics();
+    assert_eq!(m.core.idle, 0);
+    assert_eq!(m.pruned, 2);
+    assert_eq!(live.load(Ordering::SeqCst), 0, "全部析构");
+}
+
+// ── resize：事前校验拒绝不改状态 / 缩容裁剪 idle ──────────────────────────
+
+#[test]
+fn resize_rejects_illegal_params_without_state_change() {
+    let (p, _live, _drops) = tracked_pool(4, 2);
+    let before = p.metrics();
+    assert_eq!(
+        PoolManaged::resize(
+            &p,
+            ObjectPoolTuning {
+                max: 0,
+                idle_cap: 1
+            }
+        ),
+        Err(PoolResizeError::ZeroMax),
+        "max==0 必须 fail-visible 拒绝"
+    );
+    assert_eq!(
+        PoolManaged::resize(
+            &p,
+            ObjectPoolTuning {
+                max: 4,
+                idle_cap: 0
+            }
+        ),
+        Err(PoolResizeError::IdleCapZero),
+        "idle_cap==0 必须拒绝"
+    );
+    assert_eq!(
+        PoolManaged::resize(
+            &p,
+            ObjectPoolTuning {
+                max: 2,
+                idle_cap: 3
+            }
+        ),
+        Err(PoolResizeError::IdleCapExceedsMax {
+            idle_cap: 3,
+            max: 2
+        }),
+        "idle_cap>max 必须拒绝"
+    );
+    assert_eq!(
+        p.metrics(),
+        before,
+        "拒绝路径不得改任何状态（含 panic_dropped）"
+    );
+}
+
+#[test]
+fn resize_shrink_prunes_excess_idle() {
+    let (p, live, _drops) = tracked_pool(4, 2);
+    {
+        let _a = p.acquire();
+        let _b = p.acquire();
+    }
+    assert_eq!(p.metrics().core.idle, 2);
+
+    PoolManaged::resize(
+        &p,
+        ObjectPoolTuning {
+            max: 4,
+            idle_cap: 1,
+        },
+    )
+    .expect("合法缩容");
+    let m = p.metrics();
+    assert_eq!(m.core.idle, 1, "缩容裁剪到新 idle_cap");
+    assert_eq!(m.core.dropped_overflow, 1, "缩容丢弃走 dropped_overflow");
+    assert_eq!(
+        m.pruned, 0,
+        "resize 丢弃与 prune_idle 是两个独立计数，不得混账"
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn resize_shrink_does_not_revoke_borrowed() {
+    // 缩容不夺借出（PoolManaged 语义契约 2）：在借句柄不受影响，归还时按新
+    // 边界裁决（终态收敛到新 idle_cap）。
+    let (p, live, _drops) = tracked_pool(4, 4);
+    let a = p.acquire();
+    let b = p.acquire();
+    PoolManaged::resize(
+        &p,
+        ObjectPoolTuning {
+            max: 4,
+            idle_cap: 1,
+        },
+    )
+    .expect("缩容生效");
+    let m = p.metrics();
+    assert_eq!(m.core.borrowed, 2, "缩容不夺借出：在借句柄不受影响");
+    assert_eq!(m.core.idle, 0);
+    assert_eq!(live.load(Ordering::SeqCst), 2);
+
+    drop(a); // idle 0→1 留存
+    drop(b); // idle 已满 ⇒ 溢出丢弃（归还时按新边界裁决）
+    let m = p.metrics();
+    assert_eq!(m.core.idle, 1, "终态收敛到新 idle_cap");
+    assert_eq!(m.core.dropped_overflow, 1);
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+}
+
+// ── 并发借还：容量硬上界 + 终态账实一致（范式同 tests/memory_pool.rs）──────
+
+#[test]
+fn concurrent_acquire_return_keeps_ledger_consistent() {
+    let (p, live, _drops) = tracked_pool(8, 4);
+    let p = Arc::new(p);
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let p = Arc::clone(&p);
+        handles.push(thread::spawn(move || {
+            for _ in 0..200 {
+                let g = p.acquire(); // 永不阻塞永不失败——无超时参数
+                std::hint::black_box(&*g);
+                drop(g);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("负载线程不得 panic");
+    }
+    let m = p.metrics();
+    assert_eq!(m.core.borrowed, 0, "全部归还后借出数归零");
+    assert!(m.core.idle <= 4, "idle ≤ idle_cap");
+    assert!(m.core.idle <= m.core.max, "终态宇宙（= idle）≤ max");
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        m.core.idle,
+        "账实一致：存活实例数 == idle 数"
+    );
+    assert_eq!(m.panic_dropped, 0, "正常路径不得有 unwind 丢弃");
+    assert_eq!(m.reset_panicked, 0, "无钩子 ⇒ 不得有钩子因丢弃");
+    assert_eq!(m.core.watermark, 0.0);
+    // 反假绿：若配额逻辑坏到每次 acquire 都降级，`idle`/`borrowed`/`live` 全归零
+    // 上面几条照样成立。8 线程各持 1 件（≤ max=8）⇒ 正确实现零降级、工厂至多被
+    // 调用 max 次。
+    assert_eq!(m.degraded, 0, "8 线程各持 1 件 ≤ max=8 ⇒ 正确实现下零降级");
+    assert!(
+        m.constructed <= 8,
+        "工厂调用次数 ≤ max（无降级直构、无对象泄漏式重建）：{}",
+        m.constructed
+    );
+}
+
+// ── 分片均分余数：无降级 + idle 上界（max/ idle_cap 不整除分片数）──────────
+
+#[test]
+fn uneven_share_has_zero_degradation_and_bounded_idle() {
+    // max=10 / idle_cap=4 ⇒ 4 片，片配额按 share 分：max 侧 3,3,2,2（10 % 4 = 2），
+    // idle_cap 侧 1,1,1,1。宇宙恰好 10 件可同时借出 ⇒ 零降级；10 件全归还后只有
+    // 4 个 idle 名额（每片 1）⇒ 恰好 4 留存、6 按容量因丢弃。
+    let (p, live, _drops) = tracked_pool(10, 4);
+    let p = Arc::new(p);
+    let gate = Arc::new(Barrier::new(11));
+    let release = Arc::new(Barrier::new(11));
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let p = Arc::clone(&p);
+        let gate = Arc::clone(&gate);
+        let release = Arc::clone(&release);
+        handles.push(thread::spawn(move || {
+            let g = p.acquire();
+            gate.wait(); // 峰值窗口：主线程在此读数
+            release.wait();
+            std::hint::black_box(&*g);
+            drop(g);
+        }));
+    }
+    gate.wait();
+    let at_peak = p.metrics();
+    assert_eq!(at_peak.core.borrowed, 10, "10 线程各持 1 件");
+    assert_eq!(
+        at_peak.degraded, 0,
+        "宇宙恰好满 ≠ 降级（余数份额也认领得到）"
+    );
+    assert_eq!(
+        at_peak.constructed, 10,
+        "工厂调用 == 借出件数（零降级直构）"
+    );
+    assert_eq!(at_peak.core.idle, 0);
+    release.wait();
+
+    for h in handles {
+        h.join().expect("负载线程不得 panic");
+    }
+    let m = p.metrics();
+    assert_eq!(m.core.idle, 4, "idle 上界 = idle_cap（每片 1）");
+    assert_eq!(m.core.dropped_overflow, 6, "10 还 4 留 ⇒ 6 按容量因丢弃");
+    assert_eq!(m.core.borrowed, 0);
+    assert_eq!(m.reset_panicked, 0, "容量因不进钩子因计数");
+    assert_eq!(live.load(Ordering::SeqCst), 4, "存活实例数 == idle 数");
+}
+
+// ── 宇宙恰好达 max：水位线 1.0 且零降级 ─────────────────────────────────
+
+#[test]
+fn universe_exactly_at_max_stays_undegraded() {
+    let (p, live, _drops) = tracked_pool(8, 8);
+    let p = Arc::new(p);
+    let gate = Arc::new(Barrier::new(9));
+    let release = Arc::new(Barrier::new(9));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let p = Arc::clone(&p);
+        let gate = Arc::clone(&gate);
+        let release = Arc::clone(&release);
+        handles.push(thread::spawn(move || {
+            let g = p.acquire();
+            gate.wait();
+            release.wait();
+            std::hint::black_box(&*g);
+            drop(g);
+        }));
+    }
+    gate.wait();
+    let m = p.metrics();
+    assert_eq!(m.core.borrowed, 8, "宇宙满（= max）");
+    assert!((m.core.watermark - 1.0).abs() < 1e-9, "水位线 = 1.0");
+    assert_eq!(m.degraded, 0, "达 max 但未越界 ⇒ 零降级");
+    assert_eq!(m.constructed, 8);
+    assert_eq!(live.load(Ordering::SeqCst), 8);
+    release.wait();
+
+    for h in handles {
+        h.join().expect("负载线程不得 panic");
+    }
+    let m = p.metrics();
+    assert_eq!(m.core.idle, 8, "8 片各 1 留存");
+    assert_eq!(m.core.dropped_overflow, 0, "无溢出：每片恰好 1");
+    assert_eq!(m.degraded, 0);
+}
+
+// ── 跨片复用：异线程借到同片留存件（复用命中、不新建）─────────────────────
+
+#[test]
+fn cross_shard_reuse_is_counted_without_new_construction() {
+    let (p, _live, _drops) = tracked_pool(4, 4); // 4 片
+    let p = Arc::new(p);
+    {
+        // 首个领号者（本线程）home = 0 号片：借出即归还 ⇒ 0 号片留 1 件。
+        let g = p.acquire();
+        std::hint::black_box(&*g);
+    }
+    let m = p.metrics();
+    assert_eq!((m.constructed, m.reused), (1, 0), "首次借出必新建");
+
+    let p2 = Arc::clone(&p);
+    let m = thread::spawn(move || {
+        // 新线程 home = 1 号片：本片空 ⇒ 轮转扫到 0 号片的留存件。
+        let g = p2.acquire();
+        std::hint::black_box(&*g);
+        drop(g);
+        p2.metrics()
+    })
+    .join()
+    .expect("异线程借还不得 panic");
+
+    assert_eq!(m.reused, 1, "跨片复用命中（非本片空 ⇒ 轮转扫到持有片）");
+    assert_eq!(m.constructed, 1, "跨片复用不触发工厂调用");
+    assert_eq!(m.degraded, 0);
+    assert_eq!(m.core.borrowed, 0);
+}
+
+// ── 同线程多池亲和：A/B 交替各 200 轮，两池各自稳定复用 ──────────────────
+
+#[test]
+fn multi_pool_affinity_is_stable_in_same_thread() {
+    // 宿主真实形态：同一线程同时用加解密 ctx 池与连接池。亲和表按池地址分槽 ⇒
+    // 两池互不覆盖（单槽实现下每切换一次池都要重领号，亲和失效）。
+    let (a, a_live, _a_drops) = tracked_pool(4, 4);
+    let (b, b_live, _b_drops) = tracked_pool(4, 4);
+    for _ in 0..200 {
+        let mut ga = a.acquire();
+        ga.hot += 1; // 复用同一件：状态跨借还累加（证明是同一件而非重建）
+        std::hint::black_box(&*ga);
+        drop(ga);
+        let gb = b.acquire();
+        std::hint::black_box(&*gb);
+        drop(gb);
+    }
+    let ma = a.metrics();
+    let mb = b.metrics();
+    assert_eq!(ma.constructed, 1, "A 池 200 轮只造 1 件（亲和不漂移）");
+    assert_eq!(ma.reused, 199, "A 池 199 次命中复用");
+    assert_eq!(ma.core.idle, 1);
+    assert_eq!(ma.degraded, 0);
+    assert_eq!(a_live.load(Ordering::SeqCst), 1, "A 池账实一致");
+    assert_eq!(mb.constructed, 1, "B 池同款：不被 A 挤掉亲和");
+    assert_eq!(mb.reused, 199, "B 池 199 次命中复用");
+    assert_eq!(b_live.load(Ordering::SeqCst), 1, "B 池账实一致");
+    // 鉴别力锚（审计 F4-复核）：借还/构造计数在「单槽亲和」回退实现下同样正确
+    // （`pop_idle` 会轮转把唯一那件找回来）——唯「每 (线程,池) 只领一次号」这条
+    // 能区分。单槽回退时该值会涨到 ≈ 循环次数（200）。
+    assert_eq!(
+        a.affinity_issuances(),
+        1,
+        "A 池每线程只领一次号（单槽回退会涨）"
+    );
+    assert_eq!(
+        b.affinity_issuances(),
+        1,
+        "B 池每线程只领一次号（单槽回退会涨）"
+    );
+}
+
+// ── F1 回归：resize 缩 cap × 多线程归还交错，终态 idle ≤ 新 idle_cap ───────
+
+#[test]
+fn resize_shrink_racing_returns_never_breaches_new_idle_cap() {
+    // 配额若读在片锁外：归还读到旧 cap（宽）→ resize 已 store 新 cap 并裁过该片
+    // → 归还的 push 落在新上界之外，且**无任何再裁剪路径**（永久留存）。本测试
+    // 反复「放开 → 缩到 1」让窗口高频出现，终态断言硬上界。
+    //
+    // 口径：该窗口是 ns 级（须「load 配额 → 取片锁」之间恰好被 resize 整段插队），
+    // 故本条是**不变式守卫**而非确定性复现——击穿一旦发生即永久留存，join 后断言
+    // 必中的；确定性收敛路径的对照见 `resize_shrink_does_not_revoke_borrowed`。
+    const ROUNDS: usize = 3;
+    for round in 1..=ROUNDS {
+        let (p, live, _drops) = tracked_pool(32, 8);
+        let p = Arc::new(p);
+        let gate = Arc::new(Barrier::new(9));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let p = Arc::clone(&p);
+            let gate = Arc::clone(&gate);
+            handles.push(thread::spawn(move || {
+                gate.wait();
+                for _ in 0..400 {
+                    let g = p.acquire();
+                    std::hint::black_box(&*g);
+                    drop(g); // 归还与 resize 交错
+                }
+            }));
+        }
+        gate.wait();
+        for _ in 0..128 {
+            p.resize(ObjectPoolTuning {
+                max: 32,
+                idle_cap: 8,
+            })
+            .expect("放开 cap 合法");
+            p.resize(ObjectPoolTuning {
+                max: 32,
+                idle_cap: 1,
+            })
+            .expect("缩 cap 合法");
+        }
+        for h in handles {
+            h.join().expect("负载线程不得 panic");
+        }
+        // 最后一次 resize 是缩小 ⇒ 无需再收敛动作，终态必须已在界内。
+        let m = p.metrics();
+        assert!(
+            m.core.idle <= 1,
+            "round {round}: 终态 idle {} > 新 idle_cap 1（配额读在片锁外 ⇒ 永久击穿）",
+            m.core.idle
+        );
+        assert_eq!(m.core.borrowed, 0, "round {round}: 全部归还");
+        assert_eq!(m.reset_panicked, 0);
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            m.core.idle,
+            "round {round}: 账实一致（未留孤儿实例）"
+        );
+    }
+}
+
+// ── metrics：共享核心形经 Borrow 可达 + 特有读数 ──────────────────────────
+
+#[test]
+fn metrics_expose_core_via_borrow() {
+    let (p, _live, _drops) = tracked_pool(4, 2);
+    let m = p.metrics();
+    let core: &PoolMetrics = m.borrow();
+    assert_eq!(core.max, 4);
+    assert_eq!(core.idle, 0);
+    assert_eq!(core.borrowed, 0);
+    assert_eq!(core.dropped_overflow, 0);
+    assert_eq!(core.watermark, 0.0);
+    assert_eq!(m.degraded, 0);
+    assert_eq!(m.reused, 0);
+    assert_eq!(m.constructed, 0);
+    assert_eq!(m.pruned, 0);
+    assert_eq!(m.panic_dropped, 0, "panic_dropped 纳入 metrics 一致性");
+    assert_eq!(m.reset_panicked, 0, "reset_panicked 纳入 metrics 一致性");
+
+    let g = p.acquire();
+    let m = p.metrics();
+    assert_eq!(m.constructed, 1);
+    assert!((m.core.watermark - 0.25).abs() < 1e-9, "水位线 = 1/4");
+    drop(g);
+    assert_eq!(p.metrics().core.idle, 1);
+}
+
+// ── 审计流：seq 单调 + 种类齐全（借出/归还/调参/拒绝/溢出；实时回调收集面）──
+
+#[test]
+fn audit_events_cover_lifecycle_with_monotonic_seq() {
+    let (p, _live, _drops) = tracked_pool(2, 1);
+    let got: Arc<Mutex<Vec<PoolAuditEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&got);
+    let _ticket = PoolManaged::subscribe_audit(&p, move |e| {
+        sink.lock().expect("审计槽未毒化").push(*e);
+    });
+
+    let a = p.acquire(); // Borrowed（新建）
+    drop(a); // Returned
+    let b = p.acquire(); // Borrowed（复用）
+    let c = p.acquire(); // Borrowed（新建，宇宙 2/2）
+    PoolManaged::resize(
+        &p,
+        ObjectPoolTuning {
+            max: 1,
+            idle_cap: 1,
+        },
+    )
+    .expect("缩容生效"); // Resized
+    drop(b); // Returned（idle 0→1）
+    drop(c); // OverflowDropped（idle 已满）
+    assert!(
+        PoolManaged::resize(
+            &p,
+            ObjectPoolTuning {
+                max: 0,
+                idle_cap: 1
+            }
+        )
+        .is_err(),
+        "拒绝也进审计（事前校验留痕）"
+    ); // ResizeRejected
+
+    let events = got.lock().expect("审计槽未毒化").clone();
+    assert!(events.len() >= 2, "生命周期必须产生事件流");
+    for w in events.windows(2) {
+        assert!(w[0].seq < w[1].seq, "seq 必须单调：{events:?}");
+    }
+    let kinds: Vec<PoolAuditKind> = events.iter().map(|e| e.kind).collect();
+    for expected in [
+        PoolAuditKind::Borrowed,
+        PoolAuditKind::Returned,
+        PoolAuditKind::Resized,
+        PoolAuditKind::ResizeRejected,
+        PoolAuditKind::OverflowDropped,
+    ] {
+        assert!(
+            kinds.contains(&expected),
+            "生命周期事件缺 {expected:?}：实际 {kinds:?}"
+        );
+    }
+    drop(_ticket);
+}
+
+// ── 审计回调 panic：摘除留痕（audit_callback_panics）+ 环照录 + 池行为不变 ──
+
+#[test]
+fn audit_callback_panic_is_counted_and_pool_unaffected() {
+    let (p, _live, _drops) = tracked_pool(2, 2);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let _ticket = PoolManaged::subscribe_audit(&p, move |_e| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        panic!("audit boom");
+    });
+
+    let g = p.acquire(); // Borrowed ⇒ 回调 panic ⇒ fail-closed 摘除
+    drop(g); // Returned ⇒ 已摘除，不再进回调
+    assert_eq!(p.audit_callback_panics(), 1, "回调 panic 留痕且只摘一次");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "摘除后不再回调");
+
+    let m = p.metrics();
+    assert_eq!(m.core.borrowed, 0, "观测面 panic 不得改变池行为");
+    assert_eq!(m.core.idle, 1, "归还照常留存");
+    assert_eq!(m.reset_panicked, 0, "回调 panic 不是钩子因");
+    // 环照录：观测面摘除不影响事后取证面（读侧同 `PoolBase` 口径）。
+    let events = p.take_audit_events();
+    assert_eq!(events.len(), 2, "Borrowed + Returned 均入环：{events:?}");
+    assert!(p.take_audit_events().is_empty(), "随取随清");
+}
+
+// ── 工厂 panic：宇宙配额回滚，池继续可用 ──────────────────────────────────
+
+#[test]
+fn factory_panic_rolls_back_universe_and_pool_stays_usable() {
+    let boom = Arc::new(AtomicBool::new(false));
+    let live = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let make = {
+        let boom = Arc::clone(&boom);
+        let live = Arc::clone(&live);
+        let drops = Arc::clone(&drops);
+        move || {
+            if boom.swap(false, Ordering::SeqCst) {
+                panic!("factory boom");
+            }
+            live.fetch_add(1, Ordering::SeqCst);
+            Tracked {
+                hot: 0,
+                payload: None,
+                live: Arc::clone(&live),
+                drops: Arc::clone(&drops),
+            }
+        }
+    };
+    let p = ObjectPool::new(1, 1, make);
+
+    boom.store(true, Ordering::SeqCst);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _ = p.acquire();
+    }));
+    assert!(result.is_err(), "工厂 panic 必须如实传播");
+    let m = p.metrics();
+    assert_eq!(m.constructed, 1, "工厂调用即留痕（panic 时已计数）");
+    assert_eq!(m.core.borrowed, 0, "配额回滚：借出数未虚增");
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+
+    boom.store(false, Ordering::SeqCst);
+    let g = p.acquire();
+    let m = p.metrics();
+    assert_eq!(m.constructed, 2);
+    assert_eq!(m.degraded, 0, "宇宙配额已回滚 ⇒ 新建而非降级");
+    drop(g);
+    assert_eq!(p.metrics().core.idle, 1, "panic 回滚后池必须可用");
+}
+
+// ── reset panic 兜底（非 unwind 路径）：丢弃对象，进程不 abort，池仍可用 ───
+
+#[test]
+fn reset_panic_on_return_discards_object_pool_survives() {
+    const MARK: u64 = u64::MAX;
+    let (p, resets, live, _drops) = resettable_pool(
+        |t: &mut Tracked| {
+            if t.hot == MARK {
+                panic!("reset boom");
+            }
+            t.payload = None;
+        },
+        ResetPhase::OnReturn,
+    );
+
+    let mut g = p.acquire();
+    g.hot = MARK; // 标记为 reset 时爆炸
+    drop(g); // reset panic ⇒ catch_unwind 兜底：丢弃不入 idle，进程不 abort
+
+    let m = p.metrics();
+    assert_eq!(resets.load(Ordering::SeqCst), 1, "钩子确实运行过");
+    assert_eq!(
+        m.reset_panicked, 1,
+        "reset panic ⇒ 丢弃 + 钩子因计数 reset_panicked"
+    );
+    assert_eq!(
+        m.core.dropped_overflow, 0,
+        "钩子因不得混进容量口径（dropped_overflow）"
+    );
+    assert_eq!(
+        m.panic_dropped, 0,
+        "catch_unwind 兜底路径 ≠ unwind 路径（两独立计数）"
+    );
+    assert_eq!(m.core.idle, 0, "状态不可信对象不入 idle");
+    assert_eq!(m.core.borrowed, 0);
+    assert_eq!(live.load(Ordering::SeqCst), 0, "对象已销毁");
+
+    let g2 = p.acquire(); // 池仍可用
+    let m = p.metrics();
+    assert_eq!(m.constructed, 2, "宇宙配额已回吐 ⇒ 新建");
+    drop(g2); // reset 正常路径（hot=0 ≠ MARK）
+    let m = p.metrics();
+    assert_eq!(m.core.idle, 1, "reset 后正常留存");
+    assert_eq!(resets.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn reset_on_acquire_panic_propagates_and_pool_stays_consistent() {
+    const MARK: u64 = u64::MAX;
+    let (p, resets, live, _drops) = resettable_pool(
+        |t: &mut Tracked| {
+            if t.hot == MARK {
+                panic!("acquire reset boom");
+            }
+            t.payload = None;
+        },
+        ResetPhase::OnAcquire,
+    );
+
+    let mut g1 = p.acquire(); // 新对象：reset 跳过
+    g1.hot = MARK;
+    drop(g1); // OnAcquire：归还不调 reset ⇒ 留存 idle
+    assert_eq!(p.metrics().core.idle, 1);
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _ = p.acquire(); // 取出复用件 → reset panic ⇒ 原样传播（不吞）
+    }));
+    assert!(result.is_err(), "OnAcquire reset panic 必须原样传播");
+
+    let m = p.metrics();
+    assert_eq!(resets.load(Ordering::SeqCst), 1);
+    assert_eq!(m.core.idle, 0, "复用件已消费销毁");
+    assert_eq!(m.core.borrowed, 0, "借出数未虚增");
+    assert_eq!(live.load(Ordering::SeqCst), 0, "宇宙配额已回吐");
+
+    let g3 = p.acquire(); // 新建对象：reset 跳过 ⇒ 无 panic
+    let m = p.metrics();
+    assert_eq!(m.constructed, 2);
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        1,
+        "新对象跳过 reset（复证跳过语义）"
+    );
+    drop(g3);
+    assert_eq!(p.metrics().core.idle, 1);
+}
+
+// ── 语义 11：unwind 感知归还（panic 中析构 = 销毁不回池，r2d2#31 防御）────
+
+#[test]
+fn unwind_return_destroys_object_and_does_not_repool() {
+    let (p, live, drops) = tracked_pool(2, 2);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut g = p.acquire();
+        g.hot = 5;
+        g.payload = Some("dirty");
+        panic!("boom inside unwind window");
+    }));
+    assert!(result.is_err(), "panic 必须如实传播");
+
+    let m = p.metrics();
+    assert_eq!(m.panic_dropped, 1, "unwind 归还计入 panic_dropped");
+    assert_eq!(
+        m.core.dropped_overflow, 0,
+        "panic_dropped 与 dropped_overflow 两独立计数不得混账"
+    );
+    assert_eq!(m.core.idle, 0, "脏对象禁回池");
+    assert_eq!(m.core.borrowed, 0, "借出数已回吐");
+    assert_eq!(live.load(Ordering::SeqCst), 0, "对象已销毁");
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+    let g = p.acquire();
+    let m = p.metrics();
+    assert_eq!(m.constructed, 2, "对象未回池 ⇒ 下一个借出是新建");
+    assert_eq!(m.reused, 0, "复用计数不得被 unwind 归还污染");
+    drop(g);
+    assert_eq!(p.metrics().core.idle, 1, "池后续可用（正常归还回池）");
+}
+
+#[test]
+fn unwind_return_control_group_normal_return_repools() {
+    // 对照组：非 unwind 正常归还回池（复用计数 +1）——与 unwind 路径对照显形
+    let (p, _live, _drops) = tracked_pool(2, 2);
+    {
+        let mut g = p.acquire();
+        g.hot = 1;
+        g.payload = Some("dirty");
+    } // 正常 Drop ⇒ 回池
+    let m = p.metrics();
+    assert_eq!(m.panic_dropped, 0);
+    assert_eq!(m.core.idle, 1, "正常归还回池");
+
+    let g = p.acquire();
+    let m = p.metrics();
+    assert_eq!(m.reused, 1, "复用计数 +1（对照组）");
+    assert_eq!(m.constructed, 1);
+    drop(g);
+}
+
+// ── reset 重入检出：可观察失败（丢弃留痕），非静默跳过、非死锁、非 abort ──
+
+#[test]
+fn reset_reentrant_acquire_is_detected_and_discarded() {
+    // 钩子体内重入**同一池** acquire + 归还 = 契约违规（无限递归面）——
+    // thread_local 在途标记检出 ⇒ panic ⇒ 归还路径 catch_unwind 兜底：重入件
+    // 丢弃 + `reset_panicked` 留痕（钩子因，**不进容量口径** `dropped_overflow`），
+    // 外层对象照常留存（池不死锁不 abort）。
+    // 池句柄：钩子闭包读它拿池；收尾置 None 摘除强引用（断环）。
+    type PoolHandle = Arc<Mutex<Option<Arc<ObjectPool<Vec<u8>>>>>>;
+    let holder: PoolHandle = Arc::new(Mutex::new(None));
+    let hook_pool = Arc::clone(&holder);
+    let pool = Arc::new(ObjectPool::with_reset(
+        4,
+        4,
+        Vec::<u8>::new,
+        move |v: &mut Vec<u8>| {
+            if let Some(p) = hook_pool.lock().expect("holder 锁未毒化").as_ref() {
+                let inner = p.acquire(); // 重入同一池（检出点在其归还路径）
+                drop(inner); // 归还 → 重置重入检出 ⇒ panic ⇒ 兜底丢弃重入件
+            }
+            v.clear();
+        },
+        ResetPhase::OnReturn,
+    ));
+    *holder.lock().expect("holder 锁未毒化") = Some(Arc::clone(&pool));
+
+    let mut g = pool.acquire(); // 新对象：reset 跳过（无重入）
+    g.push(1);
+    drop(g); // 归还 → 钩子 → 重入 acquire → 重入件归还 → 检出 ⇒ 丢弃
+
+    let m = pool.metrics();
+    assert_eq!(
+        m.reset_panicked, 1,
+        "归还路径重入 ⇒ 兜底丢弃重入件（fail-visible，非静默跳过）"
+    );
+    assert_eq!(m.core.dropped_overflow, 0, "重入检出是钩子因，不进容量口径");
+    assert_eq!(
+        m.panic_dropped, 0,
+        "重入检出走 catch_unwind 兜底 ≠ unwind 路径（两独立计数）"
+    );
+    assert_eq!(m.core.idle, 1, "外层对象照常留存（兜底只丢弃重入件）");
+    assert_eq!(m.constructed, 2, "重入件被实际构造（调用留痕口径）");
+    assert_eq!(m.core.borrowed, 0);
+
+    // 池仍可用（复用外层件）；本测试二段归还再检出一次——每归还周期至多
+    // 检出一层（有界，非无限递归）。
+    let g2 = pool.acquire();
+    assert_eq!(pool.metrics().reused, 1, "池仍可用");
+    drop(g2);
+    let m = pool.metrics();
+    assert_eq!(m.reset_panicked, 2, "每归还周期检出恰一次（有界）");
+    assert_eq!(m.core.dropped_overflow, 0, "钩子因始终不进容量口径");
+    assert_eq!(m.core.idle, 1);
+
+    // 断环收尾：清空 holder 摘除闭包侧的池强引用，整链可析构。
+    *holder.lock().expect("holder 锁未毒化") = None;
+    drop(pool);
+}
+
+// ── reset 重入的跨池面：单标志保守语义（跨池嵌套同样被拦）───────────────
+
+#[test]
+fn reset_hook_cross_pool_nesting_is_also_detected() {
+    // 实现为进程内单标志（无法区分池身份）：A 池钩子体内触发 B 池的 reset
+    // 钩子同样被判重入 ⇒ B 的对象被丢弃（fail-visible）。红线见模块文档
+    // 「重入」节：钩子体内不得触发**任何**池的 reset 钩子。
+    type PoolHandle = Arc<Mutex<Option<Arc<ObjectPool<Tracked>>>>>;
+    let b_holder: PoolHandle = Arc::new(Mutex::new(None));
+    let b_for_a = Arc::clone(&b_holder);
+
+    // A 池：钩子体内借一件 B 的对象并立即归还（触发 B 的 reset）。
+    let (a_pool, _a_resets, _a_live, _a_drops) = resettable_pool(
+        move |t: &mut Tracked| {
+            if let Some(b) = b_for_a.lock().expect("holder 锁未毒化").as_ref() {
+                drop(b.acquire()); // 归还 B ⇒ B 的钩子被单标志拦
+            }
+            t.hot = 0;
+        },
+        ResetPhase::OnReturn,
+    );
+
+    // B 池：独立计数，便于断言其对象被丢弃。
+    let (b_pool, _b_resets, b_live, _b_drops) =
+        resettable_pool(|t: &mut Tracked| t.hot = 0, ResetPhase::OnReturn);
+    let b_pool = Arc::new(b_pool);
+    *b_holder.lock().expect("holder 锁未毒化") = Some(Arc::clone(&b_pool));
+
+    {
+        let mut g = a_pool.acquire();
+        g.hot = 7;
+    } // A 归还 ⇒ A 钩子 ⇒ 借 B ⇒ 归还 B ⇒ B 钩子被拦 ⇒ B 对象丢弃
+
+    assert_eq!(
+        b_pool.metrics().reset_panicked,
+        1,
+        "跨池嵌套同样被检出：B 的对象丢弃留痕（非静默回池）"
+    );
+    assert_eq!(
+        b_pool.metrics().core.dropped_overflow,
+        0,
+        "钩子因不进容量口径"
+    );
+    assert_eq!(b_live.load(Ordering::SeqCst), 0, "B 的对象被销毁");
+    assert_eq!(
+        a_pool.metrics().core.idle,
+        1,
+        "A 池不受影响：外层对象照常留存"
+    );
+
+    // 断环收尾：摘除 holder 侧强引用，整链可析构。
+    *b_holder.lock().expect("holder 锁未毒化") = None;
+    drop(b_pool);
+}
+
+// ── 构造期非法配置 fail-fast（同 PoolBase::new 纪律）─────────────────────
+#[test]
+#[should_panic(expected = "ObjectPool")]
+fn new_rejects_illegal_config_fail_fast() {
+    let _ = ObjectPool::<Vec<u8>>::new(0, 1, Vec::new);
+}
+
+#[test]
+#[should_panic(expected = "ObjectPool")]
+fn with_reset_rejects_illegal_config_fail_fast() {
+    let _ = ObjectPool::with_reset(4, 0, Vec::<u8>::new, |_| {}, ResetPhase::OnAcquire);
+}
+
+// ── auto traits：ObjectPool Send+Sync（T: Send 即可），Pooled T: Send 时 Send ─
+
+#[test]
+fn pool_is_send_sync_and_handle_is_send() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send<T: Send>() {}
+    assert_send_sync::<ObjectPool<Vec<u8>>>();
+    assert_send_sync::<ObjectPool<Tracked>>();
+    assert_send::<Pooled<'static, Vec<u8>>>();
+}

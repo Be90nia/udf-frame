@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Added（通用对象池件 `ObjectPool`：池化有状态对象，2026-11-02；GitHub issue#15）
+- `skeleton_infra::objpool::ObjectPool<T>`（feature `pool`，crate 根 re-export 五件）：池化**有状态**对象——`acquire()` 返回 `Pooled<'_, T>`（`Deref`/`DerefMut` 拿对象本体改参数即复用、`Drop` RAII 归还、`detach(self) -> T` 永久移交使对象脱离池生命周期）；**reset 钩子**（`ResetPhase::OnReturn` 归还时 / `OnAcquire` 取出时，锁外调用，归还路径 `catch_unwind` 兜底 ⇒ reset panic 时丢弃该对象而非 abort）；**有界降级**（`acquire()` 无超时参数、结构上不存在等待；池宇宙已满时直接构造 + `degraded` 计数，降级对象不入宇宙、归还即释放）；**分片槽位**（构造期自适应 `clamp(idle_cap,1,8)`，每片一锁 + 原子计数，借用走 thread-local 游标、归还回借出时的片）；`prune_idle(max_idle_age, now)` 显式老化口（宿主自调，池不起后台线程）；实现 `skeleton::pool::PoolManaged`（`Tuning=ObjectPoolTuning`/`Metrics=ObjectPoolMetrics`，`Borrow<PoolMetrics>` 核心形）。
+- **unwind 感知归还**：`Pooled::drop` 首查 `thread::panicking()`——panic 路径析构 ⇒ 不调 reset、不回池、直接销毁 + `panic_dropped` 计数（r2d2 #31 教训：归还不变量已破的对象会污染下一个借出方）。
+- **既有件零破坏**：`PoolBase` 的审计环抽为 crate 内 `pub(crate) PoolAuditSink` 供两池共用（`PoolBase` 公开面与行为零变化，`validate` 提 `pub(crate)` 同源复用）；`skeleton` 契约 crate 零改动；`MemoryPool` 语义不动（本件与之并存，非替代关系）。
+- 决策依据 ADR 0010：issue 字面要求的「idle 槽存 `Weak`」与「复用保证」结构性矛盾（权威依据：HikariCP 弱引用只能当缓存层、Go `sync.Pool` 官方明说放弃复用保证、Rust `Weak::upgrade` 可能返回 `None`），改以**行为等价**形态交付——借出期池不持强引用（值移出槽 ⇒ 在借对象对清理路径物理不可见）+ `detach` 脱离池生命周期后自然析构 + `idle_cap`/`prune_idle`/池 drop 三条释放路径。
+
 ### Added（fx 停机排空不再丢结果：`try_reap` 增量收割口 + `ShutdownReport`，2026-10-30；GitHub issue#13）
 - `FxScope::try_reap(&self) -> Vec<TaskError>`（增量收割口，缺口一）：锁内同步 `try_join_next` 扫已完成条目——正常完成丢弃、panic 载荷归集返回、abort 条目映射 `Cancelled`；空集零分配（`Vec::new`）、幂等；不动在途任务、不改 `in_flight` 计数（FlightGuard 独立计数）。锁内禁 await（`try_join_next` 同步，临界区与 spawn 同口径）。
 - `ShutdownReport { panicked: Vec<String>, timed_out: usize }`（`#[must_use]`，Debug/Clone/Default/PartialEq/Eq）：停机排空报告（fx 域自有；与 `shutdown` 域 coordinator 的同名报告不同型，不经 crate 根 re-export）。

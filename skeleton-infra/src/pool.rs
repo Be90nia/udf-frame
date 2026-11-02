@@ -8,8 +8,8 @@
 //!
 //! # 性能纪律（2026-10-16 拍板的契约面落位）
 //!
-//! - **校验与状态变更分离**：入口校验是纯函数（`validate`，模块内私有），
-//!   独立于任何锁——Wave2 换无锁/分片账本时校验面原样保留。
+//! - **校验与状态变更分离**：入口校验是纯函数（`validate`，`pub(crate)`——
+//!   `ObjectPool` 同源复用），独立于任何锁——Wave2 换无锁/分片账本时校验面原样保留。
 //! - **读侧 O(1) 零分配**：[`PoolBase::metrics`] 单次取锁 + `Copy` 读数；
 //!   错误面 [`PoolResizeError`] 为 `Copy`（拒绝路径不构造 `String`/`Vec`）。
 //! - **热路径禁格式化**：审计发射 = 一次 gate load 快路径（未订阅零分配零锁）
@@ -39,8 +39,10 @@ pub const AUDIT_RING_DEFAULT_CAP: usize = 1024;
 
 /// 入口校验（事前校验纪律，纯函数零锁零分配）：max==0 / idle_cap==0 /
 /// idle_cap>max 三类恒不合法配置。构造期（[`PoolBase::new`]）同规则 panic
-/// fail-fast，运行时（[`PoolBase::resize`]）显式 Err——同一套规则两档出口。
-fn validate(max: usize, idle_cap: usize) -> Result<(), PoolResizeError> {
+/// fail-fast，运行时（[`PoolBase::resize`]）显式 Err——同一套规则两档出口；
+/// `pub(crate)` 后 [`crate::objpool::ObjectPool`] 同源复用本函数（公共规则
+/// 写一次，禁复制第二套）。
+pub(crate) fn validate(max: usize, idle_cap: usize) -> Result<(), PoolResizeError> {
     if max == 0 {
         return Err(PoolResizeError::ZeroMax);
     }
@@ -83,9 +85,132 @@ struct AuditSlot {
     notify: Option<AuditCallback>,
 }
 
+/// 池域审计环（`PoolBase` 与 [`crate::objpool::ObjectPool`] 共用的抽取件）：
+/// gate 快路径 + 订阅槽（容量环 + 实时回调 + 代次）+ seq 单调 + 回调 panic
+/// 摘除计数 + TLS 重入封死。公共逻辑写一次——两池各持一个 sink 字段，各自
+/// 呈现自己的公开面（[`PoolBase`] 公开 API 与行为零变化）。
+pub(crate) struct PoolAuditSink {
+    gate: Arc<AtomicBool>,
+    audit: Arc<Mutex<Option<AuditSlot>>>,
+    seq: AtomicU64,
+    gen: AtomicU64,
+    audit_callback_panics: AtomicU64,
+}
+
+impl PoolAuditSink {
+    /// 构造空环（未订阅态：gate 落闸，发射 = 一次 load 即返）。
+    pub(crate) fn new() -> Self {
+        Self {
+            gate: Arc::new(AtomicBool::new(false)),
+            audit: Arc::new(Mutex::new(None)),
+            seq: AtomicU64::new(0),
+            gen: AtomicU64::new(0),
+            audit_callback_panics: AtomicU64::new(0),
+        }
+    }
+
+    /// 开审计流：落闸 + 建槽（容量环 `cap` 钳到 ≥1——恒保最新一件）。再次订阅
+    /// = 替换现役槽，被替换票据凭代次对账 inert（Drop 不误杀新流）。
+    pub(crate) fn subscribe_audit(
+        &self,
+        cap: usize,
+        f: impl FnMut(&PoolAuditEvent) + Send + 'static,
+    ) -> PoolAuditTicket {
+        let gen = self.gen.fetch_add(1, Ordering::Relaxed) + 1;
+        {
+            let mut guard = lock(&self.audit);
+            *guard = Some(AuditSlot {
+                ring: VecDeque::new(),
+                cap: cap.max(1),
+                gen,
+                notify: Some(Box::new(f)),
+            });
+        }
+        self.gate.store(true, Ordering::Release);
+        let gate = Arc::clone(&self.gate);
+        let audit = Arc::clone(&self.audit);
+        PoolAuditTicket::new(move || {
+            let mut guard = lock(&audit);
+            // 代次对账在锁内完成：现役票据才落闸清槽；已被后订替换的旧票据禁动。
+            if guard.as_ref().is_some_and(|slot| slot.gen == gen) {
+                *guard = None;
+                drop(guard);
+                gate.store(false, Ordering::Release);
+            }
+        })
+    }
+
+    /// 取走环内事件（事后取证读侧；环随取随清——实时回调是持续观测面，本
+    /// 方法是批量对账面，形态同 `SyncStore::take_events`）。
+    pub(crate) fn take_events(&self) -> Vec<PoolAuditEvent> {
+        match lock(&self.audit).as_mut() {
+            Some(slot) => slot.ring.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 审计回调 panic 摘除计数（fail-visible 留痕：回调 panic 后该回调被摘除、
+    /// 环照录、池行为不变——观测面禁改变被观测者，摘除必留痕禁静默）。
+    pub(crate) fn audit_callback_panics(&self) -> u64 {
+        self.audit_callback_panics.load(Ordering::Relaxed)
+    }
+
+    /// 审计发射唯一收口：未订阅 = 一次 gate load 即返（热路径零分配零锁）；
+    /// 订阅态 = seq 单调入账（容量环溢出丢最旧）+ **锁外**实时回调（回调可
+    /// 重入本池一切入口，持锁即死锁）。热路径禁格式化。
+    pub(crate) fn emit(&self, kind: PoolAuditKind) {
+        if !self.gate.load(Ordering::Acquire) {
+            return;
+        }
+        let event = PoolAuditEvent {
+            seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
+            kind,
+        };
+        let mut notify = {
+            let mut guard = lock(&self.audit);
+            match guard.as_mut() {
+                Some(slot) => {
+                    if slot.ring.len() >= slot.cap {
+                        slot.ring.pop_front();
+                    }
+                    slot.ring.push_back(event);
+                    slot.notify.take()
+                }
+                None => return,
+            }
+        };
+        if let Some(f) = notify.as_mut() {
+            if !EMIT_CB_IN_FLIGHT.with(Cell::get) {
+                EMIT_CB_IN_FLIGHT.with(|cell| cell.set(true));
+                match catch_unwind(AssertUnwindSafe(|| f(&event))) {
+                    Ok(()) => {}
+                    // 回调 panic：fail-closed 摘除（环照录、池行为不变——观测面
+                    // 禁改变被观测者），计数留痕（禁静默摘除）。
+                    Err(_) => {
+                        self.audit_callback_panics.fetch_add(1, Ordering::Relaxed);
+                        notify = None;
+                    }
+                }
+                EMIT_CB_IN_FLIGHT.with(|cell| cell.set(false));
+            }
+        }
+        if let Some(f) = notify {
+            let mut guard = lock(&self.audit);
+            if let Some(slot) = guard.as_mut() {
+                // 归还窗口内订阅被替换则宁弃旧回调，禁覆盖新槽。
+                if slot.notify.is_none() {
+                    slot.notify = Some(f);
+                }
+            }
+        }
+    }
+}
+
 thread_local! {
-    /// 审计回调在途标记：回调内重入本池的 emit 只录环不再进回调——封死
-    /// 「回调→调参→回调」自指递归（栈爆），与骨架 audit 纪律同款。
+    /// 审计回调在途标记：回调内**同线程任一池**的 emit 只录环不再进回调——封死
+    /// 「回调→调参→回调」自指递归（栈爆），与骨架 audit 纪律同款。**本标记为
+    /// `PoolBase` 与 `ObjectPool` 两池共用**（`PoolAuditSink` 是同一抽取件）：
+    /// 在 A 池回调体内触发的 B 池 emit 同样只录环。
     static EMIT_CB_IN_FLIGHT: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -98,11 +223,9 @@ thread_local! {
 /// 永不报错，槽满 = 丢弃 + [`PoolMetrics::dropped_overflow`] 计数（fail-visible）。
 pub struct PoolBase {
     core: Mutex<PoolCore>,
-    gate: Arc<AtomicBool>,
-    audit: Arc<Mutex<Option<AuditSlot>>>,
-    seq: AtomicU64,
-    gen: AtomicU64,
-    audit_callback_panics: AtomicU64,
+    /// 审计环（[`PoolAuditSink`] 共用抽取件：gate/订阅槽/seq/代次/回调 panic
+    /// 计数/TLS 重入封死——与 [`crate::objpool::ObjectPool`] 同源）。
+    sink: PoolAuditSink,
 }
 
 impl PoolBase {
@@ -124,11 +247,7 @@ impl PoolBase {
                 borrowed: 0,
                 dropped_overflow: 0,
             }),
-            gate: Arc::new(AtomicBool::new(false)),
-            audit: Arc::new(Mutex::new(None)),
-            seq: AtomicU64::new(0),
-            gen: AtomicU64::new(0),
-            audit_callback_panics: AtomicU64::new(0),
+            sink: PoolAuditSink::new(),
         }
     }
 
@@ -238,93 +357,26 @@ impl PoolBase {
         cap: usize,
         f: impl FnMut(&PoolAuditEvent) + Send + 'static,
     ) -> PoolAuditTicket {
-        let gen = self.gen.fetch_add(1, Ordering::Relaxed) + 1;
-        {
-            let mut guard = lock(&self.audit);
-            *guard = Some(AuditSlot {
-                ring: VecDeque::new(),
-                cap: cap.max(1),
-                gen,
-                notify: Some(Box::new(f)),
-            });
-        }
-        self.gate.store(true, Ordering::Release);
-        let gate = Arc::clone(&self.gate);
-        let audit = Arc::clone(&self.audit);
-        PoolAuditTicket::new(move || {
-            let mut guard = lock(&audit);
-            // 代次对账在锁内完成：现役票据才落闸清槽；已被后订替换的旧票据禁动。
-            if guard.as_ref().is_some_and(|slot| slot.gen == gen) {
-                *guard = None;
-                drop(guard);
-                gate.store(false, Ordering::Release);
-            }
-        })
+        self.sink.subscribe_audit(cap, f)
     }
 
     /// 取走环内事件（事后取证读侧；环随取随清——实时回调是持续观测面，本
     /// 方法是批量对账面，形态同 `SyncStore::take_events`）。
     pub fn take_audit_events(&self) -> Vec<PoolAuditEvent> {
-        match lock(&self.audit).as_mut() {
-            Some(slot) => slot.ring.drain(..).collect(),
-            None => Vec::new(),
-        }
+        self.sink.take_events()
     }
 
     /// 审计回调 panic 摘除计数（fail-visible 留痕：回调 panic 后该回调被摘除、
     /// 环照录、池行为不变——观测面禁改变被观测者，摘除必留痕禁静默）。
     pub fn audit_callback_panics(&self) -> u64 {
-        self.audit_callback_panics.load(Ordering::Relaxed)
+        self.sink.audit_callback_panics()
     }
 
     /// 审计发射唯一收口：未订阅 = 一次 gate load 即返（热路径零分配零锁）；
     /// 订阅态 = seq 单调入账（容量环溢出丢最旧）+ **锁外**实时回调（回调可
     /// 重入本池一切入口，持锁即死锁）。热路径禁格式化。
     fn emit(&self, kind: PoolAuditKind) {
-        if !self.gate.load(Ordering::Acquire) {
-            return;
-        }
-        let event = PoolAuditEvent {
-            seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
-            kind,
-        };
-        let mut notify = {
-            let mut guard = lock(&self.audit);
-            match guard.as_mut() {
-                Some(slot) => {
-                    if slot.ring.len() >= slot.cap {
-                        slot.ring.pop_front();
-                    }
-                    slot.ring.push_back(event);
-                    slot.notify.take()
-                }
-                None => return,
-            }
-        };
-        if let Some(f) = notify.as_mut() {
-            if !EMIT_CB_IN_FLIGHT.with(Cell::get) {
-                EMIT_CB_IN_FLIGHT.with(|cell| cell.set(true));
-                match catch_unwind(AssertUnwindSafe(|| f(&event))) {
-                    Ok(()) => {}
-                    // 回调 panic：fail-closed 摘除（环照录、池行为不变——观测面
-                    // 禁改变被观测者），计数留痕（禁静默摘除）。
-                    Err(_) => {
-                        self.audit_callback_panics.fetch_add(1, Ordering::Relaxed);
-                        notify = None;
-                    }
-                }
-                EMIT_CB_IN_FLIGHT.with(|cell| cell.set(false));
-            }
-        }
-        if let Some(f) = notify {
-            let mut guard = lock(&self.audit);
-            if let Some(slot) = guard.as_mut() {
-                // 归还窗口内订阅被替换则宁弃旧回调，禁覆盖新槽。
-                if slot.notify.is_none() {
-                    slot.notify = Some(f);
-                }
-            }
-        }
+        self.sink.emit(kind)
     }
 }
 
