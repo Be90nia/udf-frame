@@ -18,7 +18,7 @@
 |---|---|---|---|
 | `full` | 全部子开关 | — | **一键全开**（tokio 先例）：`features = ["full"]` = 下表全部子开关并集；新手心智入口，子开关=进阶裁剪面 |
 | `runtime` | — | ✅ | `SyncStore`（契约参考实现，std-only）+ `LocalSubscription` + `audit` 审计值面 |
-| `pool` | `memgov` | ✅ | `PoolBase` 管理组合件 + `ThreadPool` + `PooledThreadPool`；连带启用 `memgov` |
+| `pool` | `memgov` | ✅ | `PoolBase` 管理组合件 + `ThreadPool` + `PooledThreadPool` + `ObjectPool` 通用对象池（reset 钩子/有界降级/分片槽位）；连带启用 `memgov` |
 | （常驻，std-ext） | 十三域零依赖；`json` 域经 `json` feature 门引 `serde_json` | — | `text` `backoff` `retry` `paths` `clock` `scheduler` `ratelimit` `cache` `fsx` `encode` `id` `iter` `hash` `json` **十四域**（`std-ext` crate；行为件面；时间源/配置/日志路径契约在 `skeleton::clock`/`skeleton::config`/`skeleton::logpath`，批 1 契约真下沉；十三域零门常驻，`json` 域门控 `json` feature） |
 | （常驻，本 crate） | 零依赖 | — | `shutdown` 停机编排器（消费 `std_ext::scheduler`） |
 | `memgov` | 零依赖 | — | `CountingAllocator`/`BoundedRegistry`/`LeakGuard`/`MemoryPool` |
@@ -48,8 +48,9 @@
 |---|---|---|---|
 | runtime | `runtime`（默认） | `SyncStore`：单写者队列+同步排空环+快照广播的契约参考实现 | [`runtime`](#runtime--syncstore-契约参考实现) |
 | audit | `runtime` | 审计事件值面（事件/票据），发射点在 runtime | [`runtime::..audit`](#runtime--syncstore-契约参考实现) |
-| pool | `pool`（默认） | `PoolBase` 管理组合件 + `ThreadPool` 动态线程池 | [`pool`](#pool--poolbase--threadpool) |
-| pooled_thread_pool | `pool` | `MemoryPool` × `ThreadPool` 互喂组合件 | [`pool`](#pool--poolbase--threadpool) |
+| pool | `pool`（默认） | `PoolBase` 管理组合件 + `ThreadPool` 动态线程池 + `ObjectPool` 通用对象池 | [`pool`](#pool--poolbase--threadpool--objectpool) |
+| pooled_thread_pool | `pool` | `MemoryPool` × `ThreadPool` 互喂组合件 | [`pool`](#pool--poolbase--threadpool--objectpool) |
+| objpool | `pool` | `ObjectPool` 通用对象池：池化**有状态**对象（reset 钩子/有界降级/分片槽位） | [`pool`](#pool--poolbase--threadpool--objectpool) |
 | memgov | `memgov`（pool 连带） | 计数分配器/有界注册表/泄漏断言 + `MemoryPool` 特化 | [`memgov`](#memgov--内存治理) |
 | text | 常驻 | UTF-8 解码/字符截断/case 转换/编辑距离 | [`text`](#text--文本处理) |
 | backoff | 常驻 | 确定性线性退避计算 | [`backoff`](#backoff--确定性退避) |
@@ -260,7 +261,7 @@ pub trait Notify<S> {
 
 行为面：`tests/async_notify.rs`（§5.3 六项断言 + 投递序断言）。
 
-## pool — PoolBase + ThreadPool
+## pool — PoolBase + ThreadPool + ObjectPool
 
 **feature**：`pool`（默认，连带 `memgov`）。**依赖面**：纯 std + 契约词汇（`skeleton::pool`），域面零三方（crate 树见 [§零依赖口径](#零依赖口径)）。
 
@@ -359,6 +360,60 @@ where T: Send + 'static, F: Fn() -> T + Send + Sync + 'static
 ```
 
 借还在 worker 线程任务闭包内（`PoolGuard` 非 `'static`，提交线程不可持）：worker 认领后借缓冲 → 跑 → guard Drop 即还（panic unwind 同覆盖）。借空（超 `borrow_timeout` 无缓冲）= Discard 等价：任务体丢弃 + `borrow_rejected` 计数——与提交侧 `rejected` 是两个独立计数。`borrow_timeout` 构造期必填（无默认无限等）。
+
+### ObjectPool — 通用对象池（有状态对象，reset 钩子 + 有界降级 + 分片槽位）
+
+池化**有状态**对象：现有 `MemoryPool` 只能池无状态物（构造器只负责造，归还不重置），本件补「捞出改参数即复用」的能力（加密上下文 / 连接 wrapper / 协议状态机——构造昂贵、每次都被重造）。零领域语义（公开 API 无 buffer/connection/crypto 词汇）。
+
+```rust
+pub enum ResetPhase { OnReturn, OnAcquire }        // reset 钩子相位
+pub struct ObjectPoolTuning { pub max: usize, pub idle_cap: usize }
+pub struct ObjectPoolMetrics {                   // Borrow<PoolMetrics>
+    pub core: PoolMetrics,
+    pub degraded: u64,      // 降级直构次数（池宇宙已满时）
+    pub reused: u64,        // 命中复用次数 = idle 槽移出次数（含随后被 reset panic 销毁者）
+    pub constructed: u64,   // 工厂调用总次数
+    pub pruned: u64,        // prune_idle 释放数
+    pub reset_panicked: u64,// reset 钩子因销毁数（OnReturn 相位钩子 panic / 重入检出）——容量因走 core.dropped_overflow
+    pub panic_dropped: u64, // unwind 中归还而销毁的对象数
+}
+
+pub struct ObjectPool<T> { /* 分片槽位 + 片内计数（每片独占 cache line）*/ }
+impl<T> ObjectPool<T> {
+    pub fn new(max: usize, idle_cap: usize,
+        factory: impl Fn() -> T + Send + Sync + 'static) -> Self;   // 非法参数 panic
+    pub fn with_reset(max: usize, idle_cap: usize,
+        factory: impl Fn() -> T + Send + Sync + 'static,
+        reset: impl Fn(&mut T) + Send + Sync + 'static,
+        phase: ResetPhase) -> Self;
+    pub fn acquire(&self) -> Pooled<'_, T>;          // 永不阻塞、永不失败
+    pub fn metrics(&self) -> ObjectPoolMetrics;      // O(shards) 逐片取锁求和
+    pub fn prune_idle(&self, max_idle_age: Duration, now: Instant) -> usize;
+    pub fn resize(&self, tuning: ObjectPoolTuning) -> Result<(), PoolResizeError>;
+    pub fn audit_callback_panics(&self) -> u64;      // 回调 panic 摘除留痕（同 PoolBase 同名同义）
+    pub fn take_audit_events(&self) -> Vec<PoolAuditEvent>;  // 环内事件随取随清
+}
+// 另实现 skeleton::pool::PoolManaged（Tuning=ObjectPoolTuning, Metrics=ObjectPoolMetrics）
+
+pub struct Pooled<'p, T>(/* … */);
+impl<'p, T> Pooled<'p, T> {
+    pub fn detach(self) -> T;      // 交出所有权：对象脱离池生命周期
+}
+impl<T> Deref for Pooled<'_, T> { type Target = T; }   // Deref + DerefMut
+impl<T> Drop for Pooled<'_, T> { /* Drop 即还（禁手动还） */ }
+```
+
+- **借出期池不持强引用**：借出 = 值移动出槽（池物理不持引用）⇒ 在借对象对 `prune_idle`/`resize` 清理路径**物理不可见**（不会被「还有人用着就释放」）；`DerefMut` 拿对象本体改参数即复用；`detach()` 让对象彻底脱离池生命周期（最后一个持有者放手即自然析构，无 GC 兜底亦无额外回收器）。
+- **reset 钩子（可选，单钩子 + 相位）**：`OnReturn` 归还时重置（.NET `IResettable` / HikariCP 同位）/ `OnAcquire` 取出时重置（deadpool `recycle` 同位）；钩子在**锁外**、独占借用下调用；**归还路径的 reset 走 `catch_unwind` 兜底**——panic ⇒ 该对象状态不可信 ⇒ 丢弃（不入 idle）+ `reset_panicked` +1（禁 abort：Drop 期 panic 在 unwind 中会 abort 进程）；`OnReturn` 相位**不传播 payload**（Drop 期无日志设施，就地消化，仅计数留痕；`PoolAuditKind` 无钩子故障词汇 ⇒ 不发审计事件）、`OnAcquire` 相位**原样传播**；新构造对象不调 reset。
+- **三因分账（`dropped_overflow` vs `reset_panicked` vs `panic_dropped`）**：容量因（idle 满 / 全池余量零 / `resize` 裁剪）只进 `core.dropped_overflow`；钩子因（**`OnReturn` 相位**的钩子 panic / 重入检出；`OnAcquire` 相位原样传播不计数）只进 `reset_panicked`；unwind 中归还只进 `panic_dropped`。三个口径互不混账，禁用其一线索反推另一因。
+- **`core.borrowed` 含降级借出**：`idle + borrowed <= max` **不成立**——`max` 只约束宇宙部分（idle + 正常借出），降级件在宇宙之外（归还即释放、永不进 idle）；水位线 `borrowed / max` 因此可 > 1.0（形态合法，读数如实不钳位）。
+- **unwind 感知归还**：`Pooled::drop` 首查 `thread::panicking()`——panic 路径析构 ⇒ **不调 reset、不回池**，直接销毁 + `panic_dropped` +1（r2d2 #31 教训：归还不变量已破的对象会污染下一个借出方）。
+- **有界降级**：`acquire()` 无超时参数、结构上不存在等待——池宇宙（idle + 正常借出，硬上界 `max`）已满时**直接构造**（`degraded` +1），该对象**不入宇宙**、归还即释放、永不进 idle；**限额是留存限额，不是对象总数限额**（.NET 官方口径）。
+- **释放三路径**：`idle_cap` 满 ⇒ 归还即丢弃（`dropped_overflow`）；`prune_idle(max_idle_age, now)` 显式老化口（宿主按自己节奏调，**池不起后台线程**）；池 `drop` ⇒ 全部 idle 析构。
+- **分片与计数**：分片数构造期自适应 `clamp(idle_cap, 1, 8)`（不设旋钮）；每片一把 `Mutex`，`borrowed`/`alive`/`reused` 等**热路径计数下沉进片内**（普通 `usize`、锁内读写，无跨线程原子 RMW），且每片 `#[repr(align(64))]` 独占一条 cache line（相邻片伪共享同样把 8 线程扩展比压在 1 以下）。`max`/`idle_cap` **按片均分**（余数补给前几片，各片之和恰等于配置值 ⇒「总和 ≤ 配置值」硬上界不变；`resize` 后按新配额逐片裁剪）；**配额一律在目标片锁内读**——`resize` 先 `store` 新值再逐片加锁裁剪，于是并发归还的留存裁决要么读到新值、要么其入片被紧随其后的裁剪覆盖（锁外的陈旧快照没有这条收敛路径，缩容并发归还能把 idle 永久顶在新上界之外）；`metrics()` 逐片取锁求和（O(shards)，非热路径）。借用走**线程亲和片**（亲和表按池地址分槽、每 (线程, 池) 领一个片号后固定，首个领号者拿 0 号 ⇒ 单线程行为确定；同线程多池互不覆盖）、归还**优先回 home 片**（借出时的片，LIFO 热件常驻）；home 片 idle 满时**迁入有余量的片**（`alive` 随迁、先迁入再退 home ⇒ 账面守恒不低估；迁片只发生在归还且 home 满这一情形），全池余量为零才丢弃。`degraded` 与 `constructed` 是两个独立计数，不得混账；`constructed` 等**非每借还热路径**计数仍是全局原子（miss 路径打一次，dim4 计时窗内为 0 次）。
+- **调用方红线**：坏对象禁还池（判定权在调用方——池不知道 `T` 是什么，处置 = `detach` 带走，r2d2 `has_broken` / Commons Pool2 `invalidateObject` 动机）；池化对象应「等重」（reset 负责容量归一，大小悬殊对象混池 = 池毒化 DoS，golang/go#23199、#27735）；`prune_idle` 尽力而为，不构成释放失败信号。
+- **与 `memgov::PoolGuard` 的关系**：两个**独立守卫类型**（非模式变体）——`Pooled` = 对象所有权移交式借用（`DerefMut` 改参数即复用 / RAII 归还 / `detach` 永久移交），`PoolGuard` = 缓冲借用（`acquire` 超时失败语义）。`Pooled<'p, T>` 借用池、非 `'static`，带不进 `'static` 任务闭包——用 `detach()` 移交后由任务/连接自持。尺寸分档不在本件（通用池单类型；分档 = 按档多实例或组合层后续件）。
+- 决策依据 ADR 0010：issue 字面要求的「idle 槽存 `Weak`」与「复用保证」结构性矛盾（权威依据：HikariCP 弱引用只能当缓存层、Go `sync.Pool` 官方明说放弃复用保证、Rust `Weak::upgrade` 可能返回 `None`），改以**行为等价**形态交付上述三条释放路径。
 
 ### 最小示例
 

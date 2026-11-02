@@ -155,6 +155,12 @@ required-features = ["pool"]
 name = "pooled_thread_pool_multidim"
 required-features = ["pool"]
 
+# ObjectPool 语义锚示例（ADR 0010：①reset 后复用——构造 vs 复用计数+字段状态
+# ②无人用即释放——prune/容量淘汰 Drop 计数 ③降级直构留痕；纯 std 零新依赖）。
+[[example]]
+name = "object_pool_multidim"
+required-features = ["pool"]
+
 # FxScope 多维性能矩阵采集器（fx 域①③⑤⑦+停机面；沿 thread_pool_multidim 模式，
 # 零新依赖；tokio=fx 域本体，memgov=计数分配器测量面）。
 [[example]]

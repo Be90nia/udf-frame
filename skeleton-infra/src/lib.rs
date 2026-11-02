@@ -15,7 +15,7 @@
 //! | feature | 域 |
 //! |---|---|
 //! | `runtime`（默认） | `runtime::SyncStore`：契约参考实现（std-only）+ `audit` 审计事件值面 |
-//! | `pool`（默认） | `pool::PoolBase`：池化管理组合件（resize 校验/水位线/审计/溢出计数公共逻辑写一次） |
+//! | `pool`（默认） | `pool::PoolBase`：池化管理组合件（resize 校验/水位线/审计/溢出计数公共逻辑写一次）+ `objpool::ObjectPool`：有状态对象池（reset 钩子/有界降级/分片槽位） |
 //! | （常驻，零 feature） | `shutdown`：跨组件优雅停机编排器（注册序串行；组件 panic/超时 fail-visible 上报不拖垮整体；超时=放弃等待非中断，watchdog 线程照跑如实声明） |
 //! | （常驻，零 feature） | **std-ext 侧十四域**：十三域零门常驻（`text`/`encode`/`hash`/`iter`/`backoff`/`fsx`/`paths`/`clock`/`retry`/`scheduler`/`ratelimit`/`cache`/`id`）+ `json` 域门控（`json` feature）：随依赖树常驻可用（`json` 域需显式开门），逐域职责见 `std-ext` crate 文档 |
 //! | `config-json` | `ConfigFile`：分层装配（default→file→层叠合并→load）+ `save` 原子落盘（serde_json::Value 统一值面；serde/serde_json 仅此 feature 可达；配置契约 `ConfigPort`/`EnvSource`/`ConfigError` 已下沉 `skeleton::config`） |
@@ -111,6 +111,9 @@ pub mod alloc_site;
 pub mod pool;
 
 #[cfg(feature = "pool")]
+pub mod objpool;
+
+#[cfg(feature = "pool")]
 pub mod pooled_thread_pool;
 
 #[cfg(feature = "compose")]
@@ -170,6 +173,9 @@ pub use memgov::{
 
 #[cfg(feature = "pool")]
 pub use pool::{PoolBase, AUDIT_RING_DEFAULT_CAP};
+
+#[cfg(feature = "pool")]
+pub use objpool::{ObjectPool, ObjectPoolMetrics, ObjectPoolTuning, Pooled, ResetPhase};
 
 #[cfg(feature = "pool")]
 pub use pooled_thread_pool::PooledThreadPool;
