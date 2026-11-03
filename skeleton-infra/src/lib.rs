@@ -175,7 +175,7 @@ pub use memgov::{
 pub use pool::{PoolBase, AUDIT_RING_DEFAULT_CAP};
 
 #[cfg(feature = "pool")]
-pub use objpool::{ObjectPool, ObjectPoolMetrics, ObjectPoolTuning, Pooled, ResetPhase};
+pub use objpool::{ObjectPool, ObjectPoolMetrics, ObjectPoolTuning, Owned, Pooled, ResetPhase};
 
 #[cfg(feature = "pool")]
 pub use pooled_thread_pool::PooledThreadPool;

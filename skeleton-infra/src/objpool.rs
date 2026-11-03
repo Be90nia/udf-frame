@@ -103,11 +103,27 @@
 //! [`Pooled`] 与 `memgov::PoolGuard` 是**两个独立守卫类型，非模式变体**：
 //! `Pooled` = 对象所有权移交式借用（`DerefMut` 改参数即复用、Drop RAII 归还、
 //! `detach` 永久移交）——「对象本身交给任务」即 `Pooled` 形状，无需
-//! `submit_owned`；`PoolGuard` = 缓冲借用（`acquire` 超时失败语义）。跨
+//! 提交`；`PoolGuard` = 缓冲借用（`acquire` 超时失败语义）。跨
 //! `'static` 边界（任务闭包/线程）：`Pooled<'p, T>` 借用池非 `'static`，带不
-//! 进 `'static` 闭包——**用 `detach()` 永久移交**（对象脱离池生命周期，任务
-//! 自持）。「尺寸分档」不在本件：通用池单类型；分档 = 按档多实例或组合层
+//! 进 `'static` 闭包——两条出口：**① [`ObjectPool::acquire_owned`]**（池以
+//! `Arc` 持有 ⇒ 句柄自带一份强引用，`Drop` 照常归还，代价 = 每轮一次 `Arc`
+//! 增删，见 [`Owned`]；`Bytes::from_owner` 的所有者、`tokio::spawn` 闭包这类
+//! 「归还点是任意线程引用计数归零」的位置要的就是它）；**②
+//! [`Pooled::detach`]**（永久移交：对象脱离池生命周期，任务自持，零额外成本但
+//! 不再复用）。「尺寸分档」不在本件：通用池单类型；分档 = 按档多实例或组合层
 //! 后续件（红线 2「池化对象等重、reset 负责容量归一」已覆盖分档动机）。
+//!
+//! # 按值插入（`insert`）
+//!
+//! [`ObjectPool::insert`] 是「按值归还」的第三个口子：对象**不必由本池工厂
+//! 构造**，外部按值塞回 idle 供后续 `acquire` 复用（缓冲池 `put(Vec<u8>)` 这类
+//! 形态）。契约与归还路径**逐条同口径**：`OnReturn` 相位 reset 先跑（锁外、
+//! 独占借用；钩子 panic ⇒ 丢弃 + `reset_panicked`）——**必须跑**，否则外部异形/
+//! 脏对象直接投给下一个借出方（池毒化，红线 2）；入槽同时认领宇宙 `alive`
+//! （`max` 上界因此对插入件同样成立），**不动 `borrowed`**（从未借出）；无空位
+//! ⇒ 对象交回调用方 + `dropped_overflow` + `audit OverflowDropped`（容量因）。
+//! 与 `Pooled::drop` 的唯一差别 = **容量不满足时把对象交回调用方**（归还路径
+//! 只能就地丢弃——对象已在句柄里）。
 //!
 //! # 分片与亲和
 //!
@@ -159,15 +175,15 @@
 //!
 //! feature `pool`（纯 std + 契约词汇，零三方增量）；由 lib.rs 以
 //! `#[cfg(feature = "pool")] pub mod objpool;` 接线，crate 根 re-export
-//! `ObjectPool` / `Pooled` / `ResetPhase` / `ObjectPoolTuning` /
-//! `ObjectPoolMetrics` 五件（照 `PoolBase`/`PooledThreadPool` 的 pool 域根导出
+//! `ObjectPool` / `Pooled` / `Owned` / `ResetPhase` / `ObjectPoolTuning` /
+//! `ObjectPoolMetrics` 六件（照 `PoolBase`/`PooledThreadPool` 的 pool 域根导出
 //! 惯例）。
 
 use std::borrow::Borrow;
 use std::cell::Cell;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread_local;
 use std::time::{Duration, Instant};
 
@@ -505,6 +521,38 @@ impl<T> ObjectPool<T> {
     /// 的 reset 只对复用件调用，panic 原样传播（宇宙配额回滚后 resume，不吞）。
     /// 三条路径的记账都在**目标片锁内**完成（片内普通 `usize`，无跨线程原子）。
     pub fn acquire(&self) -> Pooled<'_, T> {
+        let (home, obj, degraded) = self.pop_or_build();
+        Pooled {
+            pool: self,
+            home,
+            slot: Some(obj),
+            degraded,
+        }
+    }
+
+    /// `'static` 借出（同 [`Self::acquire`] 的四路径与记账，只是句柄可跨
+    /// `'static` 边界）：**要求池以 `Arc` 持有**——句柄 `Drop` 时要回到池，就得
+    /// 自己握一份池的强引用（`'static` 句柄无法借用池；这是唯一不泄漏的形态）。
+    ///
+    /// 代价 = 每借还一轮一次 `Arc` 增删（两次原子），**不是零成本**：零成本主
+    /// 路径仍是借用形态 [`Self::acquire`]，只有 `'static` 位（`tokio::spawn`
+    /// 闭包、`Bytes::from_owner` 的所有者——归还点是任意线程的引用计数归零）才
+    /// 用它。**被否决的两种形态**：泄漏 `&'static ObjectPool`（零成本，但池永不
+    /// 释放）；归还通道（mpsc）（零 `Arc`，但多一次分配 + 可能跨线程唤醒，且
+    /// `'static` 通道端仍要跟着对象走）。
+    pub fn acquire_owned(self: &Arc<Self>) -> Owned<T> {
+        let (home, obj, degraded) = self.pop_or_build();
+        Owned {
+            pool: Arc::clone(self),
+            home,
+            slot: Some(obj),
+            degraded,
+        }
+    }
+
+    /// 借出四路径（[`Self::acquire`] / [`Self::acquire_owned`] 共用）：返回
+    /// (home 片, 对象, 是否降级)。
+    fn pop_or_build(&self) -> (usize, T, bool) {
         let start = self.home_shard();
         // ①② 本线程片优先、空则轮转扫其余片（锁内同时回卷本片借出数）。
         if let Some((mut obj, home)) = self.pop_idle(start) {
@@ -518,12 +566,7 @@ impl<T> ObjectPool<T> {
                 }
             }
             self.sink.emit(PoolAuditKind::Borrowed);
-            return Pooled {
-                pool: self,
-                home,
-                slot: Some(obj),
-                degraded: false,
-            };
+            return (home, obj, false);
         }
         // ③ 确有片仍有宇宙空位：工厂锁外新建（新对象不调 reset）。
         if let Some(home) = self.claim_growth(start) {
@@ -538,12 +581,7 @@ impl<T> ObjectPool<T> {
             };
             self.record_borrow(home);
             self.sink.emit(PoolAuditKind::Borrowed);
-            return Pooled {
-                pool: self,
-                home,
-                slot: Some(obj),
-                degraded: false,
-            };
+            return (home, obj, false);
         }
         // ④ 全片宇宙已满：降级直构——不入池宇宙（alive 不记账）、归还即释放。
         // 计数口径与路径③同源：调用发生即留痕（工厂 panic 时已计数、不产生对象）。
@@ -556,11 +594,125 @@ impl<T> ObjectPool<T> {
         };
         self.record_borrow(start);
         self.sink.emit(PoolAuditKind::Borrowed);
-        Pooled {
-            pool: self,
-            home: start,
-            slot: Some(obj),
-            degraded: true,
+        (start, obj, true)
+    }
+
+    /// 按值插入（「按值归还」口子）：把**已有**对象放进 idle 槽，供后续
+    /// [`Self::acquire`] 复用——给「对象不是本池工厂造的」消费方（缓冲池按值
+    /// `put(Vec<u8>)`、`Bytes::from_owner` 所有者的引用计数归零归还）开口子。
+    ///
+    /// 判定顺序与 [`Pooled`] 归还**同序**：`OnReturn` 相位的 reset 钩子先跑
+    /// （锁外、独占借用；钩子 panic ⇒ 对象丢弃 + `reset_panicked` +1，与归还路径
+    /// 同口径、不发审计事件）。**插入必须跑该钩子**：红线 2「池化对象等重、reset
+    /// 负责容量归一」——按值塞进来的外部对象形态不受本池控制，跳过钩子即把脏/
+    /// 异形对象投给下一个借出方（池毒化）。`OnAcquire` 相位不在此触发（钩子时点
+    /// 在取出时，同归还路径）。随后**一次片锁内**完成「idle 片配额 + 宇宙配额」
+    /// 双裁决并入槽（配额在片锁内读，与并发 `resize` 的收敛论证同
+    /// [`Self::resize`]）；全片皆无空位 ⇒ 对象交回调用方 + `dropped_overflow` +1
+    /// + `audit OverflowDropped`（容量因，与钩子因两账不混）。
+    ///
+    /// **宇宙记账**：插入件此前不在宇宙内 ⇒ 入槽同时认领 `alive`（同
+    /// `claim_growth` 的上界保证），**不动 `borrowed`**（从未借出，不得
+    /// 混账）。故 `max` 是「idle + 正常借出」的硬上界：宇宙已满时即使 idle 有空
+    /// 位也拒收（溢出到宇宙外就是击穿上界）。
+    ///
+    /// 返回值：`None` = 池已接管（已入 idle；或钩子失败被销毁——两种情形调用方都
+    /// 不该再持有它）；`Some(obj)` = 池没收下（容量因），对象交回（`OnReturn` 相位
+    /// 下已跑过 reset，与归还路径同序）。
+    #[must_use = "Some(obj) 表示池未收下，对象所有权回到调用方"]
+    pub fn insert(&self, mut obj: T) -> Option<T> {
+        if self.phase == ResetPhase::OnReturn {
+            if let Some(reset) = self.reset.as_ref() {
+                if run_reset_hook(reset.as_ref(), &mut obj).is_err() {
+                    self.reset_panicked.fetch_add(1, Ordering::Relaxed);
+                    drop(obj);
+                    return None;
+                }
+            }
+        }
+        match self.push_inserted(obj) {
+            Ok(()) => {
+                self.sink.emit(PoolAuditKind::Returned);
+                None
+            }
+            Err(obj) => {
+                self.dropped_overflow.fetch_add(1, Ordering::Relaxed);
+                self.sink.emit(PoolAuditKind::OverflowDropped);
+                Some(obj)
+            }
+        }
+    }
+
+    /// 插入收口（片锁内一次完成双裁决 + 入槽 + 宇宙认领）：本线程亲和片优先、空
+    /// 则轮转（同 [`Self::pop_idle`] 的扫片序——插入方与借出方同线程时热件落在
+    /// 同一片）。全片无空位 ⇒ `Err(obj)` 原样交回。
+    fn push_inserted(&self, obj: T) -> Result<(), T> {
+        let shards = self.slots.len();
+        let start = self.home_shard();
+        for i in 0..shards {
+            let idx = (start + i) % shards;
+            let mut shard = lock(&self.slots[idx]);
+            // 双配额在片锁内读（同 `return_to_shard` 的 resize 收敛论证）。
+            let idle_cap = self.idle_cap.load(Ordering::Relaxed);
+            let max = self.max.load(Ordering::Relaxed);
+            if shard.idle.len() < share(idle_cap, shards, idx)
+                && shard.alive < share(max, shards, idx)
+            {
+                shard.idle.push(IdleSlot {
+                    obj,
+                    last_used: Instant::now(),
+                });
+                shard.alive += 1;
+                return Ok(());
+            }
+        }
+        Err(obj)
+    }
+
+    /// 句柄析构收口（[`Pooled`] / [`Owned`] 共用，语义逐条见 [`Pooled`] 文档）：
+    /// unwind 路径销毁不回池；降级件归还即释放；正常件 `OnReturn` reset → 回 home
+    /// 片 → 迁片 → 全池余量零则丢弃（`dropped_overflow` + `OverflowDropped`）。
+    ///
+    /// 前提：该对象借出时在 `home` 片记过 `borrowed`（`release` / `return_to_shard`
+    /// 各回卷一次，禁混账）。
+    fn drop_handle(&self, home: usize, degraded: bool, mut obj: T) {
+        if std::thread::panicking() {
+            // unwind 路径归还（r2d2 #31 防御）：panic 中对象不变量可能已破——
+            // 禁 reset、禁回池，销毁 + panic_dropped 留痕（无对应审计 kind）。
+            self.release(home, !degraded);
+            self.panic_dropped.fetch_add(1, Ordering::Relaxed);
+            drop(obj);
+            return;
+        }
+        if degraded {
+            // 降级对象：宇宙从未计它——归还即释放，永不进 idle；释放无对应审计
+            // kind（契约词汇零改动，降级面经 metrics.degraded 表达）。
+            self.release(home, false);
+            drop(obj);
+            return;
+        }
+        if self.phase == ResetPhase::OnReturn {
+            if let Some(reset) = self.reset.as_ref() {
+                // 锁外 + 独占借用；run_reset_hook 兜底——Drop 期 panic 在 unwind
+                // 中会 abort 进程，禁；panic（钩子 bug 或重入检出）⇒ 对象状态
+                // 不可信 ⇒ 丢弃不入 idle。payload 就地消化（无日志设施，只留
+                // `reset_panicked` 计数）；`PoolAuditKind` 无钩子故障词汇 ⇒ 不发
+                // 事件（契约词汇零改动）。
+                if run_reset_hook(reset.as_ref(), &mut obj).is_err() {
+                    self.release(home, true);
+                    self.reset_panicked.fetch_add(1, Ordering::Relaxed);
+                    drop(obj);
+                    return;
+                }
+            }
+        }
+        // 放回借出时的片（LIFO 热件常驻）+ 刷新 last_used；片内记账同一临界区。
+        if let Some(overflow) = self.return_to_shard(home, obj) {
+            self.dropped_overflow.fetch_add(1, Ordering::Relaxed);
+            self.sink.emit(PoolAuditKind::OverflowDropped);
+            drop(overflow);
+        } else {
+            self.sink.emit(PoolAuditKind::Returned);
         }
     }
 
@@ -866,8 +1018,8 @@ impl<T> PoolManaged for ObjectPool<T> {
 /// **panic unwind 中析构**（r2d2 #31 防御）：不调 reset、不回池，对象销毁 +
 /// `panic_dropped` 留痕（语义 11，见模块文档「unwind 感知归还」节）。跨
 /// `'static` 边界（任务闭包/线程）：本句柄借用池、非 `'static`，带不进
-/// `'static` 闭包——用 [`Pooled::detach`] 永久移交（对象脱离池生命周期，任务
-/// 自持）。
+/// `'static` 闭包——要归还就换 [`ObjectPool::acquire_owned`]（句柄自带 `Arc`，
+/// 见 [`Owned`]），不要复用了就 [`Pooled::detach`] 永久移交。
 pub struct Pooled<'p, T> {
     pool: &'p ObjectPool<T>,
     /// 借出时的片（归还亲和：LIFO 热件常驻热缓存）。
@@ -911,48 +1063,70 @@ impl<T> std::ops::DerefMut for Pooled<'_, T> {
 
 impl<T> Drop for Pooled<'_, T> {
     fn drop(&mut self) {
-        let pool = self.pool;
-        let mut obj = self
+        let obj = self
             .slot
             .take()
             .expect("pooled slot empty on drop (bookkeeping bug)");
-        if std::thread::panicking() {
-            // unwind 路径归还（r2d2 #31 防御）：panic 中对象不变量可能已破——
-            // 禁 reset、禁回池，销毁 + panic_dropped 留痕（无对应审计 kind）。
-            pool.release(self.home, !self.degraded);
-            pool.panic_dropped.fetch_add(1, Ordering::Relaxed);
-            drop(obj);
-            return;
-        }
-        if self.degraded {
-            // 降级对象：宇宙从未计它——归还即释放，永不进 idle；释放无对应
-            // 审计 kind（契约词汇零改动，降级面经 metrics.degraded 表达）。
-            pool.release(self.home, false);
-            drop(obj);
-            return;
-        }
-        if pool.phase == ResetPhase::OnReturn {
-            if let Some(reset) = pool.reset.as_ref() {
-                // 锁外 + 独占借用；run_reset_hook 兜底——Drop 期 panic 在 unwind
-                // 中会 abort 进程，禁；panic（钩子 bug 或重入检出）⇒ 对象状态
-                // 不可信 ⇒ 丢弃不入 idle。payload 就地消化（无日志设施，只留
-                // `reset_panicked` 计数）；`PoolAuditKind` 无钩子故障词汇 ⇒ 不发
-                // 事件（契约词汇零改动）。
-                if run_reset_hook(reset.as_ref(), &mut obj).is_err() {
-                    pool.release(self.home, true);
-                    pool.reset_panicked.fetch_add(1, Ordering::Relaxed);
-                    drop(obj);
-                    return;
-                }
-            }
-        }
-        // 放回借出时的片（LIFO 热件常驻）+ 刷新 last_used；片内记账同一临界区。
-        if let Some(overflow) = pool.return_to_shard(self.home, obj) {
-            pool.dropped_overflow.fetch_add(1, Ordering::Relaxed);
-            pool.sink.emit(PoolAuditKind::OverflowDropped);
-            drop(overflow);
-        } else {
-            pool.sink.emit(PoolAuditKind::Returned);
+        self.pool.drop_handle(self.home, self.degraded, obj);
+    }
+}
+
+/// `'static` 借出句柄（[`ObjectPool::acquire_owned`] 产出）：与 [`Pooled`] **同语义、
+/// 同记账、同 Drop 路径**（共用 `drop_handle`），差别只在**自持
+/// `Arc<ObjectPool>` 而非借用** ⇒ 可进 `tokio::spawn` 闭包 / `Bytes::from_owner`
+/// 的所有者等 `'static` 位（这些位置的归还点是任意线程的引用计数归零，不可能借用
+/// 池）。代价 = 每轮一次 `Arc` 增删。
+///
+/// **Drop 语义与 [`Pooled`] 逐条相同**：`OnReturn` 相位先锁外 reset（panic ⇒ 丢弃，
+/// `reset_panicked` 留痕，禁 abort）→ 优先回 home 片 → 满则迁片 → 全池余量零才
+/// 丢弃（`dropped_overflow`）；panic unwind 中析构不 reset 不回池
+/// （`panic_dropped`）；降级件归还即释放。**池不再先于句柄死**——`Arc` 让池活到
+/// 最后一个句柄放手，句柄永不悬垂（借用形态里这条性质反过来由编译期保证）。
+pub struct Owned<T> {
+    pool: Arc<ObjectPool<T>>,
+    /// 借出时的片（归还亲和；跨线程 Drop 也回这一片）。
+    home: usize,
+    slot: Option<T>,
+    degraded: bool,
+}
+
+impl<T> Owned<T> {
+    /// 交出所有权（同 [`Pooled::detach`]）：宇宙配额随件回吐，对象彻底脱离池生命
+    /// 周期。`slot` 置空后本句柄的 `Drop` 只释放那份 `Arc`（不重复归还）。
+    pub fn detach(mut self) -> T {
+        let obj = self
+            .slot
+            .take()
+            .expect("owned slot empty before detach (bookkeeping bug)");
+        self.pool.release(self.home, !self.degraded);
+        obj
+    }
+}
+
+impl<T> std::ops::Deref for Owned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.slot
+            .as_ref()
+            .expect("owned slot empty before drop (bookkeeping bug)")
+    }
+}
+
+impl<T> std::ops::DerefMut for Owned<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.slot
+            .as_mut()
+            .expect("owned slot empty before drop (bookkeeping bug)")
+    }
+}
+
+impl<T> Drop for Owned<T> {
+    fn drop(&mut self) {
+        // detach 后 slot 已空：这里只让那份 `Arc` 正常释放（禁 mem::forget——那会
+        // 漏掉一次强引用计数，池永不析构）。
+        if let Some(obj) = self.slot.take() {
+            self.pool.drop_handle(self.home, self.degraded, obj);
         }
     }
 }
