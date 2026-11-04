@@ -612,7 +612,7 @@ impl<T> ObjectPool<T> {
     /// 双裁决并入槽（配额在片锁内读，与并发 `resize` 的收敛论证同
     /// [`Self::resize`]）；全片皆无空位 ⇒ 对象交回调用方 + `dropped_overflow` +1
     /// + `audit OverflowDropped`（容量因，与钩子因两账不混）；成功入槽发
-    /// `audit Returned`（与归还件同一事件流，契约词汇零改动）。
+    ///   `audit Returned`（与归还件同一事件流，契约词汇零改动）。
     ///
     /// **宇宙记账**：插入件此前不在宇宙内 ⇒ 入槽同时认领 `alive`（同
     /// `claim_growth` 的上界保证），**不动 `borrowed`**（从未借出，不得
