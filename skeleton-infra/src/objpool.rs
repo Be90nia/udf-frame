@@ -121,7 +121,9 @@
 //! 独占借用；钩子 panic ⇒ 丢弃 + `reset_panicked`）——**必须跑**，否则外部异形/
 //! 脏对象直接投给下一个借出方（池毒化，红线 2）；入槽同时认领宇宙 `alive`
 //! （`max` 上界因此对插入件同样成立），**不动 `borrowed`**（从未借出）；无空位
-//! ⇒ 对象交回调用方 + `dropped_overflow` + `audit OverflowDropped`（容量因）。
+//! ⇒ 对象交回调用方 + `dropped_overflow` + `audit OverflowDropped`（容量因）；
+//! 成功入槽发 `audit Returned`（与归还件同一事件流——`PoolAuditKind` 契约词汇
+//! 零改动，插入与归还共用「留存入闲槽」语义）。
 //! 与 `Pooled::drop` 的唯一差别 = **容量不满足时把对象交回调用方**（归还路径
 //! 只能就地丢弃——对象已在句柄里）。
 //!
@@ -609,7 +611,8 @@ impl<T> ObjectPool<T> {
     /// 在取出时，同归还路径）。随后**一次片锁内**完成「idle 片配额 + 宇宙配额」
     /// 双裁决并入槽（配额在片锁内读，与并发 `resize` 的收敛论证同
     /// [`Self::resize`]）；全片皆无空位 ⇒ 对象交回调用方 + `dropped_overflow` +1
-    /// + `audit OverflowDropped`（容量因，与钩子因两账不混）。
+    /// + `audit OverflowDropped`（容量因，与钩子因两账不混）；成功入槽发
+    /// `audit Returned`（与归还件同一事件流，契约词汇零改动）。
     ///
     /// **宇宙记账**：插入件此前不在宇宙内 ⇒ 入槽同时认领 `alive`（同
     /// `claim_growth` 的上界保证），**不动 `borrowed`**（从未借出，不得
