@@ -3,11 +3,11 @@
 //! 审计事件发射 seq 单调 / dropped_overflow 计数）+ 骨架审计纪律（回调 panic
 //! 摘除留痕 / 回调重入封死 / 票据关流与代次对账 / 容量环有界）。
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use skeleton::pool::{PoolAuditKind, PoolResizeError};
-use skeleton_infra::pool::{PoolBase, AUDIT_RING_DEFAULT_CAP};
+use skeleton_infra::pool::{AUDIT_RING_DEFAULT_CAP, PoolBase};
 
 // ── 四件之一：resize 事前校验，非法参数入口拒绝，拒绝不改状态 ──────────
 

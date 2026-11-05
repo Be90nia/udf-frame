@@ -33,11 +33,11 @@
 //!    置位，不能作「已被 poll」证据）；black_box 防消除；时钟地板双臂同担。
 
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use skeleton_infra::fx::{cancel_pair, FxScope};
+use skeleton_infra::fx::{FxScope, cancel_pair};
 use skeleton_infra::memgov::CountingAllocator;
 
 #[global_allocator]

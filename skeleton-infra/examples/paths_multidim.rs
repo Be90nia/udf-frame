@@ -9,7 +9,7 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use std_ext::paths::{ensure_inside, normalize_lexical, relative_to, simplify, CaseStrategy};
+use std_ext::paths::{CaseStrategy, ensure_inside, normalize_lexical, relative_to, simplify};
 
 /// 中位数采样（奇数次取中位，噪声抑制对齐既有 multidim 先例）。
 fn median_ns(iters: u32, mut f: impl FnMut()) -> u128 {

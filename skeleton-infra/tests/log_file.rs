@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use skeleton::logpath::LogPathResolver;
 #[cfg(not(debug_assertions))]
 use skeleton_infra::logx::DefaultPathResolver;
-use skeleton_infra::logx::{init_tracing_from_env, init_with_file, AlreadyInit, LogInitError};
-use std_ext::fsx::{temp_dir_in, TempDir};
+use skeleton_infra::logx::{AlreadyInit, LogInitError, init_tracing_from_env, init_with_file};
+use std_ext::fsx::{TempDir, temp_dir_in};
 
 /// 契约测试替身：任意根目录注入。
 struct FixedRoot(PathBuf);

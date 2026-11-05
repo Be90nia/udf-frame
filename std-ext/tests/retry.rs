@@ -10,7 +10,7 @@
 //! 即红），取消安全经悬停探针观测。
 
 use std::future::Future;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use skeleton::clock::{MockClock, SystemClock};
 use std_ext::retry::{
-    full_jitter, retry, retry_async, retry_if, retry_if_async, AsyncSleeper, RetryError,
-    RetryPolicy,
+    AsyncSleeper, RetryError, RetryPolicy, full_jitter, retry, retry_async, retry_if,
+    retry_if_async,
 };
 
 /// 脚本化 op：按序吐结果并计数；脚本耗尽 = retry 越权多调（测试即红）。

@@ -375,7 +375,7 @@ pub fn expect_empty<K: Ord, V>(reg: &BoundedRegistry<K, V>) {
 #[cfg(feature = "pool")]
 mod memory_pool {
     use std::borrow::Borrow;
-    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     use std::sync::{Condvar, Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
@@ -383,7 +383,7 @@ mod memory_pool {
         PoolAuditEvent, PoolAuditTicket, PoolManaged, PoolMetrics, PoolResizeError,
     };
 
-    use crate::pool::{PoolBase, AUDIT_RING_DEFAULT_CAP};
+    use crate::pool::{AUDIT_RING_DEFAULT_CAP, PoolBase};
 
     /// std Mutex 取锁：中毒 = 持锁方已 panic——fail-fast 传播（同 `pool::lock`
     /// 纪律）。收口一处，调用点只见加锁。

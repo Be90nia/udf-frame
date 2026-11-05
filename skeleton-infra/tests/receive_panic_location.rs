@@ -11,7 +11,7 @@
 use skeleton::{Effect, EffectBuf, EffectId, Reducer};
 use skeleton_infra::testing::{ExpectedEffect, TestStore};
 use std::convert::Infallible;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::channel;
 
 #[derive(Debug)]

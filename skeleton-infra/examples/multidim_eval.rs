@@ -174,7 +174,9 @@ fn perf_dispatch_idle() {
         10_000 + SAMPLES as u64 + BATCH,
         "dispatch 计数守恒"
     );
-    println!("skeleton_dispatch_p50_ns={p50} skeleton_dispatch_p99_ns={p99} skeleton_dispatch_batch_mean_ns={mean:.1}");
+    println!(
+        "skeleton_dispatch_p50_ns={p50} skeleton_dispatch_p99_ns={p99} skeleton_dispatch_batch_mean_ns={mean:.1}"
+    );
 
     let raw = RawQueue::new();
     for _ in 0..10_000 {
@@ -558,7 +560,7 @@ mod gateshapes {
 /// 镜像）。纯 std 原子，零分配热窗，内存段不适用。
 fn perf_false_sharing_gates() {
     println!("== perf: false_sharing_gates（⑦ 内联热词 draining/closed/gate：相邻 vs 垫片隔离）==");
-    use gateshapes::{dispatch_atomic_mix, Adjacent, Isolated};
+    use gateshapes::{Adjacent, Isolated, dispatch_atomic_mix};
 
     /// 双线程对撞：一线程写混（夺权/放旗），一线程读闸（closed+gate）。
     /// ns/op = 总墙钟摊到每 op（两线程等 op 数，口径同 memory_pool_profile ⑦）。
@@ -651,5 +653,7 @@ fn perf_false_sharing_gates() {
         "⑦ gate hammer (8thr × {HAMMER_PER}, full atomic mix): adjacent={adj8:.1} ns/op isolated(pad)={iso8:.1} ns/op ratio={:.2}x",
         adj8 / iso8
     );
-    println!("⑦ product 布局=adjacent 形（StoreInner 内联紧邻）；若风暴吞吐需此余量，热词拆线（Pad/Arc 化）为候选改法——本采集器只留痕不改布局。");
+    println!(
+        "⑦ product 布局=adjacent 形（StoreInner 内联紧邻）；若风暴吞吐需此余量，热词拆线（Pad/Arc 化）为候选改法——本采集器只留痕不改布局。"
+    );
 }

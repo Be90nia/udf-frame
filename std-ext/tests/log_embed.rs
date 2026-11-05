@@ -24,10 +24,10 @@ use std::time::Duration;
 use skeleton::clock::{MockClock, SystemClock};
 use std_ext::backoff::backoff_delay;
 use std_ext::cache::{LruCache, TtlCache};
-use std_ext::fsx::{copy_tree, temp_dir_in, walk, Sort, SymlinkPolicy, TempDir};
+use std_ext::fsx::{Sort, SymlinkPolicy, TempDir, copy_tree, temp_dir_in, walk};
 use std_ext::iter::process_results;
 use std_ext::ratelimit::TokenBucket;
-use std_ext::retry::{retry_if, RetryPolicy};
+use std_ext::retry::{RetryPolicy, retry_if};
 use std_ext::scheduler::Scheduler;
 
 use tracing::field::{Field, Visit};

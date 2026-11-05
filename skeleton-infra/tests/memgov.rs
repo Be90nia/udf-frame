@@ -13,7 +13,7 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::sync::{Mutex, MutexGuard};
 
 use skeleton_infra::memgov::{
-    expect_empty, BoundedRegistry, CountingAllocator, Eviction, LeakGuard,
+    BoundedRegistry, CountingAllocator, Eviction, LeakGuard, expect_empty,
 };
 
 /// 计数分配器挂全局（本二进制专用；lib 测试二进制不挂——测试 ⑩ 的降级前提）。
@@ -438,8 +438,8 @@ mod skeleton_alloc_twin {
 mod perf_anchor_alloc {
     use std::convert::Infallible;
     use std::hint::black_box;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
     use skeleton::notify::{Notify as _, NotifySink};

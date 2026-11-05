@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use skeleton_infra::config::{load_toml, save_toml, ConfigFile};
-use std_ext::fsx::{atomic_write, temp_dir_in, TempDir};
+use skeleton_infra::config::{ConfigFile, load_toml, save_toml};
+use std_ext::fsx::{TempDir, atomic_write, temp_dir_in};
 
 static EVENTS: AtomicUsize = AtomicUsize::new(0);
 

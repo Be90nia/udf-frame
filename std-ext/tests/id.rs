@@ -8,7 +8,7 @@
 //! 注册表按进程共享（同指纹单权威）：**每个测试用独立指纹常量隔离**，禁
 //! 复用他人指纹。
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

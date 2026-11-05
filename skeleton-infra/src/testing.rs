@@ -22,7 +22,7 @@ use skeleton::{ActionSender, Effect, EffectId, EffectRuntime, Infallible, Reduce
 use crate::fx::FxScope;
 #[cfg(test)]
 use crate::fx::Spawned;
-use crate::runtime::{lock, SyncStore};
+use crate::runtime::{SyncStore, lock};
 
 /// 脚本步：`run` 每次出队一步（FIFO），行为完全由脚本驱动、与到达的 Effect 值无关。
 pub enum Script<A, Op> {
@@ -309,7 +309,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Te
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fx::{expect_idle, TaskError};
+    use crate::fx::{TaskError, expect_idle};
     use skeleton::{EffectBuf, EffectId, Reducer};
     use std::convert::Infallible;
 

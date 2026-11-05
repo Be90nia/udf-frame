@@ -18,9 +18,9 @@
 //!    把工厂/容量分配挪出热窗。
 
 use std::hint::black_box;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -69,7 +69,9 @@ fn main() {
     }
     let delta = CountingAllocator::live_allocs() - before;
     let churn = CountingAllocator::total_allocs() - churn_before;
-    println!("① steady-state allocs per 10k borrow/return: {delta} (expect 0; churn={churn} — 0/0=真零分配, 0/n>0=高churn零泄漏)");
+    println!(
+        "① steady-state allocs per 10k borrow/return: {delta} (expect 0; churn={churn} — 0/0=真零分配, 0/n>0=高churn零泄漏)"
+    );
 
     // ── ② uncontended 借还往返锚（单线程闲槽直取）──────────────────────────
     let n = 100_000u64;

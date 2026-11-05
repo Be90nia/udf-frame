@@ -24,8 +24,8 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// 写缓冲容量（64KiB，禁逐行 flush）。
 const WRITE_BUF: usize = 64 * 1024;
@@ -500,7 +500,7 @@ where
                         return Err(JournalError::Corrupt {
                             line: line_no,
                             source: e,
-                        })
+                        });
                     }
                 }
             }
@@ -648,7 +648,7 @@ impl<'j, A: DeserializeOwned> Iterator for Replay<'j, A> {
                     return Some(Err(ReplayError::Corrupt {
                         line: self.line_no,
                         source: e,
-                    }))
+                    }));
                 }
             };
             if value.get("t").and_then(|t| t.as_str()) == Some("a") {
@@ -946,7 +946,7 @@ mod tests {
             .with_snapshot_every(2);
         app(&mut j, &a1);
         app(&mut j, &a2); // 达 n=2 → 自动 flush，无手动 flush
-                          // j 保持存活（BufWriter drop 兜底 flush 会污染断言），用第二句柄验证重开可见。
+        // j 保持存活（BufWriter drop 兜底 flush 会污染断言），用第二句柄验证重开可见。
         {
             let j2 = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
             let mut r = rep(&j2);
@@ -1101,7 +1101,7 @@ mod tests {
             snap(&mut j, &St { count: 3 }); // fold(a1,a2)
             app(&mut j, &a3);
             j.flush().unwrap(); // 可见性=已 flush 前缀：先 flush 再 restore
-                                // 有快照行：起点=快照态，续回放=快照行之后的增量。
+            // 有快照行：起点=快照态，续回放=快照行之后的增量。
             let (s0, mut r) = rest(&j).unwrap();
             assert_eq!(s0, St { count: 3 });
             let inc: Vec<Act> = r.by_ref().map(Result::unwrap).collect();

@@ -12,16 +12,16 @@
 //! ttl_insert_existing_key 51.6 ns（TTL 多一次注入钟读）/ retry_async_first_attempt
 //! 31.4 ns / random_id_v4 60.0 ns / random_fill_8x8 364.9 ns（8 次 8 字节 fill）。
 
-use std::future::{ready, Future};
+use std::future::{Future, ready};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use skeleton::clock::MockClock;
 use std_ext::cache::{SyncLruCache, SyncTtlCache};
-use std_ext::retry::{retry_async, AsyncSleeper, RetryPolicy};
+use std_ext::retry::{AsyncSleeper, RetryPolicy, retry_async};
 
 // ---- cache：get 命中 + insert（已有键覆盖）----
 

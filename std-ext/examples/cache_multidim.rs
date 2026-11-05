@@ -25,8 +25,8 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use skeleton::clock::MockClock;
@@ -113,7 +113,9 @@ fn perf_ttl_anchor() {
         batch_mean(|| c.get(&7u64).copied(), 100_000),
     );
     let ev = events_per(|| c.get(&7u64).copied(), 10_000);
-    println!("②′ TtlCache.get 命中（MockClock 注入）：{hit:.0} ns / {ev:.2} events（内核 14ns + 钟读净税）");
+    println!(
+        "②′ TtlCache.get 命中（MockClock 注入）：{hit:.0} ns / {ev:.2} events（内核 14ns + 钟读净税）"
+    );
 }
 
 // ---- ① 分配事件面（稳态：命中/未命中/peek/新键插入-逐尾循环）----
@@ -134,7 +136,9 @@ fn perf_alloc_face() {
         c.insert(k, k);
     };
     let insert = events_per(&mut insert_u64, 10_000);
-    println!("① 分配事件面（u64 键稳态，events/call）：get 命中 {hit:.2} / get 未命中 {miss:.2} / peek {peek:.2} / insert 新键(逐尾循环) {insert:.2}");
+    println!(
+        "① 分配事件面（u64 键稳态，events/call）：get 命中 {hit:.2} / get 未命中 {miss:.2} / peek {peek:.2} / insert 新键(逐尾循环) {insert:.2}"
+    );
 
     // String 键对照：insert 的键 clone 事件如实展示（K: Clone 契约代价：
     // to_string 1 + 键 clone 1 = 2 事件/次，键值落 map+槽各一份）
@@ -150,7 +154,9 @@ fn perf_alloc_face() {
     let insert_str = events_per(&mut insert_s, 10_000);
     let ks = "777".to_string();
     let get_str = events_per(|| cs.get(&ks).is_some(), 10_000);
-    println!("  String 键对照：insert 新键 {insert_str:.2}（键两份=to_string+clone）/ get 命中 {get_str:.2}（热路径仍零事件）");
+    println!(
+        "  String 键对照：insert 新键 {insert_str:.2}（键两份=to_string+clone）/ get 命中 {get_str:.2}（热路径仍零事件）"
+    );
 }
 
 // ---- ② ns 锚（u64 键；HashMap 查找为底盘）----
@@ -185,7 +191,9 @@ fn perf_ns_anchors() {
         batch_mean(&mut insert_once, 100_000),
         batch_mean(&mut insert_once, 100_000),
     );
-    println!("② ns 锚（u64 键，median3）：get 命中 {hit:.0} / get 未命中 {miss:.0} / peek {peek:.0} / insert 新键 {insert:.0}");
+    println!(
+        "② ns 锚（u64 键，median3）：get 命中 {hit:.0} / get 未命中 {miss:.0} / peek {peek:.0} / insert 新键 {insert:.0}"
+    );
 }
 
 // ---- ③ 容量梯度 100/1k/10k：稳态混合作业应平坦（O(1) 判据）----
@@ -230,5 +238,7 @@ fn perf_capacity_gradient() {
         mixed_workload(10_000, 300_000),
         mixed_workload(10_000, 300_000),
     );
-    println!("③ 容量梯度稳态混合作业 ns/op：cap=100: {c100:.0}  cap=1k: {c1k:.0}  cap=10k: {c10k:.0}（平坦=O(1) 判据）");
+    println!(
+        "③ 容量梯度稳态混合作业 ns/op：cap=100: {c100:.0}  cap=1k: {c1k:.0}  cap=10k: {c10k:.0}（平坦=O(1) 判据）"
+    );
 }

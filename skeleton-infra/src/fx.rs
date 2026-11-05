@@ -20,14 +20,14 @@
 use std::any::Any;
 use std::fmt;
 use std::future::Future;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::sync::{oneshot, watch, Semaphore};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::{AbortHandle, JoinSet};
 
 /// std Mutex 取锁：中毒 = 持锁方已 panic、状态不可信——fail-fast 传播 panic

@@ -86,8 +86,8 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fmt;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrd};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrd};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};

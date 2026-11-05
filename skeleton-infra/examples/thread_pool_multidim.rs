@@ -18,8 +18,8 @@
 //! ③ 并发段只测吞吐不计内存（计数器仅串行上下文有效）；池逐段 shutdown+join 清场。
 
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use skeleton::pool::PoolAuditEvent;

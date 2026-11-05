@@ -157,10 +157,10 @@ fn sync_ttl_cache_get_insert_zero_alloc() {
 // 依据：PerfProbe `retry` 组（retry_async 适配层，ReadySleeper 排除 sleep 成本）
 // ——首试成功路径不睡眠、不装箱、不收集。
 
-use std::future::{ready, Future};
+use std::future::{Future, ready};
 use std::task::{Context, Poll, Waker};
 
-use std_ext::retry::{retry_async, AsyncSleeper, RetryPolicy};
+use std_ext::retry::{AsyncSleeper, RetryPolicy, retry_async};
 
 /// 即刻就绪的睡眠口（首试成功路径压根不会走到它）。
 struct ReadySleeper;

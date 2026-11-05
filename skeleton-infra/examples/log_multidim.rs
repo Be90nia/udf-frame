@@ -18,13 +18,13 @@
 
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use skeleton::logpath::LogPathResolver;
-use skeleton_infra::logx::{init_with_file, FileSinkWriter};
+use skeleton_infra::logx::{FileSinkWriter, init_with_file};
 use skeleton_infra::memgov::CountingAllocator;
 use std_ext::fsx::temp_dir_in;
 
@@ -98,7 +98,9 @@ fn main() {
     cold.write_all(&line).expect("cold line");
     let delta = CountingAllocator::live_allocs() - before;
     let net = CountingAllocator::live_bytes() as isize - bytes_before as isize;
-    println!("①b rollover/first-open path: +{delta} allocs, net retained {net}B (path String + PathBuf + BufWriter cap)");
+    println!(
+        "①b rollover/first-open path: +{delta} allocs, net retained {net}B (path String + PathBuf + BufWriter cap)"
+    );
 
     // ── ①c 格式化路径分配事件（init_with_file 双 sink，各一份格式串）──────
     let before = CountingAllocator::live_allocs();
@@ -203,5 +205,7 @@ fn main() {
         );
     }
 
-    println!("=== notes: ⑥ zero-spin = std Mutex park (no spin loop); ⑦ n/a single-authority single-buffer; ④ per-line flush is the approved semantic (BufWriter cap not exposed)");
+    println!(
+        "=== notes: ⑥ zero-spin = std Mutex park (no spin loop); ⑦ n/a single-authority single-buffer; ④ per-line flush is the approved semantic (BufWriter cap not exposed)"
+    );
 }

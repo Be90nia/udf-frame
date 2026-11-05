@@ -33,8 +33,8 @@
 //! 件是跨 `memgov` + `pool` 两域的可选组合层，独立生命周期。零核心耦合：契约
 //! 层零动，两池类型签名零变，两池彼此仍不认识。
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::memgov::MemoryPool;

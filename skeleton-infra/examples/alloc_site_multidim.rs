@@ -26,7 +26,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 
-use skeleton_infra::alloc_site::{find, set_global_enabled, AllocSite};
+use skeleton_infra::alloc_site::{AllocSite, find, set_global_enabled};
 use skeleton_infra::alloc_sites;
 
 // ---- 采集对象表（宏表 + 梯度表）----

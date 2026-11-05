@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use skeleton::config::ConfigError;
-use skeleton_infra::config::{load_toml, save_toml, ConfigFile};
-use std_ext::fsx::{temp_dir_in, TempDir};
+use skeleton_infra::config::{ConfigFile, load_toml, save_toml};
+use std_ext::fsx::{TempDir, temp_dir_in};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct App {

@@ -87,7 +87,9 @@ fn perf_alloc_surface() {
         },
         10_000,
     );
-    println!("register+cancel（1 alloc = Arc<TaskCell>；Mutex 内嵌零额外；无捕获闭包零 Box 分配）: {reg:.2}");
+    println!(
+        "register+cancel（1 alloc = Arc<TaskCell>；Mutex 内嵌零额外；无捕获闭包零 Box 分配）: {reg:.2}"
+    );
     let scan = allocs_per(|| sched.next_deadline(), 100_000);
     println!("next_deadline（锁内 peek）           : {scan:.2}（期望 0）");
     let empty_tick = allocs_per(|| sched.tick(), 100_000);
@@ -166,7 +168,9 @@ fn perf_cancel_anchor() {
 // ---- ⑤ worker 驱动触发精度双报（真实时钟面）----
 
 fn perf_trigger_precision() {
-    println!("== ⑤ 触发精度双报（SystemClock worker 面，20 个 50ms 错峰 after 偏差 ms，含 OS 调度抖动）==");
+    println!(
+        "== ⑤ 触发精度双报（SystemClock worker 面，20 个 50ms 错峰 after 偏差 ms，含 OS 调度抖动）=="
+    );
     let sched = Arc::new(Scheduler::new(Arc::new(SystemClock)));
     let observed: Arc<std::sync::Mutex<Vec<f64>>> = Arc::default();
     // 采样锚：20 个 20ms+i*50ms 错峰一次性任务。错峰间隔取 50ms ≫ Windows
@@ -197,7 +201,9 @@ fn perf_trigger_precision() {
     let mut samples = observed.lock().expect("test vec").clone();
     let p50 = pct(&mut samples, 0.50);
     let p99 = pct(&mut samples, 0.99);
-    println!("偏差 p50 = {p50:.2} ms / p99 = {p99:.2} ms（相对各自 deadline；含 Windows 时钟粒度 ~15.6ms 与 OS 调度抖动）");
+    println!(
+        "偏差 p50 = {p50:.2} ms / p99 = {p99:.2} ms（相对各自 deadline；含 Windows 时钟粒度 ~15.6ms 与 OS 调度抖动）"
+    );
 }
 
 // ---- ⑥ idle park 零自旋 ----

@@ -10,7 +10,7 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::collections::{HashSet, VecDeque};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -32,7 +32,7 @@ mod notify;
 use audit_emit::{audit_emit, audit_enqueued};
 pub use local_subs::LocalSubscription;
 use local_subs::{local_notify, next_local_sub_id};
-use notify::{notify_async, NotifySinkSlot};
+use notify::{NotifySinkSlot, notify_async};
 
 /// std Mutex 取锁：中毒 = 持锁方已 panic、状态不可信——按 fail-fast 纪律传播
 /// panic，禁静默吞掉毒锁继续跑。（crate 内共享：testing 域 TestStore 同纪律取锁。）

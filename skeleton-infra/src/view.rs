@@ -9,12 +9,12 @@
 //! `take_patches` 与 `snapshot_doc` 同为交付点（快照重同步后下批 `from_version ==
 //! snapshot.version`）。装配纪律：mount → 全部 bind → 才允许 dispatch。
 use std::fmt;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
-use skeleton::view::{IntentMap, PayloadTag, ViewMap, PROTOCOL_VERSION};
+use skeleton::view::{IntentMap, PROTOCOL_VERSION, PayloadTag, ViewMap};
 use skeleton::{ActionSender, Store, Subscription};
 
 pub mod read;

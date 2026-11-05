@@ -8,14 +8,14 @@
 //! 内重入 / 清场与在飞快照相遇）都用 `mpsc::recv_timeout(5s)` 收口——持锁跑用户代码
 //! 会超时判败而不是把整跑拖死。
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use skeleton::lint::{
-    clear_stages, post_process, register_stage, registered_stages, LintError, LintStage,
+    LintError, LintStage, clear_stages, post_process, register_stage, registered_stages,
 };
 
 /// 测试替身阶段的闭包面（复杂类型起别名，避免类型膨胀）。

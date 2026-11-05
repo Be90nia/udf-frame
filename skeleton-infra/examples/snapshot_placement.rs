@@ -22,8 +22,8 @@ use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
 use skeleton_infra::memgov::CountingAllocator;
 use skeleton_infra::runtime::SyncStore as Store;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// 全局 clone 计数：只统计 `State::clone`（框架 `make_mut` 克隆分支触发面）——

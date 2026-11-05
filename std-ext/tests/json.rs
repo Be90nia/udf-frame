@@ -8,7 +8,7 @@
 mod json {
     use std::io::Cursor;
 
-    use std_ext::json::{decode, decode_slice, decode_str, JsonMode, MAX_INPUT_BYTES};
+    use std_ext::json::{JsonMode, MAX_INPUT_BYTES, decode, decode_slice, decode_str};
 
     #[test]
     fn strict_mode_rejects_comments() {

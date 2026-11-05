@@ -17,7 +17,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use skeleton_infra::alloc_site::{find, global_enabled, set_global_enabled, AllocSite};
+use skeleton_infra::alloc_site::{AllocSite, find, global_enabled, set_global_enabled};
 use skeleton_infra::alloc_sites;
 
 // 两张独立宏表（site 标识符跨表不得重名——每次宏调用生成独立 static 集）。

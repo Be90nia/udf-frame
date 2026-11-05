@@ -310,11 +310,7 @@ fn parse_inner(b: &[u8], weak: bool) -> Result<SystemTime, TimeParseError> {
                 return Err(TimeParseError::OutOfRange { at: i + 4 });
             }
             let mag = i64::from(oh) * 3_600 + i64::from(om) * 60;
-            if sign == b'+' {
-                mag
-            } else {
-                -mag
-            }
+            if sign == b'+' { mag } else { -mag }
         }
         Some(&c) => return Err(TimeParseError::InvalidDigit { at: i, byte: c }),
     };

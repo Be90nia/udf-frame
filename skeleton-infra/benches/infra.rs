@@ -8,10 +8,10 @@
 //! `cargo bench -p udf-skeleton-infra --all-features --bench infra`
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
 
 use skeleton::notify::{Notify as _, NotifySink};

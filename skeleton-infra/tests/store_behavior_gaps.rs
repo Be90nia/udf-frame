@@ -5,7 +5,7 @@
 use std::convert::Infallible;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 
 use skeleton::{
     ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Fragment, Reducer, Store as _,
@@ -374,7 +374,7 @@ fn closed_gate_dispatch_leaves_rejected_audit_scene() {
     store.dispatch(Msg::Bump); // 早闸位
     assert!(!store.sender().dispatch(Msg::Bump), "sender 闭门显式 false");
     store.dispatch(Msg::Bump); // enqueue 复检闸位（闭门后早闸必先命中，此行只加固计数）
-                               // 订阅窗内全部事件即三次拒绝（闭门后无其他节点），seq 单调连续。
+    // 订阅窗内全部事件即三次拒绝（闭门后无其他节点），seq 单调连续。
     let events = store.take_events();
     assert_eq!(
         events.len(),

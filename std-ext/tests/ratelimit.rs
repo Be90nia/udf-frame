@@ -5,9 +5,9 @@
 //! 确定性不等式是 sleep 通路的证伪器。标「真睡」的两个测试用
 //! SystemClock 短时长（50ms 级），覆盖锁空闲面与并发活性。
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -183,7 +183,7 @@ fn fractional_refill_accumulates_exactly() {
     let bucket = TokenBucket::new(sleeper.clone(), 2.0, 1.0);
     bucket.try_acquire(2).unwrap(); // 清空
     bucket.acquire(1).unwrap(); // 睡 1s，账本归零+1-1=0
-                                // 两个半秒各回填 0.5：try 之间无整秒，fractional 结转必须精确积累。
+    // 两个半秒各回填 0.5：try 之间无整秒，fractional 结转必须精确积累。
     sleeper.clock.advance(Duration::from_millis(500));
     assert!(bucket.try_acquire(1).is_err(), "0.5 不足 1");
     sleeper.clock.advance(Duration::from_millis(500));

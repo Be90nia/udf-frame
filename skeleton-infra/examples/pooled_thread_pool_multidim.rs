@@ -21,8 +21,8 @@
 //!    分配，同 thread_pool_multidim ①先例）；逐段 shutdown+join 清场。
 
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use skeleton_infra::memgov::{CountingAllocator, MemoryPool, MemoryTuning};
@@ -573,7 +573,9 @@ fn dim7_false_sharing() {
     println!(
         "⑦b 组合计数热点: 借空风暴（每任务烧共享原子）={storm_tps:.0} /s vs 正常借还（原子零触碰）={normal_tps:.0} /s",
     );
-    println!("    （设计注: borrow_rejected 为弃件路径冷计数——稳态借还零共享原子写，热点只在持续借空故障态）");
+    println!(
+        "    （设计注: borrow_rejected 为弃件路径冷计数——稳态借还零共享原子写，热点只在持续借空故障态）"
+    );
 
     let m = ptp.mem_pool().metrics();
     println!(

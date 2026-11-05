@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use std_ext::fsx::{temp_dir_in, walk, Sort, TempDir};
+use std_ext::fsx::{Sort, TempDir, temp_dir_in, walk};
 
 static EVENTS: AtomicUsize = AtomicUsize::new(0);
 

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use std_ext::iter::{
-    dedup, interleave, minmax, process_results, zip_longest, EitherOrBoth, MinMaxResult,
+    EitherOrBoth, MinMaxResult, dedup, interleave, minmax, process_results, zip_longest,
 };
 
 /// 分配事件计数器（text_multidim 同款：alloc/alloc_zeroed/realloc 各计一次

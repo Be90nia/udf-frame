@@ -8,9 +8,9 @@ use skeleton_infra::audit::AuditEventKind;
 use skeleton_infra::runtime::SyncStore as Store;
 use std::convert::Infallible;
 use std::marker::PhantomData;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 enum Act {
     Inc,

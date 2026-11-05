@@ -412,8 +412,12 @@ fn dim7_narrowing(names: &[&'static str]) {
     let miss_ns = median3(|| batch_ns(|| bag.get("nope"), n));
     println!("  get 命中（256 字段袋）: {hit_ns:>8.1} ns/次");
     println!("  get 未命中（全表扫描）: {miss_ns:>8.1} ns/次");
-    println!("  声明 1: 无 serde/无导出/无上报——值面到此为止，导出格式归消费方自映射（契约层零依赖纪律）");
+    println!(
+        "  声明 1: 无 serde/无导出/无上报——值面到此为止，导出格式归消费方自映射（契约层零依赖纪律）"
+    );
     println!("  声明 2: O(n) 线性 get/insert——观测袋是个位数量级小集合，线性换零哈希表分配；");
     println!("          升级路径 = 排序索引，出现大规模袋证据再升级");
-    println!("  声明 3: 字段名 &'static str 零分配（dim1 new/clone/iter=0 佐证），无字段名注册表、无日志级别语义");
+    println!(
+        "  声明 3: 字段名 &'static str 零分配（dim1 new/clone/iter=0 佐证），无字段名注册表、无日志级别语义"
+    );
 }

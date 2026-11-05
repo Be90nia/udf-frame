@@ -9,7 +9,7 @@ use skeleton::{Effect, EffectBuf, EffectId, Fragment, Reducer};
 use skeleton_infra::compose::combine;
 use skeleton_infra::testing::{ExpectedEffect, TestStore};
 use std::convert::Infallible;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 // ── 固定装置：父 Feature 委托子切片 ──────────────────────────────────────
 
@@ -76,8 +76,8 @@ enum ParentOp {
 }
 
 /// 子切片分片（组合根显式构造）：get/set 镜头 + wrap/unwrap 路由 + lift_fx 效果上提
-fn parent_child_fragment(
-) -> impl Fragment<State = ParentState, Action = ParentAction, Op = ParentOp> {
+fn parent_child_fragment()
+-> impl Fragment<State = ParentState, Action = ParentAction, Op = ParentOp> {
     combine(
         |ps: &ParentState| &ps.child,
         |ps: &mut ParentState, cs: ChildState| ps.child = cs,

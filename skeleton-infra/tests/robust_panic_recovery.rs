@@ -9,10 +9,10 @@ use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer
 use skeleton_infra::runtime::SyncStore as Store;
 use std::convert::Infallible;
 use std::marker::PhantomData;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// panic payload 转消息（断言消息子串，防 catch_unwind 假绿）。

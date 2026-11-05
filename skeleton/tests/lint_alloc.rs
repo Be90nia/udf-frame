@@ -17,10 +17,10 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use skeleton::lint::{clear_stages, post_process, register_stage, LintError, LintStage};
+use skeleton::lint::{LintError, LintStage, clear_stages, post_process, register_stage};
 
 /// 转发 `System` 并统计窗内分配事件的分配器。
 struct EventCounting;

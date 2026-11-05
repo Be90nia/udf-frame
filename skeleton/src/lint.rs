@@ -577,8 +577,8 @@ mod tests {
     //! 恢复而不报废注册表」这条 armor 只能在本模块内验证——同 crate 才够得着 `REGISTRY`。
 
     use super::{
-        clear_stages, post_process, register_stage, registered_stages, LintError, LintStage,
-        REGISTRY,
+        LintError, LintStage, REGISTRY, clear_stages, post_process, register_stage,
+        registered_stages,
     };
     use std::collections::HashMap;
     use std::panic::catch_unwind;

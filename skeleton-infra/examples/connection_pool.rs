@@ -18,13 +18,13 @@
 
 use std::borrow::Borrow;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use skeleton::pool::{
     PoolAuditEvent, PoolAuditKind, PoolAuditTicket, PoolManaged, PoolMetrics, PoolResizeError,
 };
-use skeleton_infra::pool::{PoolBase, AUDIT_RING_DEFAULT_CAP};
+use skeleton_infra::pool::{AUDIT_RING_DEFAULT_CAP, PoolBase};
 
 /// 连接池（泛型连接 + 工厂）：管理面全在 [`PoolBase`]，本类型只有特化面。
 pub struct ConnectionPool<T, F = fn() -> T> {

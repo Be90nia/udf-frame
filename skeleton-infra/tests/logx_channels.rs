@@ -27,7 +27,7 @@ use skeleton::logpath::LogPathResolver;
 use skeleton_infra::logx::{
     Channel, ChannelError, ChannelFileSink, ChannelRegistry, ChannelSink, PerChannelPathResolver,
 };
-use std_ext::fsx::{temp_dir_in, TempDir};
+use std_ext::fsx::{TempDir, temp_dir_in};
 
 /// 契约测试替身：任意根目录注入（同 tests/log_file.rs FixedRoot）。
 struct FixedRoot(PathBuf);

@@ -18,8 +18,8 @@
 //! PASS/FAIL 内嵌真 `assert_eq!`（`thread_pool_multidim` 先例），断言失败即
 //! 进程非零退出。
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use skeleton_infra::objpool::{ObjectPool, ResetPhase};

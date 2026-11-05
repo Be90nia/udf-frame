@@ -4,7 +4,7 @@
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use skeleton::notify::{Notify, NotifySink};

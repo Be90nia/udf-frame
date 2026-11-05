@@ -13,8 +13,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use std_ext::fsx::{
-    atomic_write, copy_tree, rm_all, temp_dir_in, walk, CopyError, CopyReport, Sort, SymlinkPolicy,
-    TempDir, WalkError,
+    CopyError, CopyReport, Sort, SymlinkPolicy, TempDir, WalkError, atomic_write, copy_tree,
+    rm_all, temp_dir_in, walk,
 };
 
 // ── 守卫与助手 ──
@@ -403,10 +403,12 @@ fn copy_preserve_keeps_dangling_link_on_unix() {
     let dst = g.path().join("dst");
     let report = copy_tree(&src, &dst, SymlinkPolicy::Preserve).unwrap();
     assert_eq!(report.symlinks, 1);
-    assert!(fs::symlink_metadata(dst.join("dang"))
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert!(
+        fs::symlink_metadata(dst.join("dang"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]

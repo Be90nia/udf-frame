@@ -4,7 +4,7 @@
 //! 虚拟钟冻结语义使「1ns TTL 即刻活」断言红——确定性不等式是真实钟通路
 //! 的证伪器（ratelimit 同款手法）。
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;

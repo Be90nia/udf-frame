@@ -137,7 +137,7 @@ pub use runtime::{LocalSubscription, SyncStore};
 
 #[cfg(feature = "tokio")]
 pub use fx::{
-    cancel_pair, expect_idle, CancelSource, CancelToken, FxScope, ScopeClosed, Spawned, TaskError,
+    CancelSource, CancelToken, FxScope, ScopeClosed, Spawned, TaskError, cancel_pair, expect_idle,
 };
 
 #[cfg(feature = "testing")]
@@ -150,12 +150,12 @@ pub use parse_mock::{MockJson, MockMarkdown, MockParseError, MockSqlDialect};
 pub use journal::{Journal, JournalError, JsonlJournal, Replay, ReplayError};
 
 #[cfg(feature = "log-fs")]
-pub use logx::{mask_secrets, DefaultPathResolver, FileSink, HomeDirUnresolvable};
+pub use logx::{DefaultPathResolver, FileSink, HomeDirUnresolvable, mask_secrets};
 
 #[cfg(feature = "log")]
 pub use logx::{
-    init_tracing_default, init_tracing_from_env, init_with_file, AlreadyInit, FileSinkWriter,
-    LogInitError,
+    AlreadyInit, FileSinkWriter, LogInitError, init_tracing_default, init_tracing_from_env,
+    init_with_file,
 };
 
 #[cfg(feature = "log")]
@@ -168,11 +168,11 @@ pub use tracingx::bridge_events_to_tracing;
 
 #[cfg(feature = "memgov")]
 pub use memgov::{
-    expect_empty, BoundError, BoundedRegistry, CountingAllocator, Eviction, LeakGuard, LeakReport,
+    BoundError, BoundedRegistry, CountingAllocator, Eviction, LeakGuard, LeakReport, expect_empty,
 };
 
 #[cfg(feature = "pool")]
-pub use pool::{PoolBase, AUDIT_RING_DEFAULT_CAP};
+pub use pool::{AUDIT_RING_DEFAULT_CAP, PoolBase};
 
 #[cfg(feature = "pool")]
 pub use objpool::{ObjectPool, ObjectPoolMetrics, ObjectPoolTuning, Owned, Pooled, ResetPhase};
@@ -181,4 +181,4 @@ pub use objpool::{ObjectPool, ObjectPoolMetrics, ObjectPoolTuning, Owned, Pooled
 pub use pooled_thread_pool::PooledThreadPool;
 
 #[cfg(feature = "compose")]
-pub use compose::{combine, Combine};
+pub use compose::{Combine, combine};

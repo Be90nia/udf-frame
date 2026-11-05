@@ -22,14 +22,14 @@ static ALLOC: EventCounting = EventCounting;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 
 use skeleton::lint::{
-    clear_stages, post_process, register_stage, registered_stages, LintError, LintStage,
+    LintError, LintStage, clear_stages, post_process, register_stage, registered_stages,
 };
 
 // ---- ① 分配事件计数（同 tests/lint_alloc.rs 口径）----

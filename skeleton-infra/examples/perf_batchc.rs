@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use skeleton::{EffectBuf, Fragment, NoFx, Reducer, Store as _};
 use skeleton_infra::runtime::SyncStore as Store;
-use skeleton_infra::{bridge_events_to_tracing, combine, mask_secrets, AuditEvent};
+use skeleton_infra::{AuditEvent, bridge_events_to_tracing, combine, mask_secrets};
 
 // ---- 测量助手（multidim_eval 同款）----
 

@@ -14,7 +14,7 @@ use skeleton::{
 use skeleton_infra::compose::combine;
 use skeleton_infra::runtime::SyncStore as Store;
 use skeleton_infra::testing::{ExpectedEffect, TestStore};
-use skeleton_infra::{expect_idle, FxScope, Journal as _, JsonlJournal, Spawned};
+use skeleton_infra::{FxScope, Journal as _, JsonlJournal, Spawned, expect_idle};
 
 // ---- 领域：父 Board 挂一个 Tally 子 feature（combine 显式结构）----
 
@@ -190,8 +190,8 @@ impl EffectRuntime<BoardAct, BoardFx> for HostRuntime {
             .scope
             .spawn_tracked(async move {
                 tokio::time::sleep(Duration::from_millis(5)).await; // 模拟外部 IO（真实宿主超时必填）
-                                                                    // 回灌挂点（append-before-send）：账本写成功才回灌；
-                                                                    // append Err ⇒ 禁 send（fail-closed，禁静默丢）
+                // 回灌挂点（append-before-send）：账本写成功才回灌；
+                // append Err ⇒ 禁 send（fail-closed，禁静默丢）
                 let appended = journal
                     .lock()
                     .expect("journal poisoned")

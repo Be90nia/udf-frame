@@ -5,14 +5,14 @@
 //! 与 `&str` 进出（无任何 UI 栈类型参与）。
 use std::sync::Arc;
 
-use serde_json::{json, Value};
-use skeleton::view::{BindingDecl, IntentMap, PayloadTag, ViewMap, PROTOCOL_VERSION};
+use serde_json::{Value, json};
+use skeleton::view::{BindingDecl, IntentMap, PROTOCOL_VERSION, PayloadTag, ViewMap};
 use skeleton::{EffectBuf, Infallible, NoFx, Reducer};
 use skeleton_infra::runtime::SyncStore;
 use skeleton_infra::view::{
-    read::{decode_batch, RegionReader},
     Coverage, Derived, Encoders, IntentError, JsonEncoder, RegionBacking, RegionEncoder,
     RegionWriter, Sentinel, VecBacking, ViewBridge,
+    read::{RegionReader, decode_batch},
 };
 
 // ── 领域切片（不出 Rust）──

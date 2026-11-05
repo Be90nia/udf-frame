@@ -6,7 +6,7 @@
 //! [`crate::audit`]（宿主可消费的 `AuditEvent`/`AuditEventKind`）。
 
 use std::cell::Cell;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use super::lock;
 use super::panic_cause_summary;

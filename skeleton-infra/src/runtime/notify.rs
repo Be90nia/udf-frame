@@ -9,16 +9,16 @@
 //! （拉取式，M1 无事件流 / M5 水位可检出丢拍）；内存 O(异步订阅数)，无队列、
 //! 单一复用收集缓冲（容量到订阅数峰值，不随拍增长）。契约面在 `skeleton::notify`。
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use skeleton::notify::NotifySink;
 use skeleton::Subscription;
+use skeleton::notify::NotifySink;
 
+use super::StoreInner;
 use super::lock;
 use super::panic_cause_summary;
-use super::StoreInner;
 
 /// 投递口槽位：注册表表项。表存 Weak、强引用随票据存活（与跨线程订阅表同构）；
 /// `publish` 走 `&self`，槽位免锁。`alive` 是闸回落的一次性裁决：panic 摘除与

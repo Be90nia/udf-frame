@@ -46,8 +46,8 @@
 
 use std::any::Any;
 use std::fmt;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
@@ -352,7 +352,7 @@ impl ShutdownCoordinator {
                 return g
                     .report
                     .clone()
-                    .expect("phase=Done 时首叫报告必已就位（Done 只在 report 赋值后置位）")
+                    .expect("phase=Done 时首叫报告必已就位（Done 只在 report 赋值后置位）");
             }
             // 重入装甲：组件闭包在本线程内联跑时再叫 shutdown=自等自锁。
             // fail-fast 成显式 panic → 编排面 catch_unwind → Failed 上报。

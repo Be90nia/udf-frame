@@ -78,7 +78,9 @@ fn perf_register_alloc() {
     }
     let cold = (CountingAllocator::live_allocs() - before) as f64 / N as f64;
     drop(sink);
-    println!("register（冷协调器）      : {cold:.2}（实测=name String 1 + ZST 闭包 Box 0 + 注册表 Vec 首推 1；协调器本体零堆；非 ZST 闭包 Box +1）");
+    println!(
+        "register（冷协调器）      : {cold:.2}（实测=name String 1 + ZST 闭包 Box 0 + 注册表 Vec 首推 1；协调器本体零堆；非 ZST 闭包 Box +1）"
+    );
 
     // 热注册表：单协调器顺序注册唯一名，Vec 增长摊销≈0；组件存活到 c 弃置。
     // 名字池 N+1 条：allocs_per 先预热一次再读数。
@@ -94,7 +96,9 @@ fn perf_register_alloc() {
         N,
     );
     drop(c);
-    println!("register（热注册表）      : {warm:.2}（实测=name String 1 + ZST 闭包 Box 0；Vec 增长摊销≈0；非 ZST 闭包 Box +1）");
+    println!(
+        "register（热注册表）      : {warm:.2}（实测=name String 1 + ZST 闭包 Box 0；Vec 增长摊销≈0；非 ZST 闭包 Box +1）"
+    );
     println!("（名字进报告行经 move 零二次分配——String 一次分配声明）");
 }
 

@@ -18,7 +18,7 @@ use skeleton::{
     ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Fragment, Infallible, NoFx, Reducer,
     Store as _,
 };
-use skeleton_infra::compose::{combine, Combine};
+use skeleton_infra::compose::{Combine, combine};
 use skeleton_infra::runtime::SyncStore as Store;
 
 // ── 共用根件：零效果计数器 ─────────────────────────────────────────────

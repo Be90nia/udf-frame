@@ -4,10 +4,10 @@
 //! / 「input 覆盖实读」红线的最小反例（漏报可检出）
 //! ——并发与毒化场景 demo 装不下，在此机械化（断言链①②）。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use skeleton::view::{BindingDecl, IntentMap, PayloadTag, ViewMap};
 use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
 use skeleton_infra::runtime::SyncStore;

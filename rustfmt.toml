@@ -1,0 +1,6 @@
+# 排版唯一裁判 = 本仓 CI 钉版 stable 1.96.0 `cargo fmt --all -- --check`。
+# style_edition 2024 对齐既有美学（主仓消费方同风格）。禁加 nightly-only 选项
+# （wrap_comments/imports_granularity/reorder_impl_items/brace_style 等）——
+# CI stable 不认，2026-11-05 8a39106 曾因此全线红（本地 nightly 经主仓根配置
+# 排版，CI 无该配置来源，两把刀打架）。
+style_edition = "2024"

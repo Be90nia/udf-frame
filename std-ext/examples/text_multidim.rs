@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use std_ext::text::{
-    decode_bytes, edit_distance, to_camel_case, to_kebab_case, to_pascal_case,
-    to_screaming_snake_case, to_snake_case, truncate_chars, DecodeStrategy,
+    DecodeStrategy, decode_bytes, edit_distance, to_camel_case, to_kebab_case, to_pascal_case,
+    to_screaming_snake_case, to_snake_case, truncate_chars,
 };
 
 /// 分配事件计数器（cache_multidim 同款：alloc/alloc_zeroed/realloc 各计一次
@@ -120,7 +120,9 @@ fn perf_alloc_face() {
     );
     let (a, b) = dist_inputs_100();
     let dist = events_per(|| edit_distance(&a, &b), 1_000);
-    println!("① 分配事件面（events/call）：五向转换 {five:.2}（输出 String 一次精确容量）/ truncate {trunc:.2}（零分配字符前缀扫描）/ decode Strict 有效 {dec:.2} / 距离 100×100 {dist:.2}（单行 DP）");
+    println!(
+        "① 分配事件面（events/call）：五向转换 {five:.2}（输出 String 一次精确容量）/ truncate {trunc:.2}（零分配字符前缀扫描）/ decode Strict 有效 {dec:.2} / 距离 100×100 {dist:.2}（单行 DP）"
+    );
 }
 
 // ---- ② ns 锚（median3；随 src/text.rs doc 声明判级）----
@@ -138,7 +140,9 @@ fn perf_ns_anchors() {
     let p = five_way(&to_pascal_case);
     let k = five_way(&to_kebab_case);
     let sc = five_way(&to_screaming_snake_case);
-    println!("②′ 五向 @XMLHttpRequest(14B) ns（doc ≈174-178）：snake {s:.0} / camel {c:.0} / pascal {p:.0} / kebab {k:.0} / screaming {sc:.0}");
+    println!(
+        "②′ 五向 @XMLHttpRequest(14B) ns（doc ≈174-178）：snake {s:.0} / camel {c:.0} / pascal {p:.0} / kebab {k:.0} / screaming {sc:.0}"
+    );
 
     let sn64 = median3(
         batch_mean(|| to_snake_case(S64), 20_000),
@@ -171,7 +175,9 @@ fn perf_ns_anchors() {
         batch_mean(|| truncate_chars(S64, 10_000), 500_000),
         batch_mean(|| truncate_chars(S64, 10_000), 500_000),
     );
-    println!("②‴ truncate ns（30字符截16 / 130字符截64 / 越界全扫 64B）：{t30:.0} / {t130:.0} / {t_all:.0}");
+    println!(
+        "②‴ truncate ns（30字符截16 / 130字符截64 / 越界全扫 64B）：{t30:.0} / {t130:.0} / {t_all:.0}"
+    );
 
     let dec = median3(
         batch_mean(
@@ -249,5 +255,7 @@ fn perf_distance() {
     println!(
         "③″ O(min) 同耗证据（差异内容，格数同 1M）：10k×100 {shape_10k:.0} / 5k×200 {shape_5k:.0} / 1k×1k {shape_1k:.0} ns（行宽走短侧，ns/格跨形状持平）"
     );
-    println!("③‴ 观察项：同串纯内容 10k×100 = {degenerate:.0} ns（重复串极端长宽比分支预测退化可 ~10x，非遗漏——判级用差异内容对）");
+    println!(
+        "③‴ 观察项：同串纯内容 10k×100 = {degenerate:.0} ns（重复串极端长宽比分支预测退化可 ~10x，非遗漏——判级用差异内容对）"
+    );
 }

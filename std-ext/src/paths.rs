@@ -66,10 +66,16 @@ impl std::fmt::Display for RelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RelError::MismatchedKind { path, base } => {
-                write!(f, "cannot relativize: path `{path:?}` and base `{base:?}` differ in absolute/relative kind")
+                write!(
+                    f,
+                    "cannot relativize: path `{path:?}` and base `{base:?}` differ in absolute/relative kind"
+                )
             }
             RelError::PrefixKindMismatch { path, base } => {
-                write!(f, "cannot relativize: path `{path:?}` and base `{base:?}` have different Windows prefixes")
+                write!(
+                    f,
+                    "cannot relativize: path `{path:?}` and base `{base:?}` have different Windows prefixes"
+                )
             }
             RelError::NotPrefix { path, base } => {
                 write!(
@@ -976,22 +982,26 @@ mod tests {
 
     #[test]
     fn direct_containment_ok() {
-        assert!(ensure_inside(
-            Path::new("a/b"),
-            Path::new("a/b/c/d"),
-            CaseStrategy::CaseSensitive
-        )
-        .is_ok());
+        assert!(
+            ensure_inside(
+                Path::new("a/b"),
+                Path::new("a/b/c/d"),
+                CaseStrategy::CaseSensitive
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn equal_is_inside() {
-        assert!(ensure_inside(
-            Path::new("a/b"),
-            Path::new("a/b"),
-            CaseStrategy::CaseSensitive
-        )
-        .is_ok());
+        assert!(
+            ensure_inside(
+                Path::new("a/b"),
+                Path::new("a/b"),
+                CaseStrategy::CaseSensitive
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1010,42 +1020,50 @@ mod tests {
     #[test]
     fn component_boundary_respected() {
         // starts_with 语义是组件级不是字符串级：`bc` 不在 `b` 内
-        assert!(ensure_inside(
-            Path::new("a/b"),
-            Path::new("a/bc"),
-            CaseStrategy::CaseSensitive
-        )
-        .is_err());
+        assert!(
+            ensure_inside(
+                Path::new("a/b"),
+                Path::new("a/bc"),
+                CaseStrategy::CaseSensitive
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn mixed_absolute_relative_not_inside() {
-        assert!(ensure_inside(
-            Path::new("/abs"),
-            Path::new("rel/x"),
-            CaseStrategy::CaseSensitive
-        )
-        .is_err());
+        assert!(
+            ensure_inside(
+                Path::new("/abs"),
+                Path::new("rel/x"),
+                CaseStrategy::CaseSensitive
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn case_insensitive_matches() {
-        assert!(ensure_inside(
-            Path::new("Work/Docs"),
-            Path::new("WORK/docs/sub/f.txt"),
-            CaseStrategy::CaseInsensitive
-        )
-        .is_ok());
+        assert!(
+            ensure_inside(
+                Path::new("Work/Docs"),
+                Path::new("WORK/docs/sub/f.txt"),
+                CaseStrategy::CaseInsensitive
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn case_sensitive_rejects_fold() {
-        assert!(ensure_inside(
-            Path::new("Work/Docs"),
-            Path::new("WORK/docs/f.txt"),
-            CaseStrategy::CaseSensitive
-        )
-        .is_err());
+        assert!(
+            ensure_inside(
+                Path::new("Work/Docs"),
+                Path::new("WORK/docs/f.txt"),
+                CaseStrategy::CaseSensitive
+            )
+            .is_err()
+        );
     }
 
     #[test]

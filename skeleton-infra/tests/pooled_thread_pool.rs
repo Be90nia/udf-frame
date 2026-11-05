@@ -9,7 +9,7 @@
 //! 采集器与线程池性能矩阵（本地留存，未入库））。
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Barrier, Mutex, MutexGuard};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::Duration;
 

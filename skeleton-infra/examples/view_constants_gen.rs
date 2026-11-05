@@ -111,8 +111,14 @@ fn render(m: &Manifest) -> (String, String, String) {
         "{head}export const PROTOCOL_VERSION = {} as const;\n",
         m.protocol_version
     );
-    let mut py = format!("# 由 view_constants_gen 自 manifest.toml 生成（ADR 0006 M3）——禁手改；清单为唯一真源。\nPROTOCOL_VERSION = {}\n", m.protocol_version);
-    let mut c = format!("/* 由 view_constants_gen 自 manifest.toml 生成（ADR 0006 M3）——禁手改；清单为唯一真源。 */\n#define UVBR_PROTOCOL_VERSION {}\n", m.protocol_version);
+    let mut py = format!(
+        "# 由 view_constants_gen 自 manifest.toml 生成（ADR 0006 M3）——禁手改；清单为唯一真源。\nPROTOCOL_VERSION = {}\n",
+        m.protocol_version
+    );
+    let mut c = format!(
+        "/* 由 view_constants_gen 自 manifest.toml 生成（ADR 0006 M3）——禁手改；清单为唯一真源。 */\n#define UVBR_PROTOCOL_VERSION {}\n",
+        m.protocol_version
+    );
     for b in &m.bindings {
         let tail = const_tail(&b.path);
         ts.push_str(&format!(

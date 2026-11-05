@@ -11,7 +11,7 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::borrow::Borrow;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
