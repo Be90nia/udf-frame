@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Changed（objpool 消费方反馈 API 卫生四件，2026-11-05；GitHub issue#19/#20/#21/#22）
+- **issue#19**：`ByteBudget` 提入 crate 根 re-export（pool 域七件同列，消费方不再写 `skeleton_infra::objpool::` 全路径）；`ByteBudget` doc 示例同步短路径。
+- **issue#20**：`ObjectPoolMetrics.idle_bytes` 字段 doc 显式警告「共享预算池读数 = 全局 held，不构成按池归因」+ 归因指引（按池归因用池私有预算 `with_byte_quota`；刻意不引入池侧第二账本——双记会漂移）。
+- **issue#21**：weight 钩子锁序红线从 doc 升级 **debug 防呆**——钩子执行窗（thread-local 标志，RAII 恢复）内任取片锁（`acquire`/`acquire_owned`/`insert`/`metrics`/`prune_idle_with_clock`/`resize`）⇒ `debug_assert` fail-fast，release 零开销仍禁（doc 红线不变）；`ByteBudget` 内部锁分离出 `budget_lock`（钩子体内只读预算合法，不误报）；新增 debug 重入检出测试（钩子延迟句柄 acquire → 翻牌 + 池仍干净可用）。
+- **issue#22**：`prune_idle(max_idle_age, now: Instant)` **`#[deprecated]`**（note 指向 clock 版 + 迁移理由）；正典口径 = `prune_idle_with_clock(max_idle_age, &dyn Clock)`（MockClock 确定性测试 / SystemClock 生产）；内部实现抽 `prune_idle_impl` 共用，仓内测试（7 处）与示例（1 处）全量迁移 clock 版，零弃用告警。**下游迁移**：`pool.prune_idle(d, Instant::now())` → `pool.prune_idle_with_clock(d, &SystemClock)`（`use skeleton::clock::SystemClock`）。
+- **issue#23（`spawn_idle_pruner` 托管老化任务）不收**：纯组合无新语义（`FxScope::spawn_tracked` + `tokio::time::interval` + `prune_idle_with_clock`）、`period`/`max_idle_age` 是宿主策略、与「池不起后台线程」既定纪律冲突——宿主侧 ~15 行派生，迁移 snippet 已贴 issue#23（已按 not planned 关闭）。
+
 ### Added（通用对象池件 `ObjectPool`：池化有状态对象，2026-11-02；GitHub issue#15）
 - `skeleton_infra::objpool::ObjectPool<T>`（feature `pool`，crate 根 re-export 五件）：池化**有状态**对象——`acquire()` 返回 `Pooled<'_, T>`（`Deref`/`DerefMut` 拿对象本体改参数即复用、`Drop` RAII 归还、`detach(self) -> T` 永久移交使对象脱离池生命周期）；**reset 钩子**（`ResetPhase::OnReturn` 归还时 / `OnAcquire` 取出时，锁外调用，归还路径 `catch_unwind` 兜底 ⇒ reset panic 时丢弃该对象而非 abort）；**有界降级**（`acquire()` 无超时参数、结构上不存在等待；池宇宙已满时直接构造 + `degraded` 计数，降级对象不入宇宙、归还即释放）；**分片槽位**（构造期自适应 `clamp(idle_cap,1,8)`，每片一锁 + 原子计数，借用走 thread-local 游标、归还回借出时的片）；`prune_idle(max_idle_age, now)` 显式老化口（宿主自调，池不起后台线程）；实现 `skeleton::pool::PoolManaged`（`Tuning=ObjectPoolTuning`/`Metrics=ObjectPoolMetrics`，`Borrow<PoolMetrics>` 核心形）。
 - **unwind 感知归还**：`Pooled::drop` 首查 `thread::panicking()`——panic 路径析构 ⇒ 不调 reset、不回池、直接销毁 + `panic_dropped` 计数（r2d2 #31 教训：归还不变量已破的对象会污染下一个借出方）。

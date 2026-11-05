@@ -16,9 +16,10 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
+use skeleton::clock::SystemClock;
 use skeleton::pool::{PoolAuditEvent, PoolAuditKind, PoolManaged, PoolMetrics, PoolResizeError};
 use skeleton_infra::objpool::{ObjectPool, ObjectPoolTuning, Pooled, ResetPhase};
 
@@ -311,14 +312,14 @@ fn prune_idle_releases_by_age_and_counts() {
     thread::sleep(Duration::from_millis(120));
     drop(b); // idle 2（新——last_used 晚于 a 约 120ms）
 
-    let pruned = p.prune_idle(Duration::from_millis(50), Instant::now());
+    let pruned = p.prune_idle_with_clock(Duration::from_millis(50), &SystemClock);
     assert_eq!(pruned, 1, "超龄释放恰一件");
     let m = p.metrics();
     assert_eq!(m.pruned, 1, "pruned 计数留痕");
     assert_eq!(m.core.idle, 1, "未超龄保留");
     assert_eq!(live.load(Ordering::SeqCst), 1);
 
-    let pruned_again = p.prune_idle(Duration::from_millis(50), Instant::now());
+    let pruned_again = p.prune_idle_with_clock(Duration::from_millis(50), &SystemClock);
     assert_eq!(pruned_again, 0, "未超龄不释放");
     assert_eq!(p.metrics().pruned, 1);
 }
@@ -332,7 +333,7 @@ fn prune_zero_age_releases_all_idle() {
     }
     assert_eq!(p.metrics().core.idle, 2);
 
-    let pruned = p.prune_idle(Duration::ZERO, Instant::now());
+    let pruned = p.prune_idle_with_clock(Duration::ZERO, &SystemClock);
     assert_eq!(pruned, 2, "Duration::ZERO ⇒ 释放全部 idle");
     let m = p.metrics();
     assert_eq!(m.core.idle, 0);
@@ -1248,7 +1249,7 @@ fn insert_rejects_when_universe_full_despite_idle_room() {
         "第二笔来自归还路径（单片 idle 满，既有语义，非插入）"
     );
     // 腾出宇宙余量后（prune 释放 idle 且回卷 alive）插入才成功。
-    assert_eq!(p.prune_idle(Duration::ZERO, Instant::now()), 1);
+    assert_eq!(p.prune_idle_with_clock(Duration::ZERO, &SystemClock), 1);
     let (ext2, _l2, _d2) = external(4, None);
     assert!(p.insert(ext2).is_none(), "宇宙余量恢复后插入成功");
     assert_eq!(p.metrics().core.idle, 1);
@@ -1334,7 +1335,7 @@ fn inserted_object_is_pruned_and_alive_reclaimed() {
     let (a, _al, ad) = external(1, None);
     assert!(p.insert(a).is_none());
 
-    assert_eq!(p.prune_idle(Duration::ZERO, Instant::now()), 1);
+    assert_eq!(p.prune_idle_with_clock(Duration::ZERO, &SystemClock), 1);
     assert_eq!(ad.load(Ordering::SeqCst), 1, "老化释放即析构");
     let m = p.metrics();
     assert_eq!(m.pruned, 1);
@@ -1344,7 +1345,7 @@ fn inserted_object_is_pruned_and_alive_reclaimed() {
     // 回收后宇宙余量恢复：再插一次仍成功，再 prune 仍不 panic。
     let (b, _bl, _bd) = external(2, None);
     assert!(p.insert(b).is_none());
-    assert_eq!(p.prune_idle(Duration::ZERO, Instant::now()), 1);
+    assert_eq!(p.prune_idle_with_clock(Duration::ZERO, &SystemClock), 1);
     assert_eq!(p.metrics().pruned, 2);
 }
 
@@ -1548,7 +1549,7 @@ fn byte_quota_releases_bytes_on_prune_and_resize() {
     assert_eq!(pool.metrics().idle_bytes, 2 * 8192);
 
     // prune（ZERO 特判 = 全释放）：字节额度随之回卷归零。
-    assert_eq!(pool.prune_idle(Duration::ZERO, Instant::now()), 2);
+    assert_eq!(pool.prune_idle_with_clock(Duration::ZERO, &SystemClock), 2);
     let m = pool.metrics();
     assert_eq!((m.core.idle, m.idle_bytes), (0, 0), "prune 后字节归零");
 
@@ -1711,4 +1712,50 @@ fn prune_idle_with_mock_clock_advances_deterministically() {
     );
     assert_eq!(pool.metrics().core.idle, 0);
     assert_eq!(pool.metrics().pruned, 1);
+}
+
+// ── weight 钩子重入防呆（issue#21）：debug 构建 fail-fast 检出 ──────────────
+
+/// 钩子体内经共享槽延迟拿到池句柄再 acquire（消费方误用形态——钩子构造期
+/// 拿不到池自身，运行期才可达）。debug 构建在片锁取锁点 fail-fast（检出先于
+/// 取锁 ⇒ 无锁毒化）；release 无防呆但同样禁（doc 红线，本测试 cfg 出）。
+#[cfg(debug_assertions)]
+#[test]
+fn weight_hook_reentry_is_detected_in_debug() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let slot: Arc<Mutex<Option<Arc<ObjectPool<Tracked>>>>> = Arc::new(Mutex::new(None));
+    let hook_slot = Arc::clone(&slot);
+    let live = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let pool = Arc::new(ObjectPool::with_byte_quota(
+        4,
+        2,
+        Tracked::factory(Arc::clone(&live), Arc::clone(&drops)),
+        1024,
+        move |t: &Tracked| {
+            // 误用：钩子体内借还同一池（延迟句柄）。
+            if let Some(p) = hook_slot.lock().expect("slot unpoisoned").clone() {
+                let _guard = p.acquire();
+            }
+            t.hot as usize
+        },
+    ));
+    *slot.lock().expect("slot unpoisoned") = Some(Arc::clone(&pool));
+
+    // insert 的计量点（片锁外调 weight）触发钩子 → 重入 acquire → 取片锁时
+    // debug_assert 翻牌。
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let (ext, _l, _d) = external(1, None);
+        let _ = pool.insert(ext);
+    }));
+    assert!(
+        outcome.is_err(),
+        "debug 构建须 fail-fast 检出 weight 钩子重入（同线程双重加锁死锁面）"
+    );
+
+    // 池仍干净可用：对象未入槽（计量即拒）、零构造、账面无变动。
+    let m = pool.metrics();
+    assert_eq!(m.core.idle, 0);
+    assert_eq!(m.constructed, 0, "插入件未入槽（计量点即检出）");
 }

@@ -388,7 +388,9 @@ impl<T> ObjectPool<T> {
         phase: ResetPhase) -> Self;
     pub fn acquire(&self) -> Pooled<'_, T>;          // 永不阻塞、永不失败
     pub fn metrics(&self) -> ObjectPoolMetrics;      // O(shards) 逐片取锁求和
-    pub fn prune_idle(&self, max_idle_age: Duration, now: Instant) -> usize;
+    pub fn prune_idle_with_clock(&self, max_idle_age: Duration, clock: &dyn Clock) -> usize;
+        // 正典老化口（Clock 注入：MockClock 测试 / SystemClock 生产）；
+        // `prune_idle(max_idle_age, now: Instant)` 已 #[deprecated]（issue#22）
     pub fn resize(&self, tuning: ObjectPoolTuning) -> Result<(), PoolResizeError>;
     pub fn audit_callback_panics(&self) -> u64;      // 回调 panic 摘除留痕（同 PoolBase 同名同义）
     pub fn take_audit_events(&self) -> Vec<PoolAuditEvent>;  // 环内事件随取随清
@@ -409,9 +411,9 @@ impl<T> Drop for Pooled<'_, T> { /* Drop 即还（禁手动还） */ }
 - **`core.borrowed` 含降级借出**：`idle + borrowed <= max` **不成立**——`max` 只约束宇宙部分（idle + 正常借出），降级件在宇宙之外（归还即释放、永不进 idle）；水位线 `borrowed / max` 因此可 > 1.0（形态合法，读数如实不钳位）。
 - **unwind 感知归还**：`Pooled::drop` 首查 `thread::panicking()`——panic 路径析构 ⇒ **不调 reset、不回池**，直接销毁 + `panic_dropped` +1（r2d2 #31 教训：归还不变量已破的对象会污染下一个借出方）。
 - **有界降级**：`acquire()` 无超时参数、结构上不存在等待——池宇宙（idle + 正常借出，硬上界 `max`）已满时**直接构造**（`degraded` +1），该对象**不入宇宙**、归还即释放、永不进 idle；**限额是留存限额，不是对象总数限额**（.NET 官方口径）。
-- **释放三路径**：`idle_cap` 满 ⇒ 归还即丢弃（`dropped_overflow`）；`prune_idle(max_idle_age, now)` 显式老化口（宿主按自己节奏调，**池不起后台线程**）；池 `drop` ⇒ 全部 idle 析构。
+- **释放三路径**：`idle_cap` 满 ⇒ 归还即丢弃（`dropped_overflow`）；`prune_idle_with_clock(max_idle_age, clock)` 显式老化口（宿主按自己节奏调，**池不起后台线程**；`Instant` 版 `prune_idle` 已弃用）；池 `drop` ⇒ 全部 idle 析构。
 - **分片与计数**：分片数构造期自适应 `clamp(idle_cap, 1, 8)`（不设旋钮）；每片一把 `Mutex`，`borrowed`/`alive`/`reused` 等**热路径计数下沉进片内**（普通 `usize`、锁内读写，无跨线程原子 RMW），且每片 `#[repr(align(64))]` 独占一条 cache line（相邻片伪共享同样把 8 线程扩展比压在 1 以下）。`max`/`idle_cap` **按片均分**（余数补给前几片，各片之和恰等于配置值 ⇒「总和 ≤ 配置值」硬上界不变；`resize` 后按新配额逐片裁剪）；**配额一律在目标片锁内读**——`resize` 先 `store` 新值再逐片加锁裁剪，于是并发归还的留存裁决要么读到新值、要么其入片被紧随其后的裁剪覆盖（锁外的陈旧快照没有这条收敛路径，缩容并发归还能把 idle 永久顶在新上界之外）；`metrics()` 逐片取锁求和（O(shards)，非热路径）。借用走**线程亲和片**（亲和表按池地址分槽、每 (线程, 池) 领一个片号后固定，首个领号者拿 0 号 ⇒ 单线程行为确定；同线程多池互不覆盖）、归还**优先回 home 片**（借出时的片，LIFO 热件常驻）；home 片 idle 满时**迁入有余量的片**（`alive` 随迁、先迁入再退 home ⇒ 账面守恒不低估；迁片只发生在归还且 home 满这一情形），全池余量为零才丢弃。`degraded` 与 `constructed` 是两个独立计数，不得混账；`constructed` 等**非每借还热路径**计数仍是全局原子（miss 路径打一次，dim4 计时窗内为 0 次）。
-- **调用方红线**：坏对象禁还池（判定权在调用方——池不知道 `T` 是什么，处置 = `detach` 带走，r2d2 `has_broken` / Commons Pool2 `invalidateObject` 动机）；池化对象应「等重」（reset 负责容量归一，大小悬殊对象混池 = 池毒化 DoS，golang/go#23199、#27735）；`prune_idle` 尽力而为，不构成释放失败信号。
+- **调用方红线**：坏对象禁还池（判定权在调用方——池不知道 `T` 是什么，处置 = `detach` 带走，r2d2 `has_broken` / Commons Pool2 `invalidateObject` 动机）；池化对象应「等重」（reset 负责容量归一，大小悬殊对象混池 = 池毒化 DoS，golang/go#23199、#27735）；`prune_idle_with_clock` 尽力而为，不构成释放失败信号；**weight 钩子体内禁 acquire 同一池**（片锁内计量 = 死锁面；debug 构建 fail-fast 检出，release 零开销仍禁）。**字节配额**：`idle_bytes` 在共享预算池（`with_shared_byte_quota`）下是全局 held 读数、不构成按池归因——按池归因用池私有预算（`with_byte_quota`），本件刻意不引入池侧第二账本。
 - **与 `memgov::PoolGuard` 的关系**：两个**独立守卫类型**（非模式变体）——`Pooled` = 对象所有权移交式借用（`DerefMut` 改参数即复用 / RAII 归还 / `detach` 永久移交），`PoolGuard` = 缓冲借用（`acquire` 超时失败语义）。`Pooled<'p, T>` 借用池、非 `'static`，带不进 `'static` 任务闭包——用 `detach()` 移交后由任务/连接自持。尺寸分档不在本件（通用池单类型；分档 = 按档多实例或组合层后续件）。
 - 决策依据 ADR 0010：issue 字面要求的「idle 槽存 `Weak`」与「复用保证」结构性矛盾（权威依据：HikariCP 弱引用只能当缓存层、Go `sync.Pool` 官方明说放弃复用保证、Rust `Weak::upgrade` 可能返回 `None`），改以**行为等价**形态交付上述三条释放路径。
 

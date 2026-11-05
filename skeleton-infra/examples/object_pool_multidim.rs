@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use skeleton::clock::SystemClock;
 use skeleton_infra::objpool::{ObjectPool, ResetPhase};
 
 /// 池化对象（消费方形状的缩样）：`hot` = reset 保留的热态字段（如密钥调度
@@ -129,10 +130,10 @@ fn dim2_release_paths() {
     let guards: Vec<_> = (0..4).map(|_| pool.acquire()).collect();
     drop(guards);
     assert_eq!(pool.metrics().core.idle, 4, "4 件同时归还 ⇒ idle 4");
-    let pruned = pool.prune_idle(Duration::ZERO, Instant::now());
+    let pruned = pool.prune_idle_with_clock(Duration::ZERO, &SystemClock);
     let m = pool.metrics();
     println!(
-        "  prune_idle(ZERO): 释放 {} 件 | 在池 idle {} | 存活实例 {}",
+        "  prune_idle_with_clock(ZERO): 释放 {} 件 | 在池 idle {} | 存活实例 {}",
         pruned,
         m.core.idle,
         live.load(Ordering::SeqCst)

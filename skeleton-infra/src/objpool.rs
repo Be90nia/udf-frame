@@ -182,7 +182,9 @@
 //! （容量因，与件数溢出同一计数——字节超限也是容量因）；借出/prune/resize
 //! 裁剪对称回卷。字节上界**构造期定死**（同 reset 钩子先例，不进
 //! [`ObjectPoolTuning`]——resize 调件数面，不动安全字节上界）。**weight 钩子
-//! 体内不得 acquire 同一池**（调用点在片锁内，回调池借还 = 锁自死锁面）。
+//! 体内不得 acquire 同一池**（调用点在片锁内，回调池借还 = 锁自死锁面）——
+//! debug 构建在片锁取锁点 fail-fast 检出重入（release 零开销仍禁，见
+//! [`WeightHook`]）。
 //!
 //! # 强制清零（缺口：reset 钩子可选，忘配 = 明文驻留）
 //!
@@ -210,8 +212,8 @@
 //! feature `pool`（纯 std + 契约词汇，零三方增量）；由 lib.rs 以
 //! `#[cfg(feature = "pool")] pub mod objpool;` 接线，crate 根 re-export
 //! `ObjectPool` / `Pooled` / `Owned` / `ResetPhase` / `ObjectPoolTuning` /
-//! `ObjectPoolMetrics` 六件（照 `PoolBase`/`PooledThreadPool` 的 pool 域根导出
-//! 惯例）。
+//! `ObjectPoolMetrics` / `ByteBudget` 七件（照 `PoolBase`/`PooledThreadPool`
+//! 的 pool 域根导出惯例）。
 
 use std::{
     borrow::Borrow,
@@ -312,6 +314,13 @@ pub struct ObjectPoolMetrics {
     /// 常驻 idle 字节合计（字节配额池：预算已认领部分；未启用恒 0）。**共享
     /// 预算池（`with_shared_byte_quota`）的读数 = 共享 [`ByteBudget`] 的全局
     /// held（含其他池的认领）**——字节记账单一账本（共享件一处），池内不双记。
+    ///
+    /// **共享预算下本字段不构成按池归因**（issue#20）：多池共用一份
+    /// `Arc<ByteBudget>` 时只能全局看总数（[`ByteBudget::held`] /
+    /// [`ByteBudget::available`]），无法分辨哪个池占了多少。需要按池归因的
+    /// 部署用 [`Self::with_byte_quota`]（池私有预算）或每池各自一份
+    /// `ByteBudget`——本件刻意不引入「池侧第二账本」（双记会漂移，且漂移
+    /// 只能在生产撞见，运维面无法区分真占用与记账误差）。
     pub idle_bytes: usize,
     /// 池字节预算（构造期定死；未启用恒 0）。
     pub byte_budget: usize,
@@ -329,6 +338,8 @@ type ResetHook<T> = Box<dyn Fn(&mut T) + Send + Sync>;
 
 /// 单件字节计量钩子：`Fn(&T) -> usize`——调用点在**片锁内**（归还/借出/裁剪
 /// 路径），钩子体内不得 acquire 同一池（锁自死锁面，同 reset 钩子红线）；
+/// **debug 构建在片锁取锁点 fail-fast 检出重入**（`acquire` / `insert` /
+/// `metrics` / `prune_idle` / `resize` 任一取片锁即 panic，release 零开销仍禁）；
 /// 返回值按**对象当前真实驻留字节**计（`Vec` 类 = `capacity()`，不是 `size_of`）。
 type WeightHook<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 
@@ -346,7 +357,7 @@ type WeightHook<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 /// ```
 /// use std::sync::Arc;
 ///
-/// use skeleton_infra::objpool::{ByteBudget, ObjectPool};
+/// use skeleton_infra::{ByteBudget, ObjectPool};
 ///
 /// let budget = Arc::new(ByteBudget::new(64 * 1024));
 /// // 多池共享同一份 64KiB 预算：
@@ -386,7 +397,7 @@ impl ByteBudget {
 
     /// 当前已认领字节（池内常驻对象的真实驻留合计；借出对象不计）。
     pub fn held(&self) -> usize {
-        *lock(&self.held)
+        *budget_lock(&self.held)
     }
 
     /// 剩余可认领字节。
@@ -401,7 +412,7 @@ impl ByteBudget {
         if n == 0 {
             return true;
         }
-        let mut held = lock(&self.held);
+        let mut held = budget_lock(&self.held);
         if *held + n > self.total {
             return false;
         }
@@ -415,7 +426,7 @@ impl ByteBudget {
         if n == 0 {
             return;
         }
-        let mut held = lock(&self.held);
+        let mut held = budget_lock(&self.held);
         assert!(
             *held >= n,
             "ByteBudget: give_back would go negative (bookkeeping bug)"
@@ -484,9 +495,50 @@ thread_local! {
     static RESET_IN_FLIGHT: Cell<bool> = const { Cell::new(false) };
 }
 
-/// std Mutex 取锁：中毒 = 持锁方已 panic——fail-fast 传播（同 `pool::lock`
-/// 纪律）。收口一处，调用点只见加锁。
+// weight 钩子执行中标志（**仅 debug 构建**，release 零开销）：钩子可能在片锁
+// 内执行（归还/借出/裁剪路径的计量点），体内再取片锁（`acquire` / `insert` /
+// `metrics` / `prune_idle` / `resize` 任一）= 同线程双重加锁死锁面——`lock`
+// 取锁点 `debug_assert` fail-fast 检出（issue#21：红线从 doc 升级为防呆）。
+#[cfg(debug_assertions)]
+thread_local! {
+    static WEIGHT_IN_FLIGHT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// weight 钩子执行窗（RAII：钩子 panic 时 unwind 路径恢复标志，不留脏状态）。
+#[cfg(debug_assertions)]
+struct WeightInFlightGuard(bool);
+
+#[cfg(debug_assertions)]
+impl WeightInFlightGuard {
+    fn enter() -> Self {
+        Self(WEIGHT_IN_FLIGHT.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for WeightInFlightGuard {
+    fn drop(&mut self) {
+        WEIGHT_IN_FLIGHT.with(|c| c.set(self.0));
+    }
+}
+
+/// std Mutex 取锁（**片锁口径**：全部分片锁必经此口）：中毒 = 持锁方已
+/// panic——fail-fast 传播（同 `pool::lock` 纪律）。debug 构建额外检出 weight
+/// 钩子重入（钩子在片锁内执行时体内再取片锁 = 死锁面，issue#21）。
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        !WEIGHT_IN_FLIGHT.with(Cell::get),
+        "ObjectPool: weight hook must not re-enter the pool (deadlock face: hook re-locks a shard)"
+    );
+    mutex
+        .lock()
+        .expect("objpool lock poisoned (prior holder panicked)")
+}
+
+/// ByteBudget 内部锁（同 fail-fast 纪律；**不参与**片锁重入检测——钩子体内
+/// 只读预算是合法访问，不构成死锁面）。
+fn budget_lock(mutex: &Mutex<usize>) -> MutexGuard<'_, usize> {
     mutex
         .lock()
         .expect("objpool lock poisoned (prior holder panicked)")
@@ -1033,10 +1085,25 @@ impl<T> ObjectPool<T> {
     }
 
     /// 老化口：释放「距上次使用超过 `max_idle_age`」的 idle 对象，返回释放数。
-    /// `now` 由调用方给（宿主自己的时钟；**池不起后台线程**）。`Duration::ZERO`
-    /// ⇒ 释放全部 idle 对象（特判：不比时间戳直接释放——规避时钟粒度下
-    /// 「同一瞬间归还/调用」的 0 龄漏放）。
+    ///
+    /// # Deprecated
+    ///
+    /// 用 [`Self::prune_idle_with_clock`]：时钟可注入（测试注入
+    /// [`MockClock`](skeleton::clock::MockClock) 确定性推进零真实等待，生产传
+    /// `SystemClock`）；本签名要求调用方自带 `Instant`，测试面只能真实 sleep
+    /// 或手搓时钟，与「时钟注入」口径相悖（issue#22 退役计划）。
+    #[deprecated(
+        note = "use prune_idle_with_clock: inject the Clock (MockClock for deterministic tests, SystemClock in production)"
+    )]
     pub fn prune_idle(&self, max_idle_age: Duration, now: Instant) -> usize {
+        self.prune_idle_impl(max_idle_age, now)
+    }
+
+    /// 老化实现收口（`Instant` 入参；弃用包装 [`Self::prune_idle`] 与时钟注入
+    /// 版 [`Self::prune_idle_with_clock`] 共用）。`Duration::ZERO` ⇒ 释放全部
+    /// idle 对象（特判：不比时间戳直接释放——规避时钟粒度下「同一瞬间归还/
+    /// 调用」的 0 龄漏放）。
+    fn prune_idle_impl(&self, max_idle_age: Duration, now: Instant) -> usize {
         // ZERO 特判：不比时间戳直接释放全部（契约口径「ZERO ⇒ 释放全部」——
         // 规避时钟粒度下「同一瞬间归还/调用」的 0 龄漏放）。
         let zero_sweep = max_idle_age == Duration::ZERO;
@@ -1068,13 +1135,14 @@ impl<T> ObjectPool<T> {
         n
     }
 
-    /// 老化口（Clock 注入版）：同 [`Self::prune_idle`]，`now` 取自 udf
+    /// 老化口（**正典口径**，Clock 注入版）：`now` 取自 udf
     /// [`Clock`](skeleton::clock::Clock) 契约——测试注入
     /// [`MockClock`](skeleton::clock::MockClock) 确定性推进（无需真实等待），
-    /// 生产传 `SystemClock`。宿主低频老化任务（xray-frame `spawn_idle_pruner`）
+    /// 生产传 `SystemClock`（issue#22：`prune_idle` 的 `Instant` 版已弃用，
+    /// 新代码一律走本口）。宿主低频老化任务（xray-frame `spawn_idle_pruner`）
     /// 走本口。
     pub fn prune_idle_with_clock(&self, max_idle_age: Duration, clock: &dyn Clock) -> usize {
-        self.prune_idle(max_idle_age, clock.now_instant())
+        self.prune_idle_impl(max_idle_age, clock.now_instant())
     }
 
     /// 运行时调参（`PoolManaged::resize` 同面）：非法参数入口拒绝（`Err`，状态
@@ -1281,7 +1349,12 @@ impl<T> ObjectPool<T> {
     /// `budget: None` ⇒ `weight: None`）。调用点在片锁内；钩子体内禁 acquire
     /// 同一池（见 [`WeightHook`]）。
     fn weight_of(&self, obj: &T) -> usize {
-        self.weight.as_ref().map_or(0, |w| w(obj))
+        let Some(w) = self.weight.as_ref() else {
+            return 0;
+        };
+        #[cfg(debug_assertions)]
+        let _in_flight = WeightInFlightGuard::enter();
+        w(obj)
     }
 
     /// 向字节预算认领 `n`（未启用恒 true）。原子 check+act——失败即容量因
