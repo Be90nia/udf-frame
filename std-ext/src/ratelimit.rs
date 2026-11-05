@@ -48,7 +48,7 @@
 //! | acquire(0) 阻塞 | Guava `acquire(0)` 文档 | 恒 Ok no-op | `acquire_zero_is_noop` |
 //! | 非法构造参数 | fail-closed 纪律（RetryPolicy 同款） | capacity/rate ≤0、NaN、inf 构造期 panic | `invalid_constructor_args_panic` |
 //! | 阻塞等待真实 sleep 不可测 | tokio auto-advance 反面教训 | [`Sleeper`] 注入，MockClock 实现=advance：acquire 自动推进虚拟钟，时间线零 sleep 逐纳秒断言 | `acquire_sleeps_exactly_until_tokens_sufficient` |
-//! | 测量与睡眠异钟漂移 | retry 预算漏计先例 | [`Sleeper`] 超 trait 绑 [`Clock`]，单实例单时间线 | 类型层排除 |
+//! | 测量与睡眠异钟漂移 | retry 预算漏计先例 | [`Sleeper`] 超 trait 绑 [`skeleton::clock::Clock`]，单实例单时间线 | 类型层排除 |
 //!
 //! # Examples
 //!

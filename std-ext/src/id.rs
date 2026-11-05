@@ -4,7 +4,7 @@
 //! 级 `RandomId`（UUIDv4，getrandom 底座，默认关=不进树，见文件尾段）。
 //! 时间面复用 [`skeleton::clock`] 挂钟面
 //!（`now_system` → 48bit `unix_ts_ms`），机器指纹由采用方注入（推荐
-//! [`std_ext::hash::stable64`] 派生，本域不绑定派生方式）。
+//! [`crate::hash::stable64`] 派生，本域不绑定派生方式）。
 //!
 //! # 布局（RFC 9562 §5.7，128bit 大端）
 //!

@@ -8,7 +8,7 @@
 //!
 //! - **站点**：具名计数点（`JOURNAL_APPEND`、`FX_SPAWN`……），常量初始化随
 //!   镜像常驻（无 ctor、无惰性初始化）；
-//! - **目录表**：[`alloc_sites!`] 一次调用生成的 `&'static [&'static
+//! - **目录表**：`alloc_sites!` 一次调用生成的 `&'static [&'static
 //!   AllocSite]`，声明序 = 枚举序；每次宏调用生成**独立**静态表——与
 //!   `skeleton::lint` 的进程级全局注册表性质相反，表间互不干扰，测试隔离
 //!   天然成立；
@@ -43,7 +43,7 @@
 //! # 收窄声明（明确不做，均属采用方策略层）
 //!
 //! 阈值判定 / 上报 / 告警 / 序列化 / 站点归属映射 / 自动发现——站点必须经
-//! [`alloc_sites!`]（或 [`AllocSite::new`] 手工组表）显式登记。
+//! `alloc_sites!`（或 [`AllocSite::new`] 手工组表）显式登记。
 //!
 //! # Examples
 //!
@@ -72,7 +72,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// 单个分配站点：静态名 + 原子计数 + 独立开关。
 ///
-/// 通常由 [`alloc_sites!`] 生成；不走宏的手工登记口 = [`AllocSite::new`]
+/// 通常由 `alloc_sites!` 生成；不走宏的手工登记口 = [`AllocSite::new`]
 /// 常量构造后自组 `&[&AllocSite]` 表（`name` 自定义）。
 ///
 /// 计数与开关走原子内部可变性——站点以 `static` 共享，`&self` 即可写；

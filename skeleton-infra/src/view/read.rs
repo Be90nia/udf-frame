@@ -5,7 +5,7 @@
 //!
 //! 「未知标签的判定权在读侧」（谁更懂自己的 schema 谁判）：区域段的值类型 tag 是
 //! 协议自描述层（本读器按 tag 空间判已知）；载荷形状 kind 是 schema 层，判定集
-//! 由调用方传入（[`read::decode_batch`] 的 `decls` 声明词表）。
+//! 由调用方传入（[`decode_batch`] 的 `decls` 声明词表）。
 use super::{BindingId, ENTRY_LEN, HEADER_LEN, Patch, RegionError};
 use serde_json::Value;
 use skeleton::view::BindingDecl;

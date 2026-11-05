@@ -393,7 +393,7 @@ fn a_fold_eq(a: Component<'_>, b: Component<'_>) -> bool {
 /// # 调用方处置指引（None 时）
 ///
 /// None = 家不可解析。**禁静默回退 cwd**（跨启动漂移、权限面不明、多进程
-/// 各落各的）——log 域先例 [`crate::logx::DefaultPathResolver`] 在构造期
+/// 各落各的）——log 域先例 `logx::DefaultPathResolver` 在构造期
 /// 显式 `Err`。需要 XDG 基目录的使用方走 [`config_dir`]/[`cache_dir`]/
 /// [`data_dir`]（None 语义同此，链式传播）。
 ///
@@ -468,11 +468,11 @@ fn xdg_base_dir(_var: &str, _default_suffix: &str) -> Option<PathBuf> {
 ///
 /// 纯解析面，**不创建目录**——spec 把创建责任放在写入时（目的地不存在由
 /// 写入方尝试以 0700 创建），本域只回答路径。语义与 None 面同
-/// [`resolve_xdg_dir`]（家不可解析 ⇒ None；env 空串=未设、相对值=invalid
+/// `resolve_xdg_dir`（家不可解析 ⇒ None；env 空串=未设、相对值=invalid
 /// 忽略；结果词法归一）。macOS 走本 XDG 面（std-only 约束，不引
 /// CoreFoundation FFI；XDG 变量在 macOS 亦被 git/cargo 等广泛尊重）。
 ///
-/// Windows 面恒 [`None`]（见 [`xdg_base_dir`] 拍板注）。
+/// Windows 面恒 [`None`]（见 `xdg_base_dir` 拍板注）。
 ///
 /// # Examples
 ///

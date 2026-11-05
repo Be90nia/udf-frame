@@ -5,7 +5,7 @@
 //!
 //! - **确定性内核（线程无关）**：最小堆（`BinaryHeap`+`Reverse`）按注入
 //!   [`Clock`] 的单调面（`now_instant`）排程；[`Scheduler::tick`] 在调用
-//!   线程同步点火全部到期任务并返回实际点火数。测试配 [`MockClock`]：
+//!   线程同步点火全部到期任务并返回实际点火数。测试配 [`skeleton::clock::MockClock`]：
 //!   `advance`+`tick` 零真实 sleep，时间线逐毫秒可断言（retry 域 Sleeper
 //!   同哲学的调度版）；
 //! - **驱动线程（生产外挂）**：[`Scheduler::spawn_worker`] 起单线程驱动，

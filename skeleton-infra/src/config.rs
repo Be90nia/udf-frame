@@ -2,7 +2,7 @@
 //! 翻译捷径（行为件）。
 //!
 //! 契约已下沉 `skeleton::config`（批 1 契约真下沉，2026-10-18；ADR 0001）：[`ConfigPort`](skeleton::config::ConfigPort)/
-//! [`EnvSource`](skeleton::config::EnvSource)/[`ConfigError`](skeleton::config::ConfigError)
+//! [`EnvSource`](skeleton::config::EnvSource)/[`ConfigError`]
 //! 住契约层（纯 std 零门），本域只剩 feature 门控行为件——
 //! `config-json` = [`ConfigFile`] 分层装配+原子保存（serde_json::Value 统一
 //! 值面），`config-toml` = TOML 翻译捷径（`load_toml`/`save_toml`/
@@ -55,7 +55,7 @@ use skeleton::config::ConfigError;
 ///   叠放（统一值模型），[`ConfigFile::load`] 低→高依次折叠后一次性反
 ///   序列化为 `C`；
 /// - **env 层不进本面**：字符串 env 值 → 字段类型的解析是类型化职责
-///   （[`ConfigPort`] 已有段），原始值面若代劳会把 `"8080"` 串进数字
+///   （[`ConfigPort`](skeleton::config::ConfigPort) 已有段），原始值面若代劳会把 `"8080"` 串进数字
 ///   字段=反序列化错误。装配姿势：`file` 层产物作为底座喂采用方的
 ///   ConfigPort 实现，`load(env)` 出值后采用方代码再改=explicit 层。
 ///

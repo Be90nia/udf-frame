@@ -9,7 +9,7 @@
 //! bound=公共 API 破坏性变更（未经拍板不做）；指纹供进程内/同构建日志关联，
 //! 跨 Rust 版本不承诺稳定。
 //!
-//! 常驻零依赖件：纯 std，无 feature 门。与 [`crate::memgov`] 的分工：memgov=
+//! 常驻零依赖件：纯 std，无 feature 门。与 `memgov` 的分工：memgov=
 //! 有界容器族（BTreeMap 序淘汰，`K: Ord`，首键退化语义）；本模块=精确 LRU+
 //! TTL 缓存域（`K: Eq + Hash + Clone`）。memgov `Eviction` 头注「LRU/TTL→moka
 //! 对表，不在此实现」的缺口由本模块兑现（moka 重依赖不采——零依赖纪律；
@@ -342,7 +342,7 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
 
 /// 精确 LRU 缓存：容量上界 + O(1) `get`/`insert`（索引 arena 双向链，零 unsafe）。
 ///
-/// 构造签名类型强制「上限必填」（无默认无界构造，[`crate::memgov::BoundedRegistry`]
+/// 构造签名类型强制「上限必填」（无默认无界构造，`memgov::BoundedRegistry`
 /// 同款纪律）；满插入恒逐 LRU 尾（无 Reject 形——缓存的淘汰本来就是承诺）。
 ///
 /// 并发面：单线程 `&mut self`，无内部锁；`&self` 共享面见 [`SyncLruCache`]。

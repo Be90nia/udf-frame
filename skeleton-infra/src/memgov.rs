@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// K 契约：K 须单调指派（序号/时间戳键），此时语义=逐最旧；
 /// K 乱序时语义如实退化为 EvictMinKey——调用方纪律，本件不静默补偿。
-/// LRU/TTL 精确语义在 [`crate::cache`]（本件首键退化语义的邻接补全件）。
+/// LRU/TTL 精确语义在 `std_ext::cache`（本件首键退化语义的邻接补全件）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Eviction {
     /// 满=Err(BoundError)（fail-closed）。

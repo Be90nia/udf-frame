@@ -70,7 +70,7 @@ impl std::error::Error for TimeParseError {}
 ///（`.52` / `.123456789`）——RFC 3339 `time-secfrac = "." 1*DIGIT` 合法面，
 /// roundtrip 无损。表示域 = RFC 3339 current era
 /// `[0000-01-01T00:00:00Z, 9999-12-31T23:59:59.999999999Z]`（§1），越界
-/// fail-closed panic（clock 域 armor 纪律同 [`super::MockClock::advance`]
+/// fail-closed panic（clock 域 armor 纪律同 [`skeleton::clock::MockClock::advance`]
 /// 溢出先例）。
 ///
 /// 排序限定（审计 F8）：「字符串序==时间序」仅在**同 frac 位数**下成立

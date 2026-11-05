@@ -184,7 +184,7 @@
 //! [`ObjectPoolTuning`]——resize 调件数面，不动安全字节上界）。**weight 钩子
 //! 体内不得 acquire 同一池**（调用点在片锁内，回调池借还 = 锁自死锁面）——
 //! debug 构建在片锁取锁点 fail-fast 检出重入（release 零开销仍禁，见
-//! [`WeightHook`]）。
+//! `WeightHook`）。
 //!
 //! # 强制清零（缺口：reset 钩子可选，忘配 = 明文驻留）
 //!
@@ -197,7 +197,7 @@
 //!
 //! # 自动老化（缺口：prune_idle 无调用点 = 永不老化）
 //!
-//! [`ObjectPool::prune_idle_with_clock`] 接 udf [`Clock`](skeleton::clock::Clock)
+//! [`ObjectPool::prune_idle_with_clock`] 接 udf [`Clock`]
 //! 契约（测试注入 [`MockClock`](skeleton::clock::MockClock) 确定性推进；
 //! 生产传 `SystemClock`）；**宿主用既有托管口起低频老化任务**（xray-frame
 //! `spawn_idle_pruner`：FxScope 托管 + 周期 prune），**池不起后台线程**
@@ -318,7 +318,7 @@ pub struct ObjectPoolMetrics {
     /// **共享预算下本字段不构成按池归因**（issue#20）：多池共用一份
     /// `Arc<ByteBudget>` 时只能全局看总数（[`ByteBudget::held`] /
     /// [`ByteBudget::available`]），无法分辨哪个池占了多少。需要按池归因的
-    /// 部署用 [`Self::with_byte_quota`]（池私有预算）或每池各自一份
+    /// 部署用 [`ObjectPool::with_byte_quota`]（池私有预算）或每池各自一份
     /// `ByteBudget`——本件刻意不引入「池侧第二账本」（双记会漂移，且漂移
     /// 只能在生产撞见，运维面无法区分真占用与记账误差）。
     pub idle_bytes: usize,
@@ -1136,7 +1136,7 @@ impl<T> ObjectPool<T> {
     }
 
     /// 老化口（**正典口径**，Clock 注入版）：`now` 取自 udf
-    /// [`Clock`](skeleton::clock::Clock) 契约——测试注入
+    /// [`Clock`] 契约——测试注入
     /// [`MockClock`](skeleton::clock::MockClock) 确定性推进（无需真实等待），
     /// 生产传 `SystemClock`（issue#22：`prune_idle` 的 `Instant` 版已弃用，
     /// 新代码一律走本口）。宿主低频老化任务（xray-frame `spawn_idle_pruner`）

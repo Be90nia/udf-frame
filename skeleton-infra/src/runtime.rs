@@ -1022,7 +1022,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         self.inner.feedback_exceeded.load(Ordering::SeqCst)
     }
 
-    /// Cancel 寻址校验读数：[`Effect::Cancel`](skeleton::Effect::Cancel) 引用
+    /// Cancel 寻址校验读数：[`Effect::Cancel`] 引用
     /// 从未发出的 `Run` id 的累计次数（转发环留痕，只计数不拦截——迟到
     /// Cancel 是合法时序，见 `StoreInner::cancel_unknown_id` 文档）。
     ///

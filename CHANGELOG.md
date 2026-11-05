@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Changed（docs 闸清零 + CI 防回潮，2026-11-05）
+- 全 workspace `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps` **exit 0**：清零存量 rustdoc 告警 24 处（skeleton 2 / std-ext 9 / infra 13——intra-doc 断链修指向、私有项改代码字面、冗余显式链接目标删除、宏链接改字面、宏调用前 doc 注释改普通注释）。
+- `ci.yml` 新增 **Docs** 步（`env: RUSTDOCFLAGS=-D warnings` + `cargo doc --workspace --all-features --no-deps`）：消费方 CI 常带 docs 步，本仓先行自证不红，防回潮。
+
 ### Changed（objpool 消费方反馈 API 卫生四件，2026-11-05；GitHub issue#19/#20/#21/#22）
 - **issue#19**：`ByteBudget` 提入 crate 根 re-export（pool 域七件同列，消费方不再写 `skeleton_infra::objpool::` 全路径）；`ByteBudget` doc 示例同步短路径。
 - **issue#20**：`ObjectPoolMetrics.idle_bytes` 字段 doc 显式警告「共享预算池读数 = 全局 held，不构成按池归因」+ 归因指引（按池归因用池私有预算 `with_byte_quota`；刻意不引入池侧第二账本——双记会漂移）。

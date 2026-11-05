@@ -1,7 +1,7 @@
 //! 日志域两层拆分（批 1 log feature 拆分，2026-10-18；ADR 0002）：
 //!
 //! - **`log-fs`（纯 std，零三方依赖）**：密钥掩码 [`mask_secrets`] + 文件落盘
-//!   面——路径契约 [`LogPathResolver`](skeleton::logpath::LogPathResolver)
+//!   面——路径契约 [`LogPathResolver`]
 //!   （trait 住 `skeleton::logpath`）+ 默认实现 [`DefaultPathResolver`] +
 //!   按日滚动 [`FileSink`]。单开 `log-fs` 即可用文件日志，不拉 tracing 四件套。
 //! - **`log`（= `log-fs` + log + tracing + tracing-subscriber + tracing-log，
@@ -244,7 +244,7 @@ pub struct DefaultPathResolver {
 
 impl DefaultPathResolver {
     /// debug 构建恒 Ok（home 不参与）；release 构建立即解析 home，
-    /// None → [`Err(HomeDirUnresolvable)`]。
+    /// None → `Err(HomeDirUnresolvable)`。
     pub fn new(project_name: impl Into<String>) -> Result<Self, HomeDirUnresolvable> {
         #[cfg(not(debug_assertions))]
         {
@@ -324,7 +324,7 @@ impl std::error::Error for LogInitError {
 /// 换日只是打开新文件，无 rotation 改名交接面；`OpenOptions::append` 在
 /// Unix=O_APPEND、Windows=FILE_APPEND_DATA，均按次 write() 原子追加到 EOF；
 /// std 默认以 FILE_SHARE_READ|WRITE|DELETE 打开，不挡并发打开者。每次
-/// `write` 调用=一个落盘单元（fmt 层经 [`format_line`] 保证整行单调用）。
+/// `write` 调用=一个落盘单元（fmt 层经 `format_line` 保证整行单调用）。
 ///
 /// 失败面（拍板）：写失败**不 panic、不上抛**——计数 + stderr 一次告警 +
 /// 继续（日志失败拖垮业务是反模式；纯吞禁——[`FileSink::dropped_lines`]

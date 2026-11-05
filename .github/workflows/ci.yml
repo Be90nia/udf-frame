@@ -89,6 +89,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
+      # docs 闸：全 workspace 全 feature 构建文档并拒一切 rustdoc 告警（intra-doc
+      # 断链 / 私链 / 冗余显式链）——消费方 CI 常带 docs 步，本仓先行自证不红。
+      # 存量告警（skeleton 2 / std-ext 9 / infra 13 处）已清零（2026-11-05 批）。
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps
+
       # 单切片 clippy 步（udf-frame-iop）：cfg 门挂错 feature 的 unused import
       # 只有单开该 feature 才爆，--all-features 掩盖单 feature 面，双组合各一
       - name: Clippy infra (config-json only)
