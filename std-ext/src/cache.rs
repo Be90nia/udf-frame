@@ -129,9 +129,13 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
             cap > 0 && cap <= (u32::MAX - 1) as usize,
             "cache::new: cap 必须 >0 且 <= u32::MAX-1（槽号 u32 哨兵 NONE=u32::MAX）"
         );
+        // `cap` 是**淘汰上界**，不是预分配额度：`HashMap::with_capacity(cap)` +
+        // `Vec::with_capacity(cap)` 会在构造瞬间吃掉 `cap × (Slot + 桶)` 字节，
+        // 与实际条目数无关（`LruCache::new(65535)` 实测 7.63 MB 构造即驻留）。
+        // 惰性增长：只在真正插入时按几何扩容，满载后仍收敛到同一上界。
         Self {
-            map: HashMap::with_capacity(cap),
-            slots: Vec::with_capacity(cap),
+            map: HashMap::new(),
+            slots: Vec::new(),
             free: Vec::new(),
             head: NONE,
             tail: NONE,

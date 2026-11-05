@@ -88,8 +88,8 @@
 //!    <https://github.com/golang/go/issues/23199> 、#27735
 //!    <https://github.com/golang/go/issues/27735> ）。
 //! 3. **unwind 归还语义**：panic 中句柄析构 = 对象销毁不回池（见上节）。
-//! 4. **`prune_idle` 尽力而为**：老化回收不构成释放失败信号（Go sync.Pool
-//!    官方口径 <https://raw.githubusercontent.com/golang/go/master/src/sync/pool.go> ）。
+//! 4. **`prune_idle` 尽力而为**：老化回收不构成释放失败信号（Go sync.Pool 官方口径 <https://raw.githubusercontent.com/golang/go/master/src/sync/pool.go>
+//!    ）。
 //!
 //! # 结构性防住的坑（机制自带）
 //!
@@ -169,6 +169,38 @@
 //! 次，`PoolBase` 公开面与行为零变化）；入口校验复用 `crate::pool::validate`
 //! 同源（禁复制第二套规则）。
 //!
+//! # 字节配额（缺口：件数上界 ≠ 内存上界）
+//!
+//! `max` / `idle_cap` 纯按件数；件大小可差几个数量级（8KB 缓冲 vs 1MB+ TLS
+//! 连接），件数上界不等于内存上界。[`ByteBudget`] 是**进程级共享字节预算
+//! 仲裁器**（多池共用一个上限的原语，`Arc<ByteBudget>` 传入多池即共享）。
+//! 池侧两条构造路（[`ObjectPool::with_byte_quota`] 池私有 /
+//! [`ObjectPool::with_shared_byte_quota`] 多池共享）均要求**成对给出**
+//! 字节预算与单件计量钩子 `weight(&T) -> usize`（计量钩子缺位 = 无从记账，
+//! 单边给出构造期 panic）。归还/插入路径**在片锁内**向预算认领单件字节
+//! （`try_take` 原子 check+act，无竞态窗），超预算即丢弃 + `dropped_overflow`
+//! （容量因，与件数溢出同一计数——字节超限也是容量因）；借出/prune/resize
+//! 裁剪对称回卷。字节上界**构造期定死**（同 reset 钩子先例，不进
+//! [`ObjectPoolTuning`]——resize 调件数面，不动安全字节上界）。**weight 钩子
+//! 体内不得 acquire 同一池**（调用点在片锁内，回调池借还 = 锁自死锁面）。
+//!
+//! # 强制清零（缺口：reset 钩子可选，忘配 = 明文驻留）
+//!
+//! [`ObjectPool::with_zeroing_reset`] 是「含明文/密钥对象」的**指定构造路**：
+//! 等价 `with_reset(.., zero, ResetPhase::OnReturn)` 的命名变体，把「归还必
+//! 清零」的意图抬到代码审查点可见——review 看到 `new`/`with_reset` 即知无清零
+//! 语义。不把清零默认化（会破坏既有「容量归一」语义 + 多一次 memset）；
+//! 泛型 `T` 无统一「清零」概念，清零动作由调用方给（缓冲类只许清已写入区，
+//! 禁整块清零——bd hdugl 实测 64KiB 整块清零 190.8µs vs 已写区 300ns）。
+//!
+//! # 自动老化（缺口：prune_idle 无调用点 = 永不老化）
+//!
+//! [`ObjectPool::prune_idle_with_clock`] 接 udf [`Clock`](skeleton::clock::Clock)
+//! 契约（测试注入 [`MockClock`](skeleton::clock::MockClock) 确定性推进；
+//! 生产传 `SystemClock`）；**宿主用既有托管口起低频老化任务**（xray-frame
+//! `spawn_idle_pruner`：FxScope 托管 + 周期 prune），**池不起后台线程**
+//! 纪律不变（udf 只提供同步老化口，任务生命周期归宿主托管口）。
+//!
 //! # 测试锚
 //!
 //! 语义契约逐条钉死于 `tests/object_pool.rs`（管理面基座已在
@@ -181,19 +213,26 @@
 //! `ObjectPoolMetrics` 六件（照 `PoolBase`/`PooledThreadPool` 的 pool 域根导出
 //! 惯例）。
 
-use std::borrow::Borrow;
-use std::cell::Cell;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread_local;
-use std::time::{Duration, Instant};
-
-use skeleton::pool::{
-    PoolAuditEvent, PoolAuditKind, PoolAuditTicket, PoolManaged, PoolMetrics, PoolResizeError,
+use std::{
+    borrow::Borrow,
+    cell::Cell,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    thread_local,
+    time::{Duration, Instant},
 };
 
-use crate::pool::{validate, PoolAuditSink, AUDIT_RING_DEFAULT_CAP};
+use skeleton::{
+    clock::Clock,
+    pool::{
+        PoolAuditEvent, PoolAuditKind, PoolAuditTicket, PoolManaged, PoolMetrics, PoolResizeError,
+    },
+};
+
+use crate::pool::{AUDIT_RING_DEFAULT_CAP, PoolAuditSink, validate};
 
 // 术语表：**池宇宙** = idle 槽 + 正常借出数（硬上界 `max`）；**降级对象**在
 // 宇宙之外。下文所有「宇宙」均指此口径。
@@ -270,6 +309,12 @@ pub struct ObjectPoolMetrics {
     /// unwind 中归还而销毁的对象数（panic 路径归还——对象不变量可能已破，禁
     /// reset 禁回池；与 `dropped_overflow` 是两个独立计数，不得混账）。
     pub panic_dropped: u64,
+    /// 常驻 idle 字节合计（字节配额池：预算已认领部分；未启用恒 0）。**共享
+    /// 预算池（`with_shared_byte_quota`）的读数 = 共享 [`ByteBudget`] 的全局
+    /// held（含其他池的认领）**——字节记账单一账本（共享件一处），池内不双记。
+    pub idle_bytes: usize,
+    /// 池字节预算（构造期定死；未启用恒 0）。
+    pub byte_budget: usize,
 }
 
 impl Borrow<PoolMetrics> for ObjectPoolMetrics {
@@ -281,6 +326,106 @@ impl Borrow<PoolMetrics> for ObjectPoolMetrics {
 /// reset 钩子形状收口（`type_complexity` 抑制 + 单点定义，同 `pool::AuditCallback`
 /// 先例）：`Fn(&mut T)` 在锁外、独占借用下调用。
 type ResetHook<T> = Box<dyn Fn(&mut T) + Send + Sync>;
+
+/// 单件字节计量钩子：`Fn(&T) -> usize`——调用点在**片锁内**（归还/借出/裁剪
+/// 路径），钩子体内不得 acquire 同一池（锁自死锁面，同 reset 钩子红线）；
+/// 返回值按**对象当前真实驻留字节**计（`Vec` 类 = `capacity()`，不是 `size_of`）。
+type WeightHook<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
+
+/// 进程级共享字节预算仲裁器：多池共用一个内存上限的原语（bd jovl4 缺口 1）。
+///
+/// **共享形态** = 同一份 `Arc<ByteBudget>` 传给多个池——各池的归还/插入在
+/// `try_take` 上竞争同一份余额，谁先认领谁占用，超预算方丢弃（`dropped_overflow`
+/// 容量因）。**记账 fail-fast**：`give_back` 下溢 = 记账 bug，panic（同片内
+/// `take` 纪律——计数错账禁静默钳位）。低频面（借还的字节裁决在归还路径、
+/// 相对 acquire 热路径低频），内部单把 `Mutex` 足够；持锁序恒「片锁 → 本锁」
+/// 单向（本锁内不回调池），无环无死锁。
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use skeleton_infra::objpool::{ByteBudget, ObjectPool};
+///
+/// let budget = Arc::new(ByteBudget::new(64 * 1024));
+/// // 多池共享同一份 64KiB 预算：
+/// let a = ObjectPool::with_shared_byte_quota(8, 4, Vec::<u8>::new, Arc::clone(&budget), |v| {
+///     v.capacity()
+/// });
+/// let b = ObjectPool::with_shared_byte_quota(8, 4, Vec::<u8>::new, Arc::clone(&budget), |v| {
+///     v.capacity()
+/// });
+/// assert_eq!(budget.available(), 64 * 1024);
+/// ```
+pub struct ByteBudget {
+    total: usize,
+    held: Mutex<usize>,
+}
+
+impl ByteBudget {
+    /// 构造（fail-fast：`total == 0` panic——「0 预算的池」无从起用，同
+    /// `validate` 纪律；不限字节配额的池直接走 `new`/`with_reset`，不设
+    /// 「无限预算」形态）。
+    ///
+    /// # Panics
+    ///
+    /// `total == 0`。
+    pub fn new(total: usize) -> Self {
+        assert!(total > 0, "ByteBudget::new: total must be non-zero");
+        Self { total, held: Mutex::new(0) }
+    }
+
+    /// 预算总额（构造期定死，不可 resize——字节上界是安全面）。
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// 当前已认领字节（池内常驻对象的真实驻留合计；借出对象不计）。
+    pub fn held(&self) -> usize {
+        *lock(&self.held)
+    }
+
+    /// 剩余可认领字节。
+    pub fn available(&self) -> usize {
+        self.total - self.held()
+    }
+
+    /// 认领 `n` 字节（原子 check+act：余额足 ⇒ 认领并返回 true；不足 ⇒ 返回
+    /// false，调用方按容量因丢弃）。`n == 0` 恒 true（未启用计量面的调用点
+    /// 短路，零开销）。
+    pub fn try_take(&self, n: usize) -> bool {
+        if n == 0 {
+            return true;
+        }
+        let mut held = lock(&self.held);
+        if *held + n > self.total {
+            return false;
+        }
+        *held += n;
+        true
+    }
+
+    /// 回卷 `n` 字节（借出 / prune / resize 裁剪的对称面）。下溢 = 记账 bug，
+    /// fail-fast panic。`n == 0` 短路。
+    pub fn give_back(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut held = lock(&self.held);
+        assert!(*held >= n, "ByteBudget: give_back would go negative (bookkeeping bug)");
+        *held -= n;
+    }
+}
+
+impl std::fmt::Debug for ByteBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByteBudget")
+            .field("total", &self.total)
+            .field("held", &self.held())
+            .finish()
+    }
+}
 
 /// 空闲槽：对象值 + 最近使用时间戳（归还时刷新；[`ObjectPool::prune_idle`]
 /// 按龄释放的判据）。
@@ -336,18 +481,13 @@ thread_local! {
 /// std Mutex 取锁：中毒 = 持锁方已 panic——fail-fast 传播（同 `pool::lock`
 /// 纪律）。收口一处，调用点只见加锁。
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .expect("objpool lock poisoned (prior holder panicked)")
+    mutex.lock().expect("objpool lock poisoned (prior holder panicked)")
 }
 
 /// 片内计数回卷 n：减到负 = 记账 bug（fail-fast，release 同判——计数错账禁静默
 /// 钳位）。
 fn take(count: &mut usize, n: usize, what: &str) {
-    assert!(
-        *count >= n,
-        "objpool bookkeeping bug: {what} would go negative"
-    );
+    assert!(*count >= n, "objpool bookkeeping bug: {what} would go negative");
     *count -= n;
 }
 
@@ -361,10 +501,10 @@ fn share(total: usize, shards: usize, idx: usize) -> usize {
 /// reset 钩子调用收口（防呆）：本线程已在某 reset 钩子体内时再次进入钩子 =
 /// 契约违规（归还路径重入 = 无限递归：每层归还再触发钩子——fail-fast 检出，
 /// 禁静默跳过）。返回 Ok(()) 或钩子 panic payload：
-/// - 归还路径（`Pooled::drop`）：payload 由外层 `catch_unwind` 语义消化
-///   （对象丢弃 + `reset_panicked` 留痕，禁 abort）——**`OnReturn` 相位不传播
-///   payload**（Drop 期无日志设施可用，就地丢弃；故障可见性走 `reset_panicked`
-///   计数，`PoolAuditKind` 无钩子故障词汇 ⇔ 不发审计事件）；
+/// - 归还路径（`Pooled::drop`）：payload 由外层 `catch_unwind` 语义消化 （对象丢弃 +
+///   `reset_panicked` 留痕，禁 abort）——**`OnReturn` 相位不传播 payload**（Drop
+///   期无日志设施可用，就地丢弃；故障可见性走 `reset_panicked` 计数，`PoolAuditKind` 无钩子故障词汇
+///   ⇔ 不发审计事件）；
 /// - `OnAcquire` 路径：payload 经 `resume_unwind` 原样传播（宇宙配额回滚后）。
 fn run_reset_hook<T>(
     reset: &dyn Fn(&mut T),
@@ -438,6 +578,10 @@ pub struct ObjectPool<T> {
     factory: Box<dyn Fn() -> T + Send + Sync>,
     reset: Option<ResetHook<T>>,
     phase: ResetPhase,
+    /// 单件字节计量（与 `budget` 成对出现——构造期校验，单边 panic）。
+    weight: Option<WeightHook<T>>,
+    /// 字节预算（构造期定死；`None` = 不启用字节配额——借还零额外开销）。
+    budget: Option<Arc<ByteBudget>>,
 }
 
 impl<T> ObjectPool<T> {
@@ -452,7 +596,7 @@ impl<T> ObjectPool<T> {
         idle_cap: usize,
         factory: impl Fn() -> T + Send + Sync + 'static,
     ) -> Self {
-        Self::build(max, idle_cap, Box::new(factory), None, ResetPhase::OnReturn)
+        Self::build(max, idle_cap, Box::new(factory), None, ResetPhase::OnReturn, None, None)
     }
 
     /// 构造 + reset 钩子。`phase` 决定钩子调用时点（见 [`ResetPhase`]）；
@@ -468,38 +612,115 @@ impl<T> ObjectPool<T> {
         reset: impl Fn(&mut T) + Send + Sync + 'static,
         phase: ResetPhase,
     ) -> Self {
+        Self::build(max, idle_cap, Box::new(factory), Some(Box::new(reset)), phase, None, None)
+    }
+
+    /// 构造 + **强制清零**（归还相位 [`ResetPhase::OnReturn`]）：含明文/密钥
+    /// 对象的**指定构造路**——把「归还必清零」的意图抬到代码审查点可见
+    /// （`new`/`with_reset` 的池无清零语义，review 一眼可辨）。清零动作由
+    /// 调用方给（泛型 `T` 无统一清零概念）；缓冲类只许清已写入区
+    /// （`[..len]`），禁整块清零（bd hdugl：64KiB 整块 190.8µs vs 已写区
+    /// 300ns——清零成本必须与写入量同阶）。钩子纪律（panic 兜底/重入检出/
+    /// 不回池）与 [`Self::with_reset`] 逐条同款。
+    ///
+    /// # Panics
+    ///
+    /// 同 [`Self::new`]。
+    pub fn with_zeroing_reset(
+        max: usize,
+        idle_cap: usize,
+        factory: impl Fn() -> T + Send + Sync + 'static,
+        zero: impl Fn(&mut T) + Send + Sync + 'static,
+    ) -> Self {
         Self::build(
             max,
             idle_cap,
             Box::new(factory),
-            Some(Box::new(reset)),
-            phase,
+            Some(Box::new(zero)),
+            ResetPhase::OnReturn,
+            None,
+            None,
         )
     }
 
-    /// 构造收口（两个公开构造器共用）：校验 fail-fast + 分片自适应 + 片内计数清零。
+    /// 构造 + **池私有字节配额**（归还/插入超预算即丢弃，`dropped_overflow`
+    /// 容量因）。`byte_budget` 与 `weight` 必须成对（计量缺位 = 无从记账）；
+    /// 多池共用一份上限用 [`Self::with_shared_byte_quota`] + 共享
+    /// `Arc<ByteBudget>`。
+    ///
+    /// # Panics
+    ///
+    /// 同 [`Self::new`]；`byte_budget == 0`（[`ByteBudget::new`] 纪律）。
+    pub fn with_byte_quota(
+        max: usize,
+        idle_cap: usize,
+        factory: impl Fn() -> T + Send + Sync + 'static,
+        byte_budget: usize,
+        weight: impl Fn(&T) -> usize + Send + Sync + 'static,
+    ) -> Self {
+        Self::build(
+            max,
+            idle_cap,
+            Box::new(factory),
+            None,
+            ResetPhase::OnReturn,
+            Some(Box::new(weight)),
+            Some(Arc::new(ByteBudget::new(byte_budget))),
+        )
+    }
+
+    /// 构造 + **共享字节预算**：`budget` 为多池共用的同一份
+    /// `Arc<ByteBudget>`——各池归还/插入竞争同一份余额，超预算方丢弃。
+    ///
+    /// # Panics
+    ///
+    /// 同 [`Self::new`]。
+    pub fn with_shared_byte_quota(
+        max: usize,
+        idle_cap: usize,
+        factory: impl Fn() -> T + Send + Sync + 'static,
+        budget: Arc<ByteBudget>,
+        weight: impl Fn(&T) -> usize + Send + Sync + 'static,
+    ) -> Self {
+        Self::build(
+            max,
+            idle_cap,
+            Box::new(factory),
+            None,
+            ResetPhase::OnReturn,
+            Some(Box::new(weight)),
+            Some(budget),
+        )
+    }
+
+    /// 构造收口（公开构造器共用）：校验 fail-fast + 分片自适应 + 片内计数清零。
+    /// `weight` / `budget` 必须成对出现（字节计量与配额缺一不可记账，单边
+    /// panic——半配置比不配置更危险：有预算无计量 = 恒拒收）。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "构造收口聚齐七个构造参数（max/idle_cap/factory/reset/phase/weight/budget），拆 builder 反而引入第二构造面"
+    )]
     fn build(
         max: usize,
         idle_cap: usize,
         factory: Box<dyn Fn() -> T + Send + Sync>,
         reset: Option<ResetHook<T>>,
         phase: ResetPhase,
+        weight: Option<WeightHook<T>>,
+        budget: Option<Arc<ByteBudget>>,
     ) -> Self {
         if let Err(e) = validate(max, idle_cap) {
             panic!("ObjectPool::new: {e}");
         }
+        assert!(
+            weight.is_some() == budget.is_some(),
+            "ObjectPool: byte budget and weight hook must be provided together"
+        );
         // 分片自适应（构造期定死，resize 不改——doc 钉死）。
         let shards = idle_cap.clamp(1, 8);
         Self {
             slots: (0..shards)
-                .map(|_| {
-                    Mutex::new(Shard {
-                        idle: Vec::new(),
-                        borrowed: 0,
-                        alive: 0,
-                        reused: 0,
-                    })
-                })
+                .map(|_| Mutex::new(Shard { idle: Vec::new(), borrowed: 0, alive: 0, reused: 0 }))
                 .collect(),
             max: AtomicUsize::new(max),
             idle_cap: AtomicUsize::new(idle_cap),
@@ -514,6 +735,8 @@ impl<T> ObjectPool<T> {
             factory,
             reset,
             phase,
+            weight,
+            budget,
         }
     }
 
@@ -524,12 +747,7 @@ impl<T> ObjectPool<T> {
     /// 三条路径的记账都在**目标片锁内**完成（片内普通 `usize`，无跨线程原子）。
     pub fn acquire(&self) -> Pooled<'_, T> {
         let (home, obj, degraded) = self.pop_or_build();
-        Pooled {
-            pool: self,
-            home,
-            slot: Some(obj),
-            degraded,
-        }
+        Pooled { pool: self, home, slot: Some(obj), degraded }
     }
 
     /// `'static` 借出（同 [`Self::acquire`] 的四路径与记账，只是句柄可跨
@@ -544,12 +762,7 @@ impl<T> ObjectPool<T> {
     /// `'static` 通道端仍要跟着对象走）。
     pub fn acquire_owned(self: &Arc<Self>) -> Owned<T> {
         let (home, obj, degraded) = self.pop_or_build();
-        Owned {
-            pool: Arc::clone(self),
-            home,
-            slot: Some(obj),
-            degraded,
-        }
+        Owned { pool: Arc::clone(self), home, slot: Some(obj), degraded }
     }
 
     /// 借出四路径（[`Self::acquire`] / [`Self::acquire_owned`] 共用）：返回
@@ -579,7 +792,7 @@ impl<T> ObjectPool<T> {
                 Err(payload) => {
                     self.unclaim_growth(home);
                     resume_unwind(payload);
-                }
+                },
             };
             self.record_borrow(home);
             self.sink.emit(PoolAuditKind::Borrowed);
@@ -611,8 +824,8 @@ impl<T> ObjectPool<T> {
     /// 在取出时，同归还路径）。随后**一次片锁内**完成「idle 片配额 + 宇宙配额」
     /// 双裁决并入槽（配额在片锁内读，与并发 `resize` 的收敛论证同
     /// [`Self::resize`]）；全片皆无空位 ⇒ 对象交回调用方 + `dropped_overflow` +1
-    /// + `audit OverflowDropped`（容量因，与钩子因两账不混）；成功入槽发
-    ///   `audit Returned`（与归还件同一事件流，契约词汇零改动）。
+    /// + `audit OverflowDropped`（容量因，与钩子因两账不混）；成功入槽发 `audit
+    ///   Returned`（与归还件同一事件流，契约词汇零改动）。
     ///
     /// **宇宙记账**：插入件此前不在宇宙内 ⇒ 入槽同时认领 `alive`（同
     /// `claim_growth` 的上界保证），**不动 `borrowed`**（从未借出，不得
@@ -637,12 +850,12 @@ impl<T> ObjectPool<T> {
             Ok(()) => {
                 self.sink.emit(PoolAuditKind::Returned);
                 None
-            }
+            },
             Err(obj) => {
                 self.dropped_overflow.fetch_add(1, Ordering::Relaxed);
                 self.sink.emit(PoolAuditKind::OverflowDropped);
                 Some(obj)
-            }
+            },
         }
     }
 
@@ -650,21 +863,21 @@ impl<T> ObjectPool<T> {
     /// 则轮转（同 [`Self::pop_idle`] 的扫片序——插入方与借出方同线程时热件落在
     /// 同一片）。全片无空位 ⇒ `Err(obj)` 原样交回。
     fn push_inserted(&self, obj: T) -> Result<(), T> {
+        let weight = self.weight_of(&obj);
         let shards = self.slots.len();
         let start = self.home_shard();
         for i in 0..shards {
             let idx = (start + i) % shards;
             let mut shard = lock(&self.slots[idx]);
-            // 双配额在片锁内读（同 `return_to_shard` 的 resize 收敛论证）。
+            // 双配额在片锁内读（同 `return_to_shard` 的 resize 收敛论证）；
+            // 字节预算 `try_take` 原子 check+act（失败无副作用，逐片重试无害）。
             let idle_cap = self.idle_cap.load(Ordering::Relaxed);
             let max = self.max.load(Ordering::Relaxed);
             if shard.idle.len() < share(idle_cap, shards, idx)
                 && shard.alive < share(max, shards, idx)
+                && self.budget_admits(weight)
             {
-                shard.idle.push(IdleSlot {
-                    obj,
-                    last_used: Instant::now(),
-                });
+                shard.idle.push(IdleSlot { obj, last_used: Instant::now() });
                 shard.alive += 1;
                 return Ok(());
             }
@@ -732,6 +945,7 @@ impl<T> ObjectPool<T> {
             reused += guard.reused;
         }
         let max = self.max.load(Ordering::Relaxed);
+        let (byte_budget, idle_bytes) = self.budget_snapshot();
         ObjectPoolMetrics {
             core: PoolMetrics {
                 max,
@@ -746,6 +960,8 @@ impl<T> ObjectPool<T> {
             pruned: self.pruned.load(Ordering::Relaxed),
             reset_panicked: self.reset_panicked.load(Ordering::Relaxed),
             panic_dropped: self.panic_dropped.load(Ordering::Relaxed),
+            idle_bytes,
+            byte_budget,
         }
     }
 
@@ -778,6 +994,7 @@ impl<T> ObjectPool<T> {
         // 规避时钟粒度下「同一瞬间归还/调用」的 0 龄漏放）。
         let zero_sweep = max_idle_age == Duration::ZERO;
         let mut doomed: Vec<T> = Vec::new();
+        let mut doomed_bytes = 0usize;
         for shard_mutex in &self.slots {
             let mut shard = lock(shard_mutex);
             let mut i = 0;
@@ -787,7 +1004,9 @@ impl<T> ObjectPool<T> {
                 let expired = zero_sweep
                     || now.saturating_duration_since(shard.idle[i].last_used) > max_idle_age;
                 if expired {
-                    doomed.push(shard.idle.swap_remove(i).obj);
+                    let slot = shard.idle.swap_remove(i);
+                    doomed_bytes += self.weight_of(&slot.obj);
+                    doomed.push(slot.obj);
                     take(&mut shard.alive, 1, "universe alive");
                 } else {
                     i += 1;
@@ -796,8 +1015,19 @@ impl<T> ObjectPool<T> {
         }
         let n = doomed.len();
         self.pruned.fetch_add(n as u64, Ordering::Relaxed);
+        // 字节额度随件回卷（锁外——ByteBudget 自持锁，锁序干净）。
+        self.budget_release(doomed_bytes);
         drop(doomed); // 锁外析构
         n
+    }
+
+    /// 老化口（Clock 注入版）：同 [`Self::prune_idle`]，`now` 取自 udf
+    /// [`Clock`](skeleton::clock::Clock) 契约——测试注入
+    /// [`MockClock`](skeleton::clock::MockClock) 确定性推进（无需真实等待），
+    /// 生产传 `SystemClock`。宿主低频老化任务（xray-frame `spawn_idle_pruner`）
+    /// 走本口。
+    pub fn prune_idle_with_clock(&self, max_idle_age: Duration, clock: &dyn Clock) -> usize {
+        self.prune_idle(max_idle_age, clock.now_instant())
     }
 
     /// 运行时调参（`PoolManaged::resize` 同面）：非法参数入口拒绝（`Err`，状态
@@ -828,17 +1058,22 @@ impl<T> ObjectPool<T> {
         // 混账——resize 丢弃走前者，`prune_idle` 释放走后者）。
         let shards = self.slots.len();
         let mut doomed: Vec<T> = Vec::new();
+        let mut doomed_bytes = 0usize;
         for (idx, shard_mutex) in self.slots.iter().enumerate() {
             let cap = share(tuning.idle_cap, shards, idx);
             let mut shard = lock(shard_mutex);
             if shard.idle.len() > cap {
                 let excess = shard.idle.len() - cap;
-                doomed.extend(shard.idle.drain(0..excess).map(|slot| slot.obj));
+                for slot in shard.idle.drain(0..excess) {
+                    doomed_bytes += self.weight_of(&slot.obj);
+                    doomed.push(slot.obj);
+                }
                 take(&mut shard.alive, excess, "universe alive");
             }
         }
-        self.dropped_overflow
-            .fetch_add(doomed.len() as u64, Ordering::Relaxed);
+        self.dropped_overflow.fetch_add(doomed.len() as u64, Ordering::Relaxed);
+        // 字节额度随裁剪回卷（与 prune 同款锁外回卷）。
+        self.budget_release(doomed_bytes);
         drop(doomed); // 锁外析构
         self.sink.emit(PoolAuditKind::Resized);
         Ok(())
@@ -865,10 +1100,7 @@ impl<T> ObjectPool<T> {
             // ponytail: 固定 4 槽线性查（热路径 ≤4 次比较，无分配）；同线程持有
             // >4 个池时它们轮流领号（起点漂移，正确性与上界不受影响）。升级路径 =
             // 按使用序淘汰最旧槽，要多一份年龄记账，先不值。
-            let target = table
-                .iter()
-                .position(|entry| entry.0 == EMPTY_AFFINITY_KEY)
-                .unwrap_or(0);
+            let target = table.iter().position(|entry| entry.0 == EMPTY_AFFINITY_KEY).unwrap_or(0);
             table[target] = (key, slot);
             c.set(table);
             slot % self.slots.len()
@@ -884,6 +1116,8 @@ impl<T> ObjectPool<T> {
             if let Some(slot) = shard.idle.pop() {
                 shard.borrowed += 1;
                 shard.reused += 1;
+                // 借出 = 不再驻留：字节回卷（与归还的 `try_take` 对称配平）。
+                self.budget_release(self.weight_of(&slot.obj));
                 return Some((slot.obj, idx));
             }
         }
@@ -935,15 +1169,15 @@ impl<T> ObjectPool<T> {
     /// 其后的那次裁剪覆盖。锁外的陈旧快照没有这个收敛保证——缩容并发归还时能把
     /// idle 永久顶在新上界之外（无任何再裁剪路径）。
     fn return_to_shard(&self, home: usize, obj: T) -> Option<T> {
+        let weight = self.weight_of(&obj);
         let shards = self.slots.len();
         let mut shard = lock(&self.slots[home]);
         take(&mut shard.borrowed, 1, "borrowed");
         let idle_cap = self.idle_cap.load(Ordering::Relaxed);
-        if shard.idle.len() < share(idle_cap, shards, home) {
-            shard.idle.push(IdleSlot {
-                obj,
-                last_used: Instant::now(),
-            });
+        // 字节裁决与片配额同一临界区：`try_take` 原子 check+act（失败无副作用
+        // ——额度从未占住，丢弃路径无需回卷）。
+        if shard.idle.len() < share(idle_cap, shards, home) && self.budget_admits(weight) {
+            shard.idle.push(IdleSlot { obj, last_used: Instant::now() });
             return None;
         }
         drop(shard); // 迁片前先放锁：逐片取锁、锁不嵌套
@@ -955,13 +1189,11 @@ impl<T> ObjectPool<T> {
             let max = self.max.load(Ordering::Relaxed);
             if candidate.idle.len() >= share(idle_cap, shards, idx)
                 || candidate.alive >= share(max, shards, idx)
+                || !self.budget_admits(weight)
             {
                 continue;
             }
-            candidate.idle.push(IdleSlot {
-                obj,
-                last_used: Instant::now(),
-            });
+            candidate.idle.push(IdleSlot { obj, last_used: Instant::now() });
             candidate.alive += 1;
             drop(candidate);
             take(&mut lock(&self.slots[home]).alive, 1, "universe alive");
@@ -987,11 +1219,39 @@ impl<T> ObjectPool<T> {
         let mut shard = lock(&self.slots[home]);
         shard.borrowed += 1;
     }
+
+    /// 单件字节计量（未启用字节配额的池恒 0——`weight`/`budget` 成对出现，
+    /// `budget: None` ⇒ `weight: None`）。调用点在片锁内；钩子体内禁 acquire
+    /// 同一池（见 [`WeightHook`]）。
+    fn weight_of(&self, obj: &T) -> usize {
+        self.weight.as_ref().map_or(0, |w| w(obj))
+    }
+
+    /// 向字节预算认领 `n`（未启用恒 true）。原子 check+act——失败即容量因
+    /// 丢弃（调用方计 `dropped_overflow`），无「认领一半」形态。
+    fn budget_admits(&self, n: usize) -> bool {
+        self.budget.as_ref().is_none_or(|b| b.try_take(n))
+    }
+
+    /// 字节回卷（借出 / prune / resize 裁剪的对称面；未启用恒 0 字节，短路）。
+    fn budget_release(&self, n: usize) {
+        if let Some(b) = self.budget.as_ref() {
+            b.give_back(n);
+        }
+    }
+
+    /// 池字节读数（metrics 用）：`(byte_budget, idle_bytes)`；未启用 `(0, 0)`。
+    fn budget_snapshot(&self) -> (usize, usize) {
+        match self.budget.as_ref() {
+            Some(b) => (b.total(), b.held()),
+            None => (0, 0),
+        }
+    }
 }
 
 impl<T> PoolManaged for ObjectPool<T> {
-    type Tuning = ObjectPoolTuning;
     type Metrics = ObjectPoolMetrics;
+    type Tuning = ObjectPoolTuning;
 
     fn resize(&self, tuning: ObjectPoolTuning) -> Result<(), PoolResizeError> {
         ObjectPool::resize(self, tuning)
@@ -1035,10 +1295,7 @@ impl<'p, T> Pooled<'p, T> {
     /// 交出所有权：对象彻底脱离池生命周期，调用方最后一个持有者放手即析构
     /// （池不钉住该对象，宇宙配额随件回吐）。
     pub fn detach(mut self) -> T {
-        let obj = self
-            .slot
-            .take()
-            .expect("pooled slot empty before detach (bookkeeping bug)");
+        let obj = self.slot.take().expect("pooled slot empty before detach (bookkeeping bug)");
         self.pool.release(self.home, !self.degraded);
         // 所有权已移交，归还路径不再运行（禁再回池）。
         std::mem::forget(self);
@@ -1050,26 +1307,19 @@ impl<T> std::ops::Deref for Pooled<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.slot
-            .as_ref()
-            .expect("pooled slot empty before drop (bookkeeping bug)")
+        self.slot.as_ref().expect("pooled slot empty before drop (bookkeeping bug)")
     }
 }
 
 impl<T> std::ops::DerefMut for Pooled<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        self.slot
-            .as_mut()
-            .expect("pooled slot empty before drop (bookkeeping bug)")
+        self.slot.as_mut().expect("pooled slot empty before drop (bookkeeping bug)")
     }
 }
 
 impl<T> Drop for Pooled<'_, T> {
     fn drop(&mut self) {
-        let obj = self
-            .slot
-            .take()
-            .expect("pooled slot empty on drop (bookkeeping bug)");
+        let obj = self.slot.take().expect("pooled slot empty on drop (bookkeeping bug)");
         self.pool.drop_handle(self.home, self.degraded, obj);
     }
 }
@@ -1097,10 +1347,7 @@ impl<T> Owned<T> {
     /// 交出所有权（同 [`Pooled::detach`]）：宇宙配额随件回吐，对象彻底脱离池生命
     /// 周期。`slot` 置空后本句柄的 `Drop` 只释放那份 `Arc`（不重复归还）。
     pub fn detach(mut self) -> T {
-        let obj = self
-            .slot
-            .take()
-            .expect("owned slot empty before detach (bookkeeping bug)");
+        let obj = self.slot.take().expect("owned slot empty before detach (bookkeeping bug)");
         self.pool.release(self.home, !self.degraded);
         obj
     }
@@ -1110,17 +1357,13 @@ impl<T> std::ops::Deref for Owned<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.slot
-            .as_ref()
-            .expect("owned slot empty before drop (bookkeeping bug)")
+        self.slot.as_ref().expect("owned slot empty before drop (bookkeeping bug)")
     }
 }
 
 impl<T> std::ops::DerefMut for Owned<T> {
     fn deref_mut(&mut self) -> &mut T {
-        self.slot
-            .as_mut()
-            .expect("owned slot empty before drop (bookkeeping bug)")
+        self.slot.as_mut().expect("owned slot empty before drop (bookkeeping bug)")
     }
 }
 
