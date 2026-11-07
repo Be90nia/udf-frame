@@ -76,6 +76,7 @@
 //! assert_eq!(c.expired(), 1); // fail-visible 过期计数
 //! ```
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,7 +88,7 @@ use skeleton::clock::Clock;
 /// 键指纹（log-embed 事件字段）：`DefaultHasher::new` 定长种子=进程内确定，
 /// 日志关联用（跨 Rust 版本不承诺稳定，仅身份对账非持久标识）。
 #[cfg(feature = "log-embed")]
-fn key_fingerprint<K: Hash>(k: &K) -> u64 {
+fn key_fingerprint<K: Hash + ?Sized>(k: &K) -> u64 {
     use std::hash::Hasher;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     k.hash(&mut h);
@@ -151,8 +152,13 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
         self.cap
     }
 
-    /// 键→槽号（只读查找，不 touch、不分配）。
-    fn idx_of(&self, k: &K) -> Option<u32> {
+    /// 键→槽号（只读查找，不 touch、不分配；`K: Borrow<Q>` 让 `String` 键可用
+    /// `&str` 直查，零分配）。
+    fn idx_of<Q>(&self, k: &Q) -> Option<u32>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.map.get(k).copied()
     }
 
@@ -221,13 +227,21 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
     }
 
     /// 不 touch 写值面（「更新值不刷新 recency」语义的唯一入口）。
-    fn peek_mut(&mut self, k: &K) -> Option<&mut V> {
+    fn peek_mut<Q>(&mut self, k: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let idx = self.idx_of(k)?;
         self.slots[idx as usize].value.as_mut()
     }
 
     /// touch 读 + 可变面（get=touch 语义的本体）。
-    fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+    fn get_mut<Q>(&mut self, k: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let idx = self.idx_of(k)?;
         self.move_to_front(idx);
         self.slots[idx as usize].value.as_mut()
@@ -282,13 +296,17 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
     }
 
     /// 摘除（返回值；不判过期不 touch——物理面）。
-    fn remove(&mut self, k: &K) -> Option<V> {
+    fn remove<Q>(&mut self, k: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let idx = self.idx_of(k)?;
         self.unlink(idx);
         let slot = &mut self.slots[idx as usize];
         let key = slot.key.take().expect(INV_LIVE);
         let value = slot.value.take().expect(INV_LIVE);
-        self.map.remove(&key);
+        self.map.remove::<K>(&key);
         self.free.push(idx);
         Some(value)
     }
@@ -881,9 +899,14 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
     }
 
     /// 读（touch + 惰性过期 + 命中计数）。过期条目按 miss（不计命中）。
-    pub fn get(&self, k: &K) -> Option<V>
+    ///
+    /// 借用键面（`K: Borrow<Q>`）：`K = String` 时可直接用 `&str` 查，热路径
+    /// 零分配（`HashMap::get` 的借用查询不透支键类型）。
+    pub fn get<Q>(&self, k: &Q) -> Option<V>
     where
         V: Clone,
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
     {
         let now = self.clock.now_instant();
         let mut g = self.lock_core();
@@ -986,12 +1009,16 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
     /// 惰性过期判定（语义同单线程版 [`TtlCache`]）：到期则回收+计数，返回
     /// 是否回收。计数走 [`AtomicU64`] 单点（free fn 形：guard 与计数分属
     /// 结构体字段，借参避免跨字段借用冲突）。
-    fn expire_if_due(
+    fn expire_if_due<Q>(
         g: &mut LruCore<K, TtlEntry<V>>,
         expired: &AtomicU64,
-        k: &K,
+        k: &Q,
         now: Instant,
-    ) -> bool {
+    ) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let due = matches!(g.peek_mut(k), Some(e) if e.expires <= now);
         if due {
             g.remove(k);

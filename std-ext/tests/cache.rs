@@ -604,6 +604,23 @@ fn expired_entry_never_returned_as_hit() {
     assert_eq!(c.expired(), 1, "惰性回收 fail-visible 计数");
 }
 
+// ---- 借用键查面（`K: Borrow<Q>`）：`String` 键用 `&str` 直查，零分配 ----
+
+#[test]
+fn sync_ttl_get_accepts_borrowed_key() {
+    let clock = Arc::new(MockClock::new());
+    let c = SyncTtlCache::<String, i32>::new(clock, 2);
+    let ttl = Duration::from_secs(60);
+    c.insert("a".to_string(), 1, ttl);
+    c.insert("b".to_string(), 2, ttl);
+    assert_eq!(c.get("a"), Some(1), "&str 直查 String 键（借用键面）");
+    assert_eq!(c.hits(), 1);
+    c.insert("c".to_string(), 3, ttl); // 满插逐 LRU 尾 → b（a 刚被 touch）
+    assert_eq!(c.get("b"), None, "借用键 get 与 owned 键同走 touch");
+    assert_eq!(c.get("a"), Some(1));
+    assert_eq!(c.evictions(), 1);
+}
+
 // ---- 验收：TTL 过期语义与单线程版一致（同一 MockClock 时间线逐点对表）----
 
 #[test]
