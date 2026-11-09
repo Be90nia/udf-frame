@@ -620,6 +620,19 @@ fn sync_ttl_get_accepts_borrowed_key() {
     assert_eq!(c.get("a"), Some(1));
     assert_eq!(c.evictions(), 1);
 }
+#[test]
+fn sync_ttl_borrowed_key_expires_lazily() {
+    let clock = Arc::new(MockClock::new());
+    let c = SyncTtlCache::<String, i32>::new(clock.clone(), 4);
+    c.insert("k".to_string(), 1, Duration::from_millis(100));
+    assert_eq!(c.get("k"), Some(1));
+    clock.advance(Duration::from_millis(150));
+    assert_eq!(c.get("k"), None, "借用键触碰过期条目 → miss + 惰性回收");
+    assert_eq!(c.hits(), 1, "过期触碰按 miss，命中计数不动");
+    assert_eq!(c.expired(), 1, "惰性回收 fail-visible 计数（借用键路径）");
+    assert_eq!(c.get("k"), None);
+    assert_eq!(c.expired(), 1, "已回收条目不再重复计数");
+}
 
 // ---- 验收：TTL 过期语义与单线程版一致（同一 MockClock 时间线逐点对表）----
 

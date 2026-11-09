@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Added（SyncTtlCache 借用键查面，2026-11-08；主仓 bd m6pkl N4，PR#24）
+- `SyncTtlCache::get` 泛化 `K: Borrow<Q>`（连带 `LruCore` 内部查找族 + `key_fingerprint` `?Sized`）：`String` 键可 `&str` 直查，查询热路径免每次 String 堆分配。旧调用 `get(&owned)` 源兼容（std `HashMap::get` / lru crate 同款 Borrow 惯例）；`insert`/`peek`/`contains`/`remove` 公共签名逐字未变。
+
 ### Changed（docs 闸清零 + CI 防回潮，2026-11-05）
 - 全 workspace `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps` **exit 0**：清零存量 rustdoc 告警 24 处（skeleton 2 / std-ext 9 / infra 13——intra-doc 断链修指向、私有项改代码字面、冗余显式链接目标删除、宏链接改字面、宏调用前 doc 注释改普通注释）。
 - `ci.yml` 新增 **Docs** 步（`env: RUSTDOCFLAGS=-D warnings` + `cargo doc --workspace --all-features --no-deps`）：消费方 CI 常带 docs 步，本仓先行自证不红，防回潮。
