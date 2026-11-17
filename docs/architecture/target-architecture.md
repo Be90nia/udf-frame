@@ -283,12 +283,12 @@ This is an evidence-driven sequence within the **existing workspace layout**. It
 
 ## 13. Acceptance criteria: current state versus remaining gap
 
-| Criterion | Current status | Required action |
+| Criterion | Current status | Required action |\n|---|---|---|
 |---|---|---|
-| Sync-only consumer has no Tokio in its dependency tree | **Already satisfied** for the reviewed skeleton-infra runtime feature graph | Add a CI assertion to prevent regression. |
-| Core Store contract can be implemented independently | **Already satisfied**: public skeleton::Store contract; SyncStore is an implementation | Preserve the public contract and avoid coupling it to runtime internals. |
-| Optional Tokio integration is feature-gated | **Already satisfied** in the reviewed dependency graph | Keep the regression check. |
-| Existing quickstart/tutorial material exists | **Already satisfied**: quickstart, driver tour, end-to-end example, and tutorial | Keep compiling; re-home only if a future facade is justified. |
+| Sync-only consumer has no Tokio in its dependency tree | **Satisfied but unpinned** for the reviewed skeleton-infra runtime feature graph | Add a CI assertion to prevent regression. |
+| Core Store contract can be implemented independently | **Satisfied but unpinned**: public skeleton::Store contract; SyncStore is an implementation | Preserve the public contract and avoid coupling it to runtime internals. |
+| Optional Tokio integration is feature-gated | **Satisfied but unpinned** in the reviewed dependency graph | Keep the regression check. |
+| Existing quickstart/tutorial material exists | **Satisfied but unpinned**: quickstart, driver tour, end-to-end example, and tutorial | Keep compiling; re-home only if a future facade is justified. |
 | Close and cancellation are distinct | **Implemented, but unpinned** in FxScope | Add regression/idempotency tests that pin close-gate behavior, cancellation behavior, and repeated calls. |
 | Shutdown report distinguishes timeout from actual termination | **Gap** | Extend report with explicit still-running and terminal outcome information. |
 | Thread creation failure cannot corrupt worker accounting or hang join | **Gap** | Complete #26 and deterministic spawn-failure tests. |
