@@ -73,8 +73,16 @@
 //!
 //! idle_cap 满 ⇒ 归还即丢弃（`dropped_overflow` +1）；[`ObjectPool::prune_idle`]
 //! 显式老化口（宿主按自己节奏调——**池不起后台线程**，不引生命周期暗面）；
-//! 池 drop ⇒ 全部 idle 析构（自然）。[`Pooled::detach`] 让对象彻底脱离池
+//! 池 drop ⇒ 全部 idle 析构 **+ 其认领的字节额度回卷**（`impl Drop`；共享
+//! [`ByteBudget`] 下不回卷会让额度在池死后永久不可用）。[`Pooled::detach`] 让对象彻底脱离池
 //! 生命周期：最后一个持有者放手即析构（Rust 天然，无额外回收器）。
+//!
+//! **析构记账的两条承重假设**（改动此处前先读）：①`weight` 钩子必须是留存
+//! 对象的**纯函数**——析构按钩子重算重量归还，非纯钩子 ⇒「归还合计 ≠ 认领
+//! 合计」⇒ 记账下溢 fail-fast（不是静默漂移）；②片锁中毒（前持锁者 panic）
+//! 时按 `PoisonError::into_inner` **尽力回卷、不 panic**——析构期数据已不可信，
+//! 「拒绝归还」严格更差，且在 unwind 中 panic 会让进程 abort。这是「记账 bug
+//! 一律 fail-fast」的**唯一刻意例外**。
 //!
 //! # 调用方红线（一手依据）
 //!
@@ -355,9 +363,14 @@ type WeightHook<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 /// bd d5i 实测），是对象池里最后一个跨线程单锁点。`held` 是 `AtomicUsize`，
 /// 搭配 CAS 循环：没有内核等待，`give_back` 的下溢判定仍在写盘前完成（不静默
 /// 钳位）。换后同口径实测：单线程 89-91 ns（原 103-105），4 线程 0.96-1.02 µs
-/// （原 1.95-2.16 µs）。**剩余 4 线程劣化不在账本原子本身**（同机隔离测量：
-/// 争用下 take+give 一对 32-107 ns），要归因得进 `ObjectPool` 借还路径做采集，
-/// 见 `verify/2026-11-17-p2-bytebudget-contention/`。
+/// （原 1.95-2.16 µs）。**剩余 4 线程成本仍在账本（作为整体），但不在其形态选择**：
+/// A/B 差分（同池同线程，唯一差异账本开/关）实测 1003 ns vs 102 ns ⇒ 约 900 ns
+/// 由「存在一份共享账本」这一事实本身贡献，而非 `Mutex`/CAS/分片的形态差异
+/// （争用下 take+give 一对 32-107 ns、真分片仍 696 ns——换形态都救不了）。
+/// 另注：**「4 线程 / 单线程」的倍数在此是伪指标**——分母（无预算臂）跨 run 在
+/// 84-418 ns 之间跳动，比值随之在 3.2x-10.8x 波动；绝对值才可比。判别手段：
+/// 同 run 内跑同码 dup 臂（`benches/infra.rs`），一致则读数可信。证据见
+/// `verify/2026-11-17-p3-objpool-ns-attribution/`。
 ///
 /// **为什么不分片（片内计数 + 线程亲和）**：分片账本在任何一种形态下都要么
 /// 丢掉下溢 fail-fast（`give_back` 回不到原片就无法逐片判定下溢），要么按
@@ -1414,6 +1427,14 @@ impl<T> Drop for ObjectPool<T> {
     /// `Owned` 持 `Arc`），也不存在「钩子还在跑」的窗口；经 `lock()` 反而会让
     /// 「钩子体内 drop 掉另一个池」这种无死锁的合法路径误报 panic——析构期
     /// panic 不可接受。
+    ///
+    /// **中毒片照样取回**（`PoisonError::into_inner`）：片锁中毒的来路是本 crate
+    /// 自己的 fail-fast——`weight` 钩子在 `pop_idle` / `prune_idle` / `resize` 的
+    /// 临界区内 panic，守卫 unwind 即毒化该片。此时数据可不可信已无关，**账本必须
+    /// 归还**（否则就是本单要修的「额度永久不可用」在异常路径上复现）；若析构正好
+    /// 发生在 unwind 中，沿用 `lock()` 的 panic 还会升级成**进程 abort**。这里**只**
+    /// 处理 `PoisonError`，其余 panic（含钩子再次 panic）照常传播——禁 `catch_unwind`
+    /// 吞一切，那会静默掩盖真实 bug。
     fn drop(&mut self) {
         if self.budget.is_none() {
             return;
@@ -1423,7 +1444,7 @@ impl<T> Drop for ObjectPool<T> {
             let doomed = {
                 let mut shard = shard_mutex
                     .lock()
-                    .expect("objpool lock poisoned (prior holder panicked)");
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 std::mem::take(&mut shard.idle)
             };
             idle_bytes += doomed
@@ -1432,6 +1453,8 @@ impl<T> Drop for ObjectPool<T> {
                 .sum::<usize>();
             drop(doomed); // 锁外析构
         }
+        // 逐片累积 ⇒ 本行对所有片（含取锁失败的中毒片）都必达：中毒片经
+        // `into_inner` 拿到的槽位照样计重。
         self.budget_release(idle_bytes);
     }
 }

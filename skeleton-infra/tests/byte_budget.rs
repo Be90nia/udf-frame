@@ -14,8 +14,10 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
+    time::{Duration, Instant},
 };
 
+use skeleton::clock::SystemClock;
 use skeleton_infra::objpool::{ByteBudget, ObjectPool};
 
 /// 耗尽态读数精确：认领到最后一字节才拒绝，拒绝不伪造成功。
@@ -50,11 +52,33 @@ fn no_fragmentation_when_many_small_pieces_are_held() {
 }
 
 /// 超大请求按 `checked_add` 拒绝，不靠回绕「看起来有余量」。
+///
+/// **必须带非零前置状态**：空账本时 `wrapping_add(0, MAX) = MAX > total`，回绕
+/// 实现也会拒绝（旧版测试因此在变异下照样绿）。`held == 1` 时
+/// `wrapping_add(1, MAX) = 0 <= total` ⇒ 回绕实现会受理并把账本清零，这条才钉得住。
 #[test]
 fn huge_request_is_refused_without_wrapping() {
     let budget = ByteBudget::new(1024);
-    assert!(!budget.try_take(usize::MAX));
-    assert!(!budget.try_take(1025));
+
+    // 空账本：超大请求被拒（回绕实现同样拒绝 —— 单靠这条没有鉴别力）
+    assert!(!budget.try_take(usize::MAX), "空账本也必须拒收 usize::MAX");
+    assert_eq!(budget.held(), 0);
+
+    // 非零前置：held == 1（wrapping_add(1, MAX) 回绕到 0，正是变异会受理的那一点）
+    assert!(budget.try_take(1));
+    let held_before = budget.held();
+    let available_before = budget.available();
+    assert_eq!(held_before, 1);
+
+    assert!(
+        !budget.try_take(usize::MAX),
+        "held == 1 时 usize::MAX 会回绕到 0（看起来有余量），必须拒收"
+    );
+    assert_eq!(budget.held(), held_before, "拒收不得改动账本");
+    assert_eq!(budget.available(), available_before, "拒收不得改动余额");
+    assert!(!budget.try_take(1024), "剩余 1023 字节，要 1024 必须拒收");
+
+    budget.give_back(1);
     assert_eq!(budget.held(), 0);
 }
 
@@ -381,6 +405,7 @@ fn concurrent_drop_and_take_never_breach_the_cap() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let breaches = Arc::new(AtomicUsize::new(0));
+    let samples = Arc::new(AtomicUsize::new(0));
     let churn_claims = Arc::new(AtomicUsize::new(0));
 
     thread::scope(|scope| {
@@ -388,11 +413,14 @@ fn concurrent_drop_and_take_never_breach_the_cap() {
             let budget = Arc::clone(&budget);
             let stop = Arc::clone(&stop);
             let breaches = Arc::clone(&breaches);
+            let samples = Arc::clone(&samples);
             scope.spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     if budget.held() > TOTAL {
                         breaches.fetch_add(1, Ordering::Relaxed);
                     }
+                    // 采样计数：没有它，「未越界」可能只是「一次都没采」的空转。
+                    samples.fetch_add(1, Ordering::Relaxed);
                 }
             })
         };
@@ -409,19 +437,45 @@ fn concurrent_drop_and_take_never_breach_the_cap() {
                 }
             })
         };
-        // 两个池在与 churn 交错的另一个线程里析构。
+        // ① 采样线程必须真的先跑起来：否则「未越界」可能一次都没采（空转假绿）。
+        let started = Instant::now();
+        while samples.load(Ordering::Relaxed) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "采样线程未能启动"
+            );
+            thread::yield_now();
+        }
+        let before_drop = samples.load(Ordering::Relaxed);
+
+        // ② 两个池在与 churn 交错的另一个线程里析构。
         let doomed: Vec<ObjectPool<Vec<u8>>> = pools.drain(..2).collect();
         scope
             .spawn(move || drop(doomed))
             .join()
             .expect("析构线程不得 panic");
 
+        // ③ 让并发窗口覆盖「析构刚完成」这一段（churn 仍在借还、采样仍在采样）。
+        let tail = Instant::now();
+        while tail.elapsed() < Duration::from_millis(20) {
+            thread::yield_now();
+        }
+        let after_drop = samples.load(Ordering::Relaxed);
+
         stop.store(true, Ordering::Relaxed);
         churn.join().expect("churn 线程不得 panic");
         sampler.join().expect("采样线程不得 panic");
+        assert!(
+            after_drop > before_drop,
+            "采样必须跨过析构窗口继续发生（{before_drop} → {after_drop}）"
+        );
     });
 
     drop(pools);
+    assert!(
+        samples.load(Ordering::Relaxed) > 0,
+        "采样线程必须真的采到过样本（否则「未越界」是空转假绿）"
+    );
     assert_eq!(
         breaches.load(Ordering::Relaxed),
         0,
@@ -433,4 +487,63 @@ fn concurrent_drop_and_take_never_breach_the_cap() {
     );
     assert_eq!(budget.held(), 0, "全部池 drop 后账目必须精确归零");
     assert_eq!(budget.available(), TOTAL);
+}
+
+/// 片锁中毒后析构：**不得 panic**，且中毒片里剩余的 idle 字节照样回卷。
+///
+/// 中毒怎么来（本 crate 自己的 fail-fast 造出来的）：片锁内跑用户 `weight` 钩子，
+/// 钩子 panic ⇒ 守卫 unwind ⇒ 该片锁中毒。此后任何 `lock()` 都会 panic；析构期
+/// 若沿用 `lock()`，则 ①`Drop` 中途 panic（若本就在 unwind 中 ⇒ **进程 abort**），
+/// ②本次要修的那个「额度永久不可用」在异常路径上复现。
+#[test]
+fn drop_survives_a_poisoned_shard_and_returns_its_idle_bytes() {
+    let budget = Arc::new(ByteBudget::new(1024));
+    let armed = Arc::new(AtomicBool::new(false));
+    let pool = {
+        let armed = Arc::clone(&armed);
+        ObjectPool::with_shared_byte_quota(
+            16,
+            16,
+            || vec![0u8; 100],
+            Arc::clone(&budget),
+            move |buf: &Vec<u8>| {
+                if armed.load(Ordering::Relaxed) {
+                    panic!("weight hook boom");
+                }
+                buf.len()
+            },
+        )
+    };
+
+    // 两件都落在 main 的 home 片（idle_cap = 16 ⇒ 8 片 × 每片 2 槽）。
+    assert!(pool.insert(vec![0u8; 100]).is_none());
+    assert!(pool.insert(vec![0u8; 100]).is_none());
+    assert_eq!(budget.held(), 200);
+
+    // 让钩子在**持片锁时**panic：`prune_idle` 先移出一件再计量 ⇒ 该片锁中毒，
+    // 且片里还剩 1 件（100B）待回卷。
+    armed.store(true, Ordering::Relaxed);
+    let poisoned = catch_unwind(AssertUnwindSafe(|| {
+        pool.prune_idle_with_clock(Duration::ZERO, &SystemClock);
+    }));
+    assert!(
+        poisoned.is_err(),
+        "钩子 panic 必须照常传播（禁 catch_unwind 吞掉）"
+    );
+    assert_eq!(
+        budget.held(),
+        200,
+        "panic 路径上已移出的那件不释放（既有行为，本单不动）"
+    );
+
+    // 中毒后析构：只处理 PoisonError（取回槽位），其余 panic 照常传播。
+    armed.store(false, Ordering::Relaxed); // 场景是「锁中毒」，不是「钩子永远炸」
+    let dropped = catch_unwind(AssertUnwindSafe(move || drop(pool)));
+    assert!(dropped.is_ok(), "片锁中毒时 Drop 不得 panic");
+    assert_eq!(
+        budget.held(),
+        100,
+        "中毒片里剩余的 idle 字节必须回卷（取锁失败也要计入）"
+    );
+    assert_eq!(budget.available(), 924);
 }
