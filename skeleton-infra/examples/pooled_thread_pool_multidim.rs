@@ -9,9 +9,10 @@
 //! 七维对表（派单契约）：
 //! ①全链零分配（ZST 任务 end-to-end alloc=0；Box 类型擦除包装单列如实报数）
 //! ②组合往返锚（提交含借还的完整周期）③N 并发提交者吞吐曲线（1/2/4/8）
-//! ④组合 resize 代价（压场调参 + 缩容/借空联合语义溢出/拒绝行为锚）
-//! ⑤组合延迟分布 p50/p99 ⑥等待者零自旋确认（借空等待+队列等待两处）
-//! ⑦组合态伪共享（双池计数隔离 + 组合计数热点）
+//! ④组合 resize 代价（压场调参 + 缩容/借空降级联合语义溢出/拒绝行为锚）
+//! ⑤组合延迟分布 p50/p99 ⑥等待者零自旋确认（队列等待一处；借空无等待点——
+//!   ObjectPool 永不阻塞，饱和当场降级直构）⑦组合态伪共享（双池计数隔离 +
+//!   降级计数热点）
 //!
 //! 口径注（沿 multidim 惯例）：
 //! ① CountingAllocator 常驻本二进制（内存维前提），计时含每分配 2 次 Relaxed
@@ -25,15 +26,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use skeleton_infra::memgov::{CountingAllocator, MemoryPool, MemoryTuning};
+use skeleton_infra::memgov::CountingAllocator;
+use skeleton_infra::objpool::{ObjectPool, ObjectPoolTuning};
 use skeleton_infra::pool::{ThreadPool, ThreadPoolTuning};
 use skeleton_infra::pooled_thread_pool::PooledThreadPool;
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;
-
-/// 组合借用超时（D21 同源；零自旋臂单发另配）。
-const BORROW_TIMEOUT: Duration = Duration::from_millis(100);
 
 fn pct(sorted: &[u64], p: usize) -> u64 {
     sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
@@ -55,28 +54,24 @@ fn combo(
     core: usize,
     max: usize,
     queue_cap: usize,
-    mem_max: usize,
-    mem_idle: usize,
-    borrow_timeout: Duration,
+    buf_max: usize,
+    buf_idle: usize,
 ) -> PooledThreadPool<Vec<u8>> {
     PooledThreadPool::new(
-        Arc::new(MemoryPool::<Vec<u8>>::new(mem_max, mem_idle, Vec::new)),
+        Arc::new(ObjectPool::<Vec<u8>>::new(buf_max, buf_idle, Vec::new)),
         ThreadPool::new(ThreadPoolTuning::new(core, max, queue_cap)),
-        borrow_timeout,
     )
 }
 
-/// 预热内存池（工厂/容量分配挪出热窗，沿 memory_pool_profile 惯例）。
-fn prewarm(mem: &MemoryPool<Vec<u8>>, n: usize) {
-    let warm: Vec<_> = (0..n)
-        .filter_map(|_| mem.acquire(BORROW_TIMEOUT).ok())
-        .collect();
+/// 预热缓冲池（工厂/idle 槽位分配挪出热窗，沿 memory_pool_profile 惯例）。
+fn prewarm(pool: &ObjectPool<Vec<u8>>, n: usize) {
+    let warm: Vec<_> = (0..n).map(|_| pool.acquire()).collect();
     drop(warm);
 }
 
 /// 固定量提交风暴：`submitters` 线程各提交 n/submitters 件（任务=借缓冲→碰一件
-/// →计数完成）。返回 (完成数, 受理数, 提交拒绝数, 借空弃件数, 风暴耗时)。
-/// 排空判据 = 账目恒等式：完成 + 拒绝 + 借弃 ≥ 受理。
+/// →计数完成）。返回 (完成数, 受理数, 提交拒绝数, 借空降级件数, 风暴耗时)。
+/// 排空判据 = 账目恒等式：完成 + 拒绝 ≥ 受理（降级件照常跑完，不丢工作）。
 fn storm(
     ptp: &PooledThreadPool<Vec<u8>>,
     submitters: usize,
@@ -85,7 +80,7 @@ fn storm(
     let done = Arc::new(AtomicU64::new(0));
     let accepted = Arc::new(AtomicU64::new(0));
     let refused = Arc::new(AtomicU64::new(0));
-    let br0 = ptp.borrow_rejected();
+    let deg0 = ptp.buffer_pool().metrics().degraded;
     let t0 = Instant::now();
     std::thread::scope(|s| {
         for _ in 0..submitters {
@@ -116,16 +111,14 @@ fn storm(
     });
     let elapsed = t0.elapsed();
     wait_until(Duration::from_secs(30), || {
-        done.load(Ordering::Relaxed)
-            + refused.load(Ordering::Relaxed)
-            + (ptp.borrow_rejected() - br0)
+        done.load(Ordering::Relaxed) + refused.load(Ordering::Relaxed)
             >= accepted.load(Ordering::Relaxed)
     });
     (
         done.load(Ordering::Relaxed),
         accepted.load(Ordering::Relaxed),
         refused.load(Ordering::Relaxed),
-        ptp.borrow_rejected() - br0,
+        ptp.buffer_pool().metrics().degraded - deg0,
         elapsed,
     )
 }
@@ -146,8 +139,8 @@ fn main() {
 /// 闸住后整批入队，live 差=队列中存活的分配数。ZST 任务全链恰 1/提交（Box 类型
 /// 擦除包装；借还+执行 0，对照臂同二进制直借直还 10k=0 佐证）。
 fn dim1_combo_allocs() {
-    let ptp = combo(2, 2, 32_768, 64, 64, BORROW_TIMEOUT);
-    prewarm(ptp.mem_pool(), 64);
+    let ptp = combo(2, 2, 32_768, 64, 64);
+    prewarm(ptp.buffer_pool(), 64);
     // 闸住两个 worker（无锁 AtomicBool 闸门——零 Mutex/unwrap，worker 自旋占位，
     // 被测 N 件任务的 Box 分配存活在队列里，闸门隔离释放窗）
     let gate = Arc::new(AtomicBool::new(false));
@@ -172,7 +165,7 @@ fn dim1_combo_allocs() {
         .unwrap()
     };
     let done = Arc::new(AtomicU64::new(0));
-    // ZST 任务臂：f 无捕获，包装闭包仍携带 mem/计数 Arc——量的是组合全链下限。
+    // ZST 任务臂：f 无捕获，包装闭包仍携带池/计数 Arc——量的是组合全链下限。
     let before = CountingAllocator::live_allocs();
     for _ in 0..N {
         submit_one(&ptp, &done);
@@ -181,7 +174,7 @@ fn dim1_combo_allocs() {
     // 对照臂：同池直借直还（无提交无 Box），稳态应=0
     let p0 = CountingAllocator::live_allocs();
     for _ in 0..10_000 {
-        drop(ptp.mem_pool().acquire(BORROW_TIMEOUT).unwrap());
+        drop(ptp.buffer_pool().acquire());
     }
     let pool_only = CountingAllocator::live_allocs() - p0;
     assert_eq!(allocs, N as usize, "ZST 任务全链每提交恰 1 Box，禁其他分配");
@@ -207,7 +200,7 @@ fn dim1_combo_allocs() {
         .unwrap();
     }
     wait_until(Duration::from_secs(5), || ptp.threads().metrics().busy == 2);
-    // 捕获任务臂：f 捕获一枚 Arc——包装闭包仍携带 mem/计数 Arc，量 f 捕获的增量。
+    // 捕获任务臂：f 捕获一枚 Arc——包装闭包仍携带池/计数 Arc，量 f 捕获的增量。
     let done2 = Arc::new(AtomicU64::new(0));
     let before = CountingAllocator::live_allocs();
     for _ in 0..N {
@@ -235,8 +228,8 @@ fn dim1_combo_allocs() {
 
 /// ②组合往返锚：1 worker 空闲，submit→borrow→exec→return 全程批均。
 fn dim2_roundtrip() {
-    let ptp = combo(1, 1, 32_768, 64, 64, BORROW_TIMEOUT);
-    prewarm(ptp.mem_pool(), 64);
+    let ptp = combo(1, 1, 32_768, 64, 64);
+    prewarm(ptp.buffer_pool(), 64);
     let done = Arc::new(AtomicU64::new(0));
     wait_until(Duration::from_secs(5), || ptp.threads().metrics().idle == 1);
     let n = 20_000u64;
@@ -262,14 +255,14 @@ fn dim2_roundtrip() {
 
 /// ③N 并发提交者吞吐曲线：core=2/max=8（需求性扩容可上台），1/2/4/8 提交者。
 fn dim3_throughput() {
-    println!("③N 并发提交者吞吐（每臂 100k 任务，core=2 max=8 queue=32k，mem 64 预热）:");
+    println!("③N 并发提交者吞吐（每臂 100k 任务，core=2 max=8 queue=32k，buf 64 预热）:");
     for submitters in [1usize, 2, 4, 8] {
-        let ptp = combo(2, 8, 32_768, 64, 64, BORROW_TIMEOUT);
-        prewarm(ptp.mem_pool(), 64);
-        let (done, _accepted, refused, _br, elapsed) = storm(&ptp, submitters, 100_000);
+        let ptp = combo(2, 8, 32_768, 64, 64);
+        prewarm(ptp.buffer_pool(), 64);
+        let (done, _accepted, refused, _deg, elapsed) = storm(&ptp, submitters, 100_000);
         let tps = done as f64 / elapsed.as_secs_f64();
         println!(
-            "    submitters={submitters:>2}  completed={done}  tps={:>10.0}  提交拒绝={refused}  借弃={_br}  wall={:.0}ms",
+            "    submitters={submitters:>2}  completed={done}  tps={:>10.0}  提交拒绝={refused}  降级={_deg}  wall={:.0}ms",
             tps,
             elapsed.as_millis(),
         );
@@ -279,11 +272,11 @@ fn dim3_throughput() {
 }
 
 /// ④组合 resize 代价：4a 压场调参调用时延；4b 缩容/越界归还确定性语义锚；
-/// 4c 借空 Discard 等价 + shutdown Abort 锚（两独立计数不混账）。
+/// 4c 借空降级直构 + shutdown Abort 锚（两独立计数不混账）。
 fn dim4_resize_combo() {
-    // 4a 压场调参：4 提交者风暴中 200 次交替（tp 缩/扩 + mem 缩/扩各一拍/次）
-    let ptp = combo(2, 8, 32_768, 64, 64, BORROW_TIMEOUT);
-    prewarm(ptp.mem_pool(), 64);
+    // 4a 压场调参：4 提交者风暴中 200 次交替（tp 缩/扩 + buf 缩/扩各一拍/次）
+    let ptp = combo(2, 8, 32_768, 64, 64);
+    prewarm(ptp.buffer_pool(), 64);
     let stop = Arc::new(AtomicBool::new(false));
     let accepted = Arc::new(AtomicU64::new(0));
     std::thread::scope(|s| {
@@ -307,8 +300,8 @@ fn dim4_resize_combo() {
                 ptp.threads()
                     .resize(ThreadPoolTuning::new(1, 2, 32_768))
                     .unwrap();
-                ptp.mem_pool()
-                    .resize(MemoryTuning {
+                ptp.buffer_pool()
+                    .resize(ObjectPoolTuning {
                         max: 8,
                         idle_cap: 8,
                     })
@@ -317,8 +310,8 @@ fn dim4_resize_combo() {
                 ptp.threads()
                     .resize(ThreadPoolTuning::new(2, 8, 32_768))
                     .unwrap();
-                ptp.mem_pool()
-                    .resize(MemoryTuning {
+                ptp.buffer_pool()
+                    .resize(ObjectPoolTuning {
                         max: 64,
                         idle_cap: 64,
                     })
@@ -329,7 +322,7 @@ fn dim4_resize_combo() {
         let mean = samples.iter().sum::<u64>() as f64 / samples.len() as f64;
         samples.sort_unstable();
         println!(
-            "④a 组合压场调参（tp+mem 各一拍/次）: mean={mean:.0}ns p99={}ns（4 提交者风暴中 200 次）",
+            "④a 组合压场调参（tp+buf 各一拍/次）: mean={mean:.0}ns p99={}ns（4 提交者风暴中 200 次）",
             pct(&samples, 99),
         );
         stop.store(true, Ordering::Relaxed);
@@ -338,25 +331,33 @@ fn dim4_resize_combo() {
     ptp.threads().join();
 
     // 4b 缩容+越界归还联合语义（确定性序列，断言计数账目；queue=512 容下 100 任务突发）
-    let ptp = combo(2, 2, 512, 4, 4, BORROW_TIMEOUT);
-    prewarm(ptp.mem_pool(), 4);
-    let h1 = ptp.mem_pool().acquire(BORROW_TIMEOUT).unwrap();
-    let h2 = ptp.mem_pool().acquire(BORROW_TIMEOUT).unwrap();
-    ptp.mem_pool()
-        .resize(MemoryTuning {
+    // 4 件预热（分片 4、每片 1 件）→ 缩容 idle_cap=1：片 1..3 新配额 0 ⇒ 裁剪 3 件；
+    // 随后借出 2 件（1 复用 + 1 新建），归还有 1 件片配额 0 溢出。
+    let ptp = combo(2, 2, 512, 4, 4);
+    prewarm(ptp.buffer_pool(), 4);
+    ptp.buffer_pool()
+        .resize(ObjectPoolTuning {
             max: 4,
             idle_cap: 1,
         })
         .unwrap();
-    let m = ptp.mem_pool().metrics();
-    assert_eq!(m.core.idle, 1, "缩容弃超额闲置");
-    assert_eq!(m.core.borrowed, 2, "缩容不夺借出");
+    let m = ptp.buffer_pool().metrics();
+    assert_eq!(m.core.idle, 1, "缩容后只留片 0 的一件（其余片新配额 0）");
+    assert_eq!(m.core.borrowed, 0, "缩容前零在借");
+    assert_eq!(
+        m.core.dropped_overflow, 3,
+        "缩容裁剪走容量因（三件超新片配额）"
+    );
+    let h1 = ptp.buffer_pool().acquire();
+    let h2 = ptp.buffer_pool().acquire();
+    let m = ptp.buffer_pool().metrics();
+    assert_eq!(m.core.borrowed, 2, "缩容不夺借出：两件各有主");
     drop(h1);
     drop(h2);
-    let m = ptp.mem_pool().metrics();
-    assert_eq!(m.core.dropped_overflow, 2, "越界归还=溢出丢弃计数");
+    let m = ptp.buffer_pool().metrics();
     assert_eq!(m.core.borrowed, 0);
-    assert_eq!(m.core.idle, 1);
+    assert_eq!(m.core.idle, 1, "归还件仅片 0 留一件，其余片配额 0");
+    assert_eq!(m.core.dropped_overflow, 4, "越界归还再加 1 件溢出丢弃");
     // 缩容不丢任务：worker 2→1，100 任务全完成零拒绝
     ptp.threads()
         .resize(ThreadPoolTuning::new(1, 1, 512))
@@ -378,25 +379,13 @@ fn dim4_resize_combo() {
     ptp.threads().shutdown();
     ptp.threads().join();
     println!(
-        "④b 缩容联合语义锚: 弃超额闲置 1 件 / 借出保留 2 件 / 越界归还溢出丢弃 2 件 / 缩容后 100 任务零丢失零拒绝 ✓"
+        "④b 缩容联合语义锚: 缩容裁剪 3 件（片配额 0）/ 借出保留 2 件 / 越界归还溢出 1 件 / 缩容后 100 任务零丢失零拒绝 ✓"
     );
 
-    // 4c 借空=Discard 等价（20ms 借用超时）+ shutdown 后提交=Abort 退还
-    let ptp = combo(1, 1, 64, 2, 2, Duration::from_millis(20));
-    prewarm(ptp.mem_pool(), 2);
-    let held: Vec<_> = (0..2)
-        .filter_map(|_| ptp.mem_pool().acquire(Duration::from_millis(50)).ok())
-        .collect();
-    for _ in 0..5u64 {
-        ptp.submit(|buf: &mut Vec<u8>| {
-            black_box(buf.is_empty());
-        })
-        .unwrap();
-    }
-    wait_until(Duration::from_secs(5), || ptp.borrow_rejected() == 5);
-    let tm = ptp.threads().metrics();
-    assert_eq!(tm.rejected, 0, "借空不污染提交侧计数（两独立计数）");
-    drop(held);
+    // 4c 借空=降级直构（永不丢任务）+ shutdown 后提交=Abort 退还
+    let ptp = combo(1, 1, 64, 2, 2);
+    prewarm(ptp.buffer_pool(), 2);
+    let held: Vec<_> = (0..2).map(|_| ptp.buffer_pool().acquire()).collect();
     let done = Arc::new(AtomicU64::new(0));
     for _ in 0..5u64 {
         let d = Arc::clone(&done);
@@ -407,6 +396,11 @@ fn dim4_resize_combo() {
         .unwrap();
     }
     wait_until(Duration::from_secs(5), || done.load(Ordering::Relaxed) == 5);
+    let tm = ptp.threads().metrics();
+    assert_eq!(tm.rejected, 0, "借空不污染提交侧计数（两独立计数）");
+    let m = ptp.buffer_pool().metrics();
+    assert_eq!(m.degraded, 5, "宇宙被占满：5 件任务各降级直构一次");
+    drop(held);
     ptp.threads().shutdown();
     let err = ptp
         .submit(|buf: &mut Vec<u8>| {
@@ -418,14 +412,14 @@ fn dim4_resize_combo() {
     assert_eq!(tm.rejected, 1, "shutdown 后提交=Abort 拒绝计数");
     ptp.threads().join();
     println!(
-        "④c 借空/拒绝行为锚: 借空弃件 borrow_rejected=5（提交侧 rejected=0）→ 归还后 5 任务全完成 → shutdown 后提交 Err+rejected=1 ✓（账目恒等式 完成5+借弃5=受理10）"
+        "④c 借空/拒绝行为锚: 借空降级直构 degraded=5（提交侧 rejected=0）→ 5 任务全完成 → shutdown 后提交 Err+rejected=1 ✓（零丢弃）"
     );
 }
 
 /// ⑤组合延迟分布：submit→完成 e2e 单发采样 p50/p99/max。
 fn dim5_latency_dist() {
-    let ptp = combo(1, 1, 32_768, 64, 64, BORROW_TIMEOUT);
-    prewarm(ptp.mem_pool(), 64);
+    let ptp = combo(1, 1, 32_768, 64, 64);
+    prewarm(ptp.buffer_pool(), 64);
     let done = Arc::new(AtomicU64::new(0));
     wait_until(Duration::from_secs(5), || ptp.threads().metrics().idle == 1);
     let n = 5000u64;
@@ -455,12 +449,12 @@ fn dim5_latency_dist() {
 }
 
 /// ⑥等待者零自旋确认两处：6a 队列等待（worker park 在池调度 condvar）；
-/// 6b 借空等待（worker park 在内存池 condvar）。park 判据：µs 级=OS 挂起被唤醒；
-/// ns 级即自旋。
+/// 6b 借空**无等待点**（ObjectPool 永不阻塞——宇宙饱和当场降级直构）。park 判据：
+/// µs 级=OS 挂起被唤醒；ns 级即自旋。
 fn dim6_zero_spin() {
     // 6a 队列等待：深 park 200ms 后单发任务
-    let ptp = combo(1, 1, 64, 8, 8, BORROW_TIMEOUT);
-    prewarm(ptp.mem_pool(), 8);
+    let ptp = combo(1, 1, 64, 8, 8);
+    prewarm(ptp.buffer_pool(), 8);
     let warm = Arc::new(AtomicU64::new(0));
     let w = Arc::clone(&warm);
     ptp.submit(move |buf: &mut Vec<u8>| {
@@ -488,51 +482,51 @@ fn dim6_zero_spin() {
     ptp.threads().shutdown();
     ptp.threads().join();
 
-    // 6b 借空等待：唯一缓冲被持有，worker 在借处 park；持有者 200ms 后 RAII 归还
-    let ptp = combo(1, 1, 64, 1, 1, Duration::from_secs(5));
-    let holder = ptp.mem_pool().acquire(Duration::from_millis(100)).unwrap();
+    // 6b 借空无等待点：唯一缓冲被持有达 200ms 以上也不影响——任务降级直构当场跑完
+    let ptp = combo(1, 1, 64, 1, 1);
+    let holder = ptp.buffer_pool().acquire();
     let done = Arc::new(AtomicU64::new(0));
     let d = Arc::clone(&done);
+    let t0 = Instant::now();
     ptp.submit(move |buf: &mut Vec<u8>| {
         black_box(buf.is_empty());
         d.fetch_add(1, Ordering::Relaxed);
     })
     .unwrap();
-    std::thread::sleep(Duration::from_millis(200)); // worker 已 park 在内存池 condvar
-    let t0 = Instant::now();
-    drop(holder); // RAII 归还 → notify_one → worker 借到并完成
     while done.load(Ordering::Acquire) != 1 {
         std::hint::spin_loop();
     }
-    println!(
-        "⑥b 借空深park(200ms)后归还唤醒至完成={}µs（borrow-park 判据同上）",
-        t0.elapsed().as_micros()
+    let borrow_us = t0.elapsed().as_micros();
+    assert!(
+        borrow_us < 100_000,
+        "持有者不放也须当场完成（无 borrow-park 点）"
     );
+    println!(
+        "⑥b 借空零等待（持有者不放，任务降级直构照跑）={borrow_us}µs（ObjectPool 结构上无 borrow-park 点）"
+    );
+    drop(holder);
     ptp.threads().shutdown();
     ptp.threads().join();
 }
 
 /// ⑦组合态伪共享：7a 双池计数隔离（2 线程各撞各池 vs 共撞一池——≈2×=池间零线
-/// 干扰，池内衰减=单权威锁竞争）；7b 组合计数热点（借空风暴每任务烧共享
-/// borrow_rejected 原子 vs 正常借还稳态）。
+/// 干扰，池内衰减=片锁/亲和竞争）；7b 组合计数热点（饱和降级风暴每任务烧共享
+/// `degraded`/`constructed` 原子 vs 正常借还稳态）。
 fn dim7_false_sharing() {
     // 7a 双池隔离
-    let pa = Arc::new(MemoryPool::<Vec<u8>>::new(64, 64, Vec::new));
-    let pb = Arc::new(MemoryPool::<Vec<u8>>::new(64, 64, Vec::new));
+    let pa = Arc::new(ObjectPool::<Vec<u8>>::new(64, 64, Vec::new));
+    let pb = Arc::new(ObjectPool::<Vec<u8>>::new(64, 64, Vec::new));
     prewarm(&pa, 64);
     prewarm(&pb, 64);
-    let hammer = |pool: Arc<MemoryPool<Vec<u8>>>, stop: Arc<AtomicBool>| -> u64 {
+    let hammer = |pool: Arc<ObjectPool<Vec<u8>>>, stop: Arc<AtomicBool>| -> u64 {
         let mut ops = 0u64;
         while !stop.load(Ordering::Relaxed) {
-            if let Ok(g) = pool.acquire(Duration::from_millis(10)) {
-                black_box(g.is_empty());
-                drop(g);
-                ops += 1;
-            }
+            black_box(pool.acquire().is_empty());
+            ops += 1;
         }
         ops
     };
-    let run2 = |a: Arc<MemoryPool<Vec<u8>>>, b: Arc<MemoryPool<Vec<u8>>>| -> u64 {
+    let run2 = |a: Arc<ObjectPool<Vec<u8>>>, b: Arc<ObjectPool<Vec<u8>>>| -> u64 {
         let stop = Arc::new(AtomicBool::new(false));
         let (s1, s2) = (Arc::clone(&stop), Arc::clone(&stop));
         let h1 = std::thread::spawn(move || hammer(a, s1));
@@ -544,45 +538,41 @@ fn dim7_false_sharing() {
     let dual = run2(Arc::clone(&pa), Arc::clone(&pb));
     let shared = run2(Arc::clone(&pa), Arc::clone(&pa));
     println!(
-        "⑦a 双池计数隔离: 各撞各池={dual} ops/s vs 共撞一池={shared} ops/s ratio={:.2}x（≈2x=池间零线干扰；衰减部分=池内单权威锁竞争，见 MemoryPool ③）",
+        "⑦a 双池计数隔离: 各撞各池={dual} ops/s vs 共撞一池={shared} ops/s ratio={:.2}x（ObjectPool 分片+线程亲和下 ≈1x 是预期：池内隔离已由分片实现，池间零线干扰在本件不可见）",
         dual as f64 / shared.max(1) as f64
     );
 
-    // 7b 组合计数热点：借空风暴（borrow_timeout=ZERO 非阻塞尝试，每任务烧共享
-    // borrow_rejected 原子）vs 正常借还稳态（该原子零触碰=冷路径设计）。
-    let ptp = combo(4, 4, 32_768, 4, 4, Duration::ZERO);
-    let held: Vec<_> = (0..4)
-        .filter_map(|_| ptp.mem_pool().acquire(Duration::from_millis(50)).ok())
-        .collect();
-    let (_d, accepted, refused, br, elapsed) = storm(&ptp, 4, 40_000);
+    // 7b 组合计数热点：饱和降级风暴（宇宙被占满，每任务烧共享 degraded/
+    // constructed 原子）vs 正常借还稳态（两原子零触碰=冷路径设计）。
+    let ptp = combo(4, 4, 32_768, 4, 4);
+    let held: Vec<_> = (0..4).map(|_| ptp.buffer_pool().acquire()).collect();
+    let (done, accepted, refused, deg, elapsed) = storm(&ptp, 4, 40_000);
     assert_eq!(refused, 0);
-    assert_eq!(br, accepted, "借空风暴：每受理任务恰一次 borrow_rejected");
-    let storm_tps = br as f64 / elapsed.as_secs_f64();
+    assert_eq!(done, accepted, "降级不丢工作：受理任务全跑完");
+    assert_eq!(deg, accepted, "降级风暴：每受理任务恰一次降级直构");
+    let storm_tps = deg as f64 / elapsed.as_secs_f64();
     drop(held);
     ptp.threads().shutdown();
     ptp.threads().join();
 
-    let ptp = combo(4, 4, 32_768, 64, 64, BORROW_TIMEOUT);
-    prewarm(ptp.mem_pool(), 64);
-    let (done, _accepted, refused, br, elapsed) = storm(&ptp, 4, 40_000);
+    let ptp = combo(4, 4, 32_768, 64, 64);
+    prewarm(ptp.buffer_pool(), 64);
+    let (done, _accepted, refused, deg, elapsed) = storm(&ptp, 4, 40_000);
     assert_eq!(refused, 0);
-    assert_eq!(br, 0, "正常借还稳态零 borrow_rejected 触碰");
+    assert_eq!(deg, 0, "正常借还稳态零降级（降级计数原子零触碰）");
     let normal_tps = done as f64 / elapsed.as_secs_f64();
     ptp.threads().shutdown();
     ptp.threads().join();
     println!(
-        "⑦b 组合计数热点: 借空风暴（每任务烧共享原子）={storm_tps:.0} /s vs 正常借还（原子零触碰）={normal_tps:.0} /s",
+        "⑦b 组合计数热点: 饱和降级风暴（每任务烧共享原子）={storm_tps:.0} /s vs 正常借还（原子零触碰）={normal_tps:.0} /s",
     );
     println!(
-        "    （设计注: borrow_rejected 为弃件路径冷计数——稳态借还零共享原子写，热点只在持续借空故障态）"
+        "    （设计注: degraded/constructed 为饱和路径计数——稳态借还零共享原子写，热点只在宇宙持续饱和态）"
     );
 
-    let m = ptp.mem_pool().metrics();
+    let m = ptp.buffer_pool().metrics();
     println!(
-        "final sanity: borrowed={} (expect 0) idle={} dropped_overflow={} borrow_rejected={}",
-        m.core.borrowed,
-        m.core.idle,
-        m.core.dropped_overflow,
-        ptp.borrow_rejected(),
+        "final sanity: borrowed={} (expect 0) idle={} dropped_overflow={} degraded={}",
+        m.core.borrowed, m.core.idle, m.core.dropped_overflow, m.degraded,
     );
 }
