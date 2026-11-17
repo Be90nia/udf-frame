@@ -1,8 +1,8 @@
 # UDF Target Architecture Blueprint
 
-> Status: proposed target architecture (ADR seed)
-> Scope: `udf-frame` as a reusable Rust framework; Xray is the first integration/validation consumer.
-> Compatibility: evolutionary migration; do not rewrite the current crates in one step.
+> Status: accepted architectural principles; implementation plan narrowed by repository review (2026-11-17).
+> Scope: udf-frame as a reusable Rust framework; Xray is the first substantial integration/validation consumer.
+> Compatibility: evolutionary migration. This document describes responsibilities and contracts; it is not an instruction to rename crates or rearrange the workspace now.
 
 ## 1. Product goal
 
@@ -10,243 +10,249 @@ UDF should make common application infrastructure safe, composable, observable, 
 
 The product promise is **sensible defaults + opt-in capabilities + explicit resource/lifecycle semantics**. "Zero learning curve" is an aspiration for the happy path, not a literal guarantee: advanced users must still be able to configure execution, resource budgets, and failure policies.
 
-Core principles:
+### Core principles (retained)
 
 1. Pay only for capabilities enabled/used.
 2. Keep synchronous and asynchronous applications first-class.
 3. Keep core contracts independent from concrete runtimes and I/O.
 4. Make cancellation, shutdown, backpressure, and resource limits explicit.
-5. Prefer safe Rust; isolate and document any unavoidable unsafe implementation.
-6. Never claim a performance win without a reproducible benchmark and correctness evidence.
+5. Prefer safe Rust; isolate and document any unavoidable unsafe implementation, and require correctness evidence rather than treating comments as proof.
+6. Never claim a performance win without reproducible benchmarks and correctness evidence.
 7. Keep protocol/application hot paths outside the generic state-management runtime unless profiling proves otherwise.
 
-## 2. Target architecture
+These principles are accepted constraints. The decisions below narrow the implementation path; they do not weaken or replace the principles.
 
-```mermaid
-flowchart TB
-  APP["Application / Domain<br/>Xray · Web · DB · CLI · Embedded"]
-  FACADE["udf facade (optional)<br/>prelude · profiles · builder"]
-  CORE["udf-core<br/>Action · State · Reducer · Effect · Store contracts"]
-  CONTRACTS["udf-contracts<br/>Clock · Config · Resource · Journal · Observability ports"]
-  RUNTIME["udf-runtime<br/>SyncStore · dispatch · snapshots · effect orchestration"]
-  EXEC["Execution adapters"]
-  SYNC["udf-executor-sync<br/>threads · blocking work · sync task groups"]
-  TOKIO["udf-tokio<br/>Tokio tasks · cancellation tree · async task groups"]
-  RES["udf-resource<br/>budgets · permits · pools · metrics"]
-  ADAPTERS["udf-adapters<br/>serde · tracing · journal backends · config"]
-  TEST["udf-testing<br/>conformance · mocks · fault injection"]
-  APP --> FACADE
-  FACADE --> CORE
-  FACADE --> RUNTIME
-  FACADE --> EXEC
-  CORE --> CONTRACTS
-  RUNTIME --> CORE
-  RUNTIME --> CONTRACTS
-  EXEC --> CONTRACTS
-  SYNC --> EXEC
-  TOKIO --> EXEC
-  RES --> CONTRACTS
-  ADAPTERS --> CONTRACTS
-  TEST --> CORE
-  TEST --> RUNTIME
-```
+## 2. Architectural boundaries and current crate ownership
 
-### Dependency rules
+The architecture is defined first by **logical responsibility and dependency direction**, not by the number or names of Cargo crates.
 
-- `udf-core`: ideally zero third-party dependencies and no Tokio/IO.
-- `udf-contracts`: small capability ports and value types; must not depend on concrete adapters.
-- `udf-runtime`: synchronous state machine/store runtime. It must not require Tokio merely to use SyncStore.
-- `udf-executor-sync`: optional synchronous/thread execution support.
-- `udf-tokio`: optional Tokio adapter. Tokio types stay behind this crate's public adapter boundary.
-- `udf-resource`: reusable budgets, permits, pools, and metrics. Allocator-specific storage stays in adapters/consumers.
-- `udf-adapters-* `: integrations are independently feature/crate gated.
-- `udf-testing`: conformance tests and test utilities; no production dependency path.
-- `udf`: optional facade/re-export crate with ergonomic defaults. It must not force optional dependencies into minimal consumers.
+    Application / Domain (Xray · Web · DB · CLI · Embedded)
+       ├── Pure state semantics (Action · State · Reducer · Effect · Store contract)
+       ├── Synchronous execution (SyncStore · dispatch · sync task execution)
+       ├── Async edges/adapters (Tokio tasks · async I/O · cancellation integration)
+       └── Shared infrastructure (pools · budgets · journal · observability · diagnostics)
+    
+    All paths share runtime-neutral contracts; sync and async execution remain distinct.
 
-The existing `skeleton`, `std-ext`, and `skeleton-infra` remain compatibility packages during migration. Do not rename all crates or break public APIs as the first step. Split only where dependency graphs and ownership boundaries justify it.
+### Current package mapping
+
+| Logical responsibility | Current home / decision |
+|---|---|
+| Runtime-neutral base contracts, including Clock | udf-skeleton (skeleton). Keep the existing public contract home; ADR-0001 deliberately placed Clock here. |
+| Standard utilities (cache, retry, scheduler, rate limit, IDs) | udf-std-ext (std-ext), depending on the small, zero-third-party udf-skeleton contract crate. |
+| Store, effects, scopes, runtime integration and infrastructure | Existing udf-skeleton-infra modules, with internal logical boundaries kept explicit. |
+| Tokio integration | Existing feature-gated runtime integration. Tokio must remain absent from sync-only dependency graphs. |
+| Xray protocol, sockets, relay/data plane and concrete buffer allocator | Xray consumer repository; not moved into UDF. |
+
+Do not create a second Clock abstraction or a parallel contracts crate. In particular, udf-contracts in an earlier diagram was a proposed logical responsibility, **not an approved new crate**. For the current workspace, skeleton remains the canonical home for its existing runtime-neutral contracts. If future evidence justifies a crate split, move the contracts in one coordinated migration and preserve one canonical API/home.
+
+### Crate-splitting rule
+
+Keep the current crate names, paths, and public APIs during the present implementation steps. Do not perform a workspace-wide rename, directory move, or create a facade/adapters/testing/resource crate merely to match a diagram.
+
+Extract a new Cargo crate only when at least one concrete condition is demonstrated:
+
+- an independent consumer needs to depend on that capability without pulling unrelated code;
+- the dependency graph requires a boundary that cannot be enforced adequately with current module/feature boundaries;
+- independent versioning, publication, ownership, or compilation isolation provides a measured benefit;
+- a second structurally different consumer validates that the proposed public boundary is genuinely reusable.
+
+A logical module boundary is useful even when it remains in the same Cargo package. The target tree is therefore intentionally not prescribed here.
 
 ## 3. Synchronous and asynchronous model
 
-Sync and async are two supported execution modes, not one abstraction that forces every caller to use async.
+Sync and async are two first-class execution modes. They share semantics and runtime-neutral contracts, but they do not need identical APIs or one universal executor abstraction.
 
-```mermaid
-flowchart LR
-  subgraph SYNC["Synchronous application"]
-    SA["caller thread"] --> SD["Sync dispatch / SyncStore"]
-    SD --> SR["pure Reducer"]
-    SR --> SE["sync Effect executor"]
-    SE --> SQ["bounded sync queue / thread adapter (optional)"]
-  end
-  subgraph ASYNC["Asynchronous application"]
-    AA["Tokio task"] --> AD["async ingress / bounded channel"]
-    AD --> AR["single-writer state owner"]
-    AR --> AE["async Effect executor"]
-    AE --> AT["Tokio TaskGroup + CancellationToken"]
-  end
-  CORE["shared Core contracts and domain types"]
-  SD --- CORE
-  AD --- CORE
-```
+    SYNC: caller thread -> sync dispatch / SyncStore -> pure synchronous reducer -> sync effects / bounded sync executor
+    ASYNC: Tokio task -> async ingress / bounded channel -> single-writer state owner -> async effects / Tokio tasks
+    HYBRID: sync core / reducer / state -> async edge adapter -> async I/O / Tokio
+            async completion -> explicit message/dispatch boundary -> sync core
 
 Rules:
-- Reducers remain synchronous, deterministic, and side-effect free in both modes. Async I/O belongs in Effects/adapters.
+
+- Reducers remain synchronous, deterministic, and side-effect free in every topology. Async I/O belongs at Effects/adapters or application edges.
 - A synchronous consumer must not pull Tokio into its dependency tree.
-- An async consumer may use the Tokio adapter; do not create a second async scheduler.
+- An async consumer may use the Tokio adapter; UDF must not create a second general-purpose async scheduler.
 - Do not hide blocking work inside async executor workers. Route it to an explicitly bounded blocking executor.
 - Do not force async traits into the core solely to make APIs look uniform. Share semantics and value types; let adapters expose idiomatic sync/async APIs.
-- Queue bounds, overload behavior, ordering guarantees, and shutdown semantics must be documented for each mode.
+- In a sync-core/async-edge topology, the core must never block waiting for async completion. Async work reports completion through an explicit message/dispatch boundary.
+- Queue bounds, overload behavior, ordering guarantees, and shutdown semantics must be documented for each execution path.
 
 ## 4. Lifecycle and cancellation model
 
-```mermaid
-stateDiagram-v2
-  [*] --> Running
-  Running --> Closing: close gate / reject new work
-  Closing --> Cancelling: signal cooperative cancellation
-  Cancelling --> Draining: wait for owned work until deadline
-  Draining --> Terminated: all owned work completed
-  Draining --> TimedOut: deadline reached / report survivors
-  TimedOut --> Terminated: ownership released; survivors explicitly reported
-```
+    Running -> Closing (close gate / reject new work)
+            -> Cancelling (signal cooperative cancellation)
+            -> Draining (wait for owned work until deadline)
+            -> Terminated (all owned work completed)
+            -> TimedOut (deadline reached / report survivors)
 
-Keep separate operations and semantics:
-- `close_gate`: stop accepting new work; does not imply cancellation.
-- `cancel`: signal cooperative cancellation to owned work and descendants.
-- `drain(deadline)`: wait for tracked work and collect outcomes.
-- `abort`: runtime-specific best-effort task abort; not a universal guarantee for blocking threads.
-- `shutdown(deadline)`: orchestrate the above and return a structured report.
+Keep these operations distinct:
 
-Use a cancellation tree for parent-child propagation. In Tokio, use `CancellationToken` child tokens rather than one watcher task per child scope where semantics permit. The task registry remains a separate concern: cancellation signals do not prove that work has stopped.
+- close_gate: stop accepting new work; does not imply cancellation.
+- cancel: signal cooperative cancellation to owned work and descendants.
+- drain(deadline): wait for tracked work and collect outcomes.
+- abort: runtime-specific best-effort task abort; not a universal guarantee for blocking threads.
+- shutdown(deadline): orchestrate the above and return a structured report.
 
-A timeout means the caller stopped waiting. It does not mean a synchronous thread was forcibly terminated. Reports must distinguish completed, cancelled, panicked, failed, timed out, and still-running work.
+The semantic distinctions are invariants:
 
-## 5. Resource model
+- close is not cancel;
+- a cancellation signal is not proof that work stopped;
+- timeout means the caller stopped waiting, not that work terminated;
+- aborting an async task is not equivalent to terminating a synchronous thread.
+
+Use parent-child cancellation propagation where a runtime supports it. In Tokio, prefer child cancellation tokens over one watcher task per child scope where semantics permit. The task registry remains separate: cancellation signals do not prove that work has stopped.
+
+### Current gap and scope
+
+- FxScope already distinguishes close() from cancellation and has shutdown/timeout/abort operations. Preserve those semantics with regression tests.
+- Its current ShutdownReport is too small to distinguish actual termination from the caller timing out. Extend the report so at minimum it distinguishes still_running from timed_out, and represents completed/cancelled/panicked/failed outcomes without conflating them.
+- A synchronous ThreadPool::drain(deadline) is deferred until a real sync consumer needs that contract. Do not add a speculative API without a consumer.
+- Xray-specific ConnScope/ArmScope ownership, watcher-task elimination, and inbound lifecycle wiring belong in xray-core-rust, not this repository.
+
+## 5. Resource model: admission, observation, and pool policy
 
 Separate enforcement from observation:
 
-- `ResourceBudget`: configured hard limits (bytes, tasks, connections, queue slots).
-- `ResourcePermit`: atomic/serialized reservation acquired before resource creation; RAII release.
-- `ResourceMetrics`: borrowed/idle/high-water/denied counters; never used as the sole hard-limit authority.
-- `PoolBackend`: allocation/reuse strategy owned by the consumer or adapter.
-- `PoolPolicy`: idle retention, eviction, size classes, and overflow behavior.
+- **Admission authority**: the synchronized counter, budget, or permit that decides whether a resource may be created/acquired. It must have a clear linearization point.
+- **Metrics**: borrowed/idle/high-water/denied counters for observation. Metrics must not be the sole hard-limit authority.
+- **Pool backend**: allocation/reuse strategy owned by the consumer or adapter.
+- **Pool policy**: idle retention, eviction, size classes, and overflow behavior.
 
-A hard cap must use an atomic reservation/permit protocol (or a lock with a clear linearization point), not check-then-act metrics. Buffer allocation remains replaceable: Xray may keep `xray-buf` as its allocator while UDF provides generic permits and lifecycle-safe leases.
+A hard cap must use an atomic reservation/permit protocol or a lock-protected check-and-act operation. It must not use an unsynchronized check-then-act sequence.
 
-Avoid per-acquire heap allocations in lease/drop paths unless benchmarks justify them. Prefer concrete lease types or enum dispatch over boxed `FnOnce` closures in known hot paths, while retaining a generic extension point for uncommon backends.
+### Current implementation findings
+
+The review of the current repository did not find the alleged check-then-act race in the identified admission paths:
+
+- MemoryPool::acquire checks and increments inner.created under the same mutex.
+- ObjectPool::claim_growth checks and increments shard.alive under the shard lock; share() maintains the aggregate bound.
+- ObjectPool byte quota uses ByteBudget::try_take with a mutex-held check-and-act operation.
+- PoolBase::note_borrow is metrics, not admission authority.
+
+Therefore, do not introduce a generic ResourcePermit subsystem merely to fix a race that is not present here. ByteBudget already provides a bytes-dimension reservation primitive. The remaining local documentation task is to state precisely what each configured maximum bounds (for example, total live objects = idle + borrowed versus active leases only).
+
+If a corresponding race exists in Xray's concrete buffer pool, investigate and fix it in the Xray consumer repository, where that admission path lives.
+
+Avoid per-acquire heap allocations in lease/drop paths unless benchmarks justify them. Prefer concrete lease types or enum dispatch over boxed FnOnce closures in known hot paths, while retaining generic extension points for uncommon backends.
 
 ## 6. Effect execution and backpressure
 
 Effects should declare intent/policy rather than implicitly choosing an executor:
+
 - Immediate: execute inline, bounded work only.
 - Async: runtime-native async operation.
 - Blocking: bounded blocking executor.
 - CpuBound: optional CPU pool adapter.
 - Deferred/Batch: explicit queue and flush policy.
 
-Every queued execution path needs a capacity and overflow policy: wait, reject, drop-newest, drop-oldest, or caller-runs where semantically safe. Cancellation, deadline, retry budget, and shutdown drain behavior must be explicit. Avoid an executor abstraction that silently moves arbitrary work between sync and async contexts.
+Every queued execution path needs a capacity and overflow policy: wait, reject, drop-newest, drop-oldest, or caller-runs where semantically safe. Cancellation, deadline, retry budget, and shutdown drain behavior must be explicit.
 
-## 7. Proposed source tree (target, not an immediate migration instruction)
+Do not add a new executor abstraction that silently moves arbitrary work between sync and async contexts. The sync and async edges may have different mechanics while preserving shared lifecycle, failure, and backpressure semantics.
 
-```text
-udf/
-├── Cargo.toml                    # workspace
-├── crates/
-│   ├── udf-core/                 # minimal UDF semantics and traits
-│   │   └── src/{action,effect,reducer,store,subscription}.rs
-│   ├── udf-contracts/            # runtime-neutral capability ports
-│   │   └── src/{clock,config,resource,journal,observability}.rs
-│   ├── udf-std/                  # cache/retry/backoff/rate-limit/scheduler
-│   ├── udf-runtime/              # SyncStore, dispatch loop, snapshots, effects
-│   ├── udf-executor-sync/        # sync task groups and bounded blocking pool
-│   ├── udf-tokio/                # Tokio task groups, cancellation and adapters
-│   ├── udf-resource/             # budgets, permits, pools, metrics
-│   ├── udf-adapters/
-│   │   ├── serde/
-│   │   ├── tracing/
-│   │   ├── journal-jsonl/
-│   │   └── config-env/
-│   ├── udf-testing/              # conformance and fault-injection utilities
-│   └── udf/                      # optional facade/prelude/profiles
-├── docs/
-│   ├── architecture/
-│   │   ├── target-architecture.md
-│   │   ├── decisions/
-│   │   └── diagrams/
-│   ├── guides/
-│   │   ├── quickstart-sync.md
-│   │   ├── quickstart-tokio.md
-│   │   └── choosing-executors.md
-│   └── performance/
-├── examples/
-│   ├── sync-minimal/
-│   ├── tokio-minimal/
-│   ├── bounded-worker/
-│   └── custom-resource-backend/
-└── tests/
-    ├── conformance/
-    ├── lifecycle/
-    ├── fault-injection/
-    └── compatibility/
-```
+## 7. Error model
 
-This tree is a destination proposal. The first migration should preserve the existing crate layout and extract boundaries incrementally.
+Infrastructure APIs must make failure classes and recovery semantics explicit. Avoid collapsing operational failures into panics or a single opaque error.
 
-## 8. Ergonomics and "zero-friction" adoption
+| Error class | Examples | Expected handling |
+|---|---|---|
+| Configuration / construction | invalid limits, incompatible options, unavailable backend | Return a typed error before publishing partially initialized state; caller may correct configuration and retry. |
+| Admission / overload | queue full, budget exhausted, task rejected | Return an observable rejection; do not silently drop work. Retry only under an explicit caller policy/deadline. |
+| Execution | effect failure, worker task failure, I/O failure | Preserve operation context and surface the failure to its owner; isolation policy determines whether sibling work continues. |
+| Cancellation | cooperative cancellation requested | Represent as cancellation, not success and not an unexpected runtime failure. |
+| Timeout | deadline elapsed while waiting | Report timeout and any still-running work separately; never imply termination. |
+| Runtime / infrastructure | OS thread spawn failure, executor unavailable, channel closed | Return a typed operational error; keep internal accounting consistent and the runtime usable where possible. |
+| Panic / invariant violation | task panic, internal state invariant broken | Isolate task panics where promised; invariant corruption must not be disguised as ordinary rejection or silently recovered. |
 
-Provide a layered experience:
+Rules:
 
-1. **Minimal path:** one facade dependency and a tiny sync or Tokio quickstart.
-2. **Guided defaults:** `Balanced` profile, safe queue bounds, clear shutdown defaults, and useful diagnostics.
-3. **Opt-in capabilities:** resource pools, journal, tracing, CPU executor, etc. only when enabled.
-4. **Advanced control:** users can inject their own executor, allocator, clock, journal, and policy.
-5. **No hidden global runtime:** constructing a facade must not silently spawn threads or start background tasks unless the selected capability explicitly documents that behavior.
+- Prefer typed errors at public boundaries; preserve source errors and relevant operation/context information.
+- A rejection is a result visible to the submitter, not an invisible metric increment.
+- Error reporting must distinguish the operation failing from the runtime itself becoming unavailable.
+- Structured shutdown reports summarize lifecycle outcomes; they do not replace the original operation errors.
+- Panics are not a substitute for ordinary error propagation. Reserve panic for violated internal invariants where continuing would be unsound.
 
-Cargo features are compile-time capability selection, not runtime dynamic plugin loading. If runtime loading is ever needed, it should be a separate plugin mechanism with an explicit security and ABI story.
+## 8. Source organization and optional integrations
 
-Profiles are policy bundles, not magical universal optimizers:
-- Balanced: conservative defaults and bounded queues.
-- LowLatency: avoid unnecessary queues/hops; caller-runs only where safe.
-- HighThroughput: batching and larger bounded queues where benchmarked.
-- BoundedResource: strict budgets and fail-fast/reject behavior.
+The earlier multi-crate tree (core/contracts/runtime/executors/resource/adapters/testing/facade) is withdrawn as an immediate construction plan. Its names may still be useful as **logical module labels**, but they do not authorize new packages or a workspace migration.
 
-## 9. Safety, correctness, and performance gates
+For now:
+
+- preserve skeleton, std-ext, and skeleton-infra as the existing package boundaries;
+- enforce dependency direction through module design, Cargo features, and CI checks;
+- keep Tokio optional and absent from sync-only dependency graphs;
+- keep test utilities and fault injection out of production dependency paths;
+- add adapters only when an actual integration consumer needs them.
+
+A facade/prelude may be considered after crate boundaries are stable and a second structurally different consumer demonstrates the ergonomic need. Profiles such as Balanced, LowLatency, HighThroughput, and BoundedResource are deferred until there is a facade and real consumer evidence. They are policy bundles, not universal optimizers, and should not become public API in advance of demonstrated use cases.
+
+Cargo features are compile-time capability selection, not runtime dynamic plugin loading. If runtime loading is ever needed, it must be a separate plugin mechanism with an explicit security and ABI story.
+
+## 9. Safety, correctness, and performance evidence
 
 Before optimizing a primitive:
+
 - define its linearization points and lifecycle invariants;
 - add deterministic tests for races and failure paths;
-- run stress tests and (where applicable) Loom/Miri;
-- compare against a safe baseline;
+- run stress tests and, where applicable, Loom/Miri;
+- compare against a safe reference for the specific unsafe primitive or invariant being optimized;
 - benchmark single-thread and contended workloads;
-- report throughput, p50/p95/p99/p999, allocations/op, bytes/op, lock wait, queue depth, RSS, context switches, and task leaks.
+- report metrics that are meaningful for the workload and platform.
 
-For `SyncStore` unsafe internals:
-- document every unsafe invariant adjacent to the code;
-- maintain a safe reference implementation for differential tests;
-- exercise reentrancy, panic, snapshot clone/drop, subscription and shutdown interleavings;
-- run Miri and suitable concurrency model tests;
-- do not remove the safe baseline until evidence supports doing so.
+### Unsafe implementation evidence
 
-No lock-free queue, work-stealing scheduler, sharded JoinSet, or allocator rewrite should be accepted without a benchmark demonstrating a material improvement on representative workloads.
+A local SAFETY comment is necessary documentation, not proof of correctness. The evidence must exercise the invariant that makes the unsafe operation sound.
+
+For the current DrainExclusive<T> unsafe concentration point:
+
+- keep each unsafe block's local safety explanation, but make it explicit who establishes and maintains the external drain-exclusion invariant;
+- build a debug/feature-gated Mutex-backed reference for DrainExclusive itself, not a second full implementation of SyncStore;
+- add differential tests for observable dispatch behavior;
+- add deterministic invariant tests covering concurrent dispatch with snapshot clone/drop and subscription register/unregister, proving no aliasing of effect_buf / notify_cache;
+- test panic/unwind paths to ensure the drain flag remains consistent;
+- run Miri only on the pure-std subset it can execute; record the exact test subset and result. A Loom model of the drain-flag exclusion may be added if its value justifies the dependency and maintenance cost.
+
+The evidence deliverable must be explicit and owned by a tracked task. It must not be deferred to "whoever next touches the code." A full safe rewrite of SyncStore is not required to establish evidence for this one unsafe abstraction.
+
+### Performance practice
+
+Do not commit machine-specific benchmark numbers as universal baselines or impose unstable cross-platform thresholds. The repository's scheduled performance workflow uses rolling baselines and published artifacts/trends; keep that practice.
+
+Keep separate gates for:
+
+1. correctness and deterministic failure-path tests;
+2. stress/concurrency and lifecycle/resource conformance;
+3. benchmark compilation in CI;
+4. scheduled performance tracking with environment-aware comparisons.
+
+The concrete benchmark gap identified in review is the pool/permit dimension: acquire/release, saturation/rejection, and contention. Add it after the relevant correctness path is stable. A lifecycle/resource conformance suite must follow the runtime-neutral contract definition; it must not encode unspecified semantics. Collect p50/p95/p99, allocations, queue depth, RSS, or context-switch data only where the workload and platform make those measurements meaningful.
+
+No lock-free queue, work-stealing scheduler, sharded JoinSet, or allocator rewrite should be accepted without a benchmark demonstrating a material improvement on representative workloads and correctness evidence for the associated invariants.
 
 ## 10. Xray integration boundary
 
-Xray owns protocol semantics, socket I/O, buffer allocator choice, and proxy data-plane optimization. UDF owns reusable lifecycle, state-flow, generic resource-budget and execution contracts.
+Xray owns protocol semantics, socket I/O, buffer allocator choice, and proxy data-plane optimization. UDF owns reusable lifecycle, state-flow, generic execution contracts, and resource primitives that have demonstrated more than one use.
 
 - Xray's network read/write/relay path stays on Tokio and protocol-native code.
-- Xray's `xray-buf` remains the concrete buffer backend; UDF may provide permits/metrics.
-- Xray should consume UDF via a narrow `xray-frame` facade rather than importing UDF implementation internals throughout `xray-core`.
-- Instance/Framework lifecycle ownership must converge on one coordinator and one structured shutdown report.
-- Dynamic inbound removal must release its scope registry ownership.
+- Xray's xray-buf remains the concrete buffer backend; UDF does not replace it with a speculative generic allocator.
+- Xray should consume UDF through a narrow integration boundary rather than importing implementation internals throughout xray-core.
+- Instance/Framework lifecycle ownership should converge on one coordinator and one structured shutdown report in the consumer repository.
+- Dynamic inbound removal must release its scope registry ownership in the consumer repository.
+- Do not route packet/read/write hot paths through generic Action/Reducer/Effect dispatch.
 
-## 11. Migration order
+## 11. Migration and implementation order
 
-1. Correctness fixes: thread creation rollback; scope unregister; resource permit semantics; shutdown timeout reporting.
-2. Establish benchmarks and a safe SyncStore baseline; audit unsafe invariants.
-3. Specify sync/async executor and lifecycle contracts with conformance tests.
-4. Extract std-ext's runtime-neutral dependencies so it can be consumed without the UDF runtime.
-5. Introduce optional adapters and a facade with sync/Tokio quickstarts.
-6. Split crates only after dependency boundaries are stable and tested.
-7. Validate with Xray and a second, structurally different application.
+This is an evidence-driven sequence within the **existing workspace layout**. It is not a crate-renaming schedule.
+
+1. **P0 — ThreadPool spawn failure correctness**: make spawn fallible, define the worker-accounting publication point, propagate submit rejection/resize errors, and inject deterministic spawn failures. The live-worker count must match actual workers; failed creation must never leave join waiting for a phantom worker.
+2. **P0 — DrainExclusive unsafe evidence**: produce the bounded Mutex-reference differential harness, aliasing/exclusion invariant tests, panic/unwind tests, and recorded Miri subset result. SAFETY comments alone do not close this task.
+3. **P1 — Lifecycle report contract**: extend ShutdownReport to distinguish timed-out waiting from still-running work and represent terminal outcomes; pin existing close/cancel semantics with idempotency tests.
+4. **P1 — Error taxonomy**: align public errors and rejection/reporting paths with §7, beginning with thread creation and lifecycle operations.
+5. **P1 — Architecture regression checks**: keep the sync-only dependency graph free of Tokio with a CI cargo tree assertion; preserve existing feature isolation and public Store contract.
+6. **P2 — Resource semantics documentation**: document the exact universe bounded by each pool maximum. Investigate any check-then-act race in Xray's buffer pool in the Xray repository, not by adding an unused UDF subsystem.
+7. **P2 — Performance coverage**: add pool acquire/release, saturation/rejection, and contention benchmarks after the corresponding correctness changes. Add lifecycle/resource conformance tests only after their contracts are specified.
+8. **Deferred — consumer-driven extraction**: facade, profiles, independent adapter/testing/resource crates, and workspace renames wait for stable boundaries and a second structurally different consumer. Existing quickstarts and tutorials should be retained; do not rewrite them merely to match a proposed future facade.
+9. **Consumer-repository work**: Xray ConnScope/ArmScope, watcher task topology, buffer-pool admission, and protocol/data-plane integration are tracked and implemented in xray-core-rust.
 
 ## 12. Non-goals
 
@@ -255,15 +261,26 @@ Xray owns protocol semantics, socket I/O, buffer allocator choice, and proxy dat
 - Turning every network packet/read/write into a UDF dispatch.
 - Claiming zero allocation or zero contention for all workloads.
 - One executor/pool policy that is optimal for every application.
+- Creating Cargo crates to mirror conceptual boxes before a real dependency/consumer boundary exists.
 - Runtime dynamic loading via Cargo features.
+- Shipping policy profiles without a concrete consumer and measured need.
 
-## 13. Acceptance criteria for the architecture
+## 13. Acceptance criteria: current state versus remaining gap
 
-- A sync-only consumer builds without Tokio in its dependency tree.
-- A Tokio consumer can use task scopes and cancellation without spawning one watcher task per child scope.
-- Core contracts can be implemented by a minimal third-party Store/Executor without depending on internal crates.
-- Hard resource limits cannot be exceeded under concurrent acquisition.
-- Shutdown reports distinguish timeout from actual termination.
-- Optional adapters do not enter the dependency tree unless enabled.
-- Both sync and async quickstarts are short, compile-tested examples.
-- A second non-proxy application passes the same lifecycle/resource conformance suite.
+| Criterion | Current status | Required action |
+|---|---|---|
+| Sync-only consumer has no Tokio in its dependency tree | **Already satisfied** for the reviewed skeleton-infra runtime feature graph | Add a CI assertion to prevent regression. |
+| Core Store contract can be implemented independently | **Already satisfied**: public skeleton::Store contract; SyncStore is an implementation | Preserve the public contract and avoid coupling it to runtime internals. |
+| Optional Tokio integration is feature-gated | **Already satisfied** in the reviewed dependency graph | Keep the regression check. |
+| Existing quickstart/tutorial material exists | **Already satisfied**: quickstart, driver tour, end-to-end example, and tutorial | Keep compiling; re-home only if a future facade is justified. |
+| Close and cancellation are distinct | **Already satisfied** in FxScope | Keep regression/idempotency tests. |
+| Shutdown report distinguishes timeout from actual termination | **Gap** | Extend report with explicit still-running and terminal outcome information. |
+| Thread creation failure cannot corrupt worker accounting or hang join | **Gap** | Complete #26 and deterministic spawn-failure tests. |
+| DrainExclusive unsafe invariant has executable evidence | **Gap** | Complete the bounded differential and invariant-test deliverable in §9. |
+| Resource maxima have documented semantics | **Partial** | State exactly what each maximum bounds; do not introduce a generic permit layer without a consumer. |
+| Pool admission/permit performance is measured | **Gap** | Add focused benchmark group after correctness work. |
+| Lifecycle/resource conformance semantics are specified | **Partial / dependent** | Define the runtime-neutral contract first, then test it. |
+| Facade and policy profiles are needed by multiple consumers | **Not yet demonstrated** | Defer until a second structurally different consumer provides evidence. |
+| A second non-proxy application passes conformance | **Future validation target** | Use this as a trigger for extracting reusable crates and broadening public API, not as a reason to pre-build them. |
+
+The acceptance criteria describe observable properties. They do not imply that every property requires a new crate or a new abstraction.
