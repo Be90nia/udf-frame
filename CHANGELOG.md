@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+### Fixed（`ObjectPool` 析构不回卷 idle 字节额度，2026-11-17；bd udf-frame-m34）
+- 新增 `impl Drop for ObjectPool`：逐片摘下 idle 槽（片锁立即释放）→ 锁外按权重钩子汇总字节 → 循环外一次 `ByteBudget::give_back`。共享 `Arc<ByteBudget>` 场景下，此前丢弃一个池会让它占住的额度**永久不可用**直到进程结束；现在随池析构归还（`available()` 立即恢复）。
+- 未启用字节预算的池在 `Drop` 首行早退（零开销），字段随后照常析构；锁序沿用「池片锁 → 预算叶子锁」单向、锁不嵌套；析构路径**不复用**内部 `lock()` 助手（其 debug 重入防呆会在「钩子体内 drop 另一个池」这种无死锁路径误报 panic）。
+- 新增 4 测试（`tests/byte_budget.rs`）：drop 回卷、回收额度仍受全局硬上限、私有/无预算池 drop 回归、并发「drop × try_take × 采样」不击穿 `held <= total` 且终态归零。红-绿证据：实现前 3 个行为测试失败（400≠200 / 0≠300 / 800≠0）。
+
+### Changed（`ByteBudget` 账本换型：`Mutex<usize>` → 原子 CAS，2026-11-17；bd udf-frame-d5i）
+- `held` 改 `AtomicUsize` + `fetch_update`：`try_take` 仍一次性 check+act（**无**先加后回滚窗口）、`give_back` 下溢在写盘前 fail-fast（计数不被 wrap）、`held()` 改无锁 `Relaxed` 快照。语义逐条不变，零公开 API / 零依赖变化。
+- 实测（同机同口径）：单线程 103–105 ns → **89–91 ns**（改善 13%）；4 线程 1.95–2.16 µs → **0.96–1.02 µs**（**2.1×**）。
+- **契约目标「4 线程 ≤2× 单线程」未达成**（实际 ~10.8×）——分片方案也真做了并实测（4 线程 696 ns、单线程退化 15 ns）后回滚。三重隔离测量排除账本形态：裸 counter CAS 4 线程 92–107 ns、持片锁+共享 line 原子 15.9 ns/往返（= 单线程）、真分片仍 696 ns ⇒ 剩余 ~600 ns 在 `ObjectPool` 借还路径其他环节（另票跟进，见 `udf-frame-p6x`）。
+
+### Fixed（测试：`fx_lifecycle` 的 deadline 断言确定化，2026-11-17；bd udf-frame-k4p）
+- 根因：tokio 的「任务 poll 返回 `Ready` → 标记 COMPLETE」与「另一线程 `abort()` → 置 CANCELLED」之间存在内部竞窗；deadline 路径上「正常完成/panic 落哪个桶」因此**不可断言**（CPU 竞争时漂移），旧测试在并行负载下 flaky（孤跑绿、并发红）。
+- 拆分：deadline 路径只断言与 abort 无竞态的终局类（`completed == 0` 精确、`timed_out >= 1`、`still_running >= 1`、`still_running <= timed_out`、桶和 == 3）；逐类精确落账迁到无 deadline 路径（新测试，`completed == 2` / `cancelled == 2` / `panicked` 精确 / `timed_out == still_running == 0`）。断言强度是搬家不是弱化。
+- 虚拟时钟方案实测否决：`start_paused` + `multi_thread` 编译期被拒（该选项要求 `current_thread`）；改 `current_thread` 后自旋占住唯一 worker ⇒ 虚拟钟不前进 ⇒ 30s 挂死。
+- 稳定性：12 轮 × 8 并发实例 × 12 个真实忙进程 = 96 次全绿，且报告取值逐字节一致。
+
 ### Added（ThreadPool 创建失败 typed 化 + 幻影 worker 回滚，2026-11-17；GitHub issue#26 / bd udf-frame-ck0）
 - **修复**：worker 记账改为「席位预留 → 创建成功才计入存活」，创建失败即回滚席位——幻影 worker 消除，`join()` 不再永久等待一个不存在的 worker；`resize` 补建部分失败后池保持有效、计数准确；构造期创建失败路径不再 `join()`（停机信号下发即返回，禁永久挂起）。
 - `skeleton_infra::pool::ThreadSpawnError`：worker 创建失败的 typed operational error（§7 Runtime/infrastructure 类），保留底层 `io::Error` 现场（`io_error()`）；`RejectedTask` 增成因面 `RejectCause::{Policy, SpawnFailed}` + `cause()`/`spawn_error()`（`into_task()` 语义不变，创建失败时任务原样交还调用方）；`ThreadPoolMetrics` 增 `spawn_failures`（与策略拒绝 `rejected` 分账）。
