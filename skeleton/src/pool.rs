@@ -60,7 +60,12 @@ pub struct PoolMetrics {
 /// 构造期等价校验由实现方的 `new` 以 panic 兜底（恒不合法的配置必是 bug，同
 /// `BoundedRegistry::new` fail-fast 纪律）；运行时调参走本错误显式 Err，禁静默
 /// 钳位。
+///
+/// `#[non_exhaustive]`：下游 match 须带通配臂——未来加变体属非破坏演进
+/// （同 crate 豁免；采用方在编译期被强制面对未知变体，同 [`crate::Effect`]
+/// /[`FieldValue`](crate::fields::FieldValue) 词表纪律）。变体**构造**不受限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PoolResizeError {
     /// `max == 0`：恒不可借出 = 池语义自毁。
     ZeroMax,
@@ -72,6 +77,25 @@ pub enum PoolResizeError {
         idle_cap: usize,
         /// 当时的池深。
         max: usize,
+    },
+    /// worker 创建失败（运行期环境故障，§7 Runtime/infrastructure 类）：
+    /// 扩容补建**部分生效**——调参已落地但 worker 未建够，调用方须按
+    /// 「池处于 core 不足状态」处置（已建 worker 继续服务，可重试 resize 补齐）。
+    ///
+    /// 与前三变体分属两类失败：前三者是**入口拒绝**（恒非法参数，状态未动），
+    /// 本变体是**运行期环境故障**（状态已部分生效）——错误对象自带生效状态，
+    /// 调用方不必回查指标即可判断池处于什么状态。
+    ///
+    /// 仅在存在 worker 创建面的池（线程池）上产生；纯对象/内存池不产生。
+    SpawnFailed {
+        /// 底层 OS 错误类别（`io::ErrorKind` 面判可重试性；契约层零三方 +
+        /// `Copy` 纪律，只保类别不保 OS 原文——完整现场由实现方侧保留）。
+        kind: std::io::ErrorKind,
+        /// 本次调参的目标 core（期望的保活 worker 数）。
+        target_core: usize,
+        /// 实际存活的 worker 数（池当前真实状态；补建在失败处停止，故
+        /// `workers < target_core`——即「部分生效」的缺口面）。
+        workers: usize,
     },
 }
 
@@ -92,6 +116,14 @@ impl std::fmt::Display for PoolResizeError {
                     "pool resize rejected: idle cap {idle_cap} exceeds max {max}"
                 )
             }
+            Self::SpawnFailed {
+                kind,
+                target_core,
+                workers,
+            } => write!(
+                f,
+                "pool resize partially applied: worker spawn failed ({kind:?}); target core {target_core}, live workers {workers}"
+            ),
         }
     }
 }
@@ -161,7 +193,9 @@ impl Drop for PoolAuditTicket {
 ///
 /// 1. **事前校验**：[`Self::resize`] 非法参数入口拒绝（[`PoolResizeError`]），
 ///    拒绝不改任何状态；合法调参即刻生效（plain `&self`——配置通道归宿主，
-///    文件/信号/Effect 皆可，池不管配置从哪来）。
+///    文件/信号/Effect 皆可，池不管配置从哪来）。运行期环境故障（如 worker
+///    创建失败）同样**必须经 Err 面可见**（[`PoolResizeError::SpawnFailed`]：
+///    错误对象自带「部分生效」状态）——禁以计数/指标代替提交方可见的结果。
 /// 2. **缩容不夺借出**：resize 只调边界，已借出句柄不受影响（RAII 归还时由
 ///    实现方裁决：槽满 = 丢弃 + `dropped_overflow` 计数，禁阻塞归还禁静默）。
 /// 3. **可观测**：[`Self::metrics`] 返回值语义快照，O(1) 读侧（性能预期，实现

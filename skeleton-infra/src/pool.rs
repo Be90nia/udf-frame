@@ -399,14 +399,98 @@ impl PoolBase {
 //
 // 核心形映射：max=worker 上限 / idle=驻留数 / borrowed=活跃数（水位线 =
 // busy/max，美团活跃度公式）/ dropped_overflow=被拒任务累计。
+//
+// worker 创建失败（§7 Runtime/infrastructure 类）：OS 线程创建失败 = 环境
+// 故障 → **typed 错误**（[`ThreadSpawnError`]），禁 panic、禁静默降级为「少
+// 一个 worker 也能用」。记账发布点 = **席位预留 → 创建失败即回滚席位**：
+// 存活计数恒等于真实存在的 worker（幻影 worker 消除），`join` 的等待条件
+// （workers>0）因此永不指向不存在的 worker（不挂死）。失败注入闸（[`SpawnGate`]）
+// 是类型参数——生产实例化零大小闸门后单态化消除（生产构建零开销）。
 // ═══════════════════════════════════════════════════════════════════════
 
 /// 类型擦除任务（提交路径恰一次 Box 分配——类型擦除不可避免，如实报数）。
 pub type Task = Box<dyn FnOnce() + Send + 'static>;
 
+/// worker 线程创建失败（§7 Runtime/infrastructure 类：运行期可恢复的 typed
+/// operational error——环境资源耗尽，**不是**构造期非法参数）。
+///
+/// 保留底层 OS 错误现场（[`ThreadSpawnError::io_error`]）：调用方据此判
+/// 可重试性（资源耗尽 = 退避后重试；权限/平台限制 = 不可重试）。**绝不**折
+/// 叠进 panic，也**绝不**与「策略拒绝」混账——两者恢复语义不同。
+#[derive(Debug)]
+pub struct ThreadSpawnError {
+    source: std::io::Error,
+}
+
+impl ThreadSpawnError {
+    /// 底层 OS 错误现场（`io::ErrorKind` 面判可重试性）。
+    pub fn io_error(&self) -> &std::io::Error {
+        &self.source
+    }
+}
+
+impl From<std::io::Error> for ThreadSpawnError {
+    fn from(source: std::io::Error) -> Self {
+        Self { source }
+    }
+}
+
+impl std::fmt::Display for ThreadSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "thread pool worker spawn failed: {}", self.source)
+    }
+}
+
+impl std::error::Error for ThreadSpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// 提交失败成因（[`RejectedTask`] 的诊断面）：**策略拒绝**与 **worker 创建
+/// 失败**分账——前者可等容量释放，后者是环境故障（恢复路径不同，禁混账）。
+#[derive(Debug)]
+pub enum RejectCause {
+    /// 队列满 / 已 shutdown → 拒绝策略处置（任务原样退还调用方）。
+    Policy,
+    /// worker 线程创建失败（§7 Runtime/infrastructure 类 typed error）。
+    SpawnFailed(ThreadSpawnError),
+}
+
+/// worker 创建闸（可插 seam）：生产恒放行（[`AllowAllSpawns`]），测试/仿真
+/// 注入**确定性**创建失败。
+///
+/// **零开销纪律**：闸门是**类型参数**（`ThreadPool<G>`），生产实例化
+/// `G = AllowAllSpawns` 后经单态化消除——生产构建既无 vtable 间接调用，也无
+/// 额外分配/锁/分支（闸门恒 `Ok`，分支被编译器删掉）。
+///
+/// 闸门语义：**创建前**裁决。`Ok(())` = 允许本次创建；`Err(e)` = 本次创建
+/// 失败（池据此回滚 worker 席位并把失败上抛给调用方——禁静默降级）。
+pub trait SpawnGate: Send + Sync + 'static {
+    /// 裁决一次 worker 创建（`worker_id` = 本次创建的 worker 序号，单调）。
+    fn check_spawn(&self, worker_id: u64) -> Result<(), ThreadSpawnError>;
+}
+
+/// 生产闸门：恒放行（零大小类型——生产池的闸门字段不占空间）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllowAllSpawns;
+
+impl SpawnGate for AllowAllSpawns {
+    fn check_spawn(&self, _worker_id: u64) -> Result<(), ThreadSpawnError> {
+        Ok(())
+    }
+}
+
 /// 被拒任务的退还封装（[`ThreadPool::execute`] 的 Err 面）：Box 不实现
 /// Debug，包一层让调用方 `unwrap()`/`expect()` 可用。
-pub struct RejectedTask(Task);
+///
+/// 成因随任务一起退还（[`RejectedTask::cause`]）：调用方据此区分「策略拒绝」
+/// 与「worker 创建失败」——后者携带 typed 现场（[`ThreadSpawnError`]），任务
+/// 原样交还（失败路径禁吞任务）。
+pub struct RejectedTask {
+    task: Task,
+    cause: RejectCause,
+}
 
 impl std::fmt::Debug for RejectedTask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -417,7 +501,20 @@ impl std::fmt::Debug for RejectedTask {
 impl RejectedTask {
     /// 取回原任务（Abort 场景：调用方自行执行或另行处置）。
     pub fn into_task(self) -> Task {
-        self.0
+        self.task
+    }
+
+    /// 失败成因（区分「策略拒绝」与「worker 创建失败」）。
+    pub fn cause(&self) -> &RejectCause {
+        &self.cause
+    }
+
+    /// worker 创建失败现场（`None` = 策略拒绝，非环境故障）。
+    pub fn spawn_error(&self) -> Option<&ThreadSpawnError> {
+        match &self.cause {
+            RejectCause::Policy => None,
+            RejectCause::SpawnFailed(error) => Some(error),
+        }
     }
 }
 
@@ -559,8 +656,23 @@ struct Inner {
     completed: u64,
     rejected: u64,
     task_panics: u64,
+    /// worker 创建失败累计（fail-visible：环境故障留痕；与策略拒绝 `rejected`
+    /// 分账——两者恢复语义不同，禁混账）。
+    spawn_failures: u64,
     next_id: u64,
     shutdown: bool,
+}
+
+/// 预留一个 worker 席位（**锁内调用**）：计数 +1 并分配 worker id。
+///
+/// 席位先于创建发布——保证 worker 退出时的递减不会先于计数（禁下溢）；创建
+/// 窗口内计数含该席位（保守上界：join 因此不会漏等在途创建）；创建失败由
+/// [`ThreadPool::rollback_spawn`] 回滚（幻影 worker 消除）。
+fn reserve_worker(g: &mut Inner) -> u64 {
+    g.workers += 1;
+    let id = g.next_id;
+    g.next_id += 1;
+    id
 }
 
 /// 线程池指标（§4.4.2 可观测行：队列深/活跃 worker/完成数 + 治理计数）。
@@ -571,7 +683,7 @@ struct Inner {
 pub struct ThreadPoolMetrics {
     /// 保活下限（resize 目标）。
     pub core: usize,
-    /// 存活 worker 数。
+    /// 存活 worker 数（恒等于真实存在的 worker——创建失败不留幻影计数）。
     pub workers: usize,
     /// 执行中 worker 数。
     pub busy: usize,
@@ -587,6 +699,9 @@ pub struct ThreadPoolMetrics {
     pub rejected: u64,
     /// 任务 panic 摘除累计（fail-visible：worker 存活但 panic 禁静默）。
     pub task_panics: u64,
+    /// worker 创建失败累计（fail-visible：环境故障留痕；与策略拒绝 `rejected`
+    /// 分账——恢复语义不同，禁混账）。
+    pub spawn_failures: u64,
     /// 共享核心形（可见性与 [`MemoryPoolMetrics`](crate::memgov::MemoryPoolMetrics)
     /// 的 `pub core` 同一形态；名不从 `core`——本池 `core` 已承载保活数语义，
     /// 三池命名不对称的唯一处）。
@@ -601,6 +716,9 @@ impl Borrow<PoolMetrics> for ThreadPoolMetrics {
 
 /// 动态线程池：[`PoolManaged`] 的 worker 调度特化实现（管理面委托
 /// [`PoolBase`]，任务面自有计数——切分理由见模块文档）。
+///
+/// 泛型参数 `G` 是**创建闸**（[`SpawnGate`]）：生产用 [`AllowAllSpawns`]
+/// （默认类型参数，单态化后零开销），测试/仿真注入确定性创建失败。
 ///
 /// # Examples
 ///
@@ -619,21 +737,31 @@ impl Borrow<PoolMetrics> for ThreadPoolMetrics {
 /// pool.join();
 /// assert_eq!(n.load(std::sync::atomic::Ordering::Relaxed), 1);
 /// ```
-pub struct ThreadPool {
+pub struct ThreadPool<G: SpawnGate = AllowAllSpawns> {
     base: PoolBase,
     policy: Arc<dyn RejectPolicy>,
     shared: Arc<Shared>,
+    /// 创建闸（可插 seam）：生产为 [`AllowAllSpawns`]（零大小，单态化后零开销）。
+    gate: G,
 }
 
-impl ThreadPool {
+/// worker 创建失败现场（模块私有）：typed 错误 + 未能交付的任务（交还调用方）。
+struct SpawnFailure {
+    error: ThreadSpawnError,
+    task: Option<Task>,
+}
+
+impl ThreadPool<AllowAllSpawns> {
     /// 构造（core 保活层即建）。非法配置 panic fail-fast（恒不合法 = bug，
     /// 同 [`PoolBase::new`] 纪律）；默认拒绝策略 Abort。
     ///
     /// # Panics
     ///
-    /// `core == 0` / `max == 0` / `core > max` / `queue_cap == 0`。
+    /// `core == 0` / `max == 0` / `core > max` / `queue_cap == 0`；
+    /// **worker 创建失败**（环境资源耗尽）亦 panic——本入口是 fail-fast 快捷
+    /// 面；要 typed 错误用 [`Self::try_new`]。
     pub fn new(tuning: ThreadPoolTuning) -> Self {
-        Self::with_policy(tuning, Arc::new(AbortPolicy))
+        Self::try_new(tuning).expect("thread pool worker spawn failed (thread resource exhaustion)")
     }
 
     /// 构造并指定拒绝策略（策略构造期定死——三参封顶不纳入策略动态面）。
@@ -642,37 +770,70 @@ impl ThreadPool {
     ///
     /// 同 [`Self::new`]。
     pub fn with_policy(t: ThreadPoolTuning, policy: Arc<dyn RejectPolicy>) -> Self {
+        Self::try_with_policy(t, policy)
+            .expect("thread pool worker spawn failed (thread resource exhaustion)")
+    }
+
+    /// 构造（typed 失败面）：非法配置 panic fail-fast（同 [`Self::new`]），
+    /// **worker 创建失败返回 typed 错误**（§7 Runtime/infrastructure 类）——
+    /// 返回前已建 worker 已收到停机信号（自行退役；**不 join**——join 等「存活计数归零」，计数不变量被破坏时会永久挂起）。
+    pub fn try_new(tuning: ThreadPoolTuning) -> Result<Self, ThreadSpawnError> {
+        Self::try_with_policy(tuning, Arc::new(AbortPolicy))
+    }
+
+    /// 构造并指定拒绝策略（typed 失败面）：同 [`Self::try_new`]。
+    pub fn try_with_policy(
+        t: ThreadPoolTuning,
+        policy: Arc<dyn RejectPolicy>,
+    ) -> Result<Self, ThreadSpawnError> {
+        Self::try_with_gate(t, policy, AllowAllSpawns)
+    }
+}
+
+impl<G: SpawnGate> ThreadPool<G> {
+    /// 构造（可插创建闸 + 指定拒绝策略，typed 失败面）。
+    ///
+    /// 非法配置 panic fail-fast（恒不合法 = bug，§7 构造期纪律）；worker 创建
+    /// 失败返回 [`ThreadSpawnError`]——**已创建的 worker 在返回前收到停机信号
+    /// 并自行退役**（不留悬挂线程；计数不留幻影）。
+    pub fn try_with_gate(
+        tuning: ThreadPoolTuning,
+        policy: Arc<dyn RejectPolicy>,
+        gate: G,
+    ) -> Result<Self, ThreadSpawnError> {
         // 线程池词汇的前置 fail-fast（可读消息）；随后 PoolBase::new 以同一套
         // 规则二次闸（契约同源双出口，校验必过）。
-        if t.core == 0 {
+        if tuning.core == 0 {
             panic!("ThreadPool::new: core == 0 (no permanent workers is a bug)");
         }
-        if t.max == 0 {
+        if tuning.max == 0 {
             panic!("ThreadPool::new: max == 0 (a pool that cannot run is a bug)");
         }
-        if t.core > t.max {
+        if tuning.core > tuning.max {
             panic!(
                 "ThreadPool::new: core {} exceeds max {} (illegal tuning)",
-                t.core, t.max
+                tuning.core, tuning.max
             );
         }
-        if t.queue_cap == 0 {
+        if tuning.queue_cap == 0 {
             panic!("ThreadPool::new: queue cap == 0 (hand-off pipe is a bug)");
         }
-        let base = PoolBase::new(t.max, t.core);
+        let base = PoolBase::new(tuning.max, tuning.core);
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
-                queue: VecDeque::with_capacity(t.queue_cap),
-                core: t.core,
-                max: t.max,
-                queue_cap: t.queue_cap,
-                workers: t.core, // 构造期即 spawn core 层（下方循环），计数同生
+                queue: VecDeque::with_capacity(tuning.queue_cap),
+                core: tuning.core,
+                max: tuning.max,
+                queue_cap: tuning.queue_cap,
+                // 计数随 worker 真实创建发布（禁预挂幻影 worker——join 会等它）。
+                workers: 0,
                 busy: 0,
                 idle: 0,
                 shrinking: 0,
                 completed: 0,
                 rejected: 0,
                 task_panics: 0,
+                spawn_failures: 0,
                 next_id: 0,
                 shutdown: false,
             }),
@@ -683,11 +844,24 @@ impl ThreadPool {
             base,
             policy,
             shared,
+            gate,
         };
-        for id in 0..t.core as u64 {
-            spawn_worker(&pool.shared, None, id);
+        // core 保活层逐个创建：任一失败 → 回滚该席位 + 停机等已建 worker 退役
+        // + 上抛 typed 错误（调用方拿到的是错误，不是半成品池）。
+        for _ in 0..tuning.core {
+            let worker_id = {
+                let mut g = lock(&pool.shared.inner);
+                reserve_worker(&mut g)
+            };
+            if let Err(failure) = pool.create_worker(None, worker_id) {
+                // 停机信号下发即返回（**不 join**——join 等「存活计数归零」，
+                // 计数不变量被破坏时会永久挂起；已建 worker 收到停机信号后
+                // 自行退役，池对象随即 drop 兜底重复下发该信号）。
+                pool.shutdown();
+                return Err(failure.error);
+            }
         }
-        pool
+        Ok(pool)
     }
 
     /// 提交任务（拒绝时按策略处置）。队列有位即入队（FIFO）；队列满且
@@ -696,6 +870,10 @@ impl ThreadPool {
     ///
     /// 每次提交恰一次 `Box` 分配（类型擦除不可避免）；CallerRuns 内联执行时
     /// 任务 panic 在提交线程自然传播。
+    ///
+    /// **worker 创建失败**：返回 [`RejectedTask`]，其
+    /// [`RejectCause::SpawnFailed`] 带 typed 现场，任务原样退还（调用方可
+    /// 自行执行或稍后重试）——禁 panic、禁静默吞任务。
     pub fn execute(&self, task: impl FnOnce() + Send + 'static) -> Result<(), RejectedTask> {
         self.submit(Box::new(task))
     }
@@ -714,21 +892,31 @@ impl ThreadPool {
                 return Ok(());
             } else {
                 // 队列满、workers<max：新 worker first-task 交接（不越限排队）
-                g.workers += 1;
-                spawn_id = Some(g.next_id);
-                g.next_id += 1;
+                // ——席位预留与「是否可扩容」的裁决同锁完成（禁拆开并发超建）。
+                spawn_id = Some(reserve_worker(&mut g));
             }
         }
         match spawn_id {
-            Some(id) => {
-                spawn_worker(&self.shared, Some(task), id);
-                Ok(())
-            }
+            Some(worker_id) => match self.create_worker(Some(task), worker_id) {
+                Ok(()) => Ok(()),
+                Err(failure) => Err(RejectedTask {
+                    // 创建失败必把任务原样交还（内部不变式：失败路径不吞任务）。
+                    task: failure
+                        .task
+                        .expect("worker creation failure must hand the task back"),
+                    cause: RejectCause::SpawnFailed(failure.error),
+                }),
+            },
             None => {
                 let handle = PoolHandle {
                     shared: Arc::clone(&self.shared),
                 };
-                self.policy.on_reject(task, &handle).map_err(RejectedTask)
+                self.policy
+                    .on_reject(task, &handle)
+                    .map_err(|task| RejectedTask {
+                        task,
+                        cause: RejectCause::Policy,
+                    })
             }
         }
     }
@@ -741,6 +929,12 @@ impl ThreadPool {
     /// 生效语义：扩容补建至新 core（返回即到数）；缩容发退出令牌（差额 worker
     /// 处理完当前任务即退）；回扩重算待退令牌（撤销未消费的缩容）；queue_cap
     /// 只拦未来入队（既有积压照常排空）。
+    ///
+    /// **worker 创建失败**（§7 Runtime/infrastructure 类）：扩容补建时 OS 线程
+    /// 创建失败 → **typed Err**（[`PoolResizeError::SpawnFailed`]）——错误对象
+    /// 自带「部分生效」状态（目标 core / 实际存活 worker 数），调用方不必回查
+    /// 指标即可判断池处于什么状态（已建 worker 继续服务，可重试 resize 补齐）。
+    /// 失败另经 [`ThreadPoolMetrics::spawn_failures`] 计数留痕（fail-visible）。
     pub fn resize(&self, t: ThreadPoolTuning) -> Result<(), PoolResizeError> {
         if t.queue_cap == 0 {
             return Err(PoolResizeError::IdleCapZero);
@@ -757,18 +951,36 @@ impl ThreadPool {
             shrink_pending = g.shrinking > 0;
             let deficit = t.core.saturating_sub(g.workers);
             for _ in 0..deficit {
-                g.workers += 1;
-                spawn_ids.push(g.next_id);
-                g.next_id += 1;
+                spawn_ids.push(reserve_worker(&mut g));
             }
         }
         if shrink_pending {
             self.shared.work.notify_all();
         }
-        for id in spawn_ids {
-            spawn_worker(&self.shared, None, id);
+        let mut spawn_failure = None;
+        for (index, worker_id) in spawn_ids.iter().enumerate() {
+            if let Err(failure) = self.create_worker(None, *worker_id) {
+                // 补建在失败处停止；未尝试的预留一并回滚（幻影 worker 消除，
+                // join 不会等一个不存在的 worker）。
+                self.rollback_reservations(spawn_ids.len() - index - 1);
+                spawn_failure = Some(failure.error);
+                break;
+            }
         }
-        Ok(())
+        match spawn_failure {
+            None => Ok(()),
+            Some(error) => {
+                // 部分生效报告：调参已落地但 worker 未建够——错误对象自带生效
+                // 状态（目标 core / 实际存活数），池保持有效（已建 worker 继续
+                // 服务，计数准确）。
+                let workers = lock(&self.shared.inner).workers;
+                Err(PoolResizeError::SpawnFailed {
+                    kind: error.io_error().kind(),
+                    target_core: t.core,
+                    workers,
+                })
+            }
+        }
     }
 
     /// 指标快照（值语义 `Copy`，O(1) 单次取锁）。
@@ -784,6 +996,7 @@ impl ThreadPool {
             completed: g.completed,
             rejected: g.rejected,
             task_panics: g.task_panics,
+            spawn_failures: g.spawn_failures,
             shape: PoolMetrics {
                 max: g.max,
                 idle: g.idle,
@@ -806,6 +1019,9 @@ impl ThreadPool {
 
     /// 等待全部 worker 退役（shutdown 或缩容到 0 后才有确定终点；在活跃池上
     /// 调用会阻塞到池关闭）。幂等。
+    ///
+    /// 存活计数只含**真实存在**的 worker（创建失败不留幻影）——本方法不会因
+    /// 创建失败而永久等待。
     pub fn join(&self) {
         let mut g = lock(&self.shared.inner);
         while g.workers > 0 {
@@ -830,26 +1046,85 @@ impl ThreadPool {
     pub fn take_audit_events(&self) -> Vec<PoolAuditEvent> {
         self.base.take_audit_events()
     }
+
+    /// 创建 worker（**调用方须已在锁内预留席位**——见 [`reserve_worker`]）：
+    /// 闸门裁决 → OS 创建 → 失败回滚席位（幻影 worker 消除）。
+    ///
+    /// 失败路径三件事同做：回滚席位（计数回到实际存活数）+ 失败计数
+    /// （`spawn_failures`）+ 唤醒 join（否则 join 会等一个不存在的 worker）。
+    fn create_worker(&self, first: Option<Task>, worker_id: u64) -> Result<(), SpawnFailure> {
+        // ① 闸门裁决（生产恒放行；单态化后本分支被编译器删掉）。
+        if let Err(error) = self.gate.check_spawn(worker_id) {
+            return Err(self.rollback_spawn(error, first));
+        }
+        // ② OS 创建。任务经一次性槽交接：创建失败时原样取回交还调用方
+        //    （失败路径禁吞任务——任务归属调用方）。
+        let slot = Arc::new(Mutex::new(first));
+        let worker_slot = Arc::clone(&slot);
+        let worker_shared = Arc::clone(&self.shared);
+        let spawned = thread::Builder::new()
+            .name(format!("pool-worker-{worker_id}"))
+            .spawn(move || {
+                let mut guard = lock(&worker_slot);
+                let first = guard.take();
+                drop(guard);
+                worker_loop(worker_shared, first);
+            });
+        match spawned {
+            Ok(_handle) => Ok(()),
+            Err(e) => {
+                let mut guard = lock(&slot);
+                let task = guard.take();
+                drop(guard);
+                Err(self.rollback_spawn(ThreadSpawnError::from(e), task))
+            }
+        }
+    }
+
+    /// 创建失败回滚：撤销预留席位（幻影 worker 消除）+ 失败计数 + 唤醒 join。
+    fn rollback_spawn(&self, error: ThreadSpawnError, task: Option<Task>) -> SpawnFailure {
+        {
+            let mut g = lock(&self.shared.inner);
+            g.workers -= 1;
+            g.spawn_failures += 1;
+        }
+        // join 在 `retired` 上等 worker 退役：回滚后必须唤醒，否则 join 会
+        // 永远等一个不存在的 worker。
+        self.shared.retired.notify_all();
+        SpawnFailure { error, task }
+    }
+
+    /// 回滚未尝试的预留席位（resize 补建中断时用——幻影 worker 消除）。
+    fn rollback_reservations(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        {
+            let mut g = lock(&self.shared.inner);
+            g.workers -= count;
+        }
+        self.shared.retired.notify_all();
+    }
 }
 
-impl PoolManaged for ThreadPool {
+impl<G: SpawnGate> PoolManaged for ThreadPool<G> {
     type Tuning = ThreadPoolTuning;
     type Metrics = ThreadPoolMetrics;
 
     fn resize(&self, tuning: Self::Tuning) -> Result<(), PoolResizeError> {
-        ThreadPool::resize(self, tuning)
+        ThreadPool::<G>::resize(self, tuning)
     }
 
     fn metrics(&self) -> Self::Metrics {
-        ThreadPool::metrics(self)
+        ThreadPool::<G>::metrics(self)
     }
 
     fn subscribe_audit(&self, f: impl FnMut(&PoolAuditEvent) + Send + 'static) -> PoolAuditTicket {
-        ThreadPool::subscribe_audit(self, f)
+        ThreadPool::<G>::subscribe_audit(self, f)
     }
 }
 
-impl Drop for ThreadPool {
+impl<G: SpawnGate> Drop for ThreadPool<G> {
     fn drop(&mut self) {
         // Drop = 发优雅关闭信号（排空后退役），不 join——worker 持 Shared Arc
         // 存活到排空完成，池亡线程不悬空；确定性收尾用 shutdown()+join()。
@@ -903,14 +1178,4 @@ fn worker_loop(shared: Arc<Shared>, mut first: Option<Task>) {
             g.completed += 1;
         }
     }
-}
-
-/// 拉起 worker 线程（spawn 失败 = 环境资源耗尽，fail-fast panic——静默降级
-/// 会腐化 workers/core 不变量，禁）。
-fn spawn_worker(shared: &Arc<Shared>, first: Option<Task>, id: u64) {
-    let worker_shared = Arc::clone(shared);
-    thread::Builder::new()
-        .name(format!("pool-worker-{id}"))
-        .spawn(move || worker_loop(worker_shared, first))
-        .expect("thread pool worker spawn failed (thread resource exhaustion)");
 }

@@ -7,28 +7,53 @@
 //! parking_lot 不入树；产品面毒锁 fail-fast 收口 `lock()` helper）。
 
 use std::borrow::Borrow;
+use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use skeleton::pool::{PoolAuditKind, PoolManaged, PoolMetrics, PoolResizeError};
 use skeleton_infra::pool::{
-    CallerRunsPolicy, DiscardOldestPolicy, DiscardPolicy, PoolHandle, RejectPolicy, Task,
-    ThreadPool, ThreadPoolTuning,
+    AbortPolicy, CallerRunsPolicy, DiscardOldestPolicy, DiscardPolicy, PoolHandle, RejectCause,
+    RejectPolicy, SpawnGate, Task, ThreadPool, ThreadPoolTuning, ThreadSpawnError,
 };
 
-/// 轮询至条件成立（或超时 panic 附现场）——真实线程的异步过渡统一走这里，
-/// 禁裸 sleep 定时断言。
-fn wait_until(what: &str, deadline: Duration, mut f: impl FnMut() -> bool) {
+/// 有界等待 + 现场诊断：超时 panic 并打印当时的快照（直接看出卡在什么状态）。
+///
+/// 真实线程的异步过渡统一走这里：**禁无界等待**（不变量被破坏时无界等待 =
+/// 挂死，CI 上表现为 job 超时，比一条红更难诊断）；**禁固定 sleep + 断言**
+/// （概率性）。
+fn wait_until_diag(
+    what: &str,
+    deadline: Duration,
+    mut f: impl FnMut() -> bool,
+    snapshot: impl Fn() -> String,
+) {
     let start = Instant::now();
     while !f() {
         assert!(
             start.elapsed() < deadline,
-            "timeout waiting for {what} (elapsed {:?})",
-            start.elapsed()
+            "timeout waiting for {what} (elapsed {:?})\n  现场快照：{}",
+            start.elapsed(),
+            snapshot()
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// 有界 join：先有界轮询「存活 worker 归零」（超时 panic 并打印 metrics 快照
+/// ——直接看出 workers 卡在几），再调 [`ThreadPool::join`]（此时必然立即返回）。
+///
+/// `join()` 本身是阻塞 API：若存活计数含幻影 worker（计数 > 实际存活），它会
+/// 永久等待 ⇒ 测试变挂死而非变红。本辅助把该情形转成**带诊断的红**。
+fn join_bounded<G: SpawnGate>(pool: &ThreadPool<G>, what: &str) {
+    wait_until_diag(
+        &format!("{what}：存活 worker 归零"),
+        Duration::from_secs(5),
+        || pool.metrics().workers == 0,
+        || format!("metrics={:?}", pool.metrics()),
+    );
+    pool.join();
 }
 
 /// 门闩任务：阻塞到 release 被调（模拟长任务，确定性编排饱和态）。
@@ -108,12 +133,12 @@ fn submit_execute_join_lifecycle() {
         .unwrap();
     }
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
     let m = pool.metrics();
     assert_eq!(m.workers, 0, "join 后 worker 全退");
     assert_eq!(m.completed, 16);
     assert_eq!(n.load(Ordering::Relaxed), 16);
-    pool.join(); // join 幂等：二次 join 不挂不炸
+    join_bounded(&pool, "线程池停机排空"); // join 幂等：二次 join 不挂不炸
 }
 
 #[test]
@@ -128,7 +153,7 @@ fn shutdown_drains_queued_tasks() {
         .unwrap();
     }
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
     assert_eq!(n.load(Ordering::Relaxed), 32, "shutdown 必须排空已入队任务");
 }
 
@@ -136,7 +161,7 @@ fn shutdown_drains_queued_tasks() {
 fn execute_after_shutdown_is_rejected() {
     let pool = ThreadPool::new(tuning(1, 1, 4));
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
     let ran = Arc::new(AtomicUsize::new(0));
     let r = Arc::clone(&ran);
     let err = pool.execute(move || {
@@ -161,9 +186,12 @@ fn drop_initiates_drain_and_workers_outlive_pool() {
         }
         // 未显式 shutdown 直接 drop：worker 持 Shared Arc 存活排空，不悬挂不 UB。
     }
-    wait_until("drop-drain completes", Duration::from_secs(5), || {
-        ran.load(Ordering::Relaxed) == 4
-    });
+    wait_until_diag(
+        "drop-drain completes",
+        Duration::from_secs(5),
+        || ran.load(Ordering::Relaxed) == 4,
+        || format!("已执行任务数={}", ran.load(Ordering::Relaxed)),
+    );
 }
 
 // ── resize：扩容补建 / 缩容退出令牌优雅退 / 拒绝不改状态 ────────────────
@@ -211,22 +239,31 @@ fn resize_up_spawns_workers_immediately() {
 #[test]
 fn resize_down_retires_idle_workers_via_exit_tokens() {
     let pool = ThreadPool::new(tuning(4, 4, 8));
-    wait_until("initial workers", Duration::from_secs(5), || {
-        pool.metrics().workers == 4
-    });
+    wait_until_diag(
+        "initial workers",
+        Duration::from_secs(5),
+        || pool.metrics().workers == 4,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     pool.resize(tuning(1, 4, 8)).unwrap();
     // 优雅退：差额 worker 收退出令牌后退役（异步生效，轮询等待）。
-    wait_until("shrink to 1 worker", Duration::from_secs(5), || {
-        pool.metrics().workers == 1
-    });
+    wait_until_diag(
+        "shrink to 1 worker",
+        Duration::from_secs(5),
+        || pool.metrics().workers == 1,
+        || format!("metrics={:?}", pool.metrics()),
+    );
 }
 
 #[test]
 fn shrink_lets_busy_worker_finish_current_task() {
     let pool = ThreadPool::new(tuning(2, 2, 8));
-    wait_until("workers up", Duration::from_secs(5), || {
-        pool.metrics().workers == 2
-    });
+    wait_until_diag(
+        "workers up",
+        Duration::from_secs(5),
+        || pool.metrics().workers == 2,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     let (gate, release) = Gate::new();
     let ran = Arc::new(AtomicUsize::new(0));
     let r = Arc::clone(&ran);
@@ -235,29 +272,38 @@ fn shrink_lets_busy_worker_finish_current_task() {
         r.fetch_add(1, Ordering::Relaxed);
     })
     .unwrap();
-    wait_until("task picked up", Duration::from_secs(5), || {
-        pool.metrics().busy == 1
-    });
+    wait_until_diag(
+        "task picked up",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 1,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     // worker 忙碌中缩容：当前任务必须跑完（处理完当前任务即退，禁弃任务）。
     pool.resize(tuning(1, 2, 8)).unwrap();
     release();
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
     assert_eq!(ran.load(Ordering::Relaxed), 1, "缩容不弃执行中任务");
 }
 
 #[test]
 fn resize_down_then_up_cancels_pending_shrink() {
     let pool = ThreadPool::new(tuning(4, 4, 8));
-    wait_until("workers up", Duration::from_secs(5), || {
-        pool.metrics().workers == 4
-    });
+    wait_until_diag(
+        "workers up",
+        Duration::from_secs(5),
+        || pool.metrics().workers == 4,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     pool.resize(tuning(1, 4, 8)).unwrap();
     // 未等令牌消费完立刻回扩：待退令牌重算（清零），不发生过冲退役。
     pool.resize(tuning(4, 4, 8)).unwrap();
-    wait_until("workers back to 4", Duration::from_secs(5), || {
-        pool.metrics().workers == 4
-    });
+    wait_until_diag(
+        "workers back to 4",
+        Duration::from_secs(5),
+        || pool.metrics().workers == 4,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(pool.metrics().workers, 4, "回扩后不得有 worker 退役");
 }
@@ -269,9 +315,12 @@ fn saturated_pool() -> (ThreadPool, impl Fn() + Send + Sync + 'static) {
     let pool = ThreadPool::new(tuning(1, 1, 1));
     let (gate, release) = Gate::new();
     pool.execute(gate.blocker()).unwrap();
-    wait_until("worker busy", Duration::from_secs(5), || {
-        pool.metrics().busy == 1
-    });
+    wait_until_diag(
+        "worker busy",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 1,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     pool.execute(|| {}).unwrap(); // 队列 1/1 满
     (pool, release)
 }
@@ -289,7 +338,7 @@ fn abort_policy_hands_task_back() {
     assert_eq!(pool.metrics().rejected, 1);
     release();
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
     // 被退回的任务完好：调用方自行执行仍可运行。
     assert_eq!(ran.load(Ordering::Relaxed), 0);
     err.into_task()();
@@ -301,9 +350,12 @@ fn caller_runs_policy_executes_inline() {
     let pool = ThreadPool::with_policy(tuning(1, 1, 1), Arc::new(CallerRunsPolicy));
     let (gate, release) = Gate::new();
     pool.execute(gate.blocker()).unwrap();
-    wait_until("worker busy", Duration::from_secs(5), || {
-        pool.metrics().busy == 1
-    });
+    wait_until_diag(
+        "worker busy",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 1,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     pool.execute(|| {}).unwrap(); // 队列 1/1 满
     let ran = Arc::new(AtomicUsize::new(0));
     let r = Arc::clone(&ran);
@@ -320,7 +372,7 @@ fn caller_runs_policy_executes_inline() {
     assert_eq!(pool.metrics().rejected, 1, "策略触发即计数");
     release();
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
 }
 
 #[test]
@@ -328,9 +380,12 @@ fn discard_policy_drops_and_counts() {
     let pool = ThreadPool::with_policy(tuning(1, 1, 1), Arc::new(DiscardPolicy));
     let (gate, release) = Gate::new();
     pool.execute(gate.blocker()).unwrap();
-    wait_until("worker busy", Duration::from_secs(5), || {
-        pool.metrics().busy == 1
-    });
+    wait_until_diag(
+        "worker busy",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 1,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     pool.execute(|| {}).unwrap(); // 队列满
     let ran = Arc::new(AtomicUsize::new(0));
     let r = Arc::clone(&ran);
@@ -340,7 +395,7 @@ fn discard_policy_drops_and_counts() {
     .unwrap();
     release();
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
     assert_eq!(ran.load(Ordering::Relaxed), 0, "Discard 静默丢弃不入队");
     assert_eq!(pool.metrics().rejected, 1);
 }
@@ -350,9 +405,12 @@ fn discard_oldest_policy_drops_head_keeps_newest() {
     let pool = ThreadPool::with_policy(tuning(1, 1, 2), Arc::new(DiscardOldestPolicy));
     let (gate, release) = Gate::new();
     pool.execute(gate.blocker()).unwrap();
-    wait_until("worker busy", Duration::from_secs(5), || {
-        pool.metrics().busy == 1
-    });
+    wait_until_diag(
+        "worker busy",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 1,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     let tag = Arc::new(AtomicUsize::new(0));
     let t1 = Arc::clone(&tag);
     pool.execute(move || {
@@ -371,7 +429,7 @@ fn discard_oldest_policy_drops_head_keeps_newest() {
     .unwrap();
     release();
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
     assert_eq!(
         tag.load(Ordering::Relaxed),
         0b110,
@@ -392,16 +450,19 @@ fn custom_policy_is_pluggable() {
     let pool = ThreadPool::with_policy(tuning(1, 1, 1), Arc::new(Record(Arc::clone(&calls))));
     let (gate, release) = Gate::new();
     pool.execute(gate.blocker()).unwrap();
-    wait_until("worker busy", Duration::from_secs(5), || {
-        pool.metrics().busy == 1
-    });
+    wait_until_diag(
+        "worker busy",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 1,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     pool.execute(|| {}).unwrap(); // 队列满
     pool.execute(|| {}).unwrap(); // 触发自定义策略
     assert_eq!(calls.load(Ordering::Relaxed), 1, "自定义策略被调");
     assert_eq!(pool.metrics().rejected, 1);
     release();
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
 }
 
 // ── 指标 + PoolManaged 契约面 + 审计流 ──────────────────────────────────
@@ -409,10 +470,15 @@ fn custom_policy_is_pluggable() {
 #[test]
 fn metrics_track_lifecycle_readouts() {
     let pool = ThreadPool::new(tuning(2, 4, 8));
-    wait_until("core workers parked", Duration::from_secs(5), || {
-        let m = pool.metrics();
-        m.workers == 2 && m.idle == 2
-    });
+    wait_until_diag(
+        "core workers parked",
+        Duration::from_secs(5),
+        || {
+            let m = pool.metrics();
+            m.workers == 2 && m.idle == 2
+        },
+        || format!("metrics={:?}", pool.metrics()),
+    );
     let m = pool.metrics();
     assert_eq!((m.core, m.idle, m.busy, m.queue_len), (2, 2, 0, 0));
     // 双 worker 全堵门闩（确定性饱和），第三件必排队——禁假设单任务调度交错。
@@ -420,16 +486,19 @@ fn metrics_track_lifecycle_readouts() {
     let (g2, r2) = Gate::new();
     pool.execute(g1.blocker()).unwrap();
     pool.execute(g2.blocker()).unwrap();
-    wait_until("both busy", Duration::from_secs(5), || {
-        pool.metrics().busy == 2
-    });
+    wait_until_diag(
+        "both busy",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 2,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     pool.execute(|| {}).unwrap();
     let m = pool.metrics();
     assert_eq!((m.busy, m.queue_len, m.idle), (2, 1, 0));
     r1();
     r2();
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
     let m = pool.metrics();
     assert_eq!((m.completed, m.busy, m.queue_len), (3, 0, 0));
     // 水位线（借出率）= busy/max，Meituan 活跃度公式（核形字段走 Borrow 面）。
@@ -451,9 +520,12 @@ fn poolmanaged_trait_core_shape_via_borrow() {
     let m = resize_and_read(&pool, tuning(3, 4, 8)).unwrap();
     assert_eq!(m.core, 3);
     // idle 随真实 park 异步生效（workers 计数同步、parking 异步），轮询等待。
-    wait_until("workers parked to core", Duration::from_secs(5), || {
-        pool.metrics().idle == 3
-    });
+    wait_until_diag(
+        "workers parked to core",
+        Duration::from_secs(5),
+        || pool.metrics().idle == 3,
+        || format!("metrics={:?}", pool.metrics()),
+    );
     let m = pool.metrics();
     let core: &PoolMetrics = m.borrow();
     assert_eq!(core.max, 4);
@@ -461,7 +533,7 @@ fn poolmanaged_trait_core_shape_via_borrow() {
     assert_eq!(core.borrowed, 0);
     assert_eq!(core.dropped_overflow, 0);
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
 }
 
 #[test]
@@ -485,7 +557,7 @@ fn audit_stream_records_resize_and_closes_on_ticket_drop() {
     pool.resize(tuning(3, 4, 8)).unwrap();
     assert!(pool.take_audit_events().is_empty(), "关流后不再记录");
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
 }
 
 #[test]
@@ -499,7 +571,7 @@ fn task_panic_does_not_brick_pool() {
     })
     .unwrap();
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
     assert_eq!(
         ran.load(Ordering::Relaxed),
         1,
@@ -535,7 +607,7 @@ fn concurrent_submitters_stress() {
         }
     });
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
     assert_eq!(n.load(Ordering::Relaxed), 1000);
     assert_eq!(pool.metrics().completed, 1000);
 }
@@ -555,5 +627,259 @@ fn metrics_read_side_shape() {
         "核心形映射：溢出=rejected"
     );
     pool.shutdown();
-    pool.join();
+    join_bounded(&pool, "线程池停机排空");
+}
+
+// ── worker 创建失败：typed 错误 + 计数一致 + join 不挂 ─────────────────────
+//
+// 失败注入闸（[`SpawnGate`]）：第 `fail_at` 次 worker 创建失败（序号从 1 计）。
+// 闸门归池所有，测试经 Arc 读数句柄观测尝试次数与失败次数。
+
+/// 确定性创建失败注入闸（第 N 次创建失败）。
+struct FailNthSpawn {
+    fail_at: usize,
+    seen: Arc<AtomicUsize>,
+    failed: Arc<AtomicUsize>,
+}
+
+impl FailNthSpawn {
+    /// 建闸（`fail_at` = 第几次创建失败；1 = 首次即失败）。返回闸门 + 读数句柄。
+    fn new(fail_at: usize) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                fail_at,
+                seen: Arc::clone(&seen),
+                failed: Arc::clone(&failed),
+            },
+            seen,
+            failed,
+        )
+    }
+}
+
+impl SpawnGate for FailNthSpawn {
+    fn check_spawn(&self, _worker_id: u64) -> Result<(), ThreadSpawnError> {
+        let n = self.seen.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == self.fail_at {
+            self.failed.fetch_add(1, Ordering::SeqCst);
+            Err(ThreadSpawnError::from(io::Error::other(
+                "injected worker spawn failure",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// 建带注入闸的池（首 worker 创建必成功；失败即测试前置条件破裂）。
+fn pool_with_gate(
+    t: ThreadPoolTuning,
+    gate: FailNthSpawn,
+) -> Result<ThreadPool<FailNthSpawn>, ThreadSpawnError> {
+    ThreadPool::<FailNthSpawn>::try_with_gate(t, Arc::new(AbortPolicy), gate)
+}
+
+#[test]
+fn spawn_failure_at_construction_returns_typed_error() {
+    let (gate, seen, failed) = FailNthSpawn::new(1);
+    let built = pool_with_gate(tuning(1, 2, 8), gate);
+    let err = match built {
+        Ok(_) => panic!("首 worker 创建失败必须返回 typed 错误（禁 panic）"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.io_error().kind(), io::ErrorKind::Other),
+        "typed 现场保留底层 OS 错误面"
+    );
+    assert_eq!(seen.load(Ordering::SeqCst), 1, "首 worker 创建即失败");
+    assert_eq!(failed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn resize_partial_spawn_failure_keeps_pool_valid() {
+    let (gate, seen, failed) = FailNthSpawn::new(2); // 构造第 1 次成功；resize 补建首个失败
+    let pool = match pool_with_gate(tuning(1, 3, 8), gate) {
+        Ok(p) => p,
+        Err(e) => panic!("首 worker 创建应成功: {e}"),
+    };
+    assert_eq!(pool.metrics().workers, 1, "构造即建 core 保活层");
+
+    // 补建 2 个：首个失败 → 停止补建 → **typed Err**（部分生效状态随错误给出）。
+    let err = pool.resize(tuning(3, 3, 8)).unwrap_err();
+    assert_eq!(
+        err,
+        PoolResizeError::SpawnFailed {
+            kind: io::ErrorKind::Other,
+            target_core: 3,
+            workers: 1,
+        },
+        "resize 部分生效：错误对象自带目标 core 与实际存活 worker 数"
+    );
+    assert!(
+        err.to_string().contains("partially applied"),
+        "错误文案自述部分生效: {err}"
+    );
+
+    let m = pool.metrics();
+    assert_eq!(m.workers, 1, "计数 = 实际存活 worker（幻影已回滚）");
+    assert_eq!(m.spawn_failures, 1, "创建失败留痕（fail-visible）");
+    assert_eq!(failed.load(Ordering::SeqCst), 1);
+    assert_eq!(seen.load(Ordering::SeqCst), 2, "失败后不再尝试补建");
+
+    // 池仍是有效池：任务照跑、排空、停机。
+    let ran = Arc::new(AtomicUsize::new(0));
+    let r = Arc::clone(&ran);
+    pool.execute(move || {
+        r.fetch_add(1, Ordering::Relaxed);
+    })
+    .unwrap();
+    pool.shutdown();
+    join_bounded(&pool, "线程池停机排空");
+    assert_eq!(ran.load(Ordering::Relaxed), 1, "部分失败后池仍可服务");
+}
+
+#[test]
+fn resize_spawn_failure_reports_partial_effect_state() {
+    // 构造 1 个 worker；resize 到 core=3 需补建 2 个：第 1 个建成、第 2 个失败
+    // → 池处于「部分生效」：已建成的 worker 仍存活，错误对象给出缺口面。
+    let (gate, seen, failed) = FailNthSpawn::new(3);
+    let pool = match pool_with_gate(tuning(1, 3, 8), gate) {
+        Ok(p) => p,
+        Err(e) => panic!("首 worker 创建应成功: {e}"),
+    };
+    let err = pool.resize(tuning(3, 3, 8)).unwrap_err();
+    assert_eq!(
+        err,
+        PoolResizeError::SpawnFailed {
+            kind: io::ErrorKind::Other,
+            target_core: 3,
+            workers: 2,
+        },
+        "部分生效：补建第 1 个已落地（workers=2），第 2 个失败 → 缺口 = target_core - workers"
+    );
+    assert_eq!(
+        pool.metrics().workers,
+        2,
+        "计数 = 实际存活 worker（已建成的仍存活）"
+    );
+    assert_eq!(pool.metrics().spawn_failures, 1);
+    assert_eq!(failed.load(Ordering::SeqCst), 1);
+    assert_eq!(seen.load(Ordering::SeqCst), 3, "失败后不再尝试补建");
+
+    // 部分生效的池仍可服务；join 能返回（无幻影 worker 等待）。
+    let ran = Arc::new(AtomicUsize::new(0));
+    let r = Arc::clone(&ran);
+    pool.execute(move || {
+        r.fetch_add(1, Ordering::Relaxed);
+    })
+    .unwrap();
+    let start = Instant::now();
+    pool.shutdown();
+    join_bounded(&pool, "线程池停机排空");
+    assert!(start.elapsed() < Duration::from_secs(5), "join 必返回");
+    assert_eq!(ran.load(Ordering::Relaxed), 1);
+    assert_eq!(pool.metrics().workers, 0);
+}
+
+#[test]
+fn submit_spawn_failure_returns_task_with_typed_cause() {
+    let (gate, _seen, failed) = FailNthSpawn::new(2); // 构造成功；提交触发的创建失败
+    let pool = match pool_with_gate(tuning(1, 2, 1), gate) {
+        Ok(p) => p,
+        Err(e) => panic!("首 worker 创建应成功: {e}"),
+    };
+    let (gate_h, release) = Gate::new();
+    pool.execute(gate_h.blocker()).unwrap(); // worker 忙
+    wait_until_diag(
+        "worker busy",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 1,
+        || format!("metrics={:?}", pool.metrics()),
+    );
+    pool.execute(|| {}).unwrap(); // 队列 1/1 满
+
+    // 本次提交：队列满 + workers(1) < max(2) → 需新建 worker → 创建失败。
+    let ran = Arc::new(AtomicUsize::new(0));
+    let r = Arc::clone(&ran);
+    let err = pool
+        .execute(move || {
+            r.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err.cause(), RejectCause::SpawnFailed(_)),
+        "成因必须是 worker 创建失败（与策略拒绝分账）"
+    );
+    assert!(err.spawn_error().is_some(), "typed 现场随任务交还");
+    let m = pool.metrics();
+    assert_eq!(m.workers, 1, "幻影 worker 已回滚（计数 = 实际存活）");
+    assert_eq!(m.spawn_failures, 1);
+    assert_eq!(m.rejected, 0, "创建失败不是策略拒绝（两账分开）");
+    assert_eq!(failed.load(Ordering::SeqCst), 1);
+
+    // 任务原样交还调用方（失败路径禁吞任务）。
+    err.into_task()();
+    assert_eq!(ran.load(Ordering::Relaxed), 1);
+
+    release();
+    pool.shutdown();
+    join_bounded(&pool, "线程池停机排空");
+}
+
+#[test]
+fn join_returns_after_partial_spawn_failure() {
+    let (gate, _seen, _failed) = FailNthSpawn::new(2);
+    let pool = match pool_with_gate(tuning(1, 2, 8), gate) {
+        Ok(p) => p,
+        Err(e) => panic!("首 worker 创建应成功: {e}"),
+    };
+    // 补建失败 → typed Err（部分生效：目标 core 2 / 实际存活 1）。
+    assert_eq!(
+        pool.resize(tuning(2, 2, 8)).unwrap_err(),
+        PoolResizeError::SpawnFailed {
+            kind: io::ErrorKind::Other,
+            target_core: 2,
+            workers: 1,
+        }
+    );
+    let start = Instant::now();
+    pool.shutdown();
+    join_bounded(&pool, "线程池停机排空"); // 禁等幻影 worker 永久挂起
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "join 必须在有限时间内返回（elapsed {:?}）",
+        start.elapsed()
+    );
+    assert_eq!(pool.metrics().workers, 0, "join 后 worker 全退");
+}
+
+#[test]
+fn worker_count_matches_live_workers_after_spawn_failures() {
+    let (gate, seen, failed) = FailNthSpawn::new(3); // 构造 2 次成功；resize 第 3 次失败
+    let pool = match pool_with_gate(tuning(2, 4, 8), gate) {
+        Ok(p) => p,
+        Err(e) => panic!("首 worker 创建应成功: {e}"),
+    };
+    assert_eq!(pool.metrics().workers, 2);
+    // 补建：第 3 次失败 → 停止 → typed Err（部分生效：目标 core 4 / 存活 2）。
+    assert_eq!(
+        pool.resize(tuning(4, 4, 8)).unwrap_err(),
+        PoolResizeError::SpawnFailed {
+            kind: io::ErrorKind::Other,
+            target_core: 4,
+            workers: 2,
+        }
+    );
+
+    let m = pool.metrics();
+    let created = seen.load(Ordering::SeqCst) - failed.load(Ordering::SeqCst);
+    assert_eq!(
+        m.workers, created,
+        "计数 = 实际成功创建的 worker 数（禁幻影）"
+    );
+    assert_eq!(m.spawn_failures, 1);
+    pool.shutdown();
+    join_bounded(&pool, "线程池停机排空");
 }
