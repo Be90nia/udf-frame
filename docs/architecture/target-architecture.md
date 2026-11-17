@@ -178,9 +178,9 @@ If a corresponding race exists in Xray's concrete buffer pool, investigate and f
 
 Avoid per-acquire heap allocations in lease/drop paths unless benchmarks justify them. Prefer concrete lease types or enum dispatch over boxed FnOnce closures in known hot paths, while retaining generic extension points for uncommon backends.
 
-If a corresponding race exists in Xray's concrete buffer pool, investigate and fix it in the Xray consumer repository, where that admission path lives.
 
-Avoid per-acquire heap allocations in lease/drop paths unless benchmarks justify them. Prefer concrete lease types or enum dispatch over boxed FnOnce closures in known hot paths, while retaining generic extension points for uncommon backends.
+
+
 
 ## 6. Effect execution and backpressure
 
