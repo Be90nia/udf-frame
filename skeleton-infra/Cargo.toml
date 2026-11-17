@@ -35,6 +35,12 @@ runtime = []
 # memgov 纯 std 零三方增量不变（--no-default-features --features memgov 仍独立）。
 pool = ["memgov"]
 memgov = []
+# unsafe-evidence：DrainExclusive 的差分对照变体（Mutex 版）与不变量证据门（蓝图
+# §9 / bd udf-frame-83c）。默认关、**不在 `full` 并集内**——采用方开 `full` 不应
+# 白编对照实现（它只服务证据采集，不是消费能力）；需要证据时显式
+# `--features unsafe-evidence`。默认构建零开销：无 tag、`with_mut` 直通、对照实现
+# 不编译（`strings` 符号级证明）。
+unsafe-evidence = []
 journal = ["dep:serde", "dep:serde_json"]
 tokio = ["dep:tokio"]
 # testing：测试替身（TestStore 走 SyncStore + fx 底座）。
@@ -97,12 +103,14 @@ tokio = { workspace = true, features = ["test-util"] }
 # roundtrip + ns 对照锚），dev-dep only——零依赖证明不受影响。
 humantime = "2"
 
-# bench 三组跨 fx/journal/memgov/testing 四 feature，required-features 取并集——
-# 只开 tokio 会被整目标跳过（hollow gate），CI 闸与首跑一律 --all-features。
+# bench 跨 fx/journal/memgov/testing + 池维度（ObjectPool/MemoryPool/ThreadPool）五 feature，
+# required-features 取并集——只开 tokio 会被整目标跳过（hollow gate）。池组用到
+# `pool` feature（ThreadPool），缺它则 `--no-default-features --features
+# tokio,journal,memgov,testing` 下 bench 编译失败（CI 用 --all-features 会掩盖此缺口）。
 [[bench]]
 name = "infra"
 harness = false
-required-features = ["tokio", "journal", "memgov", "testing"]
+required-features = ["tokio", "journal", "memgov", "testing", "pool"]
 
 [lints.clippy]
 await_holding_lock = "deny"
