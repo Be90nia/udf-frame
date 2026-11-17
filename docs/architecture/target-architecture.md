@@ -27,7 +27,7 @@ These principles are accepted constraints. The decisions below narrow the implem
 The architecture is defined first by **logical responsibility and dependency direction**, not by the number or names of Cargo crates.
 
     Application / Domain (Xray · Web · DB · CLI · Embedded)
-       ├── Pure state semantics (Action · State · Reducer · Effect · Store contract)
+       ├── Pure state semantics (Action · State · Fragment · Reducer · Effect · Store contract)
        ├── Synchronous execution (SyncStore · dispatch · sync task execution)
        ├── Async edges/adapters (Tokio tasks · async I/O · cancellation integration)
        └── Shared infrastructure (pools · budgets · journal · observability · diagnostics)
@@ -48,16 +48,18 @@ Do not create a second Clock abstraction or a parallel contracts crate. In parti
 
 ### Existing ADRs and relationship to this blueprint
 
-The repository's review discussion identifies ADR-0001 and ADR-0008 as existing ratified decisions. The ADR directory itself is not currently committed in the repository, so this table records only relationships that can be substantiated from the referenced review; it deliberately does not invent titles or dispositions for unavailable ADR texts.
+The repository intentionally excludes `docs/adr/` from Git under the 2026-10-28 documentation policy (the repository keeps consumer-facing documentation in-tree, while decision/research archives remain local). This is a governance constraint, not evidence that the decisions do not exist. The following ADRs have direct architectural overlap with this blueprint and are inherited here:
 
-| Existing decision | Known subject / evidence | Relationship to this blueprint |
+| ADR | Decision relevant to this blueprint | Relationship |
 |---|---|---|
-| ADR-0001 | Clock and ConfigPort were deliberately placed in the `skeleton` contract layer. | **Accepted and preserved.** This blueprint keeps `skeleton` as the canonical home; no parallel `udf-contracts` crate or duplicate Clock. |
-| ADR-0002–0007 | Referenced by the review as existing ADRs, but their decision text is not present in the committed repository tree available for this revision. | **Pending source verification.** Do not infer acceptance, narrowing, or rejection until the authoritative ADR texts are restored or linked. |
-| ADR-0008 | Two-tier coexistence for the notification surface (sync and async) is already implemented. | **Accepted and inherited.** §3 treats this as an existing precedent; §11 explicitly evaluates extending the same two-tier coexistence principle to effect execution without replacing either mode. |
-| ADR-0009–0010 | Referenced by the review as existing ADRs, but their decision text is not present in the committed repository tree available for this revision. | **Pending source verification.** Do not infer acceptance, narrowing, or rejection until the authoritative ADR texts are restored or linked. |
+| ADR-0001 | Clock / ConfigPort contract ownership belongs in `skeleton`. | **Accepted and preserved.** Keep one canonical contract home; do not introduce a duplicate Clock or parallel contracts crate. |
+| ADR-0008 | Notification surface supports two coexisting tiers: sync and async. | **Accepted and inherited.** This is the existing precedent for two-tier coexistence; §11 evaluates extending the same model to Effect execution without replacing either mode. |
+| ADR-0009 | Fragment / Reducer are distinct composition contracts: Reducer is the root contract; Fragment is the slice contract. Combining fragments as a root should fail at compile time (E0277), not at runtime by panic. | **Accepted and inherited.** The pure-state contract inventory includes both Fragment and Reducer; examples and trait bounds must preserve their root/slice distinction. |
+| ADR-0010 | ObjectPool uses bounded degradation when the accounted pool universe is full: it may directly build an object outside that universe, does not count it in `alive`, and releases it rather than returning it to the pool. | **Accepted and inherited.** §5 explicitly distinguishes the accounted pool cap from the fallback production policy; `max` is not necessarily an absolute cap on objects returned to callers. |
 
-The issue review requested ADRs under `docs/architecture/decisions/`, but that directory is absent from the current committed tree. Restoring/linking the authoritative ADR-0001…0010 texts is a documentation follow-up; this blueprint must not pretend to have reviewed decision records it cannot inspect.
+ADR-0002–0007 are not cited as premises for any decision in this blueprint and are outside this blueprint's current scope; they are **not** marked pending or treated as rejected. Their authoritative local copies remain governed by the existing `docs/adr/` exclusion policy. If a future blueprint change depends on one of them, that decision must be summarized and cited explicitly before the change is proposed.
+
+This arrangement preserves the established policy that ADR source files are not committed while making the four decisions that materially constrain this architecture visible to Git-based collaborators. It does not claim that a short index replaces the authoritative ADR records.
 
 ### Crate-splitting rule
 
@@ -133,7 +135,23 @@ Separate enforcement from observation:
 - **Pool backend**: allocation/reuse strategy owned by the consumer or adapter.
 - **Pool policy**: idle retention, eviction, size classes, and overflow behavior.
 
-A hard cap must use an atomic reservation/permit protocol or a lock-protected check-and-act operation. It must not use an unsynchronized check-then-act sequence.
+A hard cap on the **accounted pool universe** must use an atomic reservation/permit protocol or a lock-protected check-and-act operation. It must not use an unsynchronized check-then-act sequence.
+
+### Hard cap versus bounded degradation
+
+These are two independent policy axes and must not be conflated:
+
+1. **Admission authority** decides whether an object/resource may enter the accounted pool universe. Its cap governs the objects counted by the pool's accounting (for ObjectPool, the `alive` population).
+2. **Degradation policy** decides what happens when that accounted universe is full. A pool may reject production, wait, or use a bounded fallback path that still returns an object without admitting it into the pool universe.
+
+Under ADR-0010, ObjectPool deliberately supports the latter: when the accounted pool is full, the `pop_or_build` fallback may directly construct an object outside the `alive` accounting. That fallback object is not pooled; when returned, it is released rather than retained. Consequently, the configured `max` bounds the accounted pool population, **not necessarily the total number of objects temporarily handed to callers**. Describing it as an absolute production cap would be incorrect.
+
+Every pool configuration and API contract must state both axes explicitly:
+- the exact population covered by the cap (for example, accounted live pool objects, including idle and borrowed objects);
+- the full-capacity behavior (reject / wait / bounded direct-build degradation / other declared policy);
+- whether fallback objects are accounted, reusable, and how/when they are released.
+
+Do not silently infer one axis from the other. Metrics for fallback production and release should be observable separately from normal pool admission where useful.
 
 ### Current implementation findings
 
