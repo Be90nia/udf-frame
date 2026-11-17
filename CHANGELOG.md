@@ -4,6 +4,57 @@
 
 ## [Unreleased]
 
+### Added（ThreadPool 创建失败 typed 化 + 幻影 worker 回滚，2026-11-17；GitHub issue#26 / bd udf-frame-ck0）
+- **修复**：worker 记账改为「席位预留 → 创建成功才计入存活」，创建失败即回滚席位——幻影 worker 消除，`join()` 不再永久等待一个不存在的 worker；`resize` 补建部分失败后池保持有效、计数准确；构造期创建失败路径不再 `join()`（停机信号下发即返回，禁永久挂起）。
+- `skeleton_infra::pool::ThreadSpawnError`：worker 创建失败的 typed operational error（§7 Runtime/infrastructure 类），保留底层 `io::Error` 现场（`io_error()`）；`RejectedTask` 增成因面 `RejectCause::{Policy, SpawnFailed}` + `cause()`/`spawn_error()`（`into_task()` 语义不变，创建失败时任务原样交还调用方）；`ThreadPoolMetrics` 增 `spawn_failures`（与策略拒绝 `rejected` 分账）。
+- `ThreadPool` 增 typed 构造面 `try_new` / `try_with_policy` / `try_with_gate`；`new` / `with_policy` 签名与行为不变（创建失败仍 fail-fast panic，doc 已标注）。
+- `ThreadPool` 增可插创建闸 `SpawnGate`（默认 `AllowAllSpawns`：生产单态化零开销——无 vtable/无堆分配，`size_of::<ThreadPool>()` 不变 112 字节）+ `ThreadPool<G>` 泛型参数（既有 `ThreadPool::new(..)` 调用点零改动）。
+
+### Added（fx 停机报告六桶：终局分类 + 截止/未观测分离，2026-11-17；GitHub issue#27 / bd udf-frame-7ug）
+- `fx::ShutdownReport` 扩为六字段：`completed` / `cancelled` / `panicked` / `failed`（+ 逐条 `errors`）/ `timed_out` / `still_running`。**`timed_out` 取样于截止瞬间**（调用方停止等待），**`still_running` 取样于收割后**（终止未被观测）——报告不再把仍在运行的任务记成已完成或已终止。
+- `ShutdownReport` 标 `#[non_exhaustive]`：字段按真实采用面渐进扩，**跨 crate 构造须 `ShutdownReport::default()` 再赋值**（`..Default::default()` 形态同样被 E0639 拒绝），此后加字段属非破坏演进。
+- `JoinError` 归类加显式 `is_cancelled` / `is_panic` 守卫 + 非静默兜底（未知 join 变体落 `failed` + `errors`，不再对非 panic 错误调 `into_panic`——该调用自身会 panic，而这是停机收尾路径）。
+- 新增 `tests/fx_lifecycle.rs`（4 测试）：桶穷尽、`close` ≠ `cancel`、`close`/`cancel`/`shutdown` 幂等、混合终局分类。
+
+### Added（`SizeClassPool` 尺寸分档池组合件，2026-11-17；GitHub issue#15 增量3 / bd udf-frame-dks）
+- `skeleton_infra::SizeClassPool<T>`（feature `pool`，crate 根 re-export）：严格递增档位表 + 每档一个 `ObjectPool<T>`，`acquire(need)` **向上取整**选档（只有「多给」不会「少给」）；句柄记借出时的档、Drop 回那一档（**不按对象当前容量反推**——涨大后反推会把大件塞回小档池造成池毒化）；超最大档走**档外降级直构**（`over_max_degraded` 独立计数，不静默回退最大档，不入池宇宙、归还即释放）；`SizeClassMetrics` 给出按档 idle/borrowed/degraded 明细，池内降级与档外降级分账。
+- 新增 `tests/size_class_pool.rs`（8 测试）：选档正确性（含 `0..140_000` 全扫断言「借出容量恒 ≥ 请求」与「前一档 < 请求」）、归还归位（涨大对象仍回原档）、档内容量紧张可观测、档外降级可辨识。
+
+### Added（`DrainExclusive` unsafe 证据面 + `unsafe-evidence` feature，2026-11-17；GitHub issue#29 / bd udf-frame-83c）
+- `DrainExclusive` 安全纪要改**三段式**：建立者（排空旗 `draining.swap` 互斥）/ 维持者（所有独占访问必经 `ExclusiveCell::with_mut` 且限 `DrainGuard` armed，**调用点全集即检查清单**）/ 违反后果（别名写 UB + 指向可执行检测面）。`get_mut` 收为 `with_mut` 内部实现，`&mut` 不再逃逸闭包；5 处独占区间（含 `effect_buf` 与 `notify_cache` 的拆段）改经 `with_mut`。
+- 新 feature **`unsafe-evidence`**（默认关，**不在 `full` 并集内**——`full` 是消费能力合集，证据面不该让采用方白编对照实现；需要时显式 `--features unsafe-evidence`）：编入 `Mutex<T>` 版对照实现与证据专用入口 `SyncStore::new_mutex_reference`（与生产共用唯一 `assemble()`，**不重写 SyncStore**）。默认构建不编译对照实现——`strings` 符号级证明 `MutexExclusive` 在默认 rlib 中零命中；`#[cfg(test)]` 布局断言钉住 `size_of::<ExclusiveCell<u64>>() == size_of::<UnsafeCell<u64>>()`。
+- 新增 `tests/unsafe_evidence.rs`（6 测试）：并发 dispatch × 快照 clone/drop × 订阅 register/unregister 的精确性、reducer/订阅回调 panic 后旗与缓冲一致、重入 dispatch 只入队、生产 vs Mutex 对照 8 项可观察面逐项一致。**变异验证**：旁路排空旗互斥 ⇒ 1 秒内 3 测试变红（打出 `EffectBuf` 被两个排空者并发摘取的实现级崩点）。
+- Miri：**纯 std 单线程子集 3 测试**（`reducer_panic_keeps_drain_flag_consistent_and_effects_retained` / `subscriber_panic_is_quarantined_without_poisoning_drain` / `reference_store_keeps_same_public_semantics_under_panics`），命令
+  `cargo +nightly miri test -p udf-skeleton-infra --no-default-features --features runtime,unsafe-evidence --test unsafe_evidence -- panic` → exit 0。
+  **不声称覆盖并发**——并发证据由不变量测试 + 变异验证承担。**已知边界**：`miri --lib` 广跑会红于 `clock` 的 `GetSystemTimePreciseAsFileTime not available when isolation is enabled`（Miri 隔离下系统时钟不可用），故只跑上述过滤子集。
+
+### Fixed（`LeakGuard` 分配器在岗探测假阴性，2026-11-17；bd udf-frame-1yd）
+- `LeakGuard::arm()` 的探测改读**单调累计面** `total_allocs` 而非净额面 `live_allocs`：后者会被并发线程的释放对消回基线 ⇒ 探测假阴性 ⇒ 整个泄漏断言静默降级成 no-op（`check()` 恒 `Ok` = 假绿）。
+- 新增 `LeakGuard::is_enabled()`：降级态对采用方可见（原先 `enabled` 私有，外部无从区分「真无泄漏」与「根本没在观测」）；`check()` doc 明示未启用时恒 `Ok`、严格断言先查 `is_enabled()`。行为无破坏（`check()` 返回值语义不变）。
+- 新增并发锤回归闸：2 线程各预置 3 万分配、屏障后**只释放不分配**制造单向净额下降、2000 次探测断言零 miss（变异回净额面 ⇒ 1998/2000 次被欺骗，连跑 3 次必红）。
+
+### Changed（破坏性：`PooledThreadPool` 缓冲域换 `ObjectPool`，2026-11-17；GitHub issue#15 增量1 / bd udf-frame-a01）
+- 缓冲域 `MemoryPool` → `ObjectPool`：借空**不再丢任务**——`ObjectPool` 永不阻塞永不失败，满容量走降级直构，任务总能拿到缓冲执行完；`borrow_timeout` 参数**移除**、`borrow_rejected` 计数**退役**（旧语义「借空即丢」→ 新语义「借空降级」，0.1.0 未发布直迁无 shim）；降级读数走 `buffer_pool().metrics().degraded`/`constructed`。
+- 新增 `with_caller_runs(buffers, tuning)`：复用既有 `CallerRunsPolicy`，池饱和时可由提交线程代跑（不丢、不排队）。
+- `mem_pool()` 改名 `buffer_pool()`；泛型参数 `F` 移除。`examples/` 与 `docs/reference.md` 同批迁移，仓内调用点清零。
+
+### Changed（破坏性：`PoolResizeError` 加 `SpawnFailed` 变体并标 `#[non_exhaustive]`，2026-11-17；GitHub issue#26）
+- `skeleton::pool::PoolResizeError` 新增 `SpawnFailed { kind: std::io::ErrorKind, target_core: usize, workers: usize }`（**运行期环境故障**，与既有三变体「恒非法参数入口拒绝」分属两类；错误对象自带「部分生效」状态：目标 core vs 实际存活 worker 数）——`resize` 补建部分失败不再以指标代替提交方可见的结果（§7）。
+- 该枚举标 `#[non_exhaustive]`（仓内词表同款纪律：`Effect`/`FieldValue`/`parse` 词表/`view::BindError`）：**下游对该枚举的 `match` 须带 `_` 通配臂**（变体构造不受限），此后加变体属非破坏演进。
+
+### Changed（CI：sync-only 依赖图零 Tokio 断言，2026-11-17；bd udf-frame-679）
+- `ci.yml` 新增 **Sync-only dependency tree (no Tokio)** 步（`Rustfmt` 后、`Test skeleton` 前，三 OS 矩阵，`shell: bash`）：对 `udf-skeleton-infra` 默认面、`udf-skeleton-infra --no-default-features --features runtime`、`udf-std-ext` 默认面各跑一次 `cargo tree -e normal`，出现 tokio 即 `exit 1` 并打印带入路径的实际节点。**fail-closed**：`cargo tree` 自身失败同样置红（无 `continue-on-error`/`|| true`）。反向对照（`--features tokio` / `--all-features`）实测 exit 1，证明非恒绿空门。
+
+### Added（池维度基准 + 生命周期/资源 conformance，2026-11-17；bd udf-frame-9x4）
+- `benches/infra.rs` 新增池维度基准组：`ObjectPool` acquire/drop 往返、`MemoryPool` 闲槽命中 vs 空池新建、`ThreadPool` 饱和拒绝（Abort vs CallerRuns）、共享 `ByteBudget` 2×2 争用矩阵。**只产数据、无阈值、无 committed baseline**（蓝图 §9）。首轮观测：`ObjectPool` 81 ns、`MemoryPool` 109/262 ns、拒绝 23–28 ns；共享 `ByteBudget` 4 线程 ~2.15 µs（相对单线程 ~25× 劣化，成因=单一全局 `Mutex`）——记为未来 ADR 候选，本批不修。
+- 新增 `tests/conformance_lifecycle.rs`（8 测试）：六桶生命周期语义 + 资源三轴可观察断言（`max` 宇宙含降级借出 / 字节轴仅 idle、借出回卷 / 降级件两轴皆不计）+ 变异守卫。测试等待全部有界化（5–10 s 上限 + 诊断快照），不变量被破坏时**快速变红**而非挂死。
+- `[[bench]] infra` 的 `required-features` 补 `pool`（原先按声明组合编译 bench 会失败，CI 的 `--all-features` 掩盖了该缺口）。
+
+### Docs（资源上限四问 + effect 执行两档，2026-11-17；bd udf-frame-vtv / udf-frame-0zz）
+- `docs/reference.md` 新增「**资源上限四问**」：对 `PoolBase` / `ThreadPool` / `PooledThreadPool` / `ObjectPool`（三轴）/ `BoundedRegistry` / `MemoryPool` / `ByteBudget` 逐项写明①cap 覆盖的群体②满容量行为与可观察读数③是否允许合法超配及其收敛条件④`metrics()` 读数口径；并明确 **metrics 不是准入面**（准入只在三处锁内 check-and-act：`memgov.rs:568` / `pool.rs:329` / `objpool.rs:411`）。全部声明由外部探针工程逐条 assert 验证（`ALL DOC CLAIMS HOLD`）。
+- `docs/reference.md` 新增「**effect 执行两档（同步档 / 托管档）**」：排空环内联 `EffectRuntime::run` 与 `FxScope::spawn_tracked` 托管的现状坐标、两档适用条件与失败面、三条边界规则（核心永不阻塞等待异步完成 / 异步结果回灌必经 `ActionSender` / 同步档禁 await 与阻塞 IO）、与 ADR-0008 通知面两档的对应表。**不新增统一入口**——两档是同一 trait 的两种实现形态，造统一入口会逼核心替解释器选执行器（违反蓝图 §6）。
+- 新增 `tests/effect_two_tier.rs`（5 测试）：同步档内联时序、同步档 panic 上浮 + 实例恢复、托管档 `dispatch` 不等完成、托管任务失败经 `join`/`ShutdownReport` 可见、两档同序列终态一致。
+
 ### Added（SyncTtlCache 借用键查面，2026-11-08；主仓 bd m6pkl N4，PR#24）
 - `SyncTtlCache::get` 泛化 `K: Borrow<Q>`（连带 `LruCore` 内部查找族 + `key_fingerprint` `?Sized`）：`String` 键可 `&str` 直查，查询热路径免每次 String 堆分配。旧调用 `get(&owned)` 源兼容（std `HashMap::get` / lru crate 同款 Borrow 惯例）；`insert`/`peek`/`contains`/`remove` 公共签名逐字未变。
 
