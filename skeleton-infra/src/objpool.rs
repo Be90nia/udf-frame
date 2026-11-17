@@ -348,9 +348,25 @@ type WeightHook<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 /// **共享形态** = 同一份 `Arc<ByteBudget>` 传给多个池——各池的归还/插入在
 /// `try_take` 上竞争同一份余额，谁先认领谁占用，超预算方丢弃（`dropped_overflow`
 /// 容量因）。**记账 fail-fast**：`give_back` 下溢 = 记账 bug，panic（同片内
-/// `take` 纪律——计数错账禁静默钳位）。低频面（借还的字节裁决在归还路径、
-/// 相对 acquire 热路径低频），内部单把 `Mutex` 足够；持锁序恒「片锁 → 本锁」
-/// 单向（本锁内不回调池），无环无死锁。
+/// `take` 纪律——计数错账禁静默钳位）。
+///
+/// **为什么是单字原子而不是互斥量**：本预算被多个池、多个线程共享，每次借还
+/// 都要过它——互斥量在 4 线程下把预算路径从 ~103 ns 拖到 ~2 µs（19-25x，
+/// bd d5i 实测），是对象池里最后一个跨线程单锁点。`held` 是 `AtomicUsize`，
+/// 搭配 CAS 循环：没有内核等待，`give_back` 的下溢判定仍在写盘前完成（不静默
+/// 钳位）。换后同口径实测：单线程 89-91 ns（原 103-105），4 线程 0.96-1.02 µs
+/// （原 1.95-2.16 µs）。**剩余 4 线程劣化不在账本原子本身**（同机隔离测量：
+/// 争用下 take+give 一对 32-107 ns），要归因得进 `ObjectPool` 借还路径做采集，
+/// 见 `verify/2026-11-17-p2-bytebudget-contention/`。
+///
+/// **为什么不分片（片内计数 + 线程亲和）**：分片账本在任何一种形态下都要么
+/// 丢掉下溢 fail-fast（`give_back` 回不到原片就无法逐片判定下溢），要么按
+/// `share(total, N, i)` 拒绝大于单片份额的对象（**语义变化**：今天 ≤ `total`
+/// 的对象一律可认领）。单字原子的账目是精确的：全局硬上限、下溢 fail-fast、
+/// 「有余额就认领得到」（无碎片浪费、无饿死）三件都不需要额外论证。分片版
+/// （`Mutex<{held, limit}>` 每片一条 line + 片间借调）实测过：4 线程 696 ns、
+/// 单线程 105.65 ns——4 线程只赢 15-30%，单线程反而退化，且离目标仍差 ~5x，
+/// 故不留。若未来争用再成瓶颈，先用数据指认瓶颈再换账本形态——不得静默降级。
 ///
 /// # Examples
 ///
@@ -371,7 +387,7 @@ type WeightHook<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 /// ```
 pub struct ByteBudget {
     total: usize,
-    held: Mutex<usize>,
+    held: AtomicUsize,
 }
 
 impl ByteBudget {
@@ -386,7 +402,7 @@ impl ByteBudget {
         assert!(total > 0, "ByteBudget::new: total must be non-zero");
         Self {
             total,
-            held: Mutex::new(0),
+            held: AtomicUsize::new(0),
         }
     }
 
@@ -396,8 +412,12 @@ impl ByteBudget {
     }
 
     /// 当前已认领字节（池内常驻对象的真实驻留合计；借出对象不计）。
+    ///
+    /// `Relaxed` 无锁快照：并发下是某一瞬间的观测值——每次 `try_take` /
+    /// `give_back` 的**完成态**恒满足 `held <= total`，故采样值不会越过硬上限；
+    /// metrics 用途，不作裁决。
     pub fn held(&self) -> usize {
-        *budget_lock(&self.held)
+        self.held.load(Ordering::Relaxed)
     }
 
     /// 剩余可认领字节。
@@ -407,31 +427,38 @@ impl ByteBudget {
 
     /// 认领 `n` 字节（原子 check+act：余额足 ⇒ 认领并返回 true；不足 ⇒ 返回
     /// false，调用方按容量因丢弃）。`n == 0` 恒 true（未启用计量面的调用点
-    /// 短路，零开销）。
+    /// 短路，零开销）。`checked_add` 兜掉超大 `n` 的回绕（回绕后“看起来有余量”
+    /// 会击穿硬上限）。
     pub fn try_take(&self, n: usize) -> bool {
         if n == 0 {
             return true;
         }
-        let mut held = budget_lock(&self.held);
-        if *held + n > self.total {
-            return false;
-        }
-        *held += n;
-        true
+        self.held
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |held| {
+                held.checked_add(n).filter(|&end| end <= self.total)
+            })
+            .is_ok()
     }
 
     /// 回卷 `n` 字节（借出 / prune / resize 裁剪的对称面）。下溢 = 记账 bug，
     /// fail-fast panic。`n == 0` 短路。
+    ///
+    /// 与 [`Self::try_take`] 同款 CAS 循环（`fetch_update`）：闭包返回 `None` 时
+    /// 计数**原样不写盘**，所以下溢 panic 之前账目不被 wrap 成巨值，panic 之后
+    /// 仍是自洽状态。
     pub fn give_back(&self, n: usize) {
         if n == 0 {
             return;
         }
-        let mut held = budget_lock(&self.held);
+        let reverted = self
+            .held
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |held| {
+                held.checked_sub(n)
+            });
         assert!(
-            *held >= n,
+            reverted.is_ok(),
             "ByteBudget: give_back would go negative (bookkeeping bug)"
         );
-        *held -= n;
     }
 }
 
@@ -531,14 +558,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         !WEIGHT_IN_FLIGHT.with(Cell::get),
         "ObjectPool: weight hook must not re-enter the pool (deadlock face: hook re-locks a shard)"
     );
-    mutex
-        .lock()
-        .expect("objpool lock poisoned (prior holder panicked)")
-}
-
-/// ByteBudget 内部锁（同 fail-fast 纪律；**不参与**片锁重入检测——钩子体内
-/// 只读预算是合法访问，不构成死锁面）。
-fn budget_lock(mutex: &Mutex<usize>) -> MutexGuard<'_, usize> {
     mutex
         .lock()
         .expect("objpool lock poisoned (prior holder panicked)")
