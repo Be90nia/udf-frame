@@ -283,7 +283,7 @@ This is an evidence-driven sequence within the **existing workspace layout**. It
 
 ## 13. Acceptance criteria: current state versus remaining gap
 
-| Criterion | Current status | Required action |\n|---|---|---|
+| Criterion | Current status | Required action |
 |---|---|---|
 | Sync-only consumer has no Tokio in its dependency tree | **Satisfied but unpinned** for the reviewed skeleton-infra runtime feature graph | Add a CI assertion to prevent regression. |
 | Core Store contract can be implemented independently | **Satisfied but unpinned**: public skeleton::Store contract; SyncStore is an implementation | Preserve the public contract and avoid coupling it to runtime internals. |
