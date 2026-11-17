@@ -274,3 +274,163 @@ fn shared_quota_stays_usable_from_a_second_pool() {
         "合计 1200B 越过硬上限，必须拒收"
     );
 }
+
+// ── 池析构的字节回卷（bd udf-frame-m34）────────────────────────────────────
+//
+// 池 drop 时 idle 槽里的对象被析构，但预算额度必须随之回卷：共享
+// `Arc<ByteBudget>` 场景下否则那部分字节**永久不可用**（直到进程结束）。
+
+/// 装配：`idle_cap = 4 ⇒ 4 片 × 1 槽`；权重按 `len()` 计（确定性 100B）。
+fn budget_pool(budget: &Arc<ByteBudget>) -> ObjectPool<Vec<u8>> {
+    ObjectPool::with_shared_byte_quota(8, 4, Vec::<u8>::new, Arc::clone(budget), |buf: &Vec<u8>| {
+        buf.len()
+    })
+}
+
+/// drop 一个池必须把它 idle 占住的字节还给共享预算。
+#[test]
+fn dropping_a_pool_returns_its_idle_bytes_to_the_shared_budget() {
+    let budget = Arc::new(ByteBudget::new(1024));
+    let first = budget_pool(&budget);
+    let second = budget_pool(&budget);
+    for _ in 0..2 {
+        assert!(first.insert(vec![0u8; 100]).is_none());
+        assert!(second.insert(vec![0u8; 100]).is_none());
+    }
+    assert_eq!(budget.held(), 400, "两池各 200B 入 idle");
+
+    drop(first);
+    assert_eq!(budget.held(), 200, "drop 的池必须回卷自己的 idle 字节");
+    assert_eq!(budget.available(), 824);
+
+    drop(second);
+    assert_eq!(budget.held(), 0, "最后一个池 drop 后额度全数归还");
+    assert_eq!(budget.available(), 1024);
+}
+
+/// 回卷出去的额度受**全局硬上限**约束：回收后别的池能用满，但不得超发。
+#[test]
+fn released_quota_is_still_bounded_by_the_global_cap() {
+    let budget = Arc::new(ByteBudget::new(300));
+    let holder = budget_pool(&budget);
+    let newcomer = budget_pool(&budget);
+
+    for _ in 0..3 {
+        assert!(holder.insert(vec![0u8; 100]).is_none());
+    }
+    assert_eq!(budget.available(), 0, "300B 全被占满");
+    assert!(
+        newcomer.insert(vec![0u8; 100]).is_some(),
+        "满额时必须拒收，不得超发"
+    );
+
+    drop(holder);
+    assert_eq!(budget.available(), 300, "drop 后额度回到全局池");
+
+    for admitted in 1..=3 {
+        assert!(
+            newcomer.insert(vec![0u8; 100]).is_none(),
+            "第 {admitted} 件应可用回收额度入池"
+        );
+        assert_eq!(budget.held(), admitted * 100);
+    }
+    assert!(
+        newcomer.insert(vec![0u8; 100]).is_some(),
+        "再用到 400B 就越过 300B 硬上限，必须拒收"
+    );
+    assert_eq!(budget.held(), 300);
+}
+
+/// 回归：私有预算池与无预算池的析构行为不变（不掉别人的账、不 panic）。
+#[test]
+fn private_and_plain_pool_drop_leave_shared_budgets_untouched() {
+    let shared = Arc::new(ByteBudget::new(1024));
+
+    let private = ObjectPool::with_byte_quota(8, 4, Vec::<u8>::new, 512, |buf: &Vec<u8>| buf.len());
+    for _ in 0..2 {
+        assert!(private.insert(vec![0u8; 100]).is_none());
+    }
+    assert_eq!(shared.held(), 0, "私有预算池不碰共享账本");
+    drop(private);
+    assert_eq!(shared.held(), 0, "私有预算池 drop 不得改动共享账本");
+
+    let plain = ObjectPool::new(8, 4, Vec::<u8>::new);
+    for _ in 0..2 {
+        assert!(plain.insert(vec![0u8; 100]).is_none());
+    }
+    drop(plain);
+    assert_eq!(shared.held(), 0, "无预算池 drop 零副作用");
+}
+
+/// 并发：池析构与其他池的 `try_take` 交错时，采样 `held <= total` 恒成立，
+/// 且全部池 drop 后账目精确归零。
+#[test]
+fn concurrent_drop_and_take_never_breach_the_cap() {
+    const TOTAL: usize = 1024;
+    const PIECES: usize = 4;
+    const PER_POOL: usize = 2;
+
+    let budget = Arc::new(ByteBudget::new(TOTAL));
+    let mut pools: Vec<ObjectPool<Vec<u8>>> = (0..PIECES).map(|_| budget_pool(&budget)).collect();
+    for pool in &pools {
+        for _ in 0..PER_POOL {
+            assert!(pool.insert(vec![0u8; 100]).is_none());
+        }
+    }
+    assert_eq!(budget.held(), PIECES * PER_POOL * 100);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let breaches = Arc::new(AtomicUsize::new(0));
+    let churn_claims = Arc::new(AtomicUsize::new(0));
+
+    thread::scope(|scope| {
+        let sampler = {
+            let budget = Arc::clone(&budget);
+            let stop = Arc::clone(&stop);
+            let breaches = Arc::clone(&breaches);
+            scope.spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if budget.held() > TOTAL {
+                        breaches.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        let churn = {
+            let budget = Arc::clone(&budget);
+            let stop = Arc::clone(&stop);
+            let churn_claims = Arc::clone(&churn_claims);
+            scope.spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if budget.try_take(50) {
+                        churn_claims.fetch_add(1, Ordering::Relaxed);
+                        budget.give_back(50);
+                    }
+                }
+            })
+        };
+        // 两个池在与 churn 交错的另一个线程里析构。
+        let doomed: Vec<ObjectPool<Vec<u8>>> = pools.drain(..2).collect();
+        scope
+            .spawn(move || drop(doomed))
+            .join()
+            .expect("析构线程不得 panic");
+
+        stop.store(true, Ordering::Relaxed);
+        churn.join().expect("churn 线程不得 panic");
+        sampler.join().expect("采样线程不得 panic");
+    });
+
+    drop(pools);
+    assert_eq!(
+        breaches.load(Ordering::Relaxed),
+        0,
+        "任一采样点都不得越过 total"
+    );
+    assert!(
+        churn_claims.load(Ordering::Relaxed) > 0,
+        "churn 线程必须真的认领过（否则测试空转）"
+    );
+    assert_eq!(budget.held(), 0, "全部池 drop 后账目必须精确归零");
+    assert_eq!(budget.available(), TOTAL);
+}

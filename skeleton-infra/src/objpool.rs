@@ -1365,8 +1365,9 @@ impl<T> ObjectPool<T> {
     }
 
     /// 单件字节计量（未启用字节配额的池恒 0——`weight`/`budget` 成对出现，
-    /// `budget: None` ⇒ `weight: None`）。调用点在片锁内；钩子体内禁 acquire
-    /// 同一池（见 [`WeightHook`]）。
+    /// `budget: None` ⇒ `weight: None`）。调用点：借还/裁剪路径在片锁内，
+    /// **池析构路径在锁外**（`Drop` 先把槽位摘出来再计量）；两处钩子体内都禁
+    /// acquire 同一池（见 [`WeightHook`]）。
     fn weight_of(&self, obj: &T) -> usize {
         let Some(w) = self.weight.as_ref() else {
             return 0;
@@ -1395,6 +1396,43 @@ impl<T> ObjectPool<T> {
             Some(b) => (b.total(), b.held()),
             None => (0, 0),
         }
+    }
+}
+
+impl<T> Drop for ObjectPool<T> {
+    /// 池析构的字节回卷（bd udf-frame-m34）：idle 槽里的对象随池一起析构，它们
+    /// 占住的预算额度必须同时还给 [`ByteBudget`]——共享 `Arc<ByteBudget>` 时，
+    /// 否则这部分额度**永久不可用**（直到进程结束），后续池只能看到更小的上限。
+    ///
+    /// 纪律：未启用字节预算的池**零行早退**（`budget: None` ⇒ 字段随后照常
+    /// 析构，借还路径与本路径都不产生额外开销）；逐片取锁、**锁不嵌套**（预算锁
+    /// 是叶子锁，回卷在所有片锁释放后做一次）；对象**锁外**计量与析构（权重钩子
+    /// 是用户代码，不在片锁内跑）。
+    ///
+    /// 片锁这里**直取**而不走内部 `lock` 助手：后者的 debug 重入防呆是「钩子体内再取
+    /// 同一池片锁 ⇒ 自死锁」的检出，而析构期既无并发借用（`Pooled` 借住池、
+    /// `Owned` 持 `Arc`），也不存在「钩子还在跑」的窗口；经 `lock()` 反而会让
+    /// 「钩子体内 drop 掉另一个池」这种无死锁的合法路径误报 panic——析构期
+    /// panic 不可接受。
+    fn drop(&mut self) {
+        if self.budget.is_none() {
+            return;
+        }
+        let mut idle_bytes = 0usize;
+        for shard_mutex in &self.slots {
+            let doomed = {
+                let mut shard = shard_mutex
+                    .lock()
+                    .expect("objpool lock poisoned (prior holder panicked)");
+                std::mem::take(&mut shard.idle)
+            };
+            idle_bytes += doomed
+                .iter()
+                .map(|slot| self.weight_of(&slot.obj))
+                .sum::<usize>();
+            drop(doomed); // 锁外析构
+        }
+        self.budget_release(idle_bytes);
     }
 }
 
