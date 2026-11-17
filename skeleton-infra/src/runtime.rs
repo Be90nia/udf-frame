@@ -28,6 +28,10 @@ use crate::audit::{AuditEvent, AuditEventKind, AuditSink, AuditTicket};
 mod audit_emit;
 mod local_subs;
 mod notify;
+// 蓝图 §9 证据面：排空权独占载体的 Mutex 对照实现（默认构建不编译，见
+// `ExclusiveCell` 与 `tests/unsafe_evidence.rs` 的差分测试）。
+#[cfg(feature = "unsafe-evidence")]
+mod evidence;
 
 use audit_emit::{audit_emit, audit_enqueued};
 pub use local_subs::LocalSubscription;
@@ -93,9 +97,18 @@ struct DrainExclusive<T> {
     value: UnsafeCell<T>,
 }
 
-// SAFETY: DrainExclusive<T> 的安全纪要是**外部同步**——所有 `get_mut` 调用点
-// 必须位于排空权持有区间（drain 内 DrainGuard 活跃期）。排空旗 swap 互斥保证
-// 同一时刻至多一个排空者，故 &mut 独占成立；T: Send 使该独占访问可跨线程交接。
+// SAFETY（建立者）：排空权互斥由排空旗 `StoreInner::draining` 的 swap 建立——
+// `enqueue` 在 queue 锁内 `swap(true)` 判首、`drain` 同法判首，RMW 恒见修改序
+// 最新值，故同一时刻至多一个线程持权（push 与夺权同临界区合拢，见 enqueue 注）。
+// SAFETY（维持者）：三处独占字段（`effect_buf`/`notify_cache`/`notify_sink_buf`）
+// 的每次读写都必须经 [`ExclusiveCell::with_mut`]，且调用点必须在
+// [`drain_owned`] 的 `DrainGuard` armed 区间内；重入路径（reducer/订阅回调/
+// 解释器内 dispatch 或 sender dispatch）只经 `enqueue` 入队即返，不入 with_mut。
+// 「调用点全集」即本约束的检查清单——新增第四处访问点必须同时扩清单。
+// SAFETY（违反后果）：两线程同时拿到 `&mut T`（排空旗旁路，或 `&mut` 活到排空权
+// 释放之后）= `UnsafeCell` 别名写，Vec 扩容/清空撕裂、迭代器失效，属未定义行为
+// 而非可兜底的 panic；`tests/unsafe_evidence.rs` 的不变量测试与其变异验证是该
+// 论断的可执行面。`T: Send` 使独占访问可跨线程交接（排空权可被任意线程夺得）。
 unsafe impl<T: Send> Sync for DrainExclusive<T> {}
 
 impl<T> DrainExclusive<T> {
@@ -105,14 +118,101 @@ impl<T> DrainExclusive<T> {
         }
     }
 
-    /// SAFETY: 调用方必须持排空权（drain 内，DrainGuard 未 disarm），且不得让
-    /// 返回的 `&mut T` 活到排空权释放之后。重入路径（reducer/回调里 dispatch/
-    /// sender dispatch）只入队即返、到不了此处，无别名风险。
+    /// 独占区间唯一入口：`f` 执行期间本 cell 的 `&mut T` 唯一有效，且不逃逸
+    /// `f`（不跨排空权释放点存活）。默认构建在 `ExclusiveCell` 单变体上直通，
+    /// 无 tag、无分支开销。
+    ///
+    /// SAFETY: 调用方必须在排空权区间内（`DrainGuard` armed）；建立者/维持者/
+    /// 违反后果见上方类型级安全纪要。
+    fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        // SAFETY: 调用方持排空权（DrainGuard armed），见类型级安全纪要
+        f(unsafe { self.get_mut() })
+    }
+
+    /// SAFETY: 只由 [`Self::with_mut`] 在同一排空权区间内借用；调用方必须持
+    /// 排空权，且不得让返回的 `&mut T` 活到排空权释放之后。
     // clippy::mut_from_ref：本函数的不安全**就是**设计本体——外部同步（排空旗
     // 互斥）替代互斥锁，见类型级文档。allow 收口在唯一不安全面上。
     #[allow(clippy::mut_from_ref)]
     unsafe fn get_mut(&self) -> &mut T {
         &mut *self.value.get()
+    }
+}
+
+/// 排空权独占载体（[`DrainExclusive`] 的类型选择层）：默认构建只有生产变体
+/// （单变体枚举 = 无判别位、无分支，`with_mut` 直通）；`unsafe-evidence` 构建
+/// 并列编入 `Mutex` 对照变体，仅 [`SyncStore::new_mutex_reference`] 选它——
+/// 差分测试同进程对照两实现，生产装配路径（[`SyncStore::new`] /
+/// [`SyncStore::restore_from`]）恒选生产变体，默认路径零开销。
+enum ExclusiveCell<T> {
+    /// 生产实现：`UnsafeCell` + 排空旗外部同步（默认构建唯一变体）。
+    Unsynchronized(DrainExclusive<T>),
+    /// 对照实现：`Mutex<T>` 把独占区间换成锁区间（蓝图 §9 证据面，默认不编译）。
+    #[cfg(feature = "unsafe-evidence")]
+    Locked(evidence::MutexExclusive<T>),
+}
+
+impl<T> ExclusiveCell<T> {
+    /// 生产载体构造（装配默认面的唯一入口）。
+    fn unsynchronized(value: T) -> Self {
+        Self::Unsynchronized(DrainExclusive::new(value))
+    }
+
+    /// 对照载体构造（证据面唯一入口，默认构建不存在）。
+    #[cfg(feature = "unsafe-evidence")]
+    fn locked(value: T) -> Self {
+        Self::Locked(evidence::MutexExclusive::new(value))
+    }
+
+    /// 独占区间：语义与调用点约束同 [`DrainExclusive::with_mut`]（排空权区间
+    /// 内调用），对照变体额外由锁自证互斥。
+    fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        match self {
+            Self::Unsynchronized(cell) => cell.with_mut(f),
+            #[cfg(feature = "unsafe-evidence")]
+            Self::Locked(cell) => cell.with_mut(f),
+        }
+    }
+}
+
+// 零开销证据（默认构建）：单变体枚举不带判别位，布局与生产载体逐字节相同。
+#[cfg(all(test, not(feature = "unsafe-evidence")))]
+const _: () =
+    assert!(std::mem::size_of::<ExclusiveCell<u64>>() == std::mem::size_of::<UnsafeCell<u64>>());
+
+/// 三处排空权独占载体的装配组：构造入口按实现整组选择（生产 vs `Mutex` 对照），
+/// 使 `StoreInner` 只留一处字面量（[`SyncStore::assemble`]）——对照装配与生产
+/// 装配的其余字段因此不可能漂移。
+struct ExclusiveCells<S, A, Op> {
+    effect_buf: ExclusiveCell<EffectBuf<A, Op>>,
+    notify_cache: ExclusiveCell<NotifyCache<S>>,
+    notify_sink_buf: ExclusiveCell<Vec<Arc<NotifySinkSlot>>>,
+}
+
+impl<S, A, Op> ExclusiveCells<S, A, Op> {
+    /// 生产装配（默认公共面的唯一路径）。
+    fn unsynchronized() -> Self {
+        Self {
+            effect_buf: ExclusiveCell::unsynchronized(EffectBuf::new()),
+            notify_cache: ExclusiveCell::unsynchronized(NotifyCache {
+                version: 0,
+                slots: Vec::new(),
+            }),
+            notify_sink_buf: ExclusiveCell::unsynchronized(Vec::new()),
+        }
+    }
+
+    /// 对照装配（证据面唯一路径，默认构建不存在）。
+    #[cfg(feature = "unsafe-evidence")]
+    fn locked() -> Self {
+        Self {
+            effect_buf: ExclusiveCell::locked(EffectBuf::new()),
+            notify_cache: ExclusiveCell::locked(NotifyCache {
+                version: 0,
+                slots: Vec::new(),
+            }),
+            notify_sink_buf: ExclusiveCell::locked(Vec::new()),
+        }
     }
 }
 
@@ -138,10 +238,10 @@ struct StoreInner<S, A, Op> {
     /// 排空权独占（[`DrainExclusive`]）：原 `Mutex` 的 take/还 两对锁消融——
     /// reducer 期间不持任何锁的契约不变（UnsafeCell 无锁可毒），panic 路径
     /// 连容量都不再丢（缓冲留在原位，下次 clear 复用）。
-    effect_buf: DrainExclusive<EffectBuf<A, Op>>,
+    effect_buf: ExclusiveCell<EffectBuf<A, Op>>,
     /// 订阅集快照缓存（锁消融修订，见 [`NotifyCache`]）：稳态零锁读，
     /// 冷路径（订阅集变更后的首个 dispatch）才锁 `subs` 重建+代答回收死 Weak。
-    notify_cache: DrainExclusive<NotifyCache<S>>,
+    notify_cache: ExclusiveCell<NotifyCache<S>>,
     /// 订阅集版本号：订阅增删（[`SyncStore::subscribe`]）、票据注销（[`Subscription`] Drop）、
     /// 回调 panic 摘除三路自增，快照缓存失效依据。Arc 装载使注销票据持句柄可 bump。
     subs_version: Arc<AtomicUsize>,
@@ -170,7 +270,7 @@ struct StoreInner<S, A, Op> {
     /// Vec，有订阅者时每拍一次分配（PerfProbe 实测 total = 1.00 alloc/拍，见
     /// `verify/perf-probe/`）。排空权独占（同 `effect_buf`/`notify_cache`）：只在
     /// 排空环通知段读写，无需自锁。容量保留到订阅数峰值（每槽一针宽）。
-    notify_sink_buf: DrainExclusive<Vec<Arc<NotifySinkSlot>>>,
+    notify_sink_buf: ExclusiveCell<Vec<Arc<NotifySinkSlot>>>,
     /// store 身份号（本地订阅在注册线程 TLS 表中的键）：全局单调，进程内唯一。
     store_id: u64,
     /// 单写者排空守卫（确定性：同序 action 序列恒同终态；重入回灌只入队）
@@ -271,6 +371,29 @@ struct StoreInner<S, A, Op> {
 /// 既有顺序不动）。**异步档不救同步档**：慢同步订阅者的耗时照常计入 dispatch；
 /// 慢消费者靠投递口内自备通道/工作线程解耦（O(1) 是宿主契约义务，框架无法
 /// 检测也无法阻止阻塞）。
+///
+/// # 效果执行两档（同步档 / 托管档）
+///
+/// 同一「两档并存 + 同一语义契约」在效果执行面的落法（蓝图 §11 项 6，承继
+/// ADR 0008 的通知面先例）：`EffectRuntime` 只有一种实现形态要求——`run` 是
+/// 同步方法（[`EffectRuntime::run`]），排空环在
+/// `dispatch` 调用栈上内联调用它，**核心从不 `await`、从不等待任务句柄**。
+///
+/// - **同步档**：`run` 内联把活干完（有界、非阻塞、不 await）。耗时直接计入
+///   dispatch；`run` panic 原样从 [`Self::dispatch`] 上浮（fail-visible，毒锁
+///   在下一次效果转发时恢复并计入 [`Self::runtime_panic_count`]），实例不报废。
+/// - **托管档**：`run` 只把工作 `spawn_tracked` 进 [`crate::fx::FxScope`] 的
+///   生命周期集便返回——`dispatch` 返回 ≠ 效果完成。失败/取消经
+///   [`crate::fx::Spawned::join`] 的 [`crate::fx::TaskError`] 与
+///   [`crate::fx::ShutdownReport`] 分桶面可见；结果必须经 `back`
+///   （[`ActionSender`]）回灌成普通 action——状态仍只由
+///   reducer 推进，跨线程回灌按外部流量计（不受回灌深度预算约束，环防护责任
+///   在解释器自身，见 [`EffectRuntime`] 契约注）。
+///
+/// 两档共用的边界规则：核心永不阻塞等异步完成；异步结果只经 `ActionSender`
+/// 消息边界回灌；同步档内禁 `await`/禁阻塞 IO（阻塞 `run` = 阻塞整个状态机）。
+/// 行为面与逐步坐标见 `docs/reference.md` 的「effect 执行两档」节与
+/// `tests/effect_two_tier.rs`。
 ///
 /// # Panic 契约
 ///
@@ -756,6 +879,19 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
                  解释该恢复形态（fail-closed），须在实现侧补臂定义其播种语义"
             ),
         };
+        Self::assemble(root, fx, state, actions, ExclusiveCells::unsynchronized())
+    }
+
+    /// 装配尾段（[`Self::restore_from`] 与证据专用构造共用）：`StoreInner` 的
+    /// 唯一字面量——构造入口只差排空权独占载体的实现（生产 vs `Mutex` 对照），
+    /// 其余字段不可能漂移。
+    fn assemble(
+        root: impl Reducer<State = S, Action = A, Op = Op> + Send + Sync + 'static,
+        fx: impl EffectRuntime<A, Op> + Send + 'static,
+        state: S,
+        actions: Vec<A>,
+        cells: ExclusiveCells<S, A, Op>,
+    ) -> Self {
         // new_cyclic：back 缓存句柄持 Weak 指回 inner，环构造一步完成
         let inner = Arc::new_cyclic(|weak| StoreInner {
             reducer: Arc::new(root),
@@ -764,11 +900,8 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             queue: Mutex::new(VecDeque::new()),
             subs: Arc::new(Mutex::new(Vec::new())),
             back: back_sender(weak),
-            effect_buf: DrainExclusive::new(EffectBuf::new()),
-            notify_cache: DrainExclusive::new(NotifyCache {
-                version: 0,
-                slots: Vec::new(),
-            }),
+            effect_buf: cells.effect_buf,
+            notify_cache: cells.notify_cache,
             subs_version: Arc::new(AtomicUsize::new(0)),
             local_subs: Arc::new(AtomicUsize::new(0)),
             local_missed: AtomicU64::new(0),
@@ -776,7 +909,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             notify_subs: Arc::new(AtomicUsize::new(0)),
             state_version: AtomicU64::new(0),
             notify_published: AtomicU64::new(0),
-            notify_sink_buf: DrainExclusive::new(Vec::new()),
+            notify_sink_buf: cells.notify_sink_buf,
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             draining: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -805,6 +938,21 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             store.dispatch(action);
         }
         store
+    }
+
+    /// 证据专用装配（`unsafe-evidence` 构建，蓝图 §9）：与 [`Self::new`] 逐字
+    /// 同装（同一个私有 `assemble`），唯一差异是排空权独占载体换成 `Mutex<T>`
+    /// 对照实现——差分测试因此能在同一进程内对同一 dispatch 序列对照两实现的
+    /// 可观察面（状态终值/订阅触达/效果缓冲清空/panic 计数），而不必重写第二套
+    /// `SyncStore`。默认构建不存在本入口（对照变体不进默认公共面）。
+    #[cfg(feature = "unsafe-evidence")]
+    #[track_caller]
+    pub fn new_mutex_reference(
+        root: impl Reducer<State = S, Action = A, Op = Op> + Send + Sync + 'static,
+        fx: impl EffectRuntime<A, Op> + Send + 'static,
+    ) -> Self {
+        let state = root.initial();
+        Self::assemble(root, fx, state, Vec::new(), ExclusiveCells::locked())
     }
 
     /// 登记跨线程订阅，闭门显式拒绝（推荐停机序主路径）：登记路径与
@@ -1262,31 +1410,35 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // 一律计深 feedback_depth+1；迭代末守卫恢复原值，panic 栈展开亦然。
         let _reentrant = ReentrantDepthGuard::enter(inner.store_id, feedback_depth + 1);
         let current = Arc::clone(&lock(&inner.state));
-        // 效果缓冲排空权独占（DrainExclusive）：take/还
-        // 两对锁消融——clear 后原地交 reducer，转发完随下轮 clear 复用。reducer
-        // 期间不持任何锁的契约不变：UnsafeCell 无锁可毒，reducer panic 时
-        // 栈展开零残留，缓冲容量连丢一次都不丢。
+        // 效果缓冲排空权独占（[`ExclusiveCell`]）：take/还两对锁消融——clear 后
+        // 原地交 reducer，转发完随下轮 clear 复用。reducer 期间不持任何锁的契约
+        // 不变：无锁可毒、reducer panic 时栈展开零残留，缓冲容量连丢一次都不丢。
+        // 缓冲不再迭代头 clear——转发改为逐条摘除（见转发环注释），panic 时未转发
+        // 的效果原地留缓冲，下一任排空的 reduce 向其追加、转发时先续转（panic 前
+        // 已产效果禁吞，fail-visible；迭代头 clear 会无声吞掉残留）。成功路径转发
+        // 即摘除，缓冲照常回空，保容量语义不变，稳态零新增分配不受影响。
+        // reducer panic 与解释器 panic 同形留痕（与全链计数纪律对称）：catch 只
+        // 观察（计数+审计现场）后把 payload 带出区间；`resume_unwind` 落在独占
+        // 区间之外——传播语义不变（panic 照常在 dispatch 调用点上浮），且对照实现
+        // （Mutex）的锁不会在展开途中被毒化。动作本体已出队随栈展开丢失（已知
+        // 契约），缓冲已产效果原地留（续转不受观察影响）。
         // SAFETY: 持排空权（DrainGuard armed 区间）；重入 dispatch 只入队即返，
         // 到不了此处——独占访问成立，见 DrainExclusive 安全纪要
-        let buf = unsafe { inner.effect_buf.get_mut() };
-        // 缓冲不再迭代头 clear——
-        // 转发改为逐条摘除（见下方转发环注释），panic 时未转发的效果原地留缓冲，
-        // 下一任排空的 reduce 向其追加、转发时先续转（panic 前已产效果禁吞，
-        // fail-visible；迭代头 clear 会无声吞掉残留）。成功路径转发即摘除，缓冲
-        // 照常回空，保容量语义不变，稳态零新增分配不受影响。
-        // reducer panic 与解释器 panic 同形留痕（与全链计数纪律对称）：catch 只
-        // 观察（计数+审计现场）即 resume_unwind 原样重抛——传播语义不变，
-        // panic 照常在 dispatch 调用点上浮；动作本体已出队随栈展开丢失（已知
-        // 契约），缓冲已产效果原地留（续转不受观察影响）。
-        let next_val = match catch_unwind(AssertUnwindSafe(|| {
-            inner.reducer.reduce(&current, action, buf)
-        })) {
-            Ok(next) => next,
-            Err(payload) => {
-                inner.reducer_panics.fetch_add(1, Ordering::SeqCst);
-                audit_emit(inner, AuditEventKind::ReducerInterrupted);
-                std::panic::resume_unwind(payload);
+        let reduced = inner.effect_buf.with_mut(|buf| {
+            match catch_unwind(AssertUnwindSafe(|| {
+                inner.reducer.reduce(&current, action, buf)
+            })) {
+                Ok(next) => Ok(next),
+                Err(payload) => {
+                    inner.reducer_panics.fetch_add(1, Ordering::SeqCst);
+                    audit_emit(inner, AuditEventKind::ReducerInterrupted);
+                    Err(payload)
+                }
             }
+        });
+        let next_val = match reduced {
+            Ok(next) => next,
+            Err(payload) => std::panic::resume_unwind(payload),
         };
         audit_emit(inner, AuditEventKind::Reduced);
         // CoW 前置：reduce 后立即放手 current——不放
@@ -1301,37 +1453,45 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // reduce→快照替换→效果转发→通知（异步投递先行、同步回调随后）。
         // SAFETY: 持排空权（DrainGuard armed 区间）；通知段仅在排空权下进入，
         // 独占访问成立，见 DrainExclusive 安全纪要
-        let cache = unsafe { inner.notify_cache.get_mut() };
-        let version = inner.subs_version.load(Ordering::Acquire);
-        if cache.version != version {
-            let mut subs = lock(&inner.subs);
-            cache.slots.clear();
-            subs.retain(|w| match w.upgrade() {
-                Some(slot) => {
-                    cache.slots.push(slot);
-                    true
-                }
-                None => false,
-            });
-            cache.version = version;
-        }
+        // 冷重建与「有无订阅者」判读在同一次独占区间内完成；落位/转发不触达该
+        // 缓存，故与下方通知段分两次取用（不把整段管线塞进闭包）。
+        let has_subscribers = inner.notify_cache.with_mut(|cache| {
+            let version = inner.subs_version.load(Ordering::Acquire);
+            if cache.version != version {
+                let mut subs = lock(&inner.subs);
+                cache.slots.clear();
+                subs.retain(|w| match w.upgrade() {
+                    Some(slot) => {
+                        cache.slots.push(slot);
+                        true
+                    }
+                    None => false,
+                });
+                cache.version = version;
+            }
+            !cache.slots.is_empty()
+        });
         // CoW 快照落位（快照分配税消除；析构在锁外——契约细节见 helper 文档）。
         place_snapshot(inner, next_val);
         // 通知句柄：订阅态在落位后补一次 state 锁克隆新快照（回调锁外借用）；
         // 句柄随迭代末消亡，稳态计数回落 1，下一 action 的 make_mut 仍原地命中。
-        let notified_next = if cache.slots.is_empty() {
-            None
-        } else {
+        let notified_next = if has_subscribers {
             Some(Arc::clone(&lock(&inner.state)))
+        } else {
+            None
         };
         // 转发环（禁吞语义见 helper 文档）：Emit 回灌入队、Run/Cancel 交解释器。
-        forward_effects(inner, buf, feedback_depth);
+        inner
+            .effect_buf
+            .with_mut(|buf| forward_effects(inner, buf, feedback_depth));
         // 异步投递段（ADR 0008）：排在同步回调之前——否则同步档慢订阅者会把
         // 异步消费者的可见延迟一并拖后。投递只发版本号：O(1)、门控短路
         // （零异步订阅者一次 Acquire load 即返）、锁外调用宿主代码。
         notify_async(inner);
         // 通知段（本地先行、跨线程随后；返回当拍是否有订阅者收到快照）。
-        let snapshot_notified = notify_snapshot_consumers(inner, cache, &notified_next);
+        let snapshot_notified = inner
+            .notify_cache
+            .with_mut(|cache| notify_snapshot_consumers(inner, cache, &notified_next));
         // 通知节点（R1-2）：只在当拍确有订阅者收到快照时记录——零订阅者的
         // dispatch 无 Notified 事件（时间线如实，不造心跳噪声）。
         if snapshot_notified {

@@ -78,37 +78,38 @@ pub(super) fn notify_async<S, A, Op>(inner: &StoreInner<S, A, Op>) {
     // StoreInner（排空权独占），跨拍 clear 保容量——稳态投影零分配；每 store
     // 独立，宿主 publish 里回调别的 store 也不共享缓冲。
     // SAFETY: 持排空权（DrainGuard armed 区间）——本函数只由 `drain_owned` 的
-    // 通知段调用，排空旗互斥保证 &mut 独占，且引用不逃逸本函数（DrainExclusive
+    // 通知段调用，排空旗互斥保证 &mut 独占，且引用不逃逸闭包（DrainExclusive
     // 安全纪要）。
-    let slots = unsafe { inner.notify_sink_buf.get_mut() };
-    slots.clear();
-    {
-        // 表锁只覆盖收集窗；投递仍在锁外（publish 是宿主代码，持锁调用即死锁）。
-        let sinks = lock(&inner.notify_sinks);
-        slots.extend(sinks.iter().filter_map(|w| w.upgrade()));
-    }
-    if slots.is_empty() {
-        // 闸 stale 的并发摘除窗：表已空——门控语义（无人订阅不推进版本）成立
-        return;
-    }
-    // 版本推进与落位一一对应（版本号 = 状态代数）；Relaxed 足够：版本值经
-    // 调用参数出站，消费侧拉取现态自走 state 锁序。
-    let version = inner.state_version.fetch_add(1, Ordering::Relaxed) + 1;
-    for slot in slots.iter() {
-        // 锁外调用（取出→调用→归还）：投递口 panic 归一——fail-closed 摘除后
-        // 继续（中毒口每次 dispatch 必再 panic，留表即「每拍必 panic」双重变砖）。
-        // 成因留痕与订阅回调 panic 同一纪律（subscriber_panics / last_cause）；
-        // panic 的投递不计入 notify_published（成本只计成功投递）。
-        let published = catch_unwind(AssertUnwindSafe(|| slot.sink.publish(version)));
-        match published {
-            Ok(()) => {
-                inner.notify_published.fetch_add(1, Ordering::Release);
-            }
-            Err(payload) => {
-                remove_sink(slot, &inner.notify_sinks, &inner.notify_subs);
-                inner.subscriber_panics.fetch_add(1, Ordering::Release);
-                *lock(&inner.subscriber_panic_cause) = Some(panic_cause_summary(&*payload));
+    inner.notify_sink_buf.with_mut(|slots| {
+        slots.clear();
+        {
+            // 表锁只覆盖收集窗；投递仍在锁外（publish 是宿主代码，持锁调用即死锁）。
+            let sinks = lock(&inner.notify_sinks);
+            slots.extend(sinks.iter().filter_map(|w| w.upgrade()));
+        }
+        if slots.is_empty() {
+            // 闸 stale 的并发摘除窗：表已空——门控语义（无人订阅不推进版本）成立
+            return;
+        }
+        // 版本推进与落位一一对应（版本号 = 状态代数）；Relaxed 足够：版本值经
+        // 调用参数出站，消费侧拉取现态自走 state 锁序。
+        let version = inner.state_version.fetch_add(1, Ordering::Relaxed) + 1;
+        for slot in slots.iter() {
+            // 锁外调用（取出→调用→归还）：投递口 panic 归一——fail-closed 摘除后
+            // 继续（中毒口每次 dispatch 必再 panic，留表即「每拍必 panic」双重变砖）。
+            // 成因留痕与订阅回调 panic 同一纪律（subscriber_panics / last_cause）；
+            // panic 的投递不计入 notify_published（成本只计成功投递）。
+            let published = catch_unwind(AssertUnwindSafe(|| slot.sink.publish(version)));
+            match published {
+                Ok(()) => {
+                    inner.notify_published.fetch_add(1, Ordering::Release);
+                }
+                Err(payload) => {
+                    remove_sink(slot, &inner.notify_sinks, &inner.notify_subs);
+                    inner.subscriber_panics.fetch_add(1, Ordering::Release);
+                    *lock(&inner.subscriber_panic_cause) = Some(panic_cause_summary(&*payload));
+                }
             }
         }
-    }
+    });
 }
