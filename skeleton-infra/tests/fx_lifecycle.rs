@@ -1,9 +1,14 @@
 #![cfg(feature = "tokio")]
 //! 停机报告契约（蓝图 §4 / §11 第 3 项）的生命周期回归。
 //!
-//! 报告六桶互斥且穷尽：`completed` / `cancelled` / `panicked` / `failed` /
+//! 报告五个终局桶互斥且穷尽：`completed` / `cancelled` / `panicked` / `failed` /
 //! `still_running` 中每任务恰落一桶；`timed_out` 是**截止事件**的计数（调用方停止
 //! 等待），`still_running` 是**终止未观测**的计数——二者都不宣称工作已终止。
+//!
+//! 确定性分工：deadline 路径只放「终局类与 abort 无竞态」的任务（不可让渡自旋 /
+//! 长期存活）；正常完成与 panic 的逐类落账走无 deadline 路径——`close_and_take` 的
+//! abort 与 tokio「poll 返回 Ready → 标记 COMPLETE」之间存在内部竞窗，CPU 抢占即可
+//! 命中（详见 `timeout_reports_survivors_without_claiming_termination` 的文档）。
 //!
 //! 另钉三条既有语义：close ≠ cancel（闸关不连带取消在途）、close/cancel/shutdown
 //! 幂等可重入、无超时路径在任务全完成时 `timed_out == 0`。
@@ -79,12 +84,18 @@ async fn shutdown_counts_completed_and_reports_no_timeout() {
     assert_eq!(report.still_running, 0, "排空至空集 ⇒ 无未观测终局");
 }
 
-/// e2e（跑法①）：正常完成 / panic / 长期存活 / 不可让渡自旋混合场景 →
-/// `close()` → `shutdown_timeout(短期限)`。三类结局各落各桶，且报告不把超时任务
-/// 记成已终止（自旋任务在报告返回时仍在跑，abort 在其下一个 await 点才生效）。
+/// 超时路径（deadline 面）：只放**终局类与 abort 无竞态**的任务——不可让渡自旋段
+/// （abort 只能等下一 await）与长期存活任务（只会被 abort）——故断言与 CPU 负载
+/// 无关：`timed_out` 是截止事件计数、`still_running` 是终止未观测计数，二者都不得
+/// 把幸存者记成 `completed`。
+///
+/// 为什么「正常完成 / panic」不在这里：`close_and_take` 的 abort 与「任务 poll 返回
+/// Ready → tokio 标记 COMPLETE」之间有内部竞窗（cancel 落进该窗即丢输出、条目记
+/// cancelled），CPU 抢占即可命中——那是时序事实，不是可断言的语义。逐类落账改由
+/// `mixed_outcomes_classified_without_deadline` 在无 deadline 路径上确定化钉住。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mixed_outcomes_land_in_distinct_buckets_without_claiming_termination() {
-    let done = Arc::new(AtomicUsize::new(0));
+async fn timeout_reports_survivors_without_claiming_termination() {
+    let started = Arc::new(AtomicUsize::new(0));
     let hold = Arc::new(AtomicBool::new(false));
     let holding = Arc::new(AtomicBool::new(false));
     // panic 路径也放开自旋段：否则 worker 在无 await 的 poll 里滞留，运行时拆除
@@ -92,33 +103,19 @@ async fn mixed_outcomes_land_in_distinct_buckets_without_claiming_termination() 
     let _release = ReleaseOnDrop(Arc::clone(&hold));
     let scope = FxScope::new();
 
-    // ① 两个正常完成。
+    // ① 两条长期存活：入口先发「已进等待」信号再睡——启动是可判定事实，不靠时间
+    // 窗猜（abort 后要么落 cancelled、要么未收割进 still_running，都是确定类）。
     for _ in 0..2 {
-        let done_task = Arc::clone(&done);
+        let started_task = Arc::clone(&started);
         scope
             .spawn_tracked(async move {
-                done_task.fetch_add(1, Ordering::Release);
-            })
-            .unwrap();
-    }
-
-    // ② 一个 panic（句柄丢弃：载荷只走集合面，报告是唯一观测口）。
-    {
-        let handle = scope.spawn_tracked(async { panic!("boom-e2e") }).unwrap();
-        drop(handle);
-    }
-
-    // ③ 两个长期存活（abort 在 sleep await 点即生效 ⇒ 应进 cancelled）。
-    for _ in 0..2 {
-        scope
-            .spawn_tracked(async {
+                started_task.fetch_add(1, Ordering::Release);
                 tokio::time::sleep(Duration::from_secs(60)).await;
             })
             .unwrap();
     }
 
-    // ④ 一个不可让渡自旋段：abort 只在下一 await 生效 ⇒ 超时必达，报告只能报
-    // still_running（构造同 fx.rs 单测的 hold/holding 握手）。
+    // ② 一条不可让渡自旋段：abort 只在下一次 await 生效 ⇒ 超时必达。
     let (hold_task, holding_task) = (Arc::clone(&hold), Arc::clone(&holding));
     let spinner = scope
         .spawn_tracked(async move {
@@ -135,9 +132,10 @@ async fn mixed_outcomes_land_in_distinct_buckets_without_claiming_termination() 
         })
         .unwrap();
 
-    // 握手（有界等待：不变量被破坏时诊断失败而非挂死）。
-    wait_until("两个正常任务已终局", || {
-        done.load(Ordering::Acquire) >= 2
+    // 握手（有界等待，不变量被破坏时诊断失败而非挂死）：长期存活任务已真的进入
+    // 等待、自旋任务已滞留在无 await 的 poll 段内。
+    wait_until("两条长期存活任务已进入等待", || {
+        started.load(Ordering::Acquire) >= 2
     })
     .await;
     hold.store(true, Ordering::Relaxed);
@@ -148,25 +146,23 @@ async fn mixed_outcomes_land_in_distinct_buckets_without_claiming_termination() 
 
     scope.close(); // 闸关：拒新 spawn，不取消在途
     assert!(!scope.token().is_cancelled(), "close 不是 cancel");
-    let started = Instant::now();
+    let waited = Instant::now();
     let report = bounded(
         "shutdown_timeout 有界返回",
         scope.shutdown_timeout(Duration::from_millis(50)),
     )
     .await;
-    println!("mixed report (timeout path): {report:?}");
+    println!("timeout report: {report:?}");
 
     assert!(
-        started.elapsed() >= Duration::from_millis(50),
+        waited.elapsed() >= Duration::from_millis(50),
         "超时必达：提前返回即守卫失效"
     );
-    assert_eq!(report.completed, 2, "正常完成的任务进 completed");
-    assert_eq!(
-        report.panicked,
-        vec!["boom-e2e".to_owned()],
-        "panic 载荷进 panicked"
-    );
-    assert_eq!(report.failed, 0, "本场景无失败的终局");
+    // 终局面：幸存者不得被记成已完成 / 已取消。
+    assert_eq!(report.completed, 0, "超时路径不得把未观测终止记成已完成");
+    assert!(report.panicked.is_empty(), "本场景无 panic 终局");
+    assert_eq!(report.failed, 0, "本场景无非 panic 失败终局");
+    // deadline 面：截止时未完成 ≥ 自旋段；报告返回时终止未观测 ≥ 自旋段。
     assert!(report.timed_out >= 1, "自旋段把截止推过期限");
     assert!(
         report.still_running >= 1,
@@ -182,8 +178,8 @@ async fn mixed_outcomes_land_in_distinct_buckets_without_claiming_termination() 
             + report.panicked.len()
             + report.failed
             + report.still_running,
-        6,
-        "桶互斥且穷尽：每任务恰落一桶"
+        3,
+        "桶互斥且穷尽：每条任务恰落一桶"
     );
     assert!(
         !spinner.is_finished(),
@@ -195,6 +191,71 @@ async fn mixed_outcomes_land_in_distinct_buckets_without_claiming_termination() 
         bounded("超时遗留任务被 abort 收割", spinner.join()).await,
         Err(TaskError::Cancelled),
         "超时遗留任务由 abort 在下一 await 点收割"
+    );
+}
+/// 混合场景（无 deadline 路径，逐类落账确定化）：正常完成 / panic / 长期存活三类
+/// 各落各桶。`shutdown()` 等净至空集 ⇒ `timed_out` / `still_running` 恒 0，且
+/// current_thread 调度下单线程「poll 返回 Ready ⇒ 条目终局」先于测试线程恢复，
+/// 故每条任务的终局都是已确定事实，无需与 abort 赛跑。
+///
+/// 与 [`timeout_reports_survivors_without_claiming_termination`] 分工：deadline
+/// 路径只钉幸存者面（不可让渡自旋 + 长期存活），逐类落账钉在本测试——multi_thread
+/// 上让「已完成 / panic」与 abort 赛跑属 tokio 内部竞窗（cancel 落进 poll 完成窗
+/// 即丢输出、条目记 cancelled），CPU 抢占即可命中，不是可断言的语义。
+#[tokio::test]
+async fn mixed_outcomes_classified_without_deadline() {
+    let scope = FxScope::new();
+
+    // ① 两条正常完成。
+    let mut quick = Vec::new();
+    for i in 0..2u8 {
+        quick.push(scope.spawn_tracked(async move { i }).unwrap());
+    }
+    // ② 一条 panic（句柄不丢：载荷先经 join 面证一次，再由报告面落账）。
+    let boom = scope.spawn_tracked(async { panic!("boom-mixed") }).unwrap();
+    // ③ 两条长期存活（只会被 abort ⇒ 必落 cancelled）。
+    for _ in 0..2 {
+        scope
+            .spawn_tracked(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            })
+            .unwrap();
+    }
+
+    for (expected, handle) in quick.into_iter().enumerate() {
+        assert_eq!(
+            bounded("正常任务 join 收值", handle.join()).await,
+            Ok(expected as u8),
+            "正常任务 join 收值"
+        );
+    }
+    assert_eq!(
+        bounded("panic 任务 join 收割", boom.join()).await,
+        Err(TaskError::Panicked("boom-mixed".to_owned())),
+        "panic 载荷经 join 面可见"
+    );
+
+    scope.close();
+    let report = bounded("shutdown 有界返回", scope.shutdown()).await;
+    println!("mixed report (no deadline): {report:?}");
+    assert_eq!(report.completed, 2, "正常完成的任务进 completed");
+    assert_eq!(
+        report.panicked,
+        vec!["boom-mixed".to_owned()],
+        "panic 载荷进 panicked"
+    );
+    assert_eq!(report.cancelled, 2, "长期存活任务被 abort ⇒ cancelled");
+    assert_eq!(report.failed, 0, "本场景无失败的终局");
+    assert_eq!(report.timed_out, 0, "无 deadline 路径恒 0");
+    assert_eq!(report.still_running, 0, "排空至空集 ⇒ 无未观测终局");
+    assert_eq!(
+        report.completed
+            + report.cancelled
+            + report.panicked.len()
+            + report.failed
+            + report.still_running,
+        5,
+        "桶互斥且穷尽：每任务恰落一桶"
     );
 }
 
