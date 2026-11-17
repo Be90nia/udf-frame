@@ -57,7 +57,7 @@ The repository intentionally excludes `docs/adr/` from Git under the 2026-10-28 
 | ADR-0009 | Fragment / Reducer are distinct composition contracts: Reducer is the root contract; Fragment is the slice contract. Combining fragments as a root should fail at compile time (E0277), not at runtime by panic. | **Accepted and inherited.** The pure-state contract inventory includes both Fragment and Reducer; examples and trait bounds must preserve their root/slice distinction. |
 | ADR-0010 | ObjectPool uses bounded degradation when the accounted pool universe is full: it may directly build an object outside that universe, does not count it in `alive`, and releases it rather than returning it to the pool. | **Accepted and inherited.** §5 explicitly distinguishes the accounted pool cap from the fallback production policy; `max` is not necessarily an absolute cap on objects returned to callers. |
 
-ADR-0002–0007 are not cited as premises for any decision in this blueprint and are outside this blueprint's current scope; they are **not** marked pending or treated as rejected. Their authoritative local copies remain governed by the existing `docs/adr/` exclusion policy. If a future blueprint change depends on one of them, that decision must be summarized and cited explicitly before the change is proposed.
+ADR-0002–0007 are not cited as decision premises for the target-architecture choices in this blueprint. However, **ADR-0004 and ADR-0007 remain the authoritative basis for the current package layout described above** (the std-ext split and zero-third-party dependency posture); they are retained as current-state rationale, not re-decided here. ADR-0002, -0003, -0005, and -0006 are not cited as decision premises and have no material overlap with the decisions made in this blueprint. Their authoritative local copies remain governed by the existing `docs/adr/` exclusion policy. If a future blueprint change materially depends on one of them, summarize and cite that decision explicitly before proposing the change.
 
 This arrangement preserves the established policy that ADR source files are not committed while making the four decisions that materially constrain this architecture visible to Git-based collaborators. It does not claim that a short index replaces the authoritative ADR records.
 
@@ -137,32 +137,46 @@ Separate enforcement from observation:
 
 A hard cap on the **accounted pool universe** must use an atomic reservation/permit protocol or a lock-protected check-and-act operation. It must not use an unsynchronized check-then-act sequence.
 
-### Hard cap versus bounded degradation
+### Three independent resource-accounting axes
 
-These are two independent policy axes and must not be conflated:
+The ObjectPool resource contract is not a single global memory cap and not merely a two-axis model. It has three independent axes with **different covered populations**:
 
-1. **Admission authority** decides whether an object/resource may enter the accounted pool universe. Its cap governs the objects counted by the pool's accounting (for ObjectPool, the `alive` population).
-2. **Degradation policy** decides what happens when that accounted universe is full. A pool may reject production, wait, or use a bounded fallback path that still returns an object without admitting it into the pool universe.
+| Axis | What it bounds / covers | Admission or accounting point | What is excluded / full-capacity behavior |
+|---|---|---|---|
+| **Alive / object-count axis (`max`)** | The accounted pool universe: normal objects that are idle **plus** normal objects currently borrowed. | `claim_growth` checks the per-shard `share(max, shards, idx)` and increments `shard.alive` under that shard's lock. Returning/pruning/dropping normal objects decrements the universe count as appropriate. | It does not include degraded direct-build objects. A full universe selects the degradation path; `borrowed / max` may therefore exceed 1.0 because degraded borrows are intentionally outside the universe. |
+| **Idle-resident byte axis (`ByteBudget`)** | Only bytes retained by idle objects in the pool (or the aggregate idle population across pools sharing the same `Arc<ByteBudget>`). It is **not** a cap on all memory held by borrowed objects or by the process. | `weight(&T)` is measured and `ByteBudget::try_take` atomically claims bytes when an object is admitted to an idle slot (return/insert). | Borrowing an object gives its bytes back to the budget; borrowed objects consume alive capacity but **do not consume ByteBudget**. Over-budget return/insert is discarded rather than retained. |
+| **Degradation axis (bounded direct build)** | Objects constructed after the accounted alive universe is full. These objects are outside **both** the alive accounting and the idle-byte budget. | `pop_or_build` path ④ increments `degraded` and `constructed`, then directly calls the factory without `claim_growth` or `ByteBudget::try_take`. | The object is not pooled; return releases/destroys it and never inserts it into idle. Degradation can make the number of objects handed to callers exceed `max`; the idle-byte budget does not constrain these transient degraded objects either. |
 
-Under ADR-0010, ObjectPool deliberately supports the latter: when the accounted pool is full, the `pop_or_build` fallback may directly construct an object outside the `alive` accounting. That fallback object is not pooled; when returned, it is released rather than retained. Consequently, the configured `max` bounds the accounted pool population, **not necessarily the total number of objects temporarily handed to callers**. Describing it as an absolute production cap would be incorrect.
+Under ADR-0010, this bounded degradation is intentional, not an accounting bug. `max` is a hard bound on the **accounted alive universe**, not on every object temporarily handed to callers. Likewise, `ByteBudget::total` is a hard bound on **accounted idle-resident bytes**, not on borrowed-object memory or total process memory. These two hard bounds have different scopes.
 
-Every pool configuration and API contract must state both axes explicitly:
-- the exact population covered by the cap (for example, accounted live pool objects, including idle and borrowed objects);
-- the full-capacity behavior (reject / wait / bounded direct-build degradation / other declared policy);
-- whether fallback objects are accounted, reusable, and how/when they are released.
+Every pool configuration and API contract must declare all applicable axes separately:
+- the population covered by the object-count cap (idle + normal borrowed);
+- the population covered by the byte budget (idle resident objects only);
+- the behavior when either limit is reached (including direct-build degradation, discard-on-return, and whether the object bypasses one or both ledgers).
 
-Do not silently infer one axis from the other. Metrics for fallback production and release should be observable separately from normal pool admission where useful.
+Do not silently infer one axis from another. Expose degraded construction/release separately from normal admission where metrics are useful.
 
 ### Current implementation findings
 
-The review of the current repository did not find the alleged check-then-act race in the identified admission paths:
+The current ObjectPool implementation's concrete accounting points and coverage are:
 
+| Mechanism / path | Linearization or accounting point | Coverage and consequence |
+|---|---|---|
+| `ObjectPool::claim_growth` | Under each shard lock, compare `shard.alive` with `share(max, shards, idx)`, then increment `alive`. | Counts normal idle + normal borrowed objects. Aggregate normal-object universe is bounded by `max` (subject to documented resize convergence semantics). |
+| `ByteBudget::try_take` on idle admission | Under the ByteBudget mutex, check `held + n <= total`, then increment `held`; called while admitting an object into an idle slot. | Counts idle-resident bytes only. Borrowing/prune/resize trimming returns the corresponding bytes; borrowed objects are outside this budget. |
+| `pop_or_build` path ④ | When `claim_growth` returns `None`, increment `degraded` and `constructed`, then invoke the factory directly. | Bypasses both alive and ByteBudget accounting. The returned object is released on return and never becomes idle. |
+| `PoolBase::note_borrow` / metrics | Updates observation counters; it does not reserve admission capacity. | Observability only; not a hard-limit authority and must not be treated as a third admission ledger. |
+
+The review of the current repository did not find the alleged check-then-act race in the identified admission paths:
 - MemoryPool::acquire checks and increments inner.created under the same mutex.
 - ObjectPool::claim_growth checks and increments shard.alive under the shard lock; share() maintains the aggregate bound.
 - ObjectPool byte quota uses ByteBudget::try_take with a mutex-held check-and-act operation.
-- PoolBase::note_borrow is metrics, not admission authority.
 
-Therefore, do not introduce a generic ResourcePermit subsystem merely to fix a race that is not present here. ByteBudget already provides a bytes-dimension reservation primitive. The remaining local documentation task is to state precisely what each configured maximum bounds (for example, total live objects = idle + borrowed versus active leases only).
+Therefore, do not introduce a generic ResourcePermit subsystem merely to fix a race that is not present here. ByteBudget already provides the idle-resident-byte reservation primitive. The remaining local documentation task is to preserve these exact coverage semantics when documenting other pools; do not describe ByteBudget as a total-memory budget.
+
+If a corresponding race exists in Xray's concrete buffer pool, investigate and fix it in the Xray consumer repository, where that admission path lives.
+
+Avoid per-acquire heap allocations in lease/drop paths unless benchmarks justify them. Prefer concrete lease types or enum dispatch over boxed FnOnce closures in known hot paths, while retaining generic extension points for uncommon backends.
 
 If a corresponding race exists in Xray's concrete buffer pool, investigate and fix it in the Xray consumer repository, where that admission path lives.
 
