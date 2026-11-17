@@ -48,10 +48,10 @@
 |---|---|---|---|
 | runtime | `runtime`（默认） | `SyncStore`：单写者队列+同步排空环+快照广播的契约参考实现 | [`runtime`](#runtime--syncstore-契约参考实现) |
 | audit | `runtime` | 审计事件值面（事件/票据），发射点在 runtime | [`runtime::..audit`](#runtime--syncstore-契约参考实现) |
-| pool | `pool`（默认） | `PoolBase` 管理组合件 + `ThreadPool` 动态线程池 + `ObjectPool` 通用对象池 | [`pool`](#pool--poolbase--threadpool--objectpool) |
-| pooled_thread_pool | `pool` | `MemoryPool` × `ThreadPool` 互喂组合件 | [`pool`](#pool--poolbase--threadpool--objectpool) |
+| pool | `pool`（默认） | `PoolBase` 管理组合件 + `ThreadPool` 动态线程池 + `ObjectPool` 通用对象池 + 资源上限四问（cap 覆盖/满容量/超配/读数口径） | [`pool`](#pool--poolbase--threadpool--objectpool) |
+| pooled_thread_pool | `pool` | `ObjectPool` × `ThreadPool` 互喂组合件（借空降级永不丢任务 + 可选 CallerRuns 档） | [`pool`](#pool--poolbase--threadpool--objectpool) |
 | objpool | `pool` | `ObjectPool` 通用对象池：池化**有状态**对象（reset 钩子/有界降级/分片槽位） | [`pool`](#pool--poolbase--threadpool--objectpool) |
-| memgov | `memgov`（pool 连带） | 计数分配器/有界注册表/泄漏断言 + `MemoryPool` 特化 | [`memgov`](#memgov--内存治理) |
+| memgov | `memgov`（pool 连带） | 计数分配器/有界注册表/泄漏断言 + `MemoryPool` 特化 + `ByteBudget`（仅 idle 常驻字节）+ 资源上限四问 | [`memgov`](#memgov--内存治理) |
 | text | 常驻 | UTF-8 解码/字符截断/case 转换/编辑距离 | [`text`](#text--文本处理) |
 | backoff | 常驻 | 确定性线性退避计算 | [`backoff`](#backoff--确定性退避) |
 | retry | 常驻 | 同步重试编排（政策显式/预算闸/耗尽回灌） | [`retry`](#retry--同步重试编排) |
@@ -162,12 +162,42 @@ where S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
 
 - `S::Clone` 必须 panic-free：外部持有快照时状态落位走 `Arc::make_mut` 克隆分支，clone 在 state 锁内 panic 即毒锁——**实例整体报废且状态不可取出**（文档化显式契约）。
 - reducer panic 不报废实例：计数（`reducer_panic_count`）+审计现场（`AuditEventKind::ReducerInterrupted`）后原样重抛；action 已出队随栈展开丢失，状态不前进。
-- 解释器 panic 不报废实例：毒锁恢复 + 计数（`runtime_panic_count`）。
+- 解释器 panic 不报废实例：panic 原样从 `dispatch` 上浮（fail-visible），毒锁在下一次效果转发时恢复 + 计数（`runtime_panic_count`）——读数口径与首轮 panic 的细节见下文「effect 执行两档」节。
 - 订阅回调 panic：fail-closed 摘除 + `subscriber_panics` 计数 + `subscriber_panic_last_cause` 成因摘要。
 
 ### 回灌深度预算
 
 `FEEDBACK_DEPTH_BUDGET = 64`：单任排空内连续回灌链深度超限即停排 + `feedback_budget_exceeded` 计数；触发点回灌 action 原值退回队尾（零丢失），本任 dispatch 随即返回——非 panic 非静默。预算按 dispatch 调用栈深度统一计数（TLS 在途深度，back 通道不绕预算）。时间线现场 = `AuditEventKind::FeedbackBudgetExceeded`。
+
+### effect 执行两档（同步档 / 托管档）
+
+蓝图 §11 项 6：ADR 0008 在**通知面**落地了「两档并存 + 同一语义契约」，同一模式在**效果执行面**沿用——不强迫一档替掉另一档，也不新增第二个入口。
+
+**现状（源码坐标，2026-11-17）**：转发环在排空环内、`dispatch` 调用栈上**同步**调用解释器——`runtime.rs:1486`（`forward_effects` 调用点，位于 `drain_owned` 循环体内）→ `runtime.rs:1529`（`forward_effects`）→ `runtime.rs:1587`（`runtime.run(effect, &inner.back)`）；`Effect::Emit` 不经解释器直接回灌入队（`runtime.rs:1536`）。异步**不在核心内**：托管由 `fx::FxScope::spawn_tracked`（`fx.rs:417`）提供，解释器实现方在 `run` 里 spawn 并把 `back` 句柄 move 进任务。
+
+| 档 | 谁执行 | 适用条件 | 失败/取消可观察面 |
+|---|---|---|---|
+| **同步档**（内联） | 排空环转发段，在 `dispatch` 调用方线程内联执行 | 有界、非阻塞、不等待外部完成的工作；**禁 `await`、禁阻塞 IO**（内联耗时直接计入 dispatch 延迟，并阻塞整个状态机） | 解释器 `run` panic：`catch_unwind` 只观察不吞（审计 `EffectInterrupted`，`runtime.rs:1587-1589`）后 `resume_unwind`——**panic 原样从 `dispatch` 上浮**（`runtime.rs:1590`）。实例不报废：毒锁在下一次效果转发时 `into_inner` 恢复 + `clear_poison` + `runtime_panic_count` +1（`runtime.rs:1574-1580`）；读数口径 = **毒位被观察到时才计**（`runtime.rs:1141-1144`），首轮 panic 后不再产效果则读 0。panic 的那条效果随转发丢弃、不再重投（重投会恒 panic 死循环）；同批未转发的效果原地留缓冲，由下一任排空续转（`runtime.rs:1529-1536` 逐条 `pop_front` 摘除形）。 |
+| **托管档**（异步） | `FxScope` 生命周期集内的 tokio 任务 | IO / 长任务 / 需与核心解耦的等待 | 完成/失败/取消经 `Spawned::join` → `TaskError::{Cancelled, Panicked, TimedOut}`（`fx.rs:577-591`）与停机排空报告（`fx.rs:251-303`）分桶可见：`completed` / `cancelled` / `panicked` / `failed`（+`errors` 逐条）/ `still_running` 终局桶互斥穷尽，`timed_out` 是与终局桶正交的截止事件计数。句柄被丢也不丢载荷：panic 消息进生命周期集，`join` 与停机排空双重可见（诊断面非 exactly-once）。 |
+
+**边界规则（三条，两档共用）**：
+
+1. **核心永不阻塞等待异步完成**（蓝图 §3 原句）：`run` 是同步 trait 方法（`skeleton/src/lib.rs:354-358`），排空环调用它时既不 `await` 也没有「等句柄」路径——托管档的 `run` 只 `spawn_tracked` 入集（`fx.rs:417`；闸关返回 `Err(ScopeClosed)`，`fx.rs:429-432`，fail-closed 禁静默丢弃 future）后立即返回。**`dispatch` 返回 ≠ 效果完成**：这是托管档的文档化时序，不是缺陷。
+2. **异步结果回灌必须经 `ActionSender`**（显式消息边界）：任务完成后调 `back.dispatch(action)` 把结果变成普通 action 重入队列，状态仍只由 reducer 推进。跨线程回灌不是 dispatch 调用栈的一部分（按外部流量计，`reentrant_origin` 判定见 `runtime.rs:63`、深度归零见 `runtime.rs:1395`）——**跨线程回灌环的环防护责任在解释器/宿主自身**（契约注见 `skeleton::EffectRuntime`「回灌环责任边界」）。闭门后回灌显式返回 `false`（不静默）。
+3. **同步档内禁 `await`/禁阻塞 IO**：`run` 在排空环内、持排空权执行，阻塞它 = 阻塞整个状态机（后续 action 与回灌链全部排队）。需要等待就换托管档，而不是在同步档里「小睡一下」。
+
+**与 ADR 0008 的承继关系**（同一「两档并存 + 同一语义」在两个面上的对照）：
+
+| 语义位 | 通知面（ADR 0008，已实现） | 效果执行面（本节） |
+|---|---|---|
+| 同步档 | `subscribe` / `subscribe_local`：回调在 dispatch 线程内联执行 | 内联 `run`：在排空环转发段执行（`runtime.rs:1486` → `:1587`） |
+| 异步档 | `NotifySink::publish`：O(1) 版本投递，重活移出环（`skeleton/src/notify.rs:62`） | `FxScope::spawn_tracked`：工作移出环，结果经 `ActionSender` 回灌（`fx.rs:417`） |
+| 载荷/契约 | 单调版本号（状态化），消费侧按需拉快照 | 仍是 `Action`（纯 reducer 推进状态） |
+| 不救另一档 | 慢同步订阅者的耗时照常计入 dispatch | 同步档 `run` 的耗时照常计入 dispatch |
+| 失败可见 | 投递口 panic = 捕获 + 摘除 + 计数 | 解释器 panic 上浮 + 计数；托管任务失败进 `TaskError` / `ShutdownReport` |
+| 关闭语义 | 闭门后登记照常、永不触发（计数显形） | 闭门后 spawn = `Err(ScopeClosed)`；回灌返回 `false`（计数显形） |
+
+行为面：`tests/effect_two_tier.rs`（两档各自时序 + 失败面 + 终态一致，5 条）。**无统一入口**（本单评估结论）：两档不是两个 API，而是同一个 `EffectRuntime` 契约的两种实现形态；造统一入口会逼核心替解释器选执行器，违反蓝图 §6「Do not add a new executor abstraction that silently moves arbitrary work between sync and async contexts」。
 
 ### audit — 审计事件值面
 
@@ -265,6 +295,40 @@ pub trait Notify<S> {
 
 **feature**：`pool`（默认，连带 `memgov`）。**依赖面**：纯 std + 契约词汇（`skeleton::pool`），域面零三方（crate 树见 [§零依赖口径](#零依赖口径)）。
 
+### 资源上限四问 — 配置值到底约束什么
+
+本域各池只有一个共同点：**每个配置值各自约束一个特定群体**。「把 `max` 当总对象数 / 总内存上限」是最常见的误读（蓝图 §5 的三轴口径即为此立）。下表逐参数回答四问：①cap 覆盖哪些对象/字节；②满容量时的动作与可观察读数；③是否存在合法的超配中间态、靠什么收敛；④各读数字段的口径，以及哪些读数**不是**准入面。
+
+行号口径：本节落盘时的工作树快照（符号名恒准，行号随重构漂移）；路径均相对 `skeleton-infra/src/`。核心形字段定义见 `skeleton/src/pool.rs:42`。`ObjectPool` 的三轴见 [§ObjectPool](#objectpool--通用对象池有状态对象reset-钩子--有界降级--分片槽位)，`MemoryPool` / `BoundedRegistry` / `ByteBudget` 见 [§memgov 四问](#资源上限四问--memgov-三件)。
+
+#### PoolBase — 账本与裁决，不做准入
+
+| 配置/入口 | ①覆盖群体 | ②满容量行为 | ③超配中间态与收敛 | ④读数口径 | 代码锚 |
+|---|---|---|---|---|---|
+| `max` | 实现方经 `note_borrow` / `note_return` 上报的「idle + 借出」合计（组合件不持有对象，群体由特化池定义） | **无满容量动作**：`PoolBase` 不裁决单笔借出是否放行，只在归还时按边界判留存 | 是：`resize` 缩容只改边界，已在借句柄不受影响 ⇒ `borrowed` 可短时高于新 `max`，随归还收敛 | `metrics().max` = 当前配置（非构造期原值）；`watermark = borrowed / max` | `pool.rs:280` |
+| `idle_cap` | **仅闲槽留存**（不约束借出） | 归还判据 `idle < idle_cap && idle + borrowed < max`；不满足 ⇒ 丢弃 + `dropped_overflow += 1` + 审计 `OverflowDropped`（归还永不阻塞、永不报错） | 是：缩容窗内 `idle` 可短时高于新 `idle_cap`，由归还裁决 / 实现方裁剪路径收敛 | `dropped_overflow` 只数**容量因**；`PoolAuditKind::{Returned, OverflowDropped}` 与它一一对应 | `pool.rs:329` |
+| `resize(max, idle_cap)` | 参数合法性（`max == 0` / `idle_cap == 0` / `idle_cap > max`） | 非法 ⇒ `Err(PoolResizeError)`，状态零变更 + 审计 `ResizeRejected`；合法 ⇒ `Resized` | — | 错误是 `Copy` 值（拒绝路径零分配，`Display` 自带两参原值） | `pool.rs:45`、`pool.rs:261` |
+
+- **`note_borrow` / `metrics()` 是观测面，不是第三本准入账**（蓝图 §5）：`PoolBase` 不做 check-then-act；准入权在特化池——`MemoryPool` 在槽位锁内判 `created < max`（`memgov.rs:568`），`ObjectPool` 在片锁内判 `alive < share(max)`（`objpool.rs:1255`）。把 `metrics()` 当放行判据 = 无锁 check-then-act。
+
+#### ThreadPool — 三参各管一件事
+
+| 参数 | ①覆盖群体 | ②满容量行为 | ③超配中间态与收敛 | ④读数口径 | 代码锚 |
+|---|---|---|---|---|---|
+| `core` | **保活 worker 数**（驻留 park，零 CPU）；是下限，不是任务面上限 | 不触发任何拒绝；`resize` 提高 core ⇒ 补建至新值（返回即到数） | 是：扩容补建遇 worker 创建失败 ⇒ `PoolResizeError::SpawnFailed { target_core, workers }`——调参已落地而 worker 未建够（**部分生效**），已建 worker 继续服务，可重试 `resize` 补齐 | `metrics().core` = 目标保活数（非存活数） | `pool.rs:938`、`pool.rs:977` |
+| `max` | **worker 数**上限（含 core）——不是任务数、不是队列长度 | 队列满且 `workers < max` ⇒ 新建 worker 直接接管本任务（first-task 交接，队列不越限）；队列满且 `workers >= max` 或已 shutdown ⇒ 走拒绝策略 + `rejected += 1` | 是：缩容只发退出令牌（差额 worker 处理完当前任务即退）⇒ `workers` 可短时 > 新 `max`，`shape.watermark = busy / max` 因此可 > 1.0 | `workers` = 真实存活数（创建失败不留幻影）；`busy` = 执行中；`idle` = parked（**不是**遗留对象数） | `pool.rs:885`、`pool.rs:954` |
+| `queue_cap` | 中央队列槽数 | 两档互斥：`queue_len < cap` 入队 FIFO；`>= cap` 走上行的扩容或拒绝 | 否：入队与拒绝判决同锁完成，`queue_len <= queue_cap` 恒成立；`queue_cap == 0` 在 `resize` 入口即拒（直通管道 = 池语义自毁） | `queue_len` / `queue_cap` | `pool.rs:885`、`pool.rs:953` |
+| （失败分账） | — | worker 创建失败 ⇒ `RejectedTask { cause: SpawnFailed }`，任务**原样退还**调用方 | — | `spawn_failures`（环境故障）与 `rejected`（策略触发，含 CallerRuns 内联）是两本账，禁用其一反推另一 | `pool.rs:1085` |
+
+- **三参不可互相推导**：`max` 管 worker、`queue_cap` 管队列、任务总量 = 二者之和再加在跑件；调高 `queue_cap` 不提高并行度，调高 `max` 也不保证队列不溢出。
+
+#### PooledThreadPool — 无自有上限，两池的账分开记
+
+- **①覆盖群体**：自身不设任何 cap——缓冲侧吃 `ObjectPool` 三轴（`max` / 字节 / 降级），提交侧吃 `ThreadPool` 三参（`core` / `max` / `queue_cap`）[`pooled_thread_pool.rs:116`]（`submit` 直接透传 `ThreadPool::execute`）。
+- **②满容量行为**：缓冲侧**永不拒绝**——宇宙满即降级直构（`degraded` 可见）；提交侧队列满且 worker 到 `max` ⇒ 默认 `Abort` 退还 `Err(RejectedTask)`，`with_caller_runs` 档改由提交线程代跑。
+- **③超配中间态**：两侧各自成立（缓冲侧 `borrowed` 可含降级借出、提交侧 `workers` 可短时高于新 `max`）；组合件不新增第三条状态。
+- **④读数口径**：`threads().metrics().rejected`（提交侧）与 `buffer_pool().metrics().degraded` / `constructed`（缓冲侧）是两条独立路径的留痕，**禁混账**——`rejected > 0` 不代表降级过，`degraded > 0` 也不代表丢过任务。
+
 ### PoolBase — 池化管理组合件
 
 组合件不是池：不碰对象、不管槽位存储——承载任何池都要一遍的管理面账本与纪律（边界校验/水位线读数/池域审计事件流/溢出计数）。内存池/线程池各持一个 `PoolBase` 字段。
@@ -347,23 +411,36 @@ pub struct ThreadPoolMetrics {
 ### PooledThreadPool — 互喂组合件
 
 ```rust
-pub struct PooledThreadPool<T, F = fn() -> T> { /* mem: Arc<MemoryPool<T,F>>, threads, … */ }
-impl<T, F> PooledThreadPool<T, F>
-where T: Send + 'static, F: Fn() -> T + Send + Sync + 'static
+pub struct PooledThreadPool<T> { /* buffers: Arc<ObjectPool<T>>, threads, … */ }
+impl<T> PooledThreadPool<T>
+where T: Send + 'static
 {
-    pub fn new(mem: Arc<MemoryPool<T, F>>, threads: ThreadPool, borrow_timeout: Duration) -> Self;
+    pub fn new(buffers: Arc<ObjectPool<T>>, threads: ThreadPool) -> Self;
+    pub fn with_caller_runs(buffers: Arc<ObjectPool<T>>, tuning: ThreadPoolTuning) -> Self;
     pub fn submit(&self, f: impl FnOnce(&mut T) + Send + 'static) -> Result<(), RejectedTask>;
-    pub fn mem_pool(&self) -> &MemoryPool<T, F>;
+    pub fn buffer_pool(&self) -> &ObjectPool<T>;
     pub fn threads(&self) -> &ThreadPool;
-    pub fn borrow_rejected(&self) -> u64;
 }
 ```
 
-借还在 worker 线程任务闭包内（`PoolGuard` 非 `'static`，提交线程不可持）：worker 认领后借缓冲 → 跑 → guard Drop 即还（panic unwind 同覆盖）。借空（超 `borrow_timeout` 无缓冲）= Discard 等价：任务体丢弃 + `borrow_rejected` 计数——与提交侧 `rejected` 是两个独立计数。`borrow_timeout` 构造期必填（无默认无限等）。
+借还在 worker 线程任务闭包内（`Pooled` 句柄借用池、非 `'static`，提交线程不可持）：worker 认领后借缓冲 → 跑 → 句柄 Drop 即还（panic unwind 同覆盖：宇宙记账必回卷；`ObjectPool` 的 unwind 防御把 panic 件销毁不回池并计 `panic_dropped`）。
+
+**借空 = 降级直构（永不丢任务）**：`ObjectPool::acquire` 永不阻塞永不失败——宇宙（idle + 正常借出，硬上界 `max`）满时直构降级件（不入宇宙、归还即释放），任务总能跑完。旧语义「借空丢任务 + `borrow_rejected` 计数」已退役（0.1.0 未发布直迁，`borrow_timeout` 参数一并移除），降级面读 `buffer_pool().metrics()` 的 `degraded` / `constructed`。
+
+`with_caller_runs` 是**提交侧饱和档**（复用 `CallerRunsPolicy`，不另造策略机制）：队列满且 worker 到 `max` 时提交线程代跑，不丢工作。提交侧 `rejected` 与缓冲侧 `degraded` 是两个独立计数，不得混账。
 
 ### ObjectPool — 通用对象池（有状态对象，reset 钩子 + 有界降级 + 分片槽位）
 
 池化**有状态**对象：现有 `MemoryPool` 只能池无状态物（构造器只负责造，归还不重置），本件补「捞出改参数即复用」的能力（加密上下文 / 连接 wrapper / 协议状态机——构造昂贵、每次都被重造）。零领域语义（公开 API 无 buffer/connection/crypto 词汇）。
+
+**三轴各自独立，禁互相推导**（蓝图 §5 口径）：`max` 是**记账宇宙**的硬上界，`ByteBudget::total` 是**idle 常驻字节**的硬上界，降级件两条轴都不计。四问对照：
+
+| 轴 / 参数 | ①覆盖群体 | ②满容量行为 | ③超配中间态与收敛 | ④读数口径 | 代码锚 |
+|---|---|---|---|---|---|
+| alive（`max`） | 池宇宙 = idle + **正常**借出；不含降级件 | `claim_growth` 全片配额满 ⇒ 走降级轴（不等待、不失败） | 是：`resize` 缩容**不回溯裁剪** `alive`（不夺借出）⇒ 已认领存活数可短时高于新 `max`，随归还按新配额收敛；`core.borrowed` **含降级借出** ⇒ `idle + borrowed <= max` **不成立** | `core.idle` + `core.borrowed` 是宇宙读数（后者含降级）；`core.watermark = borrowed / max` 可 > 1.0，不钳位 | `objpool.rs:1255`、`objpool.rs:1164` |
+| 留存（`idle_cap`） | 仅 idle 槽位，按片 `share(idle_cap, shards, idx)` 均分（各片之和 = 配置值） | 归还时 home 片满 ⇒ 迁入有余量的片（`alive` 随迁）；全池余量零 ⇒ 丢弃 + `core.dropped_overflow += 1` + 审计 `OverflowDropped` | 是：缩容裁剪逐片串行，窗口内 `core.idle` 可短时高于新 `idle_cap`，裁剪完成即收敛到新上界 | `core.dropped_overflow` 只数**容量因**（idle 满 / 全池余量零 / resize 裁剪），与 `reset_panicked`（钩子因）分账 | `objpool.rs:1290`、`objpool.rs:1164` |
+| 字节（`ByteBudget::total`） | **仅 idle 常驻字节**（`weight(&T)` 现值，`Vec` 类按 `capacity()`）；借出对象不计 | 入 idle 槽（归还 / `insert`）时 `try_take` 原子 check+act；余额不足 ⇒ 返回 `false`，调用方按容量因丢弃（无「认领一半」） | 否：`held <= total` 恒成立；**借出即回卷**（`give_back`）——所以 `total` 不是进程内存上限，也不是借出对象内存上限 | `metrics().idle_bytes` = 预算已认领字节（**共享预算**下 = 全局 held，不构成按池归因）；`byte_budget` = 构造期总额；未启用两者恒 0 | `objpool.rs:411`、`objpool.rs:1362` |
+| 降级（`degraded`） | 宇宙满后直构的对象：不入宇宙、不占字节预算 | 直接调工厂（`degraded` +1、`constructed` +1），归还即释放、永不进 idle | 允许「交给调用方的对象数 > `max`」——ADR 0010 的有意设计，不是记账漏洞 | `degraded` = 降级直构次数；`constructed` = 工厂调用总数（含降级）——两独立计数，禁互推 | `objpool.rs:900` |
 
 ```rust
 pub enum ResetPhase { OnReturn, OnAcquire }        // reset 钩子相位
@@ -376,6 +453,8 @@ pub struct ObjectPoolMetrics {                   // Borrow<PoolMetrics>
     pub pruned: u64,        // prune_idle 释放数
     pub reset_panicked: u64,// reset 钩子因销毁数（OnReturn 相位钩子 panic / 重入检出）——容量因走 core.dropped_overflow
     pub panic_dropped: u64, // unwind 中归还而销毁的对象数
+    pub idle_bytes: usize,  // 预算已认领字节（仅 idle 常驻；未启用恒 0；共享预算下 = 全局 held）
+    pub byte_budget: usize, // 池字节预算总额（构造期定死；未启用恒 0）
 }
 
 pub struct ObjectPool<T> { /* 分片槽位 + 片内计数（每片独占 cache line）*/ }
@@ -386,6 +465,14 @@ impl<T> ObjectPool<T> {
         factory: impl Fn() -> T + Send + Sync + 'static,
         reset: impl Fn(&mut T) + Send + Sync + 'static,
         phase: ResetPhase) -> Self;
+    pub fn with_byte_quota(max: usize, idle_cap: usize,
+        factory: impl Fn() -> T + Send + Sync + 'static,
+        byte_budget: usize,                          // 池私有预算（按池归因用这个）
+        weight: impl Fn(&T) -> usize + Send + Sync + 'static) -> Self;
+    pub fn with_shared_byte_quota(max: usize, idle_cap: usize,
+        factory: impl Fn() -> T + Send + Sync + 'static,
+        budget: Arc<ByteBudget>,                     // 多池共用一份上限
+        weight: impl Fn(&T) -> usize + Send + Sync + 'static) -> Self;
     pub fn acquire(&self) -> Pooled<'_, T>;          // 永不阻塞、永不失败
     pub fn metrics(&self) -> ObjectPoolMetrics;      // O(shards) 逐片取锁求和
     pub fn prune_idle_with_clock(&self, max_idle_age: Duration, clock: &dyn Clock) -> usize;
@@ -414,8 +501,64 @@ impl<T> Drop for Pooled<'_, T> { /* Drop 即还（禁手动还） */ }
 - **释放三路径**：`idle_cap` 满 ⇒ 归还即丢弃（`dropped_overflow`）；`prune_idle_with_clock(max_idle_age, clock)` 显式老化口（宿主按自己节奏调，**池不起后台线程**；`Instant` 版 `prune_idle` 已弃用）；池 `drop` ⇒ 全部 idle 析构。
 - **分片与计数**：分片数构造期自适应 `clamp(idle_cap, 1, 8)`（不设旋钮）；每片一把 `Mutex`，`borrowed`/`alive`/`reused` 等**热路径计数下沉进片内**（普通 `usize`、锁内读写，无跨线程原子 RMW），且每片 `#[repr(align(64))]` 独占一条 cache line（相邻片伪共享同样把 8 线程扩展比压在 1 以下）。`max`/`idle_cap` **按片均分**（余数补给前几片，各片之和恰等于配置值 ⇒「总和 ≤ 配置值」硬上界不变；`resize` 后按新配额逐片裁剪）；**配额一律在目标片锁内读**——`resize` 先 `store` 新值再逐片加锁裁剪，于是并发归还的留存裁决要么读到新值、要么其入片被紧随其后的裁剪覆盖（锁外的陈旧快照没有这条收敛路径，缩容并发归还能把 idle 永久顶在新上界之外）；`metrics()` 逐片取锁求和（O(shards)，非热路径）。借用走**线程亲和片**（亲和表按池地址分槽、每 (线程, 池) 领一个片号后固定，首个领号者拿 0 号 ⇒ 单线程行为确定；同线程多池互不覆盖）、归还**优先回 home 片**（借出时的片，LIFO 热件常驻）；home 片 idle 满时**迁入有余量的片**（`alive` 随迁、先迁入再退 home ⇒ 账面守恒不低估；迁片只发生在归还且 home 满这一情形），全池余量为零才丢弃。`degraded` 与 `constructed` 是两个独立计数，不得混账；`constructed` 等**非每借还热路径**计数仍是全局原子（miss 路径打一次，dim4 计时窗内为 0 次）。
 - **调用方红线**：坏对象禁还池（判定权在调用方——池不知道 `T` 是什么，处置 = `detach` 带走，r2d2 `has_broken` / Commons Pool2 `invalidateObject` 动机）；池化对象应「等重」（reset 负责容量归一，大小悬殊对象混池 = 池毒化 DoS，golang/go#23199、#27735）；`prune_idle_with_clock` 尽力而为，不构成释放失败信号；**weight 钩子体内禁 acquire 同一池**（片锁内计量 = 死锁面；debug 构建 fail-fast 检出，release 零开销仍禁）。**字节配额**：`idle_bytes` 在共享预算池（`with_shared_byte_quota`）下是全局 held 读数、不构成按池归因——按池归因用池私有预算（`with_byte_quota`），本件刻意不引入池侧第二账本。
-- **与 `memgov::PoolGuard` 的关系**：两个**独立守卫类型**（非模式变体）——`Pooled` = 对象所有权移交式借用（`DerefMut` 改参数即复用 / RAII 归还 / `detach` 永久移交），`PoolGuard` = 缓冲借用（`acquire` 超时失败语义）。`Pooled<'p, T>` 借用池、非 `'static`，带不进 `'static` 任务闭包——用 `detach()` 移交后由任务/连接自持。尺寸分档不在本件（通用池单类型；分档 = 按档多实例或组合层后续件）。
+- **与 `memgov::PoolGuard` 的关系**：两个**独立守卫类型**（非模式变体）——`Pooled` = 对象所有权移交式借用（`DerefMut` 改参数即复用 / RAII 归还 / `detach` 永久移交），`PoolGuard` = 缓冲借用（`acquire` 超时失败语义）。`Pooled<'p, T>` 借用池、非 `'static`，带不进 `'static` 任务闭包——用 `detach()` 移交后由任务/连接自持。尺寸分档不在本件（通用池单类型）；分档 = 组合层按档多实例，见下文 **`### SizeClassPool`**。
 - 决策依据 ADR 0010：issue 字面要求的「idle 槽存 `Weak`」与「复用保证」结构性矛盾（权威依据：HikariCP 弱引用只能当缓存层、Go `sync.Pool` 官方明说放弃复用保证、Rust `Weak::upgrade` 可能返回 `None`），改以**行为等价**形态交付上述三条释放路径。
+
+### SizeClassPool — 尺寸分档池组合件（按档借还 + 档位不匹配降级）
+
+**feature**：`pool`（默认）。一张**严格递增**档位表 + 每档一个 `ObjectPool<T>`，对外按尺寸借还。消费方形态（sing-box `common/buf/alloc.go` 十二级 `sync.Pool`，64B→64KB）：请求 64KB 却拿到 128KB 块的根因不在单池，而在缺一层选档——本件只补这层，档内借还复用 `ObjectPool` 的四路径与记账（不改单池实现）。
+
+```rust
+pub struct SizeClassStat { pub class_bytes: usize, pub pool: ObjectPoolMetrics }
+pub struct SizeClassMetrics {
+    pub classes: Vec<SizeClassStat>,   // 按档明细，与档位表同序同长
+    pub over_max_degraded: u64,        // 超最大档的档外直构次数（独立口径）
+}
+impl SizeClassMetrics {
+    pub fn idle(&self) -> usize;         // 全档合计
+    pub fn borrowed(&self) -> usize;     // 全档合计（含池内降级借出）
+    pub fn class_degraded(&self) -> u64; // 全档**池内**降级合计
+}
+
+pub struct SizeClassPool<T> { /* 档位表 + 每档一个 ObjectPool */ }
+impl<T: 'static> SizeClassPool<T> {
+    pub fn new(class_bytes: impl IntoIterator<Item = usize>,
+        max: usize, idle_cap: usize,
+        factory: impl Fn(usize) -> T + Send + Sync + 'static) -> Self;
+        // 非法档表 panic（空 / 含 0 / 非严格递增）；max/idle_cap 校验同 ObjectPool
+    pub fn acquire(&self, need: usize) -> SizeClassHandle<'_, T>;  // 永不失败
+    pub fn class_bytes(&self) -> &[usize];                         // 档位表
+    pub fn metrics(&self) -> SizeClassMetrics;                     // 按档明细 + 档外降级
+}
+
+pub struct SizeClassHandle<'p, T>(/* … */);
+impl<T> SizeClassHandle<'_, T> {
+    pub fn class_index(&self) -> Option<usize>;  // None = 请求超出最大档（档外直构）
+    pub fn class_bytes(&self) -> usize;          // 档字节；档外直构时 = 请求字节
+    pub fn is_over_max_degraded(&self) -> bool;  // 是否走档外降级直构
+}
+impl<T> Deref for SizeClassHandle<'_, T> { type Target = T; }  // + DerefMut；Drop 即还
+```
+
+- **向上取整选档**：`acquire(need)` 取档位表里第一个 `>= need` 的档。请求 64KB 拿 128KB 块**允许**（浪费上界 = 档位表相邻档比值）；反向（请求 128KB 拿 64KB）**不可能**——严格递增表 + 单调选档，只有「多给」。
+- **归还按档归位**：句柄记**借出时的档**，Drop 回那一档的池（`ObjectPool` 的 home 片亲和照旧）；**不按对象当前容量反推档位**——对象借出期涨大后按容量反推会把大件塞回小档池（池毒化，golang/go#23199、#27735）或漂到相邻档，两种都是错账。
+- **超最大档 = 档外降级直构**：按**请求字节**直接构造（`over_max_degraded` +1），不入任何档的池宇宙、归还即释放；**不静默回退到最大档**——否则「请求 1MB 拿到 64KB」成为无信号的隐式截断，调用方拿到远小于请求的对象却查不到任何线头。
+- **池内降级与档外降级分账**：档内池满走的仍是 `ObjectPool` 的降级直构（读数在 `classes[i].pool.degraded`）；与 `over_max_degraded` 是两个独立计数——混账则「档位错配」与「容量不足」无法区分。`classes[i].pool.core.borrowed` 含池内降级借出（同单池口径）。
+- **组合红线**：①**池化对象等重**（同档件都应是该档字节量级；`factory` 收到档字节或请求字节，按其开容量）；②**若配 reset 钩子，钩子必须把容量归一到档字节**（`Vec::clear` 不缩容量，需 `shrink_to`）——容量只涨不归则档位语义随时间漂移、按档读数与字节预算全失真。本件构造的档池走 `ObjectPool::new`（无 reset 钩子，对象状态跨借还保留）；需要归还时重置的部署自建 `ObjectPool::with_reset` 档池并自证归一——本件刻意不暴露 reset 配置面（单池钩子相位/重入/panic 纪律属单池契约，组合层再开一个调参入口会让调用方无从判断哪个生效）。
+- **每档池深相同**（`max`/`idle_cap` 逐档复用）：**聚合宇宙 = 档数 × `max`**——`max` 是**每档**的正常对象上界（idle + 正常借出），全池可同时持有的正常对象上限是 `档数 × max`；把它当「全池对象总数上限」是确切误读。档深差异化需求先改单池调参面，本件不复制第二个调参入口。`metrics()` 为 O(档数 × 分片数) 取锁求和、每次分配一个 `Vec`（档数固定、诊断面才读）。
+
+**最小示例**
+
+```rust
+use skeleton_infra::SizeClassPool;
+
+let pool = SizeClassPool::new([64, 1024, 65_536], 4, 2, |size| Vec::<u8>::with_capacity(size));
+let buf = pool.acquire(600);              // 向上取整 → 1KiB 档
+assert_eq!(buf.class_bytes(), 1024);
+let huge = pool.acquire(1 << 20);         // 超最大档 → 档外直构，不回退到 64KiB
+assert!(huge.is_over_max_degraded());
+assert_eq!(pool.metrics().over_max_degraded, 1);
+```
 
 ### 最小示例
 
@@ -440,6 +583,19 @@ assert_eq!(n.load(std::sync::atomic::Ordering::Relaxed), 1);
 ## memgov — 内存治理
 
 **feature**：`memgov`（零外部依赖纯 std）；`pool` feature 连带启用。`MemoryPool` 特化面要求 `pool`。
+
+### 资源上限四问 — memgov 三件
+
+`ByteBudget` 类型住 `objpool`（根重导出 `skeleton_infra::ByteBudget`，`lib.rs:179`），与 `ObjectPool` 的字节轴同源——本节从「预算」视角钉四问，池内三轴见 [§ObjectPool](#objectpool--通用对象池有状态对象reset-钩子--有界降级--分片槽位)。
+
+| 入口 | ①覆盖群体 | ②满容量行为 | ③超配中间态与收敛 | ④读数口径 | 代码锚 |
+|---|---|---|---|---|---|
+| `BoundedRegistry::capacity` | 条目数（`len`），**不约束值体量** | `Eviction::Reject` ⇒ `Err(BoundError { capacity })` 且原内容不动；`Eviction::EvictOldest` ⇒ 先 `pop_first()`（首键）再插；已存在 key = 覆盖（`len` 不变，不触发淘汰） | 否：判定与插入同函数内完成，`len <= capacity` 恒成立；`Clone` 是深拷贝，副本容量语义逐句柄独立 | `len()` / `capacity()`；`BoundError.capacity` 回报撞上的上界 | `memgov.rs:64`、`memgov.rs:79` |
+| `MemoryPool::max` | `created` = idle 槽 + 借出在外（**槽位锁内** check-and-act：`inner.created < inner.max`） | 闲槽空且 `created == max` ⇒ condvar park 至调用方期限，到期 `Err(PoolAcquireTimeout)`（`Duration::ZERO` = 非阻塞尝试）；有配额空位则工厂**锁外**新建（panic 经配额回滚后原样传播） | 是：`resize` 缩容只弃超限 idle（`created` 同步递减），借出句柄不受影响 ⇒ `created` 可短时 > 新 `max`，随归还跌破（丢弃路径 `created -= 1`） | `metrics().core`：`max` 当前配置 / `idle` 闲槽 / `borrowed` 在外 / `dropped_overflow` 容量因丢弃累计 / `watermark = borrowed / max`；`MemoryPoolMetrics.idle_cap` 单列 | `memgov.rs:558`、`memgov.rs:568` |
+| `MemoryPool::idle_cap` | 闲槽上限（收回留裁决） | 归还时判 `idle < idle_cap && idle + borrowed < max`；不满足 ⇒ 对象析构 + `created` 配额回吐 + `dropped_overflow` +1 | 仅账本瞬窗：缩容在同一临界区 `truncate` idle，`PoolBase` 账本更新跟在槽位锁之后（一次 `note_idle_delta` 延迟）——是读数时序，不是容量击穿 | `MemoryPoolMetrics.idle_cap` = 当前配置（resize 可调） | `pool.rs:329`（裁决）、`memgov.rs:718`（调用点） |
+| `ByteBudget::total` | **仅 idle 常驻字节**（多池共享同一份 `Arc<ByteBudget>` 时 = 各池 idle 之和） | `try_take` 在预算锁内 check+act：余额不足返回 `false`，调用方按容量因丢弃；`n == 0` 恒 `true`（未启用计量面的调用点短路） | 否：`held <= total` 恒成立（总额构造期定死、不可 resize）；借出 / prune / resize 裁剪经 `give_back` 回卷，下溢 = 记账 bug ⇒ panic | `total()` 总额、`held()` 已认领、`available()` 余额；共享预算下 `ObjectPool::metrics().idle_bytes` = 全局 held，**不构成按池归因** | `objpool.rs:411`、`objpool.rs:394` |
+
+- **观测面 ≠ 准入面**：`CountingAllocator::live_bytes` 一类读数是进程级观测（含测试框架自身分配），不能当池的准入判据；准入/裁决只有三处**锁内 check-and-act**——`created < max`（`memgov.rs:568`）、`idle < idle_cap && idle + borrowed < max`（`pool.rs:329`）、`held + n <= total`（`objpool.rs:411`）。`metrics()` 全是纯读数。
 
 ### 计数分配器与泄漏断言
 

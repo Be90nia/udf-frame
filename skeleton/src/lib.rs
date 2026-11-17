@@ -327,6 +327,24 @@ impl<A, Op> Default for EffectBuf<A, Op> {
 /// `run` 的 panic 如实传播（fail-visible），实现方可自选恢复策略并留痕；
 /// panic 后 `self` 的一致性由实现自证（核心不为中断在任意中间态的解释器兜底）。
 ///
+/// # 执行两档（同步档 / 托管档）
+///
+/// 同一个 `run` 契约下两档并存：`dispatch` 的**时序**在两档上不同，**语义**
+/// 相同（状态只由 reducer 推进，效果结果一律经 [`ActionSender`] 回灌）：
+///
+/// - **同步档**：`run` 在排空环内联执行完（有界、非阻塞、不 `await`）。返回时
+///   效果已执行；`back.dispatch` 与 dispatch 同栈，计入回灌深度预算。
+/// - **托管档**：`run` 把工作交给适配层的异步托管（`skeleton-infra` 的
+///   `fx::FxScope::spawn_tracked` 是先例），持 `back` 句柄立即返回——**返回 ≠
+///   效果完成**。结果由任务经 `back.dispatch` 回灌成普通 action（显式消息
+///   边界）；失败/取消面由托管层自报（如任务句柄的 `TaskError`、停机排空报告）。
+///
+/// 边界铁律（两档共用）：核心永不阻塞等待异步完成；异步结果只经
+/// [`ActionSender`] 回灌；同步档内禁 `await`、禁阻塞 IO——`run` 在排空环内执行，
+/// 阻塞它即阻塞整个状态机（后续 action 与回灌链全部排队）。禁为「API 对称」把
+/// `run` 改成 async：reducer 与核心恒同步，异步只住在边沿（适配层暴露自己的
+/// 惯用异步形）。
+///
 /// # 回灌环责任边界
 ///
 /// `back.dispatch` 与 dispatch 同栈（同步实现）时计入回灌深度预算
