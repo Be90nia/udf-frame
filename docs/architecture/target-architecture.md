@@ -46,6 +46,19 @@ The architecture is defined first by **logical responsibility and dependency dir
 
 Do not create a second Clock abstraction or a parallel contracts crate. In particular, udf-contracts in an earlier diagram was a proposed logical responsibility, **not an approved new crate**. For the current workspace, skeleton remains the canonical home for its existing runtime-neutral contracts. If future evidence justifies a crate split, move the contracts in one coordinated migration and preserve one canonical API/home.
 
+### Existing ADRs and relationship to this blueprint
+
+The repository's review discussion identifies ADR-0001 and ADR-0008 as existing ratified decisions. The ADR directory itself is not currently committed in the repository, so this table records only relationships that can be substantiated from the referenced review; it deliberately does not invent titles or dispositions for unavailable ADR texts.
+
+| Existing decision | Known subject / evidence | Relationship to this blueprint |
+|---|---|---|
+| ADR-0001 | Clock and ConfigPort were deliberately placed in the `skeleton` contract layer. | **Accepted and preserved.** This blueprint keeps `skeleton` as the canonical home; no parallel `udf-contracts` crate or duplicate Clock. |
+| ADR-0002–0007 | Referenced by the review as existing ADRs, but their decision text is not present in the committed repository tree available for this revision. | **Pending source verification.** Do not infer acceptance, narrowing, or rejection until the authoritative ADR texts are restored or linked. |
+| ADR-0008 | Two-tier coexistence for the notification surface (sync and async) is already implemented. | **Accepted and inherited.** §3 treats this as an existing precedent; §11 explicitly evaluates extending the same two-tier coexistence principle to effect execution without replacing either mode. |
+| ADR-0009–0010 | Referenced by the review as existing ADRs, but their decision text is not present in the committed repository tree available for this revision. | **Pending source verification.** Do not infer acceptance, narrowing, or rejection until the authoritative ADR texts are restored or linked. |
+
+The issue review requested ADRs under `docs/architecture/decisions/`, but that directory is absent from the current committed tree. Restoring/linking the authoritative ADR-0001…0010 texts is a documentation follow-up; this blueprint must not pretend to have reviewed decision records it cannot inspect.
+
 ### Crate-splitting rule
 
 Keep the current crate names, paths, and public APIs during the present implementation steps. Do not perform a workspace-wide rename, directory move, or create a facade/adapters/testing/resource crate merely to match a diagram.
@@ -85,6 +98,7 @@ Rules:
             -> Draining (wait for owned work until deadline)
             -> Terminated (all owned work completed)
             -> TimedOut (deadline reached / report survivors)
+    TimedOut -> Terminated (ownership released; survivors reported, possibly completing later)
 
 Keep these operations distinct:
 
@@ -101,7 +115,7 @@ The semantic distinctions are invariants:
 - timeout means the caller stopped waiting, not that work terminated;
 - aborting an async task is not equivalent to terminating a synchronous thread.
 
-Use parent-child cancellation propagation where a runtime supports it. In Tokio, prefer child cancellation tokens over one watcher task per child scope where semantics permit. The task registry remains separate: cancellation signals do not prove that work has stopped.
+The repository's CancelToken is a UDF-owned watch-based implementation (fx.rs:78-135), not tokio-util's CancellationToken. Parent-child propagation is a target capability, not an instruction to add tokio-util implicitly. The implementation choice is pending an explicit dependency decision: either extend the UDF-owned token with parent/child semantics, or evaluate tokio-util and accept its dependency only after a documented review of dependency cost, feature isolation, and behavior. Until that decision is made, do not add a per-child watcher task topology as an assumed requirement. Track this as deferred work in §11. The task registry remains separate: cancellation signals do not prove that work has stopped.
 
 ### Current gap and scope
 
@@ -166,7 +180,7 @@ Infrastructure APIs must make failure classes and recovery semantics explicit. A
 
 Rules:
 
-- Prefer typed errors at public boundaries; preserve source errors and relevant operation/context information.
+- Prefer typed errors for runtime-recoverable failures at public boundaries; preserve source errors and relevant operation/context information. This does not convert constructor-time, unconditionally invalid programmer arguments into Result: those remain fail-fast panics under the repository's established discipline.
 - A rejection is a result visible to the submitter, not an invisible metric increment.
 - Error reporting must distinguish the operation failing from the runtime itself becoming unavailable.
 - Structured shutdown reports summarize lifecycle outcomes; they do not replace the original operation errors.
@@ -247,12 +261,14 @@ This is an evidence-driven sequence within the **existing workspace layout**. It
 1. **P0 — ThreadPool spawn failure correctness**: make spawn fallible, define the worker-accounting publication point, propagate submit rejection/resize errors, and inject deterministic spawn failures. The live-worker count must match actual workers; failed creation must never leave join waiting for a phantom worker.
 2. **P0 — DrainExclusive unsafe evidence**: produce the bounded Mutex-reference differential harness, aliasing/exclusion invariant tests, panic/unwind tests, and recorded Miri subset result. SAFETY comments alone do not close this task.
 3. **P1 — Lifecycle report contract**: extend ShutdownReport to distinguish timed-out waiting from still-running work and represent terminal outcomes; pin existing close/cancel semantics with idempotency tests.
-4. **P1 — Error taxonomy**: align public errors and rejection/reporting paths with §7, beginning with thread creation and lifecycle operations.
+4. **P1 — Remaining error taxonomy**: align the remaining public runtime-recoverable errors and rejection/reporting paths with §7. Thread-creation typed errors and submit/resize propagation are delivered in P0; do not duplicate that work or convert constructor-time invariant violations from panic to Result.
 5. **P1 — Architecture regression checks**: keep the sync-only dependency graph free of Tokio with a CI cargo tree assertion; preserve existing feature isolation and public Store contract.
-6. **P2 — Resource semantics documentation**: document the exact universe bounded by each pool maximum. Investigate any check-then-act race in Xray's buffer pool in the Xray repository, not by adding an unused UDF subsystem.
-7. **P2 — Performance coverage**: add pool acquire/release, saturation/rejection, and contention benchmarks after the corresponding correctness changes. Add lifecycle/resource conformance tests only after their contracts are specified.
-8. **Deferred — consumer-driven extraction**: facade, profiles, independent adapter/testing/resource crates, and workspace renames wait for stable boundaries and a second structurally different consumer. Existing quickstarts and tutorials should be retained; do not rewrite them merely to match a proposed future facade.
-9. **Consumer-repository work**: Xray ConnScope/ArmScope, watcher task topology, buffer-pool admission, and protocol/data-plane integration are tracked and implemented in xray-core-rust.
+6. **P1 — Effect execution two-tier parity**: carry forward ADR-0008's already implemented two-tier sync/async notification model as an explicit precedent, then evaluate and document how the same two-tier coexistence applies to effect execution. Do not force one mode to replace the other; preserve the existing notification contract while defining the effect-side boundary and tests.
+7. **Deferred — CancelToken parent/child design**: make and record an explicit dependency decision between extending the UDF-owned watch-based CancelToken and adopting tokio-util. No implicit tokio-util dependency or watcher-per-child implementation before that decision.
+8. **P2 — Resource semantics documentation**: document the exact universe bounded by each pool maximum. Investigate any check-then-act race in Xray's buffer pool in the Xray repository, not by adding an unused UDF subsystem.
+9. **P2 — Performance coverage**: add pool acquire/release, saturation/rejection, and contention benchmarks after the corresponding correctness changes. Add lifecycle/resource conformance tests only after their contracts are specified.
+10. **Deferred — consumer-driven extraction**: facade, profiles, independent adapter/testing/resource crates, and workspace renames wait for stable boundaries and a second structurally different consumer. Existing quickstarts and tutorials should be retained; do not rewrite them merely to match a proposed future facade. The architecture owner/maintainer must review this deferred set at each release cut (and at least once every 90 days), using concrete signals: a second structurally different consumer, dependency-graph pressure, repeated integration duplication, or a demonstrated publication/versioning need. Record the review outcome in #25 or a linked decision issue; keep the item explicitly deferred with the next review date if no trigger has occurred.
+11. **Consumer-repository work**: Xray ConnScope/ArmScope, watcher task topology, buffer-pool admission, and protocol/data-plane integration are tracked and implemented in xray-core-rust.
 
 ## 12. Non-goals
 
@@ -273,7 +289,7 @@ This is an evidence-driven sequence within the **existing workspace layout**. It
 | Core Store contract can be implemented independently | **Already satisfied**: public skeleton::Store contract; SyncStore is an implementation | Preserve the public contract and avoid coupling it to runtime internals. |
 | Optional Tokio integration is feature-gated | **Already satisfied** in the reviewed dependency graph | Keep the regression check. |
 | Existing quickstart/tutorial material exists | **Already satisfied**: quickstart, driver tour, end-to-end example, and tutorial | Keep compiling; re-home only if a future facade is justified. |
-| Close and cancellation are distinct | **Already satisfied** in FxScope | Keep regression/idempotency tests. |
+| Close and cancellation are distinct | **Implemented, but unpinned** in FxScope | Add regression/idempotency tests that pin close-gate behavior, cancellation behavior, and repeated calls. |
 | Shutdown report distinguishes timeout from actual termination | **Gap** | Extend report with explicit still-running and terminal outcome information. |
 | Thread creation failure cannot corrupt worker accounting or hang join | **Gap** | Complete #26 and deterministic spawn-failure tests. |
 | DrainExclusive unsafe invariant has executable evidence | **Gap** | Complete the bounded differential and invariant-test deliverable in §9. |
