@@ -168,15 +168,15 @@ Do not add a new executor abstraction that silently moves arbitrary work between
 
 Infrastructure APIs must make failure classes and recovery semantics explicit. Avoid collapsing operational failures into panics or a single opaque error.
 
-| Error class | Examples | Expected handling |
-|---|---|---|
-| Configuration / construction | invalid limits, incompatible options, unavailable backend | Return a typed error before publishing partially initialized state; caller may correct configuration and retry. |
-| Admission / overload | queue full, budget exhausted, task rejected | Return an observable rejection; do not silently drop work. Retry only under an explicit caller policy/deadline. |
-| Execution | effect failure, worker task failure, I/O failure | Preserve operation context and surface the failure to its owner; isolation policy determines whether sibling work continues. |
-| Cancellation | cooperative cancellation requested | Represent as cancellation, not success and not an unexpected runtime failure. |
-| Timeout | deadline elapsed while waiting | Report timeout and any still-running work separately; never imply termination. |
-| Runtime / infrastructure | OS thread spawn failure, executor unavailable, channel closed | Return a typed operational error; keep internal accounting consistent and the runtime usable where possible. |
-| Panic / invariant violation | task panic, internal state invariant broken | Isolate task panics where promised; invariant corruption must not be disguised as ordinary rejection or silently recovered. |
+| Error class | Examples | Expected handling | Constructor-time invariant / policy |
+|---|---|---|---|
+| Configuration / construction | invalid limits, incompatible options, invalid weight/budget pairing | Unconditionally invalid constructor arguments are programmer errors: fail fast before publishing state. Environment-dependent failures discovered at runtime return typed errors. | **恒非法参数 = panic fail-fast**; do not bulk-convert established constructors to Result. This preserves the repository's current discipline (MemoryPool::new, ThreadPool::new, PoolBase::new, ByteBudget::new, ObjectPool construction). |
+| Admission / overload | queue full, budget exhausted, task rejected | Return an observable typed rejection; do not silently drop work. Retry only under an explicit caller policy/deadline. | Runtime condition; may recover when capacity becomes available. |
+| Execution | effect failure, worker task failure, I/O failure | Preserve operation context and surface the failure to its owner; isolation policy determines whether sibling work continues. | Operation-dependent; propagate or isolate according to declared policy. |
+| Cancellation | cooperative cancellation requested | Represent as cancellation, not success and not an unexpected runtime failure. | Expected runtime control flow. |
+| Timeout | deadline elapsed while waiting | Report timeout and any still-running work separately; never imply termination. | Runtime condition; timeout does not prove termination. |
+| Runtime / infrastructure | OS thread spawn failure, executor unavailable, channel closed | Return a typed operational error; keep internal accounting consistent and the runtime usable where possible. | Environment/runtime failure; typed error, not constructor-argument panic. |
+| Panic / invariant violation | task panic, internal state invariant broken | Isolate task panics where promised; invariant corruption must not be disguised as ordinary rejection or silently recovered. | Internal invariant violations remain fail-fast where continuing is unsound. |
 
 Rules:
 
