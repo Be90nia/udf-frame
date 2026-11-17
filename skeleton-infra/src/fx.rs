@@ -14,8 +14,9 @@
 //! ——不 panic/不锁/不阻塞，logx 未初始化即静默退让（tracing 语义）。
 //!
 //! 增量收割面（issue#13）：完成条目滞留集合到 [`FxScope::try_reap`] 显式收割；
-//! `shutdown`/`shutdown_timeout` 排空产出 [`ShutdownReport`]（panic 载荷清单 + 超时
-//! 未完成数），panic 载荷 join 与收割双重可见（诊断面语义非 exactly-once）。
+//! `shutdown`/`shutdown_timeout` 排空产出 [`ShutdownReport`]（终局五桶 completed/
+//! cancelled/panicked/failed/still_running + 截止计数 timed_out；超时不等于已终止），
+//! panic 载荷 join 与收割双重可见（诊断面语义非 exactly-once）。
 
 use std::any::Any;
 use std::fmt;
@@ -28,7 +29,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, oneshot, watch};
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinError, JoinSet};
 
 /// std Mutex 取锁：中毒 = 持锁方已 panic、状态不可信——fail-fast 传播 panic
 /// （核心壳 `lock` 同形，禁静默吞毒锁）。
@@ -232,17 +233,72 @@ where
     }
 }
 
-/// 停机排空报告（issue#13 缺口二）：停机排空不再静默丢结果——panic 载荷归集
-/// 返回，超时未完成数显式计数。
+/// 停机排空报告（issue#13 缺口二 / 蓝图 §4）：停机排空不再静默丢结果——终局按桶
+/// 归集，超时只表达「调用方停止等待」，仍在运行的任务显式申报。
+///
+/// 五桶（`completed` / `cancelled` / `panicked` / `failed` / `still_running`）互斥
+/// 且穷尽：本次排空观测到的每条任务终局恰落一桶；`timed_out` 是截止事件的计数，
+/// 与终局桶正交（可覆盖截止瞬间已终局但尚未收割的条目）。失败桶另带 `errors`
+/// 逐条明细（计数与文案同一处写入）。
+///
+/// `#[non_exhaustive]`：字段按真实采用面渐进扩，加字段属非破坏演进——**跨 crate
+/// 禁用 struct literal**（含 `..Default::default()` 形态，rustc 一律 E0639），采用
+/// 方走 `ShutdownReport::default()` 起手再按需赋值/读侧访问（同 crate 豁免，纪律
+/// 同 [`skeleton::Effect`] 词表的加变体面）。
 #[must_use]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ShutdownReport {
+    /// 正常终局（任务体返回 `Ok(())`）的条数——含此前已终局、滞留生命周期集至
+    /// 本次排空才收割的条目。
+    pub completed: usize,
+    /// 已确认被中止的条数（abort 在任务下一 await 点生效后，生命周期集报
+    /// cancelled）。**只数已观测到的终止**：abort 已发而终止未观测者进
+    /// [`Self::still_running`]。
+    pub cancelled: usize,
     /// 排空中收割到的任务 panic 消息（含句柄已被丢的任务——载荷入集合不丢，
     /// 见 [`FxScope::spawn_tracked`] 的双重可见语义）。
     pub panicked: Vec<String>,
-    /// 截止时未完成、由剩余集 Drop=abort 兜底中止的任务数（仅
-    /// [`FxScope::shutdown_timeout`] 超时路径 >0；[`FxScope::shutdown`] 恒 0）。
+    /// 非 panic 的失败终局条数（任务体错误 `TaskError::TimedOut` 等，以及未知
+    /// join 变体的兜底落账）；逐条文案与 [`Self::errors`] 对齐。任务包装体当前只
+    /// 把 panic 归一成终局错误，故常态 0。
+    pub failed: usize,
+    /// [`Self::failed`] 的逐条诊断文案（与计数同点写入，`errors.len() == failed`）；
+    /// 未知 join 变体在此留 `Display` 原文，禁静默吞。
+    pub errors: Vec<String>,
+    /// 截止时未完成、调用方停止等待的条数（仅 [`FxScope::shutdown_timeout`] 超时
+    /// 路径 >0；[`FxScope::shutdown`] 恒 0）。**语义边界**：超时只表示调用方不再
+    /// 等待，不表示工作已终止——此数含截止瞬间已终局但尚未收割的条目。
     pub timed_out: usize,
+    /// 报告返回时终止**未被观测到**的条数（仍在生命周期集内，剩余集 Drop=abort
+    /// 已排队但尚未生效）。**语义边界**：不宣称这些任务仍在执行，只申报「终止未
+    /// 确认」；超时路径上 ≤ [`Self::timed_out`]（截止后的首轮收割只会减少）。
+    pub still_running: usize,
+}
+
+impl ShutdownReport {
+    /// 单条终局归类（`join_next` / `try_join_next` 同形，排空两面共用一张表——
+    /// 桶互斥且穷尽）。
+    fn record(&mut self, outcome: Result<Result<(), TaskError>, JoinError>) {
+        match outcome {
+            Ok(Ok(())) => self.completed += 1,
+            Ok(Err(TaskError::Panicked(msg))) => self.panicked.push(msg),
+            Ok(Err(TaskError::Cancelled)) => self.cancelled += 1,
+            Ok(Err(err)) => {
+                self.failed += 1;
+                self.errors.push(err.to_string());
+            }
+            Err(err) if err.is_cancelled() => self.cancelled += 1,
+            // `is_panic` 显式守卫：`into_panic` 在非 panic 时自身 panic，而本路径
+            // 是停机收尾——报告代码不得因 JoinError 将来新增变体而炸。
+            Err(err) if err.is_panic() => self.panicked.push(panic_message(err.into_panic())),
+            // 兜底：未知 join 变体按失败落账并留 `Display` 原文（禁 `_ => {}` 静默吞）。
+            Err(err) => {
+                self.failed += 1;
+                self.errors.push(format!("unknown join failure: {err}"));
+            }
+        }
+    }
 }
 
 /// 托管 scope：内部 = `Mutex<JoinSet<Result<(), TaskError>>>`（生命周期集，短临界区
@@ -422,20 +478,19 @@ impl FxScope {
     }
 
     /// fx 域停机三段一次收拢：① close（accepting 闸关，拒新 spawn）→
-    /// ② abort_all（在途任务收取消通知——[`CancelSource`] 协作取消面）→
-    /// ③ 等净（join_next 循环至任务集清空）。锁内 abort_all + mem::take(JoinSet)，
-    /// take 后的 set 在锁外 await join_next 循环（禁持 std 锁跨 await）。
+    /// ② abort_all（在途任务收 abort——[`CancelSource`] 协作取消面；未到 await 点
+    /// 的任务在下一次让渡时才终止）→ ③ 等净（join_next 循环至任务集清空）。锁内
+    /// abort_all + mem::take(JoinSet)，take 后的 set 在锁外 await join_next 循环
+    /// （禁持 std 锁跨 await）。
     ///
-    /// 排空即收割（issue#13）：panic 载荷入 [`ShutdownReport`]，不再静默丢弃；
-    /// abort 条目 = 预期消亡（`Cancelled`），不计入报告。
-    #[must_use = "shutdown 报告含 panic 载荷清单，丢弃即静默丢失（纯收尾用 `let _ =` 显式让渡）"]
+    /// 排空即收割（issue#13）：终局按 [`ShutdownReport`] 五桶归集（panic 载荷入
+    /// 清单，不静默丢弃）；本路径等净至空集 ⇒ `timed_out` / `still_running` 恒 0。
+    #[must_use = "shutdown 报告含终局归集与 panic 载荷清单，丢弃即静默丢失（纯收尾用 `let _ =` 显式让渡）"]
     pub async fn shutdown(&self) -> ShutdownReport {
         let mut set = self.close_and_take();
         let mut report = ShutdownReport::default();
         while let Some(outcome) = set.join_next().await {
-            if let Ok(Err(TaskError::Panicked(msg))) = outcome {
-                report.panicked.push(msg);
-            }
+            report.record(outcome);
         }
         report
     }
@@ -443,31 +498,32 @@ impl FxScope {
     /// 同上+超时：先 close+abort_all；超时不再返回 `Err`，改 [`ShutdownReport`]
     /// 的 `timed_out > 0` 表达（join_timeout 的 `TimedOut` 单任务面保留）。
     /// abortable 任务零残留（剩余集 Drop=abort 兜底）；不可 abort 段依赖自终止
-    /// 契约。超时即返前先增量收割已完结条目——panic 载荷不因超时丢失，剩余
-    /// 未完成数计 `timed_out`。
+    /// 契约。
+    ///
+    /// 超时即返前先记截止计数、再增量收割已完结条目——终局不因超时丢失。截止时
+    /// 未完成数计 [`ShutdownReport::timed_out`]，报告返回时终止仍未观测到者计
+    /// [`ShutdownReport::still_running`]：超时路径**不得**把仍在运行记成已完成或
+    /// 已终止。
     pub async fn shutdown_timeout(&self, d: Duration) -> ShutdownReport {
         let mut set = self.close_and_take();
         let mut report = ShutdownReport::default();
         {
             let drain = async {
                 while let Some(outcome) = set.join_next().await {
-                    if let Ok(Err(TaskError::Panicked(msg))) = outcome {
-                        report.panicked.push(msg);
-                    }
+                    report.record(outcome);
                 }
             };
             if tokio::time::timeout(d, drain).await.is_ok() {
                 return report;
             }
         }
-        // 超时即返：drain await 窗内已完结者收割（panic 载荷不丢），剩余 = 截止时
-        // 未完成数；下面 set drop = abort 兜底（零残留）。
-        while let Some(outcome) = set.try_join_next() {
-            if let Ok(Err(TaskError::Panicked(msg))) = outcome {
-                report.panicked.push(msg);
-            }
-        }
+        // 超时即返：先记截止时未完成数（调用方停等的量），再收割此刻已终局者
+        // （panic 载荷不丢），剩余 = 终止未观测数；下面 set drop = abort 兜底。
         report.timed_out = set.len();
+        while let Some(outcome) = set.try_join_next() {
+            report.record(outcome);
+        }
+        report.still_running = set.len();
         report
     }
 
@@ -669,11 +725,16 @@ mod tests {
             scope.spawn_tracked(async move { i }).unwrap();
         }
         let report = scope.shutdown().await;
+        // abort 与任务 poll 竞速：四条任务可能落 completed 或 cancelled，但必各落
+        // 一桶（桶穷尽面）；截止/未观测两桶恒 0（排空至空集）。
         assert_eq!(
-            report,
-            ShutdownReport::default(),
-            "排空收割：零 panic 零超时"
+            report.completed + report.cancelled,
+            4,
+            "四条任务各落一桶（排空收割到空集）"
         );
+        assert!(report.panicked.is_empty(), "无 panic 载荷");
+        assert_eq!(report.timed_out, 0, "shutdown 无截止 ⇒ 恒 0");
+        assert_eq!(report.still_running, 0, "等净至空集 ⇒ 无未观测终局");
         expect_idle(&scope);
 
         use std::time::Instant;
@@ -1046,7 +1107,7 @@ mod tests {
             report,
             ShutdownReport {
                 panicked: vec!["boom-report".to_owned()],
-                timed_out: 0,
+                ..ShutdownReport::default()
             }
         );
     }
