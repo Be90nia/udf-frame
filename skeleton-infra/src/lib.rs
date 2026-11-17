@@ -116,6 +116,9 @@ pub mod objpool;
 #[cfg(feature = "pool")]
 pub mod pooled_thread_pool;
 
+#[cfg(feature = "pool")]
+pub mod size_class_pool;
+
 #[cfg(feature = "compose")]
 pub mod compose;
 
@@ -181,6 +184,9 @@ pub use objpool::{
 
 #[cfg(feature = "pool")]
 pub use pooled_thread_pool::PooledThreadPool;
+
+#[cfg(feature = "pool")]
+pub use size_class_pool::{SizeClassHandle, SizeClassMetrics, SizeClassPool, SizeClassStat};
 
 #[cfg(feature = "compose")]
 pub use compose::{Combine, combine};
