@@ -470,6 +470,11 @@ fn byte_budget_contention(c: &mut Criterion) {
             });
         }
         group.bench_function("unbudgeted_four_threads", |b| b.iter(|| round_trip(&plain)));
+        // 同码 dup 臂作噪声锚：同 run 内两者一致 ⇒ 读数可信；跨 run 同一臂跳动 ⇒ 噪声在 run 之间（线程落点），
+        // 不是稳定代码属性。判别「噪声 vs 效应」的实测依据（bd udf-frame-p6x）。
+        group.bench_function("unbudgeted_four_threads_dup", |b| {
+            b.iter(|| round_trip(&plain))
+        });
         stop_plain.store(true, Ordering::Release);
     });
 
@@ -483,6 +488,10 @@ fn byte_budget_contention(c: &mut Criterion) {
             });
         }
         group.bench_function("budgeted_four_threads", |b| {
+            b.iter(|| round_trip(&budgeted))
+        });
+        // 同码 dup 臂作噪声锚（同上）。
+        group.bench_function("budgeted_four_threads_dup", |b| {
             b.iter(|| round_trip(&budgeted))
         });
         stop_budgeted.store(true, Ordering::Release);
