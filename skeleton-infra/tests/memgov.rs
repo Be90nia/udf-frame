@@ -133,6 +133,10 @@ fn leak_guard_reports_clean_scope_as_ok() {
     let _serial = serial();
     settle();
     let guard = LeakGuard::arm();
+    assert!(
+        guard.is_enabled(),
+        "本二进制挂了 CountingAllocator：观测面必须在岗（否则 check 恒 Ok 是空转）"
+    );
     let v = Vec::<u8>::with_capacity(128);
     drop(v);
     guard.check().expect("freed everything: no leak");
@@ -150,6 +154,68 @@ fn leak_guard_reports_leak_with_exact_delta() {
     assert_eq!(report.allocs_delta, 1);
     assert_eq!(report.bytes_delta, 256);
     // guard Drop 的兜底 eprintln 在本测结束后预期出现——尽力而为语义，不参与断言。
+}
+
+/// ⑧b LeakGuard 探测面抗并发**净额**波动（回归闸：钉死 arm() 读单调累计面而非净额面）。
+///
+/// 变异验证（可复跑）：把 `arm()` 的探测改回 `live_allocs`，本测试必红——并发释放把
+/// 探测窗内的 +1 抵消回基线，`is_enabled()` 假阴性变 false。
+///
+/// 为何不是概率性通过（两方向分开论证）：
+/// - **绿方向（正确实现）恒成立**：`total_allocs` 单调不减，任何并发分配/释放都只能让
+///   它增大，`moved` 恒 true——与其它测试共享全局计数的干扰无关（这正是修复的语义）。
+/// - **红方向（变异实现）由构造给出足够干扰密度**：两枚锤线程各自预置 3 万个小分配，
+///   屏障放行后**只释放不分配**（净额整段时间单向下降，无 +1 抵消回填），释放间隔
+///   ≈10ns 量级；探测窗（两次 load + 一次 64B 分配）≈50-100ns ⇒ 窗口内至少落一次 free
+///   的概率按 `1-exp(-窗/间隔)` 接近 1，且主线程做 2000 次探测。因此断言 `misses==0`
+///   （任何一次命中即红），不写成「至少命中一次」的统计断言。
+/// - **防空转**：join 取回每枚锤的真实释放数并断言等于预置量，线程没跑/提前退即红。
+#[test]
+fn leak_guard_probe_survives_concurrent_net_gauge_fluctuation() {
+    let _serial = serial();
+    settle();
+
+    const HAMMERS: usize = 2;
+    const RESERVE: usize = 30_000;
+    const PROBES: usize = 2_000;
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(HAMMERS + 1));
+    let mut handles = Vec::with_capacity(HAMMERS);
+    for _ in 0..HAMMERS {
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            // 预置面+屏障都在被计时的窗口之外：放行瞬间起才是「只释放」的净额下降段。
+            let mut reserve: Vec<Vec<u8>> = (0..RESERVE).map(|_| Vec::with_capacity(1)).collect();
+            barrier.wait();
+            let mut freed = 0usize;
+            while reserve.pop().is_some() {
+                freed += 1;
+            }
+            freed
+        }));
+    }
+
+    barrier.wait();
+    let mut misses = 0usize;
+    for _ in 0..PROBES {
+        if !LeakGuard::arm().is_enabled() {
+            misses += 1;
+        }
+    }
+    let freed: usize = handles
+        .into_iter()
+        .map(|h| h.join().expect("hammer thread must not panic"))
+        .sum();
+
+    assert_eq!(
+        freed,
+        HAMMERS * RESERVE,
+        "锤线程未按预期释放（{freed}）：干扰窗空转，本闸会失效"
+    );
+    assert_eq!(
+        misses, 0,
+        "arm() 探测被并发净额波动骗成降级（{misses}/{PROBES} 次）：探针必须读单调累计面"
+    );
 }
 
 /// ⑨ expect_empty panic 路径（带 len/capacity 现场）。

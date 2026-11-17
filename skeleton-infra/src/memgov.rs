@@ -294,14 +294,17 @@ pub struct LeakGuard {
 
 impl LeakGuard {
     /// 记当前基线。global_allocator 未声明 [`CountingAllocator`] 时 enabled=false
-    /// 全 no-op（诚实降级不虚报）。
+    /// 全 no-op（诚实降级不虚报；降级态经 [`Self::is_enabled`] 对调用方可见——
+    /// 禁把「未观测」读成「无泄漏」）。
     pub fn arm() -> Self {
         // 探测：分配一枚探针看计数器动不动——动=计数分配器在岗；不动=裸 System（或其他
         // 分配器），降级。black_box 防 LLVM 消除 malloc/free 对造成假阴性。
-        let before = LIVE_ALLOCS.load(Ordering::Relaxed);
+        // 探针读**累计面**（total_allocs 单调不减）：live_allocs 是净额面，并发线程的
+        // 释放会把本次分配抵消回去 → 假阴性即静默降级（观测面失效却报「无泄漏」）。
+        let before = TOTAL_ALLOCS.load(Ordering::Relaxed);
         let probe = Vec::<u8>::with_capacity(64);
         std::hint::black_box(&probe);
-        let moved = LIVE_ALLOCS.load(Ordering::Relaxed) > before;
+        let moved = TOTAL_ALLOCS.load(Ordering::Relaxed) > before;
         drop(probe);
         Self {
             baseline_allocs: LIVE_ALLOCS.load(Ordering::Relaxed),
@@ -310,7 +313,19 @@ impl LeakGuard {
         }
     }
 
+    /// 观测面是否真在岗（[`CountingAllocator`] 已作 `#[global_allocator]` 安装）。
+    ///
+    /// `false` = [`Self::check`] 恒 `Ok` 的诚实降级态：要求「泄漏必红」的严格断言
+    /// 者先断言本方法为 `true`，否则 [`Self::check`] 的 `Ok` 是空转——「未观测」
+    /// 不等于「无泄漏」。
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// allocs/bytes 回基线=Ok；否则 Err(LeakReport)。
+    ///
+    /// 未启用观测（[`Self::is_enabled`]=false）时恒 `Ok`——「没泄漏」与「根本没在
+    /// 观测」在返回值上不可区分，严格断言须先查 [`Self::is_enabled`]。
     pub fn check(&self) -> Result<(), LeakReport> {
         if !self.enabled {
             return Ok(());
@@ -816,11 +831,17 @@ mod tests {
     fn leak_guard_degrades_to_noop_without_counting_allocator() {
         let guard = LeakGuard::arm();
         assert!(
-            !guard.enabled,
+            !guard.is_enabled(),
             "lib test binary must NOT declare a CountingAllocator global allocator"
         );
-        let _live = Vec::<u8>::with_capacity(64);
-        assert!(guard.check().is_ok());
+        // 泄漏假阴性现场：故意 forget 一块内存，check 仍 Ok——「没泄漏」与
+        // 「没观测」在返回值上不可区分，故降级态必须靠 is_enabled 显式区分。
+        let leaked = Vec::<u8>::with_capacity(64);
+        std::mem::forget(leaked);
+        assert!(
+            guard.check().is_ok(),
+            "降级态下真实泄漏也报 Ok（观测面未在岗）"
+        );
     }
 
     /// 零覆盖 #8：bounded(0) 构造期 panic——恒满注册表必是 bug，fail-fast
