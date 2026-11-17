@@ -30,6 +30,43 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all -- --check
 
+      # 架构回归闸（蓝图 §13 行 1「Sync-only consumer has no Tokio in its
+      # dependency tree」/ §11 项 5）：sync-only 依赖图出现 tokio 即红。
+      # cargo tree 不编译（毫秒级），故前置在测试步前快速失败。三条图分别覆盖
+      # infra 默认面（P12 零 default feature）、显式 sync-only 面、独立消费
+      # crate std-ext。三 OS 全跑：图本身与平台无关，成本数秒，但能抓到
+      # [target.'cfg(...)'.dependencies] 里偷偷注入的 tokio。
+      # fail-closed：cargo tree 失败与检出 tokio 都置 exit 1（无
+      # continue-on-error、无 || true）；失败时打印含 tokio 的实际依赖节点供定责。
+      # shell: bash 原因：断言需跨 OS 单写法（不引 action/不乱引脚本文件），
+      # Windows runner 自带 Git Bash；默认 shell 在 Windows 是 pwsh，同一脚本
+      # 无法双跑。
+      - name: Sync-only dependency tree (no Tokio)
+        shell: bash
+        run: |
+          fail=0
+          assert_no_tokio() {
+            local label="$1" tree
+            shift
+            if ! tree="$(cargo tree "$@" -e normal 2>&1)"; then
+              echo "::error::cargo tree failed for: $label"
+              printf '%s\n' "$tree"
+              fail=1
+              return
+            fi
+            if printf '%s\n' "$tree" | grep -q tokio; then
+              echo "::error::$label dependency graph contains tokio:"
+              printf '%s\n' "$tree" | grep tokio
+              fail=1
+            else
+              echo "ok: $label dependency graph is tokio-free"
+            fi
+          }
+          assert_no_tokio "udf-skeleton-infra (default features)" -p udf-skeleton-infra
+          assert_no_tokio "udf-skeleton-infra --no-default-features --features runtime" -p udf-skeleton-infra --no-default-features --features runtime
+          assert_no_tokio "udf-std-ext (default features)" -p udf-std-ext
+          exit "$fail"
+
       # 契约 doctest 门（r2 审计建议-2 单列口径随迁）：skeleton 为纯契约 crate，
       # 行为测试矩阵随实现居 skeleton-infra
       - name: Test skeleton
