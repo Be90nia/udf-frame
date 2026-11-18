@@ -327,3 +327,106 @@ async fn close_gate_does_not_cancel_in_flight_work() {
     assert_eq!(report.completed, 1);
     assert_eq!(report.cancelled, 0, "不得把在途任务记成已取消");
 }
+
+/// 交叉面（issue#39 F3）：`shutdown_timeout` 遇**非空已完成集**——排空前已完成
+/// 的条目（滞留集合、未收割）与一条不可让渡自旋段（终止未观测）同时在场。
+///
+/// 两侧各落各桶：已完成者进 `completed`（由停机排空面收割，**不**依赖
+/// `try_reap`）；幸存者进 `timed_out` / `still_running`（终止未观测，**不得**被
+/// 记成已完成）。停机前的可观测面：已完成未收割条目数 > 0（`completed_unreaped`
+/// ——`join` 只消费结果、**不**移除集合条目）。
+///
+/// 确定性分工：已完成的两条在停机前**已彻底终结**（future 已析构 ⇒ 运行时已完成
+/// COMPLETE 记账），故 `close_and_take` 的 abort 打不到它们 ⇒ 必落 `completed`
+/// （与 `timeout_reports_survivors_without_claiming_termination` 里「终局类与
+/// abort 无竞态」的分工同源）；幸存者用不可让渡自旋段（abort 只在下一次 await
+/// 生效）⇒ 超时必达。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_timeout_with_non_empty_completed_set_classifies_both_faces() {
+    let hold = Arc::new(AtomicBool::new(false));
+    let holding = Arc::new(AtomicBool::new(false));
+    // panic 路径也放开自旋段：否则 worker 在无 await 的 poll 里滞留 ⇒ 运行时拆除
+    // 期等它 ⇒ 测试挂死（CI 上表现为 job 超时）。
+    let _release = ReleaseOnDrop(Arc::clone(&hold));
+    let scope = FxScope::new();
+
+    // ① 两条已完成任务：条目滞留集合 ⇒ 非空已完成集。
+    let mut quick = Vec::new();
+    for i in 0..2u8 {
+        quick.push(scope.spawn_tracked(async move { i }).unwrap());
+    }
+    for (expected, handle) in quick.into_iter().enumerate() {
+        assert_eq!(
+            bounded("已完成任务 join 收值", handle.join()).await,
+            Ok(expected as u8),
+            "已完成任务 join 收值"
+        );
+    }
+    // 任务体已终结（future 已析构 ⇒ 运行时完成 COMPLETE 记账，abort 打不到）。
+    wait_until("已完成任务体终结", || scope.in_flight() == 0).await;
+    // 已完成未收割条目可观测（join 不移除集合条目 ⇒ 保留量计数不因 join 而减）。
+    wait_until("已完成条目滞留集合", || {
+        scope.counts().completed_unreaped == 2
+    })
+    .await;
+
+    // ② 一条不可让渡自旋段：abort 只在下一次 await 生效 ⇒ 超时必达。
+    let (hold_task, holding_task) = (Arc::clone(&hold), Arc::clone(&holding));
+    let spinner = scope
+        .spawn_tracked(async move {
+            loop {
+                if hold_task.load(Ordering::Relaxed) {
+                    holding_task.store(true, Ordering::Relaxed);
+                    while hold_task.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .unwrap();
+
+    // 握手（有界等待，不变量被破坏时诊断失败而非挂死）：自旋任务已滞留在无
+    // await 的 poll 段内（免运行即撤模拟不了该场景）。
+    hold.store(true, Ordering::Relaxed);
+    wait_until("自旋任务已进入不可让渡段", || {
+        holding.load(Ordering::Relaxed)
+    })
+    .await;
+
+    let report = bounded(
+        "shutdown_timeout 有界返回",
+        scope.shutdown_timeout(Duration::from_millis(50)),
+    )
+    .await;
+    println!("timeout report with non-empty completed set: {report:?}");
+
+    assert_eq!(
+        report.completed, 2,
+        "停机前已完成的条目进 completed（排空面收割，不依赖 try_reap）"
+    );
+    assert_eq!(report.cancelled, 0, "已完成条目不得被误记为取消");
+    assert!(report.panicked.is_empty(), "本场景无 panic 终局");
+    assert_eq!(report.failed, 0, "本场景无非 panic 失败终局");
+    assert_eq!(report.timed_out, 1, "截止时未完成 = 不可让渡自旋段");
+    assert_eq!(
+        report.still_running, 1,
+        "终止未观测 = 自旋段（不宣称已终止）"
+    );
+    assert_eq!(
+        report.completed
+            + report.cancelled
+            + report.panicked.len()
+            + report.failed
+            + report.still_running,
+        3,
+        "桶互斥且穷尽：每条任务恰落一桶"
+    );
+
+    hold.store(false, Ordering::Relaxed); // 放行让渡，abort 在下一 await 点生效
+    assert_eq!(
+        bounded("超时遗留任务被 abort 收割", spinner.join()).await,
+        Err(TaskError::Cancelled),
+        "超时遗留任务由 abort 在下一 await 点收割"
+    );
+}

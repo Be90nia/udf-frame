@@ -620,7 +620,7 @@ pub struct LeakReport { pub allocs_delta: isize, pub bytes_delta: isize }
 pub fn expect_empty<K: Ord, V>(reg: &BoundedRegistry<K, V>);  // 非空即 panic（判据二）
 ```
 
-Drop 兜底尽力而为——**规范用法=测试尾显式 `check()`**/`expect_empty`/fx 侧 `expect_idle`。判据三（任务面）在 `fx::expect_idle`。
+Drop 兜底尽力而为——**规范用法=测试尾显式 `check()`**/`expect_empty`/fx 侧 `expect_body_idle`。判据三（任务面）在 `FxScope::expect_body_idle`（任务体结束口径）；要「跟踪集合已完全收割」的更强判据用 `expect_fully_reaped_idle`。
 
 **churn 口径（live × total 联用判级）**：窗口 churn = `total_allocs(t2) − total_allocs(t1)`。live 净额对「即用即还」恒 0——净 0 无法区分「真零分配」与「同量 churn」；联用：live 平 + total 增 = 高 churn 零泄漏，两者皆平 = 窗口真零分配。realloc 成功按「换块」计（total 两面各 +1；live 面不动）。total_allocs 与 total_deallocs 差值长期不等 = 累计泄漏/外部遗忘面。
 
@@ -1985,9 +1985,19 @@ impl CancelToken {
 }
 
 pub fn cancel_pair() -> (CancelSource, CancelToken);
-pub fn expect_idle(scope: &FxScope);   // in_flight==0 断言（LeakGuard fx 侧锚点）
+pub enum AdmissionError { Closed, PendingFull, TrackedFull }   // typed 过载/闸关（issue#39）
+pub struct FxCounts { pub active: usize, pub waiting: usize, pub completed_unreaped: usize, pub rejected: usize }
+impl FxScope {
+    pub fn with_max_pending(self, n: usize) -> Self;   // 等待许可的准入上限（默认无界，opt-in）
+    pub fn with_max_tracked(self, n: usize) -> Self;    // 保留条目上限（含已完成未收割，默认无界）
+    pub fn try_spawn_tracked<T>(&self, fut: impl Future<Output = T> + Send + 'static)
+        -> Result<Spawned<T>, AdmissionError>;         // 有界准入：过载 typed 拒绝（不阻塞、不 panic）
+    pub fn counts(&self) -> FxCounts;                   // active/waiting/completed_unreaped/rejected
+    pub fn expect_body_idle(&self);                    // 任务体全部结束（LeakGuard fx 侧锚点）
+    pub fn expect_fully_reaped_idle(&self);            // 更强：跟踪集合已完全收割
 ```
 
+- **三资源维度（issue#39）**：`with_concurrency` 只限**任务体并发**，**不是**内存/保留量上界；保留上界 = `with_max_tracked`（含已完成未收割条目），等待许可数 = `with_max_pending`，两者默认**无界**（opt-in 显式设）。有界准入走 `try_spawn_tracked` → `Result<_, AdmissionError>`（过载 typed 拒绝，不阻塞不 panic）；`spawn_tracked` 是**无界旧口**（保持兼容，不受上界约束）。`Spawned::join()` 只消费结果、**不**移除集合条目（收割口 = `try_reap`）。`counts()` 暴露 active/waiting/completed_unreaped/rejected。
 - 任务结局归一：panic 经 catch_unwind 归一 `TaskError::Panicked(消息)`（payload downcast &str/String，否则哨兵文案）；发送端消亡=Cancelled；join 超时=TimedOut 且任务已 abort（禁留活口）。
 - `spawn_tracked` 线性化=锁内原子 RMW 过闸 + 插入与 shutdown 的 abort_all 串行——过闸任务必被 shutdown 覆及。
 - 条目滞留与收割（issue#13）：生命周期集条目不再静默丢弃——panic 载荷进集合（句柄被丢也不丢），**join 与 `try_reap`/停机排空双重可见**（同一 panic 两条路都可能报出，诊断面语义非 exactly-once）；完成条目滞留集合至 `try_reap`（增量收割口：锁内同步 `try_join_next` 扫已完成条目，空集零分配、幂等，不动在途任务、不改 in_flight）或停机排空显式消费。
@@ -1996,12 +2006,12 @@ pub fn expect_idle(scope: &FxScope);   // in_flight==0 断言（LeakGuard fx 侧
 **实测**（单批，Windows 10 x64 / 16 核 / rustc 1.96.0；`cargo run --release -p udf-skeleton-infra --features tokio,memgov --example fxscope_multidim` ⑤停机段；粗测供判级，跨批波动 10–30% 属常态）：shutdown 排空已完结条目 **252ns/条目**（10k 条目 join_next 收割面）；shutdown 中止在途 111µs（100 park 任务 close+abort_all+收割）；`shutdown_timeout` 守卫设定 5ms 中位 7ms、超时命中 3/3（报告形 `timed_out>0` 判定；超出部分=Windows 计时器粒度+传播开销）。
 
 ```rust
-use skeleton_infra::fx::{expect_idle, FxScope};
+use skeleton_infra::fx::FxScope;
 
 let scope = FxScope::new();
 let handle = scope.spawn_tracked(async { 41 + 1 }).unwrap();
 // assert_eq!(handle.join().await, Ok(42));  // 需 tokio 运行时：见 tests 与 fx.rs doctest
-expect_idle(&scope);
+scope.expect_body_idle();   // 任务体结束；集合是否已收割用 expect_fully_reaped_idle()
 ```
 
 > 注：`join()` 需在 tokio 运行时内 await；独立可编译片段见 `examples/quickstart.rs` 与 `src/fx.rs` 单元测试（`#[tokio::test]` 十九件：spawn/abort/panic/timeout/close/shutdown 排空/超时收割/`try_reap` 增量收割面语义全钉）。

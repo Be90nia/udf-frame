@@ -140,7 +140,8 @@ pub use runtime::{LocalSubscription, SyncStore};
 
 #[cfg(feature = "tokio")]
 pub use fx::{
-    CancelSource, CancelToken, FxScope, ScopeClosed, Spawned, TaskError, cancel_pair, expect_idle,
+    AdmissionError, CancelSource, CancelToken, FxCounts, FxScope, ScopeClosed, Spawned, TaskError,
+    cancel_pair,
 };
 
 #[cfg(feature = "testing")]

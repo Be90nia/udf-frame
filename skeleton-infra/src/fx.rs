@@ -17,6 +17,12 @@
 //! `shutdown`/`shutdown_timeout` 排空产出 [`ShutdownReport`]（终局五桶 completed/
 //! cancelled/panicked/failed/still_running + 截止计数 timed_out；超时不等于已终止），
 //! panic 载荷 join 与收割双重可见（诊断面语义非 exactly-once）。
+//!
+//! 三资源轴（issue#39）：`max_concurrency`（并发许可）/ `max_pending`（已准入
+//! 但等待许可）/ `max_tracked`（集合保留条目，含已完成未收割）互相独立——
+//! `with_concurrency` **不是**内存/保留量上界（保留上界是 `with_max_tracked`）；
+//! 有界准入口 `try_spawn_tracked` 过载时 typed 拒绝（`AdmissionError`），
+//! 不阻塞不 panic；计数面见 `FxScope::counts`。
 
 use std::any::Any;
 use std::fmt;
@@ -28,7 +34,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 
 /// std Mutex 取锁：中毒 = 持锁方已 panic、状态不可信——fail-fast 传播 panic
@@ -73,6 +79,50 @@ impl fmt::Display for ScopeClosed {
 }
 
 impl std::error::Error for ScopeClosed {}
+
+/// 有界准入的 typed 拒绝原因（issue#39）：过载**不** panic、**不**阻塞调用方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionError {
+    /// accepting 闸已关（scope 关闭中）——与 [`ScopeClosed`] 同义。
+    Closed,
+    /// `max_pending` 触顶：已准入但等待并发许可的任务数达上界。
+    PendingFull,
+    /// `max_tracked` 触顶：生命周期集合保留的条目数（含已完成未收割）达上界。
+    TrackedFull,
+}
+
+impl fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed => f.write_str("fx scope closed for new spawns (accepting gate)"),
+            Self::PendingFull => {
+                f.write_str("fx scope pending capacity exhausted (max_pending reached)")
+            }
+            Self::TrackedFull => {
+                f.write_str("fx scope tracked capacity exhausted (max_tracked reached)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AdmissionError {}
+
+/// fx 域三资源轴的占用快照（issue#39 可观测面）。
+///
+/// 三轴互相独立：`active` 对应 `max_concurrency`（并发许可）、`waiting` 对应
+/// `max_pending`（已准入但等待许可）；`completed_unreaped` 对应 `max_tracked`
+/// （集合保留但任务体已终局的条目数——**含**已完成未收割者）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FxCounts {
+    /// 持有并发许可的任务数（准入即取许可 ⇒ 含已准入未开跑者）。
+    pub active: usize,
+    /// 已准入但等待并发许可的任务数。
+    pub waiting: usize,
+    /// 已完成但尚未从生命周期集合收割的条目数（含 panic / abort 终局条目）。
+    pub completed_unreaped: usize,
+    /// 因容量上界被拒的准入次数（累计；闸关拒发不计入）。
+    pub rejected: usize,
+}
 
 /// 取消源（fx 域停机三段的② abort 协作取消通知面，三段定义见
 /// [`FxScope::shutdown`] 文档）；幂等 cancel。
@@ -185,21 +235,33 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 /// 统一 `Ok(())`——真实值只走 oneshot 旁路，集合条目仅承载生命周期与 panic 面。
 async fn task_body<T, F>(
     sem: Option<Arc<Semaphore>>,
+    permit: Option<OwnedSemaphorePermit>,
     fut: F,
     tx: oneshot::Sender<Result<T, TaskError>>,
+    mut slot: SlotGuard,
 ) -> Result<(), TaskError>
 where
     F: Future<Output = T>,
 {
-    let _permit = match sem {
-        None => None,
-        Some(sem) => match sem.acquire_owned().await {
-            Ok(permit) => Some(permit),
-            // 信号量关闭在本 API 面不存在（从不 close）；显式归 Cancelled 禁吞。
-            Err(_) => {
-                let _ = tx.send(Err(TaskError::Cancelled));
-                return Ok(());
-            }
+    // 参数声明序 = 析构序（逆序）：`slot`（终局记账守卫）先于 `tx` 析构 ⇒
+    // join 侧被唤醒时终局记账已落（无观测竞窗）。
+    let _permit = match permit {
+        // 准入时已取到许可（持有档）：许可随 future 析构回收（abort 连带回收）。
+        Some(permit) => Some(permit),
+        // 等待档：许可在任务体内部取得（此时才迁移 waiting → active）。
+        None => match sem {
+            None => None,
+            Some(sem) => match sem.acquire_owned().await {
+                Ok(permit) => {
+                    slot.promote();
+                    Some(permit)
+                }
+                // 信号量关闭在本 API 面不存在（从不 close）；显式归 Cancelled 禁吞。
+                Err(_) => {
+                    let _ = tx.send(Err(TaskError::Cancelled));
+                    return Ok(());
+                }
+            },
         },
     };
     let fut = std::pin::pin!(fut);
@@ -207,6 +269,8 @@ where
         Ok(value) => Ok(value),
         Err(payload) => Err(TaskError::Panicked(panic_message(payload))),
     };
+    // 终局记账先于投递：join 侧返回时「已完成未收割」计数已可见。
+    slot.report_terminal();
     // panic 载荷双投（issue#13）：oneshot 先行（句柄在 → join 收原值），集合收
     // clone——句柄被丢也不丢。句柄已亡（send 失败）留一行 warn 痕（tracing 无
     // 订阅者 no-op；宏关=默认，零增量）。clone 只在 panic 异常路径付一次。
@@ -301,6 +365,95 @@ impl ShutdownReport {
     }
 }
 
+/// 准入计数（issue#39 三轴内部账）：并发许可占用 + 集合保留条目 + 终局记账。
+///
+/// 锁序铁律：`set` 锁 → `caps` 锁（准入/收割/排空三处同序，禁反序取锁）。
+#[derive(Debug)]
+struct Capacity {
+    /// 持有并发许可的任务数。
+    active: usize,
+    /// 已准入但等待并发许可的任务数。
+    waiting: usize,
+    /// 生命周期集合保留的条目数（含已完成未收割）。
+    tracked: usize,
+    /// 已完成但尚未收割的条目数（终局记账 +1，收割 -1）。
+    completed_unreaped: usize,
+    /// 因容量上界被拒的准入次数（累计）。
+    rejected: usize,
+    /// 累计准入任务数（终局记账的对照面）。
+    admitted: usize,
+    /// 累计终局任务数（每个任务恰 +1）。
+    terminal: usize,
+    /// 跟踪记账是否开启：停机排空取走集合后置 false（scope 不再保留任何条目）。
+    tracking: bool,
+}
+
+impl Default for Capacity {
+    fn default() -> Self {
+        Self {
+            active: 0,
+            waiting: 0,
+            tracked: 0,
+            completed_unreaped: 0,
+            rejected: 0,
+            admitted: 0,
+            terminal: 0,
+            tracking: true,
+        }
+    }
+}
+
+/// 并发槽守卫：任务终局（正常完成 / panic / 取消 / abort）**恰好**释放一次许可
+/// ——RAII 单一 Drop 落点，不多（多放会让并发度越界）不少（少放＝泄漏）。
+///
+/// `holds_slot` = 持有许可档（计入 `active`）/ 等待档（计入 `waiting`）；
+/// `terminal_reported` 防任务体与 Drop 双记终局。
+struct SlotGuard {
+    caps: Arc<Mutex<Capacity>>,
+    /// true = 计入 `active`（持有许可）；false = 计入 `waiting`（等待许可）。
+    holds_slot: bool,
+    /// 终局是否已记账。
+    terminal_reported: bool,
+}
+
+impl SlotGuard {
+    /// 取得并发许可时的迁移：等待档 → 持有档（`waiting` 减一、`active` 加一）。
+    fn promote(&mut self) {
+        let mut caps = lock(&self.caps);
+        caps.waiting -= 1;
+        caps.active += 1;
+        self.holds_slot = true;
+    }
+
+    /// 终局记账：任务体已终局 ⇒ 条目仍在集合内 ⇒ 未收割计数加一（收割时再减一）。
+    ///
+    /// 在**投递结果之前**调用：join 侧被唤醒时计数已落（无观测竞窗）。
+    fn report_terminal(&mut self) {
+        if self.terminal_reported {
+            return;
+        }
+        self.terminal_reported = true;
+        let mut caps = lock(&self.caps);
+        caps.terminal += 1;
+        if caps.tracking {
+            caps.completed_unreaped += 1;
+        }
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        // 终局记账兜底：准入后未跑到收尾（被 abort）时由 Drop 代记——恰好一次。
+        self.report_terminal();
+        let mut caps = lock(&self.caps);
+        if self.holds_slot {
+            caps.active -= 1;
+        } else {
+            caps.waiting -= 1;
+        }
+    }
+}
+
 /// 托管 scope：内部 = `Mutex<JoinSet<Result<(), TaskError>>>`（生命周期集，短临界区
 /// 零 await；条目载荷 = panic 归一面——完成条目滞留至 [`Self::try_reap`] 或停机排空
 /// 显式收割，见 issue#13）+ AtomicBool accepting 闸 + `Option<Arc<Semaphore>>` 并发闸
@@ -309,6 +462,11 @@ pub struct FxScope {
     set: Mutex<JoinSet<Result<(), TaskError>>>,
     accepting: AtomicBool,
     sem: Option<Arc<Semaphore>>,
+    caps: Arc<Mutex<Capacity>>,
+    /// `max_pending` 上界（`usize::MAX` = 不限；默认不限 ⇒ 兼容既有消费方）。
+    max_pending: usize,
+    /// `max_tracked` 上界（`usize::MAX` = 不限；默认不限 ⇒ 兼容既有消费方）。
+    max_tracked: usize,
     in_flight: Arc<AtomicUsize>,
     source: CancelSource,
     token: CancelToken,
@@ -322,16 +480,51 @@ impl FxScope {
             set: Mutex::new(JoinSet::new()),
             accepting: AtomicBool::new(true),
             sem: None,
+            caps: Arc::new(Mutex::new(Capacity::default())),
+            max_pending: usize::MAX,
+            max_tracked: usize::MAX,
             in_flight: Arc::new(AtomicUsize::new(0)),
             source,
             token,
         }
     }
 
-    /// 并发闸：每任务 future 内 acquire（permit-in-future——abort 连带回收 permit）。
+    /// 并发闸（`max_concurrency` 轴）：限制**同时持有并发许可的任务体**数量。
+    ///
+    /// **语义边界——本口不是内存/保留量上界**：本闸只约束「同时执行的任务体数」，
+    /// **不**约束生命周期集合保留的条目数 ⇒ 已准入而未收割的条目照样滞留集合。
+    /// 保留量上界是 [`Self::with_max_tracked`]。
+    ///
+    /// 许可在**准入时**取走（`try_acquire`）：取到即计入 `active`，取不到即落等待
+    /// 档（计入 `waiting`，任务体内部 `acquire`）——permit-in-future，abort 连带
+    /// 回收 permit。
     pub fn with_concurrency(mut self, max: usize) -> Self {
         assert!(max > 0, "fx scope concurrency cap must be > 0");
         self.sem = Some(Arc::new(Semaphore::new(max)));
+        self
+    }
+
+    /// `max_pending` 轴上界：已准入但**等待并发许可**的任务数上限。
+    ///
+    /// 只约束有界准入口 [`Self::try_spawn_tracked`]（触顶 ⇒
+    /// [`AdmissionError::PendingFull`]，typed 拒绝、不阻塞不 panic）；
+    /// [`Self::spawn_tracked`] 是无界旧口，不受此约束。未设
+    /// [`Self::with_concurrency`] 时无任务等许可 ⇒ 本轴恒不触发（与并发轴独立）。
+    pub fn with_max_pending(mut self, max: usize) -> Self {
+        assert!(max > 0, "fx scope pending cap must be > 0");
+        self.max_pending = max;
+        self
+    }
+
+    /// `max_tracked` 轴上界：生命周期集合保留的**全部**条目数上限——**含**已完成
+    /// 未收割者（[`Spawned::join`] 只消费结果、**不**移除集合条目 ⇒ 出集合只能靠
+    /// [`Self::try_reap`] 或停机排空）。
+    ///
+    /// 显式 opt-in：默认不限 ⇒ 兼容既有消费方。本轴只约束有界准入口
+    /// [`Self::try_spawn_tracked`]（触顶 ⇒ [`AdmissionError::TrackedFull`]）。
+    pub fn with_max_tracked(mut self, max: usize) -> Self {
+        assert!(max > 0, "fx scope tracked cap must be > 0");
+        self.max_tracked = max;
         self
     }
 
@@ -371,8 +564,11 @@ impl FxScope {
     /// 托管 spawn（tracked）：任务进 JoinSet 生命周期集——过闸任务必被停机三段
     /// 覆盖，scope drop ⇒ 全组 abort。结果走 oneshot 旁路（生命周期集条目载 panic 归一面，
     /// 规避 JoinSet 单类型限制）；[`Spawned`] Drop 不 abort（忘 join 也不泄漏，
-    /// JoinSet Drop 兜底）。闸关=Err(ScopeClosed)；并发闸不在 spawn 点排队
-    /// （permit 在 future 内）。
+    /// JoinSet Drop 兜底）。闸关=Err(ScopeClosed)。
+    ///
+    /// **无界旧口**（issue#39）：本口不施加 `max_pending` / `max_tracked` 上界
+    /// （并发闸仍生效：许可取不到时任务在内部排队，不阻塞调用方）。需要保留量 /
+    /// 准入上界保证的调用方必须走 [`Self::try_spawn_tracked`]。
     ///
     /// # 两套 drop 语义对照（选口先选语义）
     ///
@@ -421,9 +617,43 @@ impl FxScope {
     where
         T: Send + 'static,
     {
-        let mut set = lock(&self.set);
-        // 闸核验=原子 RMW 而非 plain load：close 并发下 spawn 的线性化点。
-        // 插入在锁内，与 shutdown 的 abort_all 串行——过闸任务必被 shutdown 覆及。
+        let mut set = self.admit_gate()?;
+        // 无界档准入（legacy 口）：不施加 `max_pending` / `max_tracked` 上界 ⇒
+        // 预留恒成功（触顶分支不可达）。
+        let (permit, slot) = self
+            .reserve_slot(None)
+            .expect("unbounded admission must not hit a limit (no limits configured)");
+        Ok(self.spawn_reserved(&mut set, fut, permit, slot))
+    }
+
+    /// 有界准入口（issue#39）：typed 准入结果——成功 / 闸关 / 过载。
+    ///
+    /// 与 [`Self::spawn_tracked`] 的差别：本口施加两轴上界——`max_pending`
+    /// （已准入但等待许可的任务数）与 `max_tracked`（集合保留的条目数，含已完成
+    /// 未收割者），触顶即 **typed 拒绝**（[`AdmissionError::PendingFull`] /
+    /// [`AdmissionError::TrackedFull`]）——过载用返回值表达，既不阻塞调用方也不
+    /// panic。
+    ///
+    /// 其余语义与 [`Self::spawn_tracked`] 一致（生命周期集托管、oneshot 旁路、
+    /// `Spawned::join()` 只消费结果、**不**移除集合条目）。
+    pub fn try_spawn_tracked<T>(
+        &self,
+        fut: impl Future<Output = T> + Send + 'static,
+    ) -> Result<Spawned<T>, AdmissionError>
+    where
+        T: Send + 'static,
+    {
+        // 闸关与 tracked 侧同义（`ScopeClosed` 无载荷 ⇒ 1:1 映射，无信息丢失）。
+        let mut set = self.admit_gate().map_err(|_| AdmissionError::Closed)?;
+        let (permit, slot) = self.reserve_slot(Some((self.max_pending, self.max_tracked)))?;
+        Ok(self.spawn_reserved(&mut set, fut, permit, slot))
+    }
+
+    /// 取集合锁并核验 accepting 闸（闸核验 = 原子 RMW 而非 plain load：close
+    /// 并发下准入的线性化点）。**锁内核验** ⇒ 与 shutdown 的 `abort_all` 串行
+    /// ——过闸任务必被 shutdown 覆及（不存在「过闸却逃过停机」的窗）。
+    fn admit_gate(&self) -> Result<MutexGuard<'_, JoinSet<Result<(), TaskError>>>, ScopeClosed> {
+        let set = lock(&self.set);
         if self
             .accepting
             .compare_exchange(true, true, Ordering::AcqRel, Ordering::Acquire)
@@ -431,6 +661,72 @@ impl FxScope {
         {
             return Err(ScopeClosed);
         }
+        Ok(set)
+    }
+
+    /// 槽位预留（闸核验通过、`set` 锁已持时调用）。
+    ///
+    /// `limits` = `Some((max_pending, max_tracked))` 时施加两轴上界，触顶返回
+    /// typed 拒绝（不阻塞、不 panic）；`None` = 无界档（恒成功）。
+    ///
+    /// 分类口径：准入时能立刻取到并发许可 ⇒ 持有档（计入 `active`）；取不到 ⇒
+    /// 等待档（计入 `waiting`，许可在任务体内部取得时才迁移到持有档）。
+    fn reserve_slot(
+        &self,
+        limits: Option<(usize, usize)>,
+    ) -> Result<(Option<OwnedSemaphorePermit>, SlotGuard), AdmissionError> {
+        let (max_pending, max_tracked) = limits.unwrap_or((usize::MAX, usize::MAX));
+        let mut caps = lock(&self.caps);
+        // tracked 轴：集合保留条目数（含已完成未收割）达上界 ⇒ 拒发。
+        if caps.tracked >= max_tracked {
+            caps.rejected += 1;
+            return Err(AdmissionError::TrackedFull);
+        }
+        let (permit, holds_slot) = match &self.sem {
+            Some(sem) => match sem.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    caps.active += 1;
+                    (Some(permit), true)
+                }
+                Err(_) => {
+                    // pending 轴：等待许可的任务数达上界 ⇒ 拒发。
+                    if caps.waiting >= max_pending {
+                        caps.rejected += 1;
+                        return Err(AdmissionError::PendingFull);
+                    }
+                    caps.waiting += 1;
+                    (None, false)
+                }
+            },
+            None => {
+                // 无并发闸：任务体不受许可限制，占用视图仍计入 active。
+                caps.active += 1;
+                (None, true)
+            }
+        };
+        caps.tracked += 1;
+        caps.admitted += 1;
+        Ok((
+            permit,
+            SlotGuard {
+                caps: Arc::clone(&self.caps),
+                holds_slot,
+                terminal_reported: false,
+            },
+        ))
+    }
+
+    /// 入集：把已预留的槽位与任务装进生命周期集（`set` 锁已持）。
+    fn spawn_reserved<T>(
+        &self,
+        set: &mut JoinSet<Result<(), TaskError>>,
+        fut: impl Future<Output = T> + Send + 'static,
+        permit: Option<OwnedSemaphorePermit>,
+        slot: SlotGuard,
+    ) -> Spawned<T>
+    where
+        T: Send + 'static,
+    {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let sem = self.sem.clone();
@@ -438,14 +734,14 @@ impl FxScope {
         // tokio ≥1.53：JoinSet::spawn 直接返回 AbortHandle（旧版 JoinHandle::abort_handle 已废）。
         let abort = set.spawn(async move {
             let _flight = flight; // abort/panic/完成三路必经 drop——归零契约的落点
-            task_body(sem, fut, tx).await
+            task_body(sem, permit, fut, tx, slot).await
         });
-        Ok(Spawned { handle: abort, rx })
+        Spawned { handle: abort, rx }
     }
 
     /// 脱管 spawn（detached）：任务不进 JoinSet 生命周期集——shutdown/close 不等
     /// 它、scope drop 不 abort 它；返回裸 tokio `JoinHandle`，其 Drop=detach（任务
-    /// 自生自灭）。不计 in_flight（等净断言/泄漏判据均不含它，`expect_idle` 对它
+    /// 自生自灭）。不计 in_flight（等净断言/泄漏判据均不含它，`expect_body_idle` 对它
     /// 沉默）；不吃并发闸（permit 语义属托管集）。accepting 闸仍生效——scope 已关
     /// 拒发任何新工作（含脱管的）。
     ///
@@ -540,13 +836,21 @@ impl FxScope {
     pub fn try_reap(&self) -> Vec<TaskError> {
         let mut set = lock(&self.set);
         let mut reaped = Vec::new();
+        let mut harvested = 0usize;
         while let Some(outcome) = set.try_join_next() {
+            harvested += 1;
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(te)) => reaped.push(te),
                 Err(je) if je.is_cancelled() => reaped.push(TaskError::Cancelled),
                 Err(je) => reaped.push(TaskError::Panicked(panic_message(je.into_panic()))),
             }
+        }
+        // 收割记账：条目出集合 ⇒ 保留数与未收割数各减一（锁序 set → caps）。
+        if harvested > 0 {
+            let mut caps = lock(&self.caps);
+            caps.tracked -= harvested;
+            caps.completed_unreaped -= harvested;
         }
         reaped
     }
@@ -555,7 +859,59 @@ impl FxScope {
         self.close();
         let mut set = lock(&self.set);
         set.abort_all();
-        std::mem::take(&mut *set)
+        let taken = std::mem::take(&mut *set);
+        // 记账收口：集合已被取走 ⇒ scope 不再保留任何条目（跟踪面归零；此后终局
+        // 不再计入未收割数——条目已不在本 scope 的集合里）。
+        {
+            let mut caps = lock(&self.caps);
+            caps.tracking = false;
+            caps.tracked = 0;
+            caps.completed_unreaped = 0;
+        }
+        taken
+    }
+
+    /// 三资源轴占用快照（issue#39 可观测面）：`active`（并发许可占用）/
+    /// `waiting`（等待许可的已准入任务）/ `completed_unreaped`（已完成未收割的
+    /// 集合条目）/ `rejected`（因上界被拒的准入次数）。
+    pub fn counts(&self) -> FxCounts {
+        let caps = lock(&self.caps);
+        FxCounts {
+            active: caps.active,
+            waiting: caps.waiting,
+            completed_unreaped: caps.completed_unreaped,
+            rejected: caps.rejected,
+        }
+    }
+
+    /// 任务体已结束断言（body-idle）：所有已准入任务的任务体都已终局（完成 /
+    /// panic / 取消 / abort）——**不**要求生命周期集合已收割。
+    ///
+    /// 与 [`Self::expect_fully_reaped_idle`] 分工：后者要求集合条目已全部收割
+    /// （更强的判据）。两个名字各自精确，禁互相误读。
+    pub fn expect_body_idle(&self) {
+        // 断言在锁外：锁内 panic 会毒化 caps 锁（后续观测全被毒化掩盖）。
+        let (admitted, terminal) = {
+            let caps = lock(&self.caps);
+            (caps.admitted, caps.terminal)
+        };
+        assert!(
+            terminal == admitted,
+            "fx scope not body-idle: {} task body(ies) still running",
+            admitted - terminal
+        );
+    }
+
+    /// 跟踪集合已完全收割断言（fully-reaped-idle）：生命周期集合无滞留条目
+    /// （全部已收割，或已随停机排空被取走）——比 [`Self::expect_body_idle`] 更强：
+    /// 任务体结束**不**蕴含条目已出集合（`Spawned::join()` 不移除条目）。
+    pub fn expect_fully_reaped_idle(&self) {
+        // 断言在锁外：锁内 panic 会毒化 caps 锁（后续观测全被毒化掩盖）。
+        let retained = { lock(&self.caps).tracked };
+        assert!(
+            retained == 0,
+            "fx scope not fully-reaped-idle: {retained} entry(ies) retained in the lifecycle set"
+        );
     }
 }
 
@@ -574,6 +930,12 @@ pub struct Spawned<T> {
 
 impl<T: Send + 'static> Spawned<T> {
     /// recv 映射：Ok(v)→v；recv Err（发送端随 abort 消亡）→TaskError::Cancelled。
+    ///
+    /// **只消费结果、不移除生命周期集合条目**：join 之后该任务的集合条目仍滞留
+    /// （含已完成未收割者）⇒ 保留量计数 [`FxScope::counts`] 的
+    /// `completed_unreaped` 不因 join 而减少。出集合只能靠 [`FxScope::try_reap`]
+    /// 或停机排空（[`FxScope::shutdown`]）。保留量上界见
+    /// [`FxScope::with_max_tracked`]。
     pub async fn join(self) -> Result<T, TaskError> {
         match self.rx.await {
             Ok(result) => result,
@@ -602,15 +964,6 @@ impl<T: Send + 'static> Spawned<T> {
     pub fn is_finished(&self) -> bool {
         self.handle.is_finished()
     }
-}
-
-/// 泄漏断言（memgov LeakGuard 的 fx 侧锚点；放 fx 因依赖 FxScope 类型）。
-pub fn expect_idle(scope: &FxScope) {
-    let in_flight = scope.in_flight();
-    assert!(
-        in_flight == 0,
-        "fx scope not idle: {in_flight} task(s) still in flight"
-    );
 }
 
 #[cfg(test)]
@@ -643,7 +996,7 @@ mod tests {
         let scope = FxScope::new();
         let handle = scope.spawn_tracked(async { 41 + 1 }).unwrap();
         assert_eq!(handle.join().await, Ok(42));
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// ②abort→join=Cancelled。
@@ -659,7 +1012,7 @@ mod tests {
         handle.abort();
         assert_eq!(handle.join().await, Err(TaskError::Cancelled));
         wait_idle(&scope).await;
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// ③任务 panic（含非 String payload）→join=Panicked(msg)。
@@ -678,7 +1031,7 @@ mod tests {
             handle.join().await,
             Err(TaskError::Panicked("non-string panic payload".to_owned()))
         );
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// ④join_timeout 超时→TimedOut 且 in_flight 归零（abort 生效断言）。
@@ -696,7 +1049,7 @@ mod tests {
             Err(TaskError::TimedOut)
         );
         wait_idle(&scope).await;
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// ⑤close 后 spawn=Err(ScopeClosed)，close 前 spawn 正常、在途可 join。
@@ -735,7 +1088,7 @@ mod tests {
         assert!(report.panicked.is_empty(), "无 panic 载荷");
         assert_eq!(report.timed_out, 0, "shutdown 无截止 ⇒ 恒 0");
         assert_eq!(report.still_running, 0, "等净至空集 ⇒ 无未观测终局");
-        expect_idle(&scope);
+        scope.expect_body_idle();
 
         use std::time::Instant;
         let hold = Arc::new(AtomicBool::new(false)); // 测试→任务：留在 poll 内不让渡
@@ -786,7 +1139,7 @@ mod tests {
         // join 返回≠guard 已归零：tx drop（唤醒 join）与 wrapper 内 FlightGuard drop
         // 是相邻语句，跨线程可被抢占观测（macos 2 核 CI flake 实证）——有界让渡等真实归零。
         wait_idle(&scope).await;
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// ⑦with_concurrency(max)=并发度实测 ≤max 且 permit 随 abort 回收（满载 abort 后
@@ -831,7 +1184,7 @@ mod tests {
         assert!(!queued.is_finished()); // 卡在 acquire，未执行
         blocker.abort();
         assert_eq!(queued.join().await, Ok(99));
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// ⑧Drop Spawned 不 abort（忘 join 任务仍跑完且 in_flight 归零）。
@@ -848,7 +1201,7 @@ mod tests {
         drop(handle); // 忘 join
         wait_idle(&scope).await;
         assert_eq!(ran.load(Ordering::SeqCst), 1); // 任务仍跑完
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// ⑨cancel_pair 传播（cancel→token.is_cancelled/run_until_cancelled=None）+
@@ -896,7 +1249,7 @@ mod tests {
             total += outer.join().await.unwrap_or(0);
         }
         assert_eq!(total, 8 * 16 * 3);
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// 零覆盖 #14：shutdown 超时路径对在途任务的 abort 收割——超时返回
@@ -942,7 +1295,7 @@ mod tests {
         // join 返回≠guard 已归零（tx drop 唤醒在前、FlightGuard drop 在后的跨线程
         // 观测窗，见 ⑥）——有界让渡等真实归零。
         wait_idle(&scope).await;
-        expect_idle(&scope); // abort 即刻回收（FlightGuard Drop）——零 sleep、事件化
+        scope.expect_body_idle(); // abort 即刻回收（FlightGuard Drop）——零 sleep、事件化
     }
 
     /// ⑪两套 drop 语义·tracked 侧：scope drop ⇒ 生命周期集（JoinSet）drop ⇒ 全组
@@ -1036,7 +1389,7 @@ mod tests {
         for handle in handles {
             handle.join().await.expect("task ok");
         }
-        expect_idle(&scope);
+        scope.expect_body_idle();
         let map = ledger.lock().expect("poisoned");
         assert_eq!(map.len(), 8);
         for k in 0..8u32 {
@@ -1087,7 +1440,7 @@ mod tests {
         let again = scope.try_reap();
         assert!(again.is_empty(), "二次收割空（幂等）");
         assert_eq!(again.capacity(), 0, "空收割零分配（Vec::new 形态）");
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// 停机报告收 panic（issue#13 验收③）：shutdown_timeout 窗口内 panic 的任务
@@ -1127,7 +1480,7 @@ mod tests {
         assert!(!handle.is_finished());
         assert_eq!(handle.join().await, Ok(7), "reap 后在途任务照常完成可 join");
         assert!(scope.try_reap().is_empty(), "Ok 条目收割为空（丢弃面）");
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// 收割·abort 条目（P1）：abort 在下一 await 点生效后，条目由 try_reap 收割

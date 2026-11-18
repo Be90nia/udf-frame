@@ -92,7 +92,7 @@ pub enum Script<A, Op> {
 ///         tokio::task::yield_now().await;
 ///     }
 ///     assert_eq!(*store.snapshot(), 1, "脚本 Emit 经回灌推进 store");
-///     let _ = scope.shutdown().await; // 收尾净空（泄漏断言锚见 fx::expect_idle）
+///     let _ = scope.shutdown().await; // 收尾净空（泄漏断言锚见 fx::FxScope::expect_body_idle）
 /// });
 /// # }
 /// ```
@@ -125,7 +125,7 @@ impl<A, Op> ScriptedRuntime<A, Op> {
         self.scripts.extend(scripts);
     }
 
-    /// 作用域读侧（测试收尾 expect_idle 断言用）。
+    /// 作用域读侧（测试收尾 expect_body_idle 断言用）。
     pub fn scope(&self) -> &Arc<FxScope> {
         &self.scope
     }
@@ -309,7 +309,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Te
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fx::{TaskError, expect_idle};
+    use crate::fx::TaskError;
     use skeleton::{EffectBuf, EffectId, Reducer};
     use std::convert::Infallible;
 
@@ -381,7 +381,7 @@ mod tests {
         let handle = rt.handles.pop().expect("Emit 脚本必须产出任务");
         assert_eq!(handle.join().await, Ok(()));
         assert_eq!(*store.snapshot(), 1, "回灌 Action 必须推进 store");
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// ② Panic→任务内 panic!，scope 捕获归一 TaskError::Panicked(msg)（fail-closed 链）。
@@ -402,7 +402,7 @@ mod tests {
             Err(TaskError::Panicked("scripted-boom".to_owned()))
         );
         wait_idle(&scope).await;
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// ③ Never→任务挂起（in_flight=1），abort 后归零（挂起面/取消竞窗锚）。
@@ -422,7 +422,7 @@ mod tests {
         handle.abort();
         assert_eq!(handle.join().await, Err(TaskError::Cancelled));
         wait_idle(&scope).await;
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// ④ 脚本耗尽=no-op：不 spawn 不 panic（TestStore.receive 超时即自然失败信号）。
@@ -438,7 +438,7 @@ mod tests {
         );
         assert_eq!(scope.in_flight(), 0);
         assert!(rt.handles.is_empty());
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// ⑤ FIFO 消费序：句柄序=脚本序（Emit→Never→Panic 逐段核验，乱序即错位）。
@@ -481,7 +481,7 @@ mod tests {
             Err(TaskError::Panicked("third".to_owned()))
         ); // 末脚本=Panic
         wait_idle(&scope).await;
-        expect_idle(&scope);
+        scope.expect_body_idle();
     }
 
     /// 零覆盖 #12：Run(op) 占位透传——任务携 op 正常完成（join=Ok(())），零行为
@@ -510,6 +510,6 @@ mod tests {
         assert_eq!(handles.remove(0).join().await, Ok(()));
         assert_eq!(*store.snapshot(), 0, "透传零回灌：store 不动");
         wait_idle(&fxscope_scope).await;
-        expect_idle(&fxscope_scope);
+        fxscope_scope.expect_body_idle();
     }
 }

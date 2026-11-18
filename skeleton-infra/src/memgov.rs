@@ -285,7 +285,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 /// 泄漏断言 guard（三类判据之一：allocs/bytes 回基线）。
 /// Drop 兜底尽力而为——panic-in-drop 会被吞，**规范用法=测试尾显式 [`LeakGuard::check`]**
-/// /`expect_empty`/fx 侧 `expect_idle`。
+/// /`expect_empty`/fx 侧 `FxScope::expect_body_idle`。
 pub struct LeakGuard {
     baseline_allocs: usize,
     baseline_bytes: usize,
@@ -363,7 +363,7 @@ pub struct LeakReport {
 }
 
 /// 判据二：注册表排空断言——非空即 panic，带 len/capacity 现场。
-/// 判据三（任务面 expect_idle）在 fx.rs——依赖 FxScope 类型故放彼处。
+/// 判据三（任务面 `FxScope::expect_body_idle`）在 fx.rs——依赖 FxScope 类型故放彼处。
 pub fn expect_empty<K: Ord, V>(reg: &BoundedRegistry<K, V>) {
     assert!(
         reg.is_empty(),

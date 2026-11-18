@@ -14,7 +14,7 @@ use skeleton::{
 use skeleton_infra::compose::combine;
 use skeleton_infra::runtime::SyncStore as Store;
 use skeleton_infra::testing::{ExpectedEffect, TestStore};
-use skeleton_infra::{FxScope, Journal as _, JsonlJournal, Spawned, expect_idle};
+use skeleton_infra::{FxScope, Journal as _, JsonlJournal, Spawned};
 
 // ---- 领域：父 Board 挂一个 Tally 子 feature（combine 显式结构）----
 
@@ -283,7 +283,7 @@ async fn runtime_face() {
     store.dispatch(BoardAct::Ping); // 闭门后 no-op
     assert_eq!(store.rejected_after_close(), 1, "fail-visible counter");
     let _ = scope.shutdown().await;
-    expect_idle(&scope);
+    scope.expect_body_idle();
     journal
         .lock()
         .expect("journal poisoned")

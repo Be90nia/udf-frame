@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+### Changed（fx 三资源维度分离 + 准入上界 typed 化，2026-11-18；GitHub issue#39）
+- **破坏性**：`skeleton_infra::fx::expect_idle`（自由函数）**已删除**，拆为 `FxScope::expect_body_idle`（任务体结束口径）与 `FxScope::expect_fully_reaped_idle`（跟踪集合已完全收割，更强）；crate 根重导出同步移除，调用点全量迁移（`fx.rs` 13 处 / `testing.rs` 6 处 / `examples/end_to_end.rs` 2 处），**无 shim、无旧别名**。`docs/reference.md` 与 `docs/tutorials/thirty-min.md` 的 6 处引用同步更正。
+- 新增 `AdmissionError{Closed, PendingFull, TrackedFull}`（typed 过载/闸关）与 `FxCounts{active, waiting, completed_unreaped, rejected}`；新增 `FxScope::{with_max_pending, with_max_tracked, try_spawn_tracked, counts, expect_body_idle, expect_fully_reaped_idle}`。
+- **三个互相独立的资源维度**：`max_concurrency`（任务体并发，信号量）/ `max_pending`（已准入待许可）/ `max_tracked`（保留的全部集合条目，**含已完成未收割**）。`with_concurrency` **不是**内存/保留量上界（rustdoc 明写）；保留上界 = `with_max_tracked`。两者**默认无界**（保持兼容，opt-in 显式设）。
+- 有界准入走 `try_spawn_tracked -> Result<Spawned<T>, AdmissionError>`：过载 **typed 拒绝**（不阻塞、不 panic）；`spawn_tracked` 是**无界旧口**（保持兼容，不受上界约束）。
+- `Spawned::join()` 只消费结果、**不**移除集合条目（收割口 = `try_reap`）——写进 rustdoc。
+- **行为变更**：`spawn_tracked` 现在在**准入时**取并发许可（原在任务体内取）⇒ 许可随准入占用，abort 仍连带回收；`active` 计数含「已准入未开跑」者。
+- **容量在六条终态路径恰好释放一次**：正常完成 / panic（`catch_unwind` 归一）/ 取消 / abort / shutdown(`abort_all`) / receiver-drop。证据三重：RAII 单一 `Drop` 落点（不多）+ `active/waiting` 归零断言（不少）+ 并发度探针 `peak ≤ 1`（多放会让实测并发度变 2）+ debug 计数下溢直接 panic。
+- 测试：新增 `tests/fx_resource_axes.rs`（6 用例：pending 满 typed 拒绝 / 从不 reap 时计数可观测且有界 / 六终态路径恰好释放一次 / 三 limit 独立 / body-idle 与 fully-reaped-idle 可区分）；`tests/fx_lifecycle.rs` 补 F3 交叉面（`shutdown_timeout` × 非空已完成集，+103 行）。
+- 变异两则：两轴上界检查改成 `>= usize::MAX` ⇒ 3 个测试 FAILED；`active -= 1` 写两次 ⇒ 4 个 FAILED + 进程 abort `0xc0000409`（证明释放路径有鉴别力）。
+- PM 亲验：`fx_resource_axes` 6/6、`fx_lifecycle` 5/5；仓库级四门（test `--all-features` 串行 / clippy `-D warnings` / fmt `--check` / rustdoc `-D warnings`）全 exit 0。
+
 ### Fixed（reducer 事务边界：失败迁移的暂存效果不再执行，2026-11-18；GitHub issue#44）
 - **根因**：`drain_owned` 里 `reducer.reduce` 写入共享 `effect_buf`（在 `catch_unwind` 内）；reducer panic 时不清理该次调用的 effects，panic 在 `place_snapshot` 之前 resume（`next_state` 未提交），下次成功 dispatch 转发时旧后缀先发 ⇒ **一次失败的状态转换，其副作用在别的 action 里执行了**。
 - **修复**：新增私有结构 `EffectBufs<A, Op>{staged, pending}`——`staged` 是本次 reducer 调用的暂存区（每次调用级清零），`pending` 是已提交待转发队列；reducer 成功 ⇒ `commit()` 整段并入 `pending`（保持 action 序）；reducer panic ⇒ 只清 `staged`，不动 `pending`。

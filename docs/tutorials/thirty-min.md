@@ -384,7 +384,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
 use skeleton_infra::runtime::SyncStore;
-use skeleton_infra::{expect_idle, FxScope, Journal as _, JsonlJournal, Spawned};
+use skeleton_infra::{FxScope, Journal as _, JsonlJournal, Spawned};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Column {
@@ -639,7 +639,7 @@ async fn main() {
     assert_eq!(store.rejected_after_close(), 2, "两入口同一拒绝计数");
 
     let _ = scope.shutdown().await; // #[must_use]：纯收尾不读报告，显式让渡
-    expect_idle(&scope);
+    scope.expect_body_idle();
     journal.lock().expect("journal poisoned").flush().expect("flush");
     drop(store); // append 源归零后重开账本
 
