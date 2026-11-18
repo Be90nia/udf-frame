@@ -173,7 +173,7 @@ where S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
 
 蓝图 §11 项 6：ADR 0008 在**通知面**落地了「两档并存 + 同一语义契约」，同一模式在**效果执行面**沿用——不强迫一档替掉另一档，也不新增第二个入口。
 
-**现状（源码坐标，2026-11-17）**：转发环在排空环内、`dispatch` 调用栈上**同步**调用解释器——`runtime.rs:1486`（`forward_effects` 调用点，位于 `drain_owned` 循环体内）→ `runtime.rs:1529`（`forward_effects`）→ `runtime.rs:1587`（`runtime.run(effect, &inner.back)`）；`Effect::Emit` 不经解释器直接回灌入队（`runtime.rs:1536`）。异步**不在核心内**：托管由 `fx::FxScope::spawn_tracked`（`fx.rs:417`）提供，解释器实现方在 `run` 里 spawn 并把 `back` 句柄 move 进任务。
+**现状（源码坐标：落盘于 2026-11-17 的快照值，本轮 #34/#35/#39/#40/#41/#42/#44 改动后**行号可能已漂**——符号名恒准，定位请按符号名）**：转发环在排空环内、`dispatch` 调用栈上**同步**调用解释器——`runtime.rs:1486`（`forward_effects` 调用点，位于 `drain_owned` 循环体内）→ `runtime.rs:1529`（`forward_effects`）→ `runtime.rs:1587`（`runtime.run(effect, &inner.back)`）；`Effect::Emit` 不经解释器直接回灌入队（`runtime.rs:1536`）。异步**不在核心内**：托管由 `fx::FxScope::spawn_tracked`（`fx.rs:417`）提供，解释器实现方在 `run` 里 spawn 并把 `back` 句柄 move 进任务。
 
 | 档 | 谁执行 | 适用条件 | 失败/取消可观察面 |
 |---|---|---|---|
@@ -299,7 +299,7 @@ pub trait Notify<S> {
 
 本域各池只有一个共同点：**每个配置值各自约束一个特定群体**。「把 `max` 当总对象数 / 总内存上限」是最常见的误读（蓝图 §5 的三轴口径即为此立）。下表逐参数回答四问：①cap 覆盖哪些对象/字节；②满容量时的动作与可观察读数；③是否存在合法的超配中间态、靠什么收敛；④各读数字段的口径，以及哪些读数**不是**准入面。
 
-行号口径：本节落盘时的工作树快照（符号名恒准，行号随重构漂移）；路径均相对 `skeleton-infra/src/`。核心形字段定义见 `skeleton/src/pool.rs:42`。`ObjectPool` 的三轴见 [§ObjectPool](#objectpool--通用对象池有状态对象reset-钩子--有界降级--分片槽位)，`MemoryPool` / `BoundedRegistry` / `ByteBudget` 见 [§memgov 四问](#资源上限四问--memgov-三件)。
+行号口径：全篇行号锚为 **2026-11-17 落盘时的快照值**（本轮 #34/#35/#39/#40/#41/#42/#44 改动后**未逐个更新行号**）——**符号名恒准，行号随重构漂移**；代码变动后行号可能已过时，定位请按符号名（各处坐标均附符号名或所在函数）。路径均相对 `skeleton-infra/src/`。核心形字段定义见 `skeleton/src/pool.rs:42`。`ObjectPool` 的三轴见 [§ObjectPool](#objectpool--通用对象池有状态对象reset-钩子--有界降级--分片槽位)，`MemoryPool` / `BoundedRegistry` / `ByteBudget` 见 [§memgov 四问](#资源上限四问--memgov-三件)。
 
 #### PoolBase — 账本与裁决，不做准入
 
