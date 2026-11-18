@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -24,8 +25,15 @@ thread_local! {
 struct LocalSubEntry {
     store_id: u64,
     sub_id: u64,
-    notify: Box<dyn LocalNotify>,
+    /// 回调句柄走 `Rc`：通知阶段快照句柄、释放表借用后再调用户代码
+    /// （回调重入不再撞表借用）；回调中途注销自身/他者时，快照的强引用
+    /// 保住槽体活到调用返回。
+    notify: LocalNotifyHandle,
 }
+
+/// 通知回调句柄：`Rc` 供通知阶段快照（强引用保槽体活到调用返回），
+/// `RefCell` 供 `&mut` 下发（TLS 单线程内安全）。
+type LocalNotifyHandle = Rc<RefCell<Box<dyn LocalNotify>>>;
 
 /// 状态擦除的本地回调：TLS 容器无泛型，快照经 `dyn Any` 下发——store_id
 /// 唯一性保证下发必是本 store 的 `S`（downcast 失败属 TLS 键碰撞，不可达）。
@@ -65,7 +73,7 @@ fn local_sub_register(store_id: u64, sub_id: u64, notify: Box<dyn LocalNotify>) 
         table.borrow_mut().push(LocalSubEntry {
             store_id,
             sub_id,
-            notify,
+            notify: Rc::new(RefCell::new(notify)),
         });
     });
 }
@@ -80,31 +88,56 @@ fn local_sub_unregister(store_id: u64, sub_id: u64) {
 }
 
 /// 触发本线程登记的某 store 全部本地订阅；返回 (命中数, panic 摘除数,
-/// 最近一次成因摘要)。命中数 = 本线程表内该 store 的登记笔数（含本轮被摘除
-/// 的毒回调）——闸>0 而命中=0 即本线程 dispatch 未触达任何本地订阅（跨线程
-/// miss，调用方计入 `local_missed` 留痕）。摘除数计入 `subscriber_panics` +
-/// 留痕 `subscriber_panic_last_cause`，摘除即从此不再触发——fail-closed。
-/// 回调内重入 dispatch 只入队即返（排空权互斥），不会重入本函数，RefCell
-/// 不可重入借用天然满足。通知序 = 登记序（确定性）。
+/// 最近一次成因摘要)。命中数 = 本轮开始时表内该 store 的登记笔数（含本轮
+/// 被摘除的毒回调与回调期间被注销而跳过的登记）——闸>0 而命中=0 即本线程
+/// dispatch 未触达任何本地订阅（跨线程 miss，调用方计入 `local_missed`
+/// 留痕）。摘除数计入 `subscriber_panics` + 留痕
+/// `subscriber_panic_last_cause`，摘除即从此不再触发——fail-closed。
+///
+/// 两阶段防重入（issue#42）：阶段一在表借用下只做快照（克隆回调句柄的
+/// `Rc`，登记序即通知序），借用随即释放；阶段二**不持表借用**逐个调回调
+/// ——回调内再入（跨 store dispatch 的嵌套通知、callback-time
+/// subscribe/unregister）都能正常拿表借用，不再炸 `BorrowMutError` 被误判
+/// 成用户 panic。同 store 重入 dispatch 只入队即返（排空权互斥），同一
+/// 句柄的内部 `RefCell` 不可能双重借用。回调期间新注册的本轮不可见
+/// （快照确定性，下一轮可见）；本轮开始时在册、被调到之前已注销的登记
+/// 跳过（Drop=退订即时生效，不复活死订阅）。真用户 panic 照旧
+/// fail-closed 摘除。
 pub(super) fn local_notify(store_id: u64, state: &dyn std::any::Any) -> (u64, u64, Option<String>) {
     LOCAL_SUBS.with(|table| {
-        let mut table = table.borrow_mut();
-        let mut matched = 0u64;
+        let snapshot: Vec<(u64, LocalNotifyHandle)> = {
+            let table = table.borrow();
+            table
+                .iter()
+                .filter(|e| e.store_id == store_id)
+                .map(|e| (e.sub_id, Rc::clone(&e.notify)))
+                .collect()
+        };
+        let matched = snapshot.len() as u64;
         let mut dead = Vec::new();
         let mut last_cause = None;
-        for entry in table.iter_mut() {
-            if entry.store_id != store_id {
+        for (sub_id, handle) in snapshot {
+            // 本轮内已被注销（回调中途 drop 了排位靠后的票据）→ 跳过。
+            let alive = table
+                .borrow()
+                .iter()
+                .any(|e| e.store_id == store_id && e.sub_id == sub_id);
+            if !alive {
                 continue;
             }
-            matched += 1;
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| entry.notify.notify(state))) {
-                dead.push(entry.sub_id);
+            // 句柄内部借用拿在 catch_unwind 外：RefCell 若真被双重借用
+            // （不变式外路径），panic 原样传播，不误记到用户回调头上。
+            let mut slot = handle.borrow_mut();
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| slot.notify(state))) {
+                dead.push(sub_id);
                 last_cause = Some(panic_cause_summary(&*payload));
             }
         }
         let removed = dead.len() as u64;
         if !dead.is_empty() {
-            table.retain(|e| e.store_id != store_id || !dead.contains(&e.sub_id));
+            table
+                .borrow_mut()
+                .retain(|e| e.store_id != store_id || !dead.contains(&e.sub_id));
         }
         (matched, removed, last_cause)
     })
