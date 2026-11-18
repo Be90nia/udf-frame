@@ -93,6 +93,60 @@ fn effect_steady_state(c: &mut Criterion) {
     });
 }
 
+// ---- effect_batch_forward：批量效果转发（每拍 k 条效果）----
+//
+// 每拍 reducer 产 k 条 Run 效果，转发环逐条摘除。旧形态 `Vec::remove(0)`
+// 摘队首把尾部整体前移一格 ⇒ 排空 k 条共 k(k-1)/2 次元素搬移（O(k²)）；
+// 环形缓冲摘队首零搬移（issue#43）。
+//
+// 本组**只产墙钟读数**：这条路径的墙钟被布局噪声主导，纳秒级读数不作证据；
+// 元素搬移数与分配面的计数证据见 skeleton crate 单元测（元素搬移计数）与
+// `tests/effect_fifo.rs`（分配事件面）。同码 dup 臂作噪声锚（byte-budget 臂
+// 同款纪律：同 run 内两者一致 ⇒ 读数可信）。
+struct BatchProducer {
+    per_action: u64,
+}
+
+impl skeleton::Reducer for BatchProducer {
+    type State = u64;
+    type Action = u64;
+    type Op = Beep;
+
+    fn initial(&self) -> u64 {
+        0
+    }
+
+    fn reduce(&self, s: &u64, _a: u64, out: &mut skeleton::EffectBuf<u64, Beep>) -> u64 {
+        for i in 0..self.per_action {
+            out.push(Effect::Run {
+                // id 每拍复用（run_ids 是只增集合，固定 id ⇒ 稳态不涨内存）。
+                id: skeleton::EffectId::new(i + 1),
+                op: Beep::One,
+            });
+        }
+        *s + 1
+    }
+}
+
+fn effect_batch_forward(c: &mut Criterion) {
+    let mut group = c.benchmark_group("effect_batch_forward");
+    for k in [1u64, 4, 16, 64, 256, 1024, 4096] {
+        let store = SyncStore::new(BatchProducer { per_action: k }, NullFx);
+        // 预热：缓冲/队列到稳态容量（此后 dispatch 恒复用，无新增分配）。
+        for _ in 0..10 {
+            store.dispatch(1u64);
+        }
+        group.bench_function(&format!("k{k}"), |b| {
+            b.iter(|| store.dispatch(black_box(1u64)))
+        });
+        // 同码 dup 臂作噪声锚（byte-budget 臂同款纪律）。
+        group.bench_function(&format!("k{k}_dup"), |b| {
+            b.iter(|| store.dispatch(black_box(1u64)))
+        });
+    }
+    group.finish();
+}
+
 // ---- journal_append_line：BufWriter 缓冲态单行 append（无逐行 flush）----
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -505,6 +559,7 @@ criterion_group!(
     fxscope_spawn_join,
     journal_append_line,
     effect_steady_state,
+    effect_batch_forward,
     dispatch_per_beat,
     notify_dispatch,
     object_pool_acquire_drop,

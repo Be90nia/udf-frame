@@ -735,4 +735,25 @@ mod tests {
         assert!(buf.is_empty());
         assert_eq!(buf.effects.capacity(), cap, "clear 必须保容量");
     }
+
+    /// 摘队首**不得搬动其余效果**——排空 k 条效果时每次摘除只允许 O(1) 搬移。
+    ///
+    /// 判据取**地址不变**（其余效果原地不动）而非计时：计时被布局噪声主导，
+    /// 不可作证据（issue#43 测量纪律）。旧实现 `Vec::remove(0)` 每次把尾部
+    /// 全部元素前移一格 ⇒ 其余效果地址改变 ⇒ 此测在旧实现下为红。
+    #[test]
+    fn effect_buf_pop_front_does_not_relocate_remaining_effects() {
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        for _ in 0..8 {
+            buf.push(Effect::Emit(Tick::Tick));
+        }
+        // 第 2 条效果当前所在地址（摘队首后它应原地不动，只换逻辑序号）。
+        let tail_before = &buf.effects[1] as *const Effect<Tick, Infallible>;
+        buf.pop_front();
+        let tail_after = &buf.effects[0] as *const Effect<Tick, Infallible>;
+        assert_eq!(
+            tail_before, tail_after,
+            "pop_front 只摘队首（其余效果原地不动）——否则排空退化为 O(k²) 元素搬移"
+        );
+    }
 }
