@@ -117,6 +117,9 @@ pub struct FxCounts {
     /// 持有并发许可的任务数（准入即取许可 ⇒ 含已准入未开跑者）。
     pub active: usize,
     /// 已准入但等待并发许可的任务数。
+    ///
+    /// **不保证按准入先后获得许可**——见 [`FxScope::with_max_pending`] 的公平性
+    /// 说明：新准入者的 `try_acquire` 不看等待队列，可越过既有等待者。
     pub waiting: usize,
     /// 已完成但尚未从生命周期集合收割的条目数（含 panic / abort 终局条目）。
     pub completed_unreaped: usize,
@@ -496,8 +499,8 @@ impl FxScope {
     /// 保留量上界是 [`Self::with_max_tracked`]。
     ///
     /// 许可在**准入时**取走（`try_acquire`）：取到即计入 `active`，取不到即落等待
-    /// 档（计入 `waiting`，任务体内部 `acquire`）——permit-in-future，abort 连带
-    /// 回收 permit。
+    /// 档（计入 `waiting`，任务体内部 `acquire` 排队等待）——许可由准入时的槽位
+    /// 守卫持有，abort / 任务体终局时连带回收。
     pub fn with_concurrency(mut self, max: usize) -> Self {
         assert!(max > 0, "fx scope concurrency cap must be > 0");
         self.sem = Some(Arc::new(Semaphore::new(max)));
@@ -510,6 +513,14 @@ impl FxScope {
     /// [`AdmissionError::PendingFull`]，typed 拒绝、不阻塞不 panic）；
     /// [`Self::spawn_tracked`] 是无界旧口，不受此约束。未设
     /// [`Self::with_concurrency`] 时无任务等许可 ⇒ 本轴恒不触发（与并发轴独立）。
+    ///
+    /// **许可分配不保证 FIFO（依 tokio 1.53.3 源码核实）**：取不到许可的任务体在
+    /// 内部 `acquire()` 排队——该路径是 FIFO 公平的；但**新准入者用
+    /// `try_acquire` 取许可，它不查看等待队列**，因此可能抢在既有等待者之前拿到
+    /// 刚释放的许可。后果：**并发上限仍然严格**（信号量是唯一闸，许可总数受限），
+    /// 但 `waiting` 中的任务**不保证按准入先后获得许可**，极端情况下存在饥饿可能。
+    /// 需要严格 FIFO 时，不要依赖本轴的排队顺序——改用不设上界的口，让许可由
+    /// 任务体自行 `acquire` 获取。
     pub fn with_max_pending(mut self, max: usize) -> Self {
         assert!(max > 0, "fx scope pending cap must be > 0");
         self.max_pending = max;
