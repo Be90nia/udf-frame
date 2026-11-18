@@ -47,8 +47,8 @@ enum Cmd {
     /// 产一条 `Emit(Add(n))` 再正常返回：效果缓冲 + 回灌环在并发下被持续读写，
     /// 且终值仍精确（自身 +n，回灌再把 +n 走一遍）。
     AddAndEmit(u64),
-    /// 先产一条 `Emit(Add(n))` 再 panic：panic 前已产效果必须原地留缓冲，
-    /// 由下一任排空的转发段续转（禁吞）。
+    /// 先产一条 `Emit(Add(n))` 再 panic：本次调用已产效果随**未提交**迁移一并
+    /// 丢弃（不执行）——未提交的效果从未成为已提交效果（issue#44 事务边界）。
     EmitThenPanic(u64),
     Panic,
 }
@@ -230,13 +230,13 @@ fn concurrent_dispatch_snapshot_and_subscription_interleaving_is_exact() {
     assert_eq!(store.snapshot().total, expected_total, "闭门后状态不再前进");
 }
 
-// ── ② panic/unwind：排空旗一致 + 已产效果零丢失 ────────────────────────────
+// ── ② panic/unwind：排空旗一致 + 失败迁移零副作用 ───────────────────────────
 
 /// 断言 SAFETY 论断 2 的异常路径：`DrainGuard` 在栈展开时复位排空旗，且
-/// `effect_buf` 的 panic 后状态仍自洽（容量与未转发内容都在）——旗若残留 true，
-/// 后续 dispatch 只入队不执行（静默变砖），本测试立即显形。
+/// `effect_buf` 的 panic 后状态仍自洽（容量与已提交待转发内容都在）——旗若残留
+/// true，后续 dispatch 只入队不执行（静默变砖），本测试立即显形。
 #[test]
-fn reducer_panic_keeps_drain_flag_consistent_and_effects_retained() {
+fn reducer_panic_keeps_drain_flag_consistent_and_staged_effects_discarded() {
     let store = TestStore::new(TallyReducer, NoFx);
     let hits = Arc::new(AtomicU64::new(0));
     let _ticket = store.subscribe(counting_subscriber(&hits));
@@ -257,20 +257,21 @@ fn reducer_panic_keeps_drain_flag_consistent_and_effects_retained() {
     // 排空旗已复位：下一次 dispatch 必须真的执行（若旗残留 true 则只入队、
     // 状态不动——这正是「旗恒 true → 静默变砖」的可执行检测面）。
     store.dispatch(Cmd::Add(1));
-    // panic 前已产的 Emit(Add(5)) 原地留缓冲，本任排空的转发段先续转：
-    // total = 1（Add(1)）+ 5（残留回灌）= 6；reduce 拍数 = 2。
+    // panic 前已产的 Emit(Add(5)) 随未提交迁移一并丢弃（不执行）——失败迁移的
+    // 副作用绝不能泄漏到后续无关 dispatch；本任排空只推进 Add(1) 这一拍：
+    // total = 1，reduce 拍数 = 1。
     assert_eq!(
         *store.snapshot(),
         Tally {
-            total: 6,
-            applied: 2
+            total: 1,
+            applied: 1
         },
-        "panic 前已产效果必须续转（禁吞），且排空旗已放行"
+        "失败迁移的暂存效果必须丢弃（未提交零副作用），且排空旗已放行"
     );
-    assert_eq!(hits.load(Ordering::Relaxed), 2, "两拍各一次通知");
+    assert_eq!(hits.load(Ordering::Relaxed), 1, "一拍一次通知");
 
     store.dispatch(Cmd::Add(1));
-    assert_eq!(store.snapshot().total, 7, "实例可继续复用（无中毒）");
+    assert_eq!(store.snapshot().total, 2, "实例可继续复用（无中毒）");
     assert_eq!(store.reducer_panic_count(), 1, "计数不重复");
 
     // 纯 panic（不产效果）同款：旗与计数纪律一致。
@@ -278,7 +279,7 @@ fn reducer_panic_keeps_drain_flag_consistent_and_effects_retained() {
     assert!(failed.is_err());
     assert_eq!(store.reducer_panic_count(), 2);
     store.dispatch(Cmd::Add(1));
-    assert_eq!(store.snapshot().total, 8);
+    assert_eq!(store.snapshot().total, 3);
     assert_eq!(store.pending_actions(), 0);
 }
 
@@ -509,13 +510,14 @@ fn mutex_reference_and_production_cells_observe_identically() {
     let prod = run_sequence(&TestStore::new(TallyReducer, NoFx));
     let refr = run_sequence(&TestStore::new_mutex_reference(TallyReducer, NoFx));
     assert_eq!(prod, refr, "确定性序列：两实现可观察面必须逐项一致");
-    // 契约期望值（手算）：total = 1 + 2 + 2(回灌) + 0(panic 拍) + 3 + 5(残留续转)
-    // + 1 = 14；reduce 拍数 = Add1/Add2/回灌Add2/Add3/回灌Add5/Add1 = 6，其中
-    // 最后一拍发生在订阅注销后故不计通知 ⇒ notified = 5。
+    // 契约期望值（手算）：total = 1 + 2 + 2(回灌) + 0(panic 拍) + 3 + 1 = 9；
+    // reduce 拍数 = Add1/Add2/回灌Add2/Add3/Add1 = 5，其中最后一拍发生在订阅
+    // 注销后故不计通知 ⇒ notified = 4。（panic 拍的暂存 Emit(Add(5)) 随未提交
+    // 迁移丢弃，不再续转——否则失败迁移的副作用会泄漏到后续 action。）
     let expected = Observables {
-        total: 14,
-        applied: 6,
-        notified: 5,
+        total: 9,
+        applied: 5,
+        notified: 4,
         subscriber_panics: 1,
         reducer_panics: 1,
         subscribers: 0,

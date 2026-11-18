@@ -508,3 +508,207 @@ fn nested_store_drain_keeps_depth_accounting_paired() {
         assert!(n <= 400, "泄漏：外部 action 被误标回灌深度，永远触顶");
     }
 }
+// -- 效果事务边界(issue#44):暂存区 / 已提交待转发 两段隔离 ------------
+
+/// 效果事务固定装置的动作词表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxAction {
+    /// 产一条效果后 panic(本次调用的暂存效果不得执行)。
+    StageThenPanic,
+    /// 产三条效果(E1/E2/E3):解释器在首条上 panic => E2/E3 留待续转。
+    StageThree,
+    /// 产一条自有效果(OWN)。
+    StageOwn,
+    /// 回灌链:n 环各产一条效果(Emit 回灌下一环)。
+    Chain(u32),
+}
+
+/// 效果事务固定装置的效果载荷。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxOp {
+    /// 失败迁移的暂存效果(必须永不执行)。
+    Staged,
+    /// 已提交效果 E1。
+    E1,
+    /// 已提交效果 E2。
+    E2,
+    /// 已提交效果 E3。
+    E3,
+    /// 成功迁移的自有效果。
+    Own,
+    /// 回灌链效果。
+    Chain(u32),
+}
+
+/// 效果事务固定装置的 reducer。
+struct TxFeature;
+
+impl Reducer for TxFeature {
+    type State = u32;
+    type Action = TxAction;
+    type Op = TxOp;
+    fn initial(&self) -> u32 {
+        0
+    }
+    fn reduce(&self, s: &u32, a: TxAction, out: &mut EffectBuf<TxAction, TxOp>) -> u32 {
+        match a {
+            TxAction::StageThenPanic => {
+                out.push(Effect::Run {
+                    id: EffectId::new(1),
+                    op: TxOp::Staged,
+                });
+                panic!("reducer boom after staging (drill)");
+            }
+            TxAction::StageThree => {
+                out.push(Effect::Run {
+                    id: EffectId::new(2),
+                    op: TxOp::E1,
+                });
+                out.push(Effect::Run {
+                    id: EffectId::new(3),
+                    op: TxOp::E2,
+                });
+                out.push(Effect::Run {
+                    id: EffectId::new(4),
+                    op: TxOp::E3,
+                });
+                *s
+            }
+            TxAction::StageOwn => {
+                out.push(Effect::Run {
+                    id: EffectId::new(5),
+                    op: TxOp::Own,
+                });
+                s + 1
+            }
+            TxAction::Chain(n) => {
+                out.push(Effect::Run {
+                    id: EffectId::new(10 + n as u64),
+                    op: TxOp::Chain(n),
+                });
+                if n < 2 {
+                    out.push(Effect::Emit(TxAction::Chain(n + 1)));
+                }
+                s + 1
+            }
+        }
+    }
+}
+
+/// 记录收到的效果、可在首条效果上 panic 的解释器。
+struct TxFx {
+    seen: Arc<std::sync::Mutex<Vec<TxOp>>>,
+    /// 首条效果上 panic 一次(其后照常转发--模拟解释器中断后被毒锁恢复)。
+    panic_on_first: bool,
+}
+
+impl EffectRuntime<TxAction, TxOp> for TxFx {
+    fn run(&mut self, effect: Effect<TxAction, TxOp>, _back: &ActionSender<TxAction>) {
+        // Effect 词表 non_exhaustive(跨 crate:if let 不命中即忽略)
+        if let Effect::Run { op, .. } = effect {
+            self.seen.lock().expect("seen 锁不中毒").push(op);
+            if self.panic_on_first {
+                self.panic_on_first = false;
+                panic!("interpreter boom (drill)");
+            }
+        }
+    }
+}
+
+/// 效果事务的固定装置装配(记录执行过的效果 + 解释器是否在首条上 panic)。
+fn tx_store(
+    seen: &Arc<std::sync::Mutex<Vec<TxOp>>>,
+    panic_on_first: bool,
+) -> Store<u32, TxAction, TxOp> {
+    Store::new(
+        TxFeature,
+        TxFx {
+            seen: Arc::clone(seen),
+            panic_on_first,
+        },
+    )
+}
+
+/// issue#44 红测:reducer panic 时**本次调用已产的效果不得执行**——该次迁移
+/// 未提交,其副作用绝不能泄漏到后续无关 dispatch(修复前:暂存效果留在共享
+/// 缓冲,下一拍的转发段先续转它 => 失败迁移的副作用在别的 dispatch 里执行)。
+#[test]
+fn reducer_panic_discards_staged_effects() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = tx_store(&seen, false);
+    let failed = catch_unwind(AssertUnwindSafe(|| {
+        store.dispatch(TxAction::StageThenPanic)
+    }));
+    assert!(failed.is_err(), "reducer panic 必须上浮(传播语义不变)");
+    assert_eq!(
+        store.reducer_panic_count(),
+        1,
+        "计数语义不变:每次 reducer panic 计一次"
+    );
+    assert_eq!(*store.snapshot(), 0, "失败拍的迁移不推进状态");
+    store.dispatch(TxAction::StageOwn);
+    assert_eq!(
+        *seen.lock().expect("seen 锁不中毒"),
+        vec![TxOp::Own],
+        "失败 reducer 暂存的效果绝不可执行(未提交迁移零外部副作用)"
+    );
+}
+
+/// issue#44 钉:解释器 panic(状态已提交之后)=> **未转发的已提交后缀**必须
+/// 留存,由下一任成功排空续转,且先于该拍自有效果;已转发前缀不重放(解释器
+/// panic 的既有语义不变——与 reducer panic 的丢弃语义严格区分)。
+#[test]
+fn runtime_panic_retains_unforwarded_committed_suffix() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = tx_store(&seen, true);
+    let failed = catch_unwind(AssertUnwindSafe(|| store.dispatch(TxAction::StageThree)));
+    assert!(failed.is_err(), "解释器 panic 必须上浮(fail-visible)");
+    assert_eq!(*store.snapshot(), 0, "StageThree 只产效果不推进状态");
+    store.dispatch(TxAction::StageOwn);
+    assert_eq!(store.runtime_panic_count(), 1, "解释器 panic 计数语义不变");
+    assert_eq!(
+        *seen.lock().expect("seen 锁不中毒"),
+        vec![TxOp::E1, TxOp::E2, TxOp::E3, TxOp::Own],
+        "未转发后缀先续转、自有效果随后;已转发前缀不重放"
+    );
+}
+
+/// issue#44 钉(禁无差别清空):reducer panic **只丢本次调用的暂存效果**,更早
+/// 已提交、只等续转的效果不得被连带清掉——整队清空会重新引入「上次解释器
+/// panic 遗留的效果丢失」这个已有保障的回归(issue#44 硬约束)。
+#[test]
+fn reducer_panic_preserves_committed_pending_effects() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = tx_store(&seen, true);
+    // 1 解释器 panic:E1 在飞行中丢弃,E2/E3 留待续转。
+    let failed = catch_unwind(AssertUnwindSafe(|| store.dispatch(TxAction::StageThree)));
+    assert!(failed.is_err(), "解释器 panic 必须上浮");
+    // 2 reducer panic:只丢本次暂存(Staged),E2/E3 原样留存。
+    let failed = catch_unwind(AssertUnwindSafe(|| {
+        store.dispatch(TxAction::StageThenPanic)
+    }));
+    assert!(failed.is_err(), "reducer panic 必须上浮");
+    assert_eq!(store.reducer_panic_count(), 1, "计数语义不变");
+    // 3 成功拍:E2/E3 续转在前,自有效果随后;Staged 永不执行。
+    store.dispatch(TxAction::StageOwn);
+    assert_eq!(
+        *seen.lock().expect("seen 锁不中毒"),
+        vec![TxOp::E1, TxOp::E2, TxOp::E3, TxOp::Own],
+        "更早已提交的效果不得被 reducer panic 连带清掉"
+    );
+}
+
+/// issue#44 钉:一次 dispatch 内的多 action 排空保持 action 序与效果序
+/// (Emit 回灌链:每环一条效果,执行序 = action 序)。
+#[test]
+fn multi_action_drain_preserves_action_and_effect_order() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = tx_store(&seen, false);
+    store.dispatch(TxAction::Chain(0));
+    assert_eq!(
+        *seen.lock().expect("seen 锁不中毒"),
+        vec![TxOp::Chain(0), TxOp::Chain(1), TxOp::Chain(2)],
+        "多 action 排空的效果序 = action 序"
+    );
+    assert_eq!(*store.snapshot(), 3, "三环各自推进一拍");
+}

@@ -104,6 +104,8 @@ struct DrainExclusive<T> {
 // 的每次读写都必须经 [`ExclusiveCell::with_mut`]，且调用点必须在
 // [`drain_owned`] 的 `DrainGuard` armed 区间内；重入路径（reducer/订阅回调/
 // 解释器内 dispatch 或 sender dispatch）只经 `enqueue` 入队即返，不入 with_mut。
+// `effect_buf` 一个字段内含暂存区与已提交待转发队列两段（见 [`EffectBufs`]）：
+// 一次 with_mut 取两段的 &mut——不新增独占字段、不新增访问点。
 // 「调用点全集」即本约束的检查清单——新增第四处访问点必须同时扩清单。
 // SAFETY（违反后果）：两线程同时拿到 `&mut T`（排空旗旁路，或 `&mut` 活到排空权
 // 释放之后）= `UnsafeCell` 别名写，Vec 扩容/清空撕裂、迭代器失效，属未定义行为
@@ -183,8 +185,45 @@ const _: () =
 /// 三处排空权独占载体的装配组：构造入口按实现整组选择（生产 vs `Mutex` 对照），
 /// 使 `StoreInner` 只留一处字面量（[`SyncStore::assemble`]）——对照装配与生产
 /// 装配的其余字段因此不可能漂移。
+/// 效果缓冲两段式（issue#44 事务边界）：暂存区（本次 reducer 调用的未提交
+/// 输出）与已提交待转发队列（状态已发布的迁移的效果，跨 action 存活）。
+///
+/// 两段同属一个排空权独占载体（ExclusiveCell）——SAFETY 纪要的「三处独占字段」
+/// 清单不变（effect_buf 一个字段、一次 with_mut 取两段的 &mut）。
+struct EffectBufs<A, Op> {
+    /// 暂存区：每次 reducer 调用独享（入口清零 ⇒ 跨调用不串味）；reduce
+    /// panic ⇒ 整段丢弃（未提交的迁移零外部副作用）。
+    staged: EffectBuf<A, Op>,
+    /// 已提交待转发队列：提交点把暂存区整段并入队尾（保持 action 序）；解释器
+    /// panic ⇒ 只留未转发的后缀（已转发前缀不重放），下一任成功排空续转。
+    pending: EffectBuf<A, Op>,
+}
+
+impl<A, Op> EffectBufs<A, Op> {
+    /// 两段皆空（装配期构造一次，此后各自复用容量）。
+    fn new() -> Self {
+        Self {
+            staged: EffectBuf::new(),
+            pending: EffectBuf::new(),
+        }
+    }
+
+    /// 提交点：暂存区整段并入已提交待转发队列（保持 action 序——暂存区按写入
+    /// 序出队，已提交队列按同序追加）。已提交队列为空时整段移交（O(1)）；非空
+    /// （解释器 panic 遗留了未转发后缀）时把暂存区追加到队尾。
+    fn commit(&mut self) {
+        if self.pending.is_empty() {
+            std::mem::swap(&mut self.pending, &mut self.staged);
+        } else {
+            while let Some(effect) = self.staged.pop_front() {
+                self.pending.push(effect);
+            }
+        }
+    }
+}
+
 struct ExclusiveCells<S, A, Op> {
-    effect_buf: ExclusiveCell<EffectBuf<A, Op>>,
+    effect_buf: ExclusiveCell<EffectBufs<A, Op>>,
     notify_cache: ExclusiveCell<NotifyCache<S>>,
     notify_sink_buf: ExclusiveCell<Vec<Arc<NotifySinkSlot>>>,
 }
@@ -193,7 +232,7 @@ impl<S, A, Op> ExclusiveCells<S, A, Op> {
     /// 生产装配（默认公共面的唯一路径）。
     fn unsynchronized() -> Self {
         Self {
-            effect_buf: ExclusiveCell::unsynchronized(EffectBuf::new()),
+            effect_buf: ExclusiveCell::unsynchronized(EffectBufs::new()),
             notify_cache: ExclusiveCell::unsynchronized(NotifyCache {
                 version: 0,
                 slots: Vec::new(),
@@ -206,7 +245,7 @@ impl<S, A, Op> ExclusiveCells<S, A, Op> {
     #[cfg(feature = "unsafe-evidence")]
     fn locked() -> Self {
         Self {
-            effect_buf: ExclusiveCell::locked(EffectBuf::new()),
+            effect_buf: ExclusiveCell::locked(EffectBufs::new()),
             notify_cache: ExclusiveCell::locked(NotifyCache {
                 version: 0,
                 slots: Vec::new(),
@@ -234,11 +273,13 @@ struct StoreInner<S, A, Op> {
     subs: Arc<Mutex<Vec<Weak<SubscriptionSlot<S>>>>>,
     /// 回灌句柄缓存：每 store 构造一次；`sender()` 克隆、排空循环借用。
     back: ActionSender<A>,
-    /// 效果缓冲（锁消融修订）：reduce 出参，clear 保容量跨 dispatch 复用。
+    /// 效果缓冲（锁消融修订）：**两段式**——暂存区（每次 reducer 调用的未提交
+    /// 输出）+ 已提交待转发队列（状态已发布的迁移的效果，跨 action 存活，见
+    /// [`EffectBufs`]）；clear 保容量跨 dispatch 复用。
     /// 排空权独占（[`DrainExclusive`]）：原 `Mutex` 的 take/还 两对锁消融——
     /// reducer 期间不持任何锁的契约不变（UnsafeCell 无锁可毒），panic 路径
     /// 连容量都不再丢（缓冲留在原位，下次 clear 复用）。
-    effect_buf: ExclusiveCell<EffectBuf<A, Op>>,
+    effect_buf: ExclusiveCell<EffectBufs<A, Op>>,
     /// 订阅集快照缓存（锁消融修订，见 [`NotifyCache`]）：稳态零锁读，
     /// 冷路径（订阅集变更后的首个 dispatch）才锁 `subs` 重建+代答回收死 Weak。
     notify_cache: ExclusiveCell<NotifyCache<S>>,
@@ -404,7 +445,8 @@ struct StoreInner<S, A, Op> {
 /// State 的 panic-free 性兜底。对照：`S::Drop` 的 panic 已由「旧快照锁外析构」
 /// 排除（见 `drain_owned` 落位段）；解释器 panic 不报废实例（毒锁恢复+计数，
 /// 见 [`Self::runtime_panic_count`]）；reducer panic 同不报废（计数+审计现场，
-/// 见 [`Self::reducer_panic_count`]——action 本体已出队随栈展开丢失，状态不前进）。
+/// 见 [`Self::reducer_panic_count`]——action 本体已出队随栈展开丢失，状态不前进；
+/// 本次调用已产的暂存效果随未提交迁移一并丢弃，不执行）。
 pub struct SyncStore<S, A, Op = Infallible> {
     inner: Arc<StoreInner<S, A, Op>>,
 }
@@ -1148,7 +1190,10 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// reducer panic 计数（fail-visible 留痕读侧）：reduce 的 panic 在排空环
     /// catch_unwind 观察点计数后 `resume_unwind` 原样重抛——传播语义不变，
     /// panic 照常在 dispatch 调用点上浮。动作本体已出队、以值传入 reduce，
-    /// panic 即丢失（状态不前进、实例可复用、已产效果原地留缓冲先续转）；
+    /// panic 即丢失（状态不前进、实例可复用；**本次调用已产的暂存效果随未提交
+    /// 迁移一并丢弃，不计数**——未提交的效果从未成为已提交效果，另立计数会把
+    /// 「失败迁移的副作用」混进已提交效果的账；更早已提交、只等续转的效果原样
+    /// 留存，不受牵连）；
     /// 审计时间线现场 = [`AuditEventKind::ReducerInterrupted`]。至此四条
     /// panic/异常路径读侧齐全：解释器 [`Self::runtime_panic_count`]、订阅回调
     /// [`Self::subscriber_panics`]、回灌超限 [`Self::feedback_budget_exceeded`]、
@@ -1410,26 +1455,44 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // 一律计深 feedback_depth+1；迭代末守卫恢复原值，panic 栈展开亦然。
         let _reentrant = ReentrantDepthGuard::enter(inner.store_id, feedback_depth + 1);
         let current = Arc::clone(&lock(&inner.state));
-        // 效果缓冲排空权独占（[`ExclusiveCell`]）：take/还两对锁消融——clear 后
-        // 原地交 reducer，转发完随下轮 clear 复用。reducer 期间不持任何锁的契约
-        // 不变：无锁可毒、reducer panic 时栈展开零残留，缓冲容量连丢一次都不丢。
-        // 缓冲不再迭代头 clear——转发改为逐条摘除（见转发环注释），panic 时未转发
-        // 的效果原地留缓冲，下一任排空的 reduce 向其追加、转发时先续转（panic 前
-        // 已产效果禁吞，fail-visible；迭代头 clear 会无声吞掉残留）。成功路径转发
-        // 即摘除，缓冲照常回空，保容量语义不变，稳态零新增分配不受影响。
+        // 效果缓冲排空权独占（[`ExclusiveCell`]）：take/还两对锁消融——reducer
+        // 期间不持任何锁的契约不变：无锁可毒、reducer panic 时栈展开零残留，
+        // 缓冲容量连丢一次都不丢。
+        // 两段式缓冲（issue#44 事务边界，见 [`EffectBufs`]）：**暂存区**每次
+        // reducer 调用独享（入口清零），**已提交待转发队列**跨 action 存活。
+        // reducer 正常返回 ⇒ 提交点把暂存区整段并入已提交队列（按 action 序）；
+        // reducer panic ⇒ 本次暂存区整段丢弃（未提交的迁移零外部副作用），
+        // 更早已提交、只等续转的效果原样留存（禁无差别清空：否则「上次解释器
+        // panic 遗留的效果丢失」这个已有保障回归）。解释器 panic ⇒ 状态已发布，
+        // 只留**未转发**的后缀（已转发前缀不重放），下一任成功排空续转。
+        // 转发改为逐条摘除（见转发环注释），成功路径转发即摘除，缓冲照常回空，
+        // 保容量语义不变，稳态零新增分配不受影响。
         // reducer panic 与解释器 panic 同形留痕（与全链计数纪律对称）：catch 只
         // 观察（计数+审计现场）后把 payload 带出区间；`resume_unwind` 落在独占
         // 区间之外——传播语义不变（panic 照常在 dispatch 调用点上浮），且对照实现
         // （Mutex）的锁不会在展开途中被毒化。动作本体已出队随栈展开丢失（已知
-        // 契约），缓冲已产效果原地留（续转不受观察影响）。
+        // 契约）；本次调用已产的暂存效果随未提交迁移一并丢弃（**不计数**，见
+        // [`SyncStore::reducer_panic_count`]）。
         // SAFETY: 持排空权（DrainGuard armed 区间）；重入 dispatch 只入队即返，
         // 到不了此处——独占访问成立，见 DrainExclusive 安全纪要
-        let reduced = inner.effect_buf.with_mut(|buf| {
+        let reduced = inner.effect_buf.with_mut(|bufs| {
+            // 暂存区入口清零：每次 reducer 调用独享（跨调用不串味）。
+            bufs.staged.clear();
             match catch_unwind(AssertUnwindSafe(|| {
-                inner.reducer.reduce(&current, action, buf)
+                inner.reducer.reduce(&current, action, &mut bufs.staged)
             })) {
-                Ok(next) => Ok(next),
+                Ok(next) => {
+                    // 提交点（issue#44）：reducer 正常返回 ⇒ 本次调用的暂存输出
+                    // 整段并入已提交待转发队列（按 action 序）。提交点落在状态
+                    // 发布之前——旧快照析构 panic（状态已发布）时，已提交效果
+                    // 不得随之丢失。
+                    bufs.commit();
+                    Ok(next)
+                }
                 Err(payload) => {
+                    // 失败调用：本次暂存输出整段丢弃（未提交的迁移零外部副作用）
+                    // ——更早已提交、只等续转的效果原样留存（禁无差别清空）。
+                    bufs.staged.clear();
                     inner.reducer_panics.fetch_add(1, Ordering::SeqCst);
                     audit_emit(inner, AuditEventKind::ReducerInterrupted);
                     Err(payload)
@@ -1450,7 +1513,8 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // 快照落位（消融：原「再锁 state 再 Arc::clone」的快照预取一对锁+一对
         // 引用计数整对删除）：快照即 `next` 本体。零订阅稳态把 `next` 直接移入
         // state（省 clone 对）；有订阅者才 clone 留本体给回调。管线序：
-        // reduce→快照替换→效果转发→通知（异步投递先行、同步回调随后）。
+        // reduce（含提交点：暂存区→已提交待转发队列）→快照替换→效果转发→通知
+        // （异步投递先行、同步回调随后）。
         // SAFETY: 持排空权（DrainGuard armed 区间）；通知段仅在排空权下进入，
         // 独占访问成立，见 DrainExclusive 安全纪要
         // 冷重建与「有无订阅者」判读在同一次独占区间内完成；落位/转发不触达该
@@ -1483,7 +1547,7 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // 转发环（禁吞语义见 helper 文档）：Emit 回灌入队、Run/Cancel 交解释器。
         inner
             .effect_buf
-            .with_mut(|buf| forward_effects(inner, buf, feedback_depth));
+            .with_mut(|bufs| forward_effects(inner, &mut bufs.pending, feedback_depth));
         // 异步投递段（ADR 0008）：排在同步回调之前——否则同步档慢订阅者会把
         // 异步消费者的可见延迟一并拖后。投递只发版本号：O(1)、门控短路
         // （零异步订阅者一次 Acquire load 即返）、锁外调用宿主代码。
@@ -1518,9 +1582,9 @@ fn place_snapshot<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send 
     drop(old_snapshot);
 }
 
-/// 转发环：逐条借出转发，
-/// 成功才从缓冲摘除——panic 时未转发的效果原地留在缓冲，由下一任排空的
-/// reduce 追加、转发时先续转（禁吞：panic 前已产效果零丢失）。不能用
+/// 转发环：逐条借出转发（只转发**已提交**的效果——暂存区在提交点已并入队列）。
+/// 成功才从缓冲摘除——panic 时未转发的效果原地留在已提交待转发队列，由下一任
+/// 成功排空续转（禁吞：已提交效果零丢失；已转发前缀不重放）。不能用
 /// `drain(..)`：其 Drop 语义是「完成排空」（未消费元素被 drop，drain_keep_rest
 /// 才回填且 unstable）——`drain(..)` 的静默蒸发本体在此，「clear 吞掉」
 /// 是次生路径。正在转发的一条随 panic 丢弃：其失败已显式传播+计数，重投
