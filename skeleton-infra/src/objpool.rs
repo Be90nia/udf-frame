@@ -77,10 +77,11 @@
 //! [`ByteBudget`] 下不回卷会让额度在池死后永久不可用）。[`Pooled::detach`] 让对象彻底脱离池
 //! 生命周期：最后一个持有者放手即析构（Rust 天然，无额外回收器）。
 //!
-//! **析构记账的两条承重假设**（改动此处前先读）：①`weight` 钩子必须是留存
-//! 对象的**纯函数**——析构按钩子重算重量归还，非纯钩子 ⇒「归还合计 ≠ 认领
-//! 合计」⇒ 记账下溢 fail-fast（不是静默漂移）；②片锁中毒（前持锁者 panic）
-//! 时按 `PoisonError::into_inner` **尽力回卷、不 panic**——析构期数据已不可信，
+//! **析构记账的承重假设**（改动此处前先读）：①（issue#35 起退役）析构不再调
+//! `weight` 钩子——字节按**入池计量值**（`IdleSlot.weight` 存槽）随件回卷；
+//! 「钩子必须是留存对象纯函数」的假设随之撤销：钩子只在归还/插入时对**当前**
+//! 状态计量一次，之后释放路径不碰用户代码；②片锁中毒（前持锁者 panic）时按
+//! `PoisonError::into_inner` **尽力回卷、不 panic**——析构期数据已不可信，
 //! 「拒绝归还」严格更差，且在 unwind 中 panic 会让进程 abort。这是「记账 bug
 //! 一律 fail-fast」的**唯一刻意例外**。
 //!
@@ -189,9 +190,12 @@
 //! （`try_take` 原子 check+act，无竞态窗），超预算即丢弃 + `dropped_overflow`
 //! （容量因，与件数溢出同一计数——字节超限也是容量因）；借出/prune/resize
 //! 裁剪对称回卷。字节上界**构造期定死**（同 reset 钩子先例，不进
-//! [`ObjectPoolTuning`]——resize 调件数面，不动安全字节上界）。**weight 钩子
-//! 体内不得 acquire 同一池**（调用点在片锁内，回调池借还 = 锁自死锁面）——
-//! debug 构建在片锁取锁点 fail-fast 检出重入（release 零开销仍禁，见
+//! [`ObjectPoolTuning`]——resize 调件数面，不动安全字节上界）。**计量只在入池
+//! 时做一次**（issue#35）：weight 钩子在归还/插入路径（片锁外）调用一次，值随
+//! 槽存档；借出/prune/resize/池析构的回卷一律用存储值，**不再对已记账对象调
+//! 用户代码**（钩子在移出后 panic 曾让字节永久漏记 + 计数悬挂）。**weight 钩子
+//! 体内仍不得 acquire/insert 同一池**（重入 = 递归面——插入路径会再次触发计量）
+//! ——debug 构建在片锁取锁点 fail-fast 检出重入（release 零开销仍禁，见
 //! `WeightHook`）。
 //!
 //! # 强制清零（缺口：reset 钩子可选，忘配 = 明文驻留）
@@ -344,11 +348,12 @@ impl Borrow<PoolMetrics> for ObjectPoolMetrics {
 /// 先例）：`Fn(&mut T)` 在锁外、独占借用下调用。
 type ResetHook<T> = Box<dyn Fn(&mut T) + Send + Sync>;
 
-/// 单件字节计量钩子：`Fn(&T) -> usize`——调用点在**片锁内**（归还/借出/裁剪
-/// 路径），钩子体内不得 acquire 同一池（锁自死锁面，同 reset 钩子红线）；
-/// **debug 构建在片锁取锁点 fail-fast 检出重入**（`acquire` / `insert` /
-/// `metrics` / `prune_idle` / `resize` 任一取片锁即 panic，release 零开销仍禁）；
-/// 返回值按**对象当前真实驻留字节**计（`Vec` 类 = `capacity()`，不是 `size_of`）。
+/// 单件字节计量钩子：`Fn(&T) -> usize`——调用点仅**入池计量**（归还/插入路径、
+/// 片锁外；issue#35 起一次计量随 `IdleSlot` 存槽，释放路径不再调用）。钩子体内
+/// 不得 acquire/insert 同一池（重入 = 递归面——插入路径会再次触发计量）；debug
+/// 构建在片锁取锁点 fail-fast 检出重入（`acquire` / `insert` / `metrics` /
+/// `prune_idle` / `resize` 任一取片锁即 panic，release 零开销仍禁）；返回值按
+/// **对象当前真实驻留字节**计（`Vec` 类 = `capacity()`，不是 `size_of`）。
 type WeightHook<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 
 /// 进程级共享字节预算仲裁器：多池共用一个内存上限的原语（bd jovl4 缺口 1）。
@@ -485,10 +490,16 @@ impl std::fmt::Debug for ByteBudget {
 }
 
 /// 空闲槽：对象值 + 最近使用时间戳（归还时刷新；[`ObjectPool::prune_idle`]
-/// 按龄释放的判据）。
+/// 按龄释放的判据）+ 入池计量值。
+///
+/// `weight` 是**入池时一次性计量**的字节额度持有量（issue#35）：此后借出 /
+/// prune / resize / 池析构的回卷一律用存储值——释放已记账对象不再调用户代码
+/// （钩子在移出后 panic 曾让字节永久漏记 + 计数悬挂）。
 struct IdleSlot<T> {
     obj: T,
     last_used: Instant,
+    /// 入池计量值（[`ObjectPool::weight_of`] 的返回；未启用字节配额的池恒 0）。
+    weight: usize,
 }
 
 /// 分片：槽位 + **片内计数**——借还热路径只碰本片锁与片内普通 `usize`，无跨线程
@@ -989,7 +1000,9 @@ impl<T> ObjectPool<T> {
 
     /// 插入收口（片锁内一次完成双裁决 + 入槽 + 宇宙认领）：本线程亲和片优先、空
     /// 则轮转（同 [`Self::pop_idle`] 的扫片序——插入方与借出方同线程时热件落在
-    /// 同一片）。全片无空位 ⇒ `Err(obj)` 原样交回。
+    /// 同一片）。全片无空位 ⇒ `Err(obj)` 原样交回。入池计量（[`Self::weight_of`]，
+    /// 片锁外）的值随槽存档（issue#35）；钩子 panic ⇒ 对象销毁、片锁未取、账面
+    /// 零变更、payload 传播——字节从未认领，无需回卷。
     fn push_inserted(&self, obj: T) -> Result<(), T> {
         let weight = self.weight_of(&obj);
         let shards = self.slots.len();
@@ -1008,6 +1021,7 @@ impl<T> ObjectPool<T> {
                 shard.idle.push(IdleSlot {
                     obj,
                     last_used: Instant::now(),
+                    weight,
                 });
                 shard.alive += 1;
                 return Ok(());
@@ -1017,8 +1031,10 @@ impl<T> ObjectPool<T> {
     }
 
     /// 句柄析构收口（[`Pooled`] / [`Owned`] 共用，语义逐条见 [`Pooled`] 文档）：
-    /// unwind 路径销毁不回池；降级件归还即释放；正常件 `OnReturn` reset → 回 home
-    /// 片 → 迁片 → 全池余量零则丢弃（`dropped_overflow` + `OverflowDropped`）。
+    /// unwind 路径销毁不回池；降级件归还即释放；正常件 `OnReturn` reset →
+    /// 入池计量（`weight` 钩子，锁外；panic ⇒ `release` 回卷借出/宇宙账目后
+    /// payload 原样传播——对象不入池、字节从未认领，issue#35）→ 回 home 片 →
+    /// 迁片 → 全池余量零则丢弃（`dropped_overflow` + `OverflowDropped`）。
     ///
     /// 前提：该对象借出时在 `home` 片记过 `borrowed`（`release` / `return_to_shard`
     /// 各回卷一次，禁混账）。
@@ -1053,8 +1069,19 @@ impl<T> ObjectPool<T> {
                 }
             }
         }
+        // 入池计量（issue#35：weight 只在入池时测一次、随 IdleSlot 存槽）；释放
+        // 路径一律用存储值，不再对已记账对象跑用户代码。此处不在 unwind 中
+        // （unwind 归还在上方分流），panic 传播不构成 Drop 期 abort 面。
+        let weight = match catch_unwind(AssertUnwindSafe(|| self.weight_of(&obj))) {
+            Ok(weight) => weight,
+            Err(payload) => {
+                self.release(home, true);
+                drop(obj);
+                resume_unwind(payload);
+            }
+        };
         // 放回借出时的片（LIFO 热件常驻）+ 刷新 last_used；片内记账同一临界区。
-        if let Some(overflow) = self.return_to_shard(home, obj) {
+        if let Some(overflow) = self.return_to_shard(home, obj, weight) {
             self.dropped_overflow.fetch_add(1, Ordering::Relaxed);
             self.sink.emit(PoolAuditKind::OverflowDropped);
             drop(overflow);
@@ -1134,7 +1161,8 @@ impl<T> ObjectPool<T> {
     /// 老化实现收口（`Instant` 入参；弃用包装 [`Self::prune_idle`] 与时钟注入
     /// 版 [`Self::prune_idle_with_clock`] 共用）。`Duration::ZERO` ⇒ 释放全部
     /// idle 对象（特判：不比时间戳直接释放——规避时钟粒度下「同一瞬间归还/
-    /// 调用」的 0 龄漏放）。
+    /// 调用」的 0 龄漏放）。字节回卷用 `IdleSlot.weight` 的入池存储值——释放
+    /// 路径不调钩子（issue#35：钩子在移出后 panic 曾让字节永久漏记 + 计数悬挂）。
     fn prune_idle_impl(&self, max_idle_age: Duration, now: Instant) -> usize {
         // ZERO 特判：不比时间戳直接释放全部（契约口径「ZERO ⇒ 释放全部」——
         // 规避时钟粒度下「同一瞬间归还/调用」的 0 龄漏放）。
@@ -1151,7 +1179,7 @@ impl<T> ObjectPool<T> {
                     || now.saturating_duration_since(shard.idle[i].last_used) > max_idle_age;
                 if expired {
                     let slot = shard.idle.swap_remove(i);
-                    doomed_bytes += self.weight_of(&slot.obj);
+                    doomed_bytes += slot.weight;
                     doomed.push(slot.obj);
                     take(&mut shard.alive, 1, "universe alive");
                 } else {
@@ -1181,7 +1209,8 @@ impl<T> ObjectPool<T> {
     /// 不变）；缩容裁剪 idle（超限丢弃 + `dropped_overflow` 计数）；**缩容不夺
     /// 借出**——借出句柄不受影响，归还时按新边界裁决（本片 idle 满 = 丢弃 +
     /// 计数）。**不改分片数**（构造期自适应定死）；新旧 `max` / `idle_cap` 都按
-    /// 片均分（`share`：各片之和恰等于配置值）。
+    /// 片均分（`share`：各片之和恰等于配置值）。被裁件的字节按入池存储权重回卷
+    /// （issue#35：释放路径不调钩子）。
     ///
     /// 合法中间态（doc 钉死）：裁剪逐片串行进行，并发窗口内
     /// `metrics().core.idle` 可能短暂高于新 `idle_cap`——读数如实呈现，终态收敛
@@ -1212,7 +1241,7 @@ impl<T> ObjectPool<T> {
             if shard.idle.len() > cap {
                 let excess = shard.idle.len() - cap;
                 for slot in shard.idle.drain(0..excess) {
-                    doomed_bytes += self.weight_of(&slot.obj);
+                    doomed_bytes += slot.weight;
                     doomed.push(slot.obj);
                 }
                 take(&mut shard.alive, excess, "universe alive");
@@ -1259,7 +1288,8 @@ impl<T> ObjectPool<T> {
     }
 
     /// 扫片移出：起始片优先、空则轮转扫其余片；锁内一并回卷本片借出数（命中即
-    /// 在同一临界区完成记账）——逐片取锁、锁不嵌套。
+    /// 在同一临界区完成记账）——逐片取锁、锁不嵌套。字节回卷用 `IdleSlot.weight`
+    /// 的入池存储值（issue#35：释放路径不调钩子）。
     fn pop_idle(&self, start: usize) -> Option<(T, usize)> {
         for i in 0..self.slots.len() {
             let idx = (start + i) % self.slots.len();
@@ -1268,7 +1298,7 @@ impl<T> ObjectPool<T> {
                 shard.borrowed += 1;
                 shard.reused += 1;
                 // 借出 = 不再驻留：字节回卷（与归还的 `try_take` 对称配平）。
-                self.budget_release(self.weight_of(&slot.obj));
+                self.budget_release(slot.weight);
                 return Some((slot.obj, idx));
             }
         }
@@ -1308,6 +1338,11 @@ impl<T> ObjectPool<T> {
     /// 归还收口（锁 home 片一次完成记账 + 留存裁决）：借出数回卷；home 片 idle 未
     /// 达**片配额**（[`share`]）⇒ 刷新时间戳入片、返回 `None`。
     ///
+    /// `weight` 由调用方在**锁外**计量后传入（入池一次性计量，issue#35：钩子只在
+    /// 这一处调用，本函数与后续释放路径都不再碰用户代码）；计量 panic 的处置在
+    /// [`Self::drop_handle`]——对象不入池、字节从未认领、`borrowed` / `alive`
+    /// 回卷后 payload 原样传播。
+    ///
     /// **迁片只发生在「归还 + home 片 idle 满」这一种情形**：轮转找仍有 idle 余量
     /// 的片迁入留存（`alive` 随件迁移、宇宙账面守恒）。按片均分 + 线程亲和下，
     /// 单线程只回自己那片，若死守本片配额则 `idle_cap / shards` 以外的额度全被
@@ -1319,8 +1354,7 @@ impl<T> ObjectPool<T> {
     /// 再逐片加锁裁剪 ⇒ 归还要么读到新值（按新配额裁决），要么它的 push 会被紧随
     /// 其后的那次裁剪覆盖。锁外的陈旧快照没有这个收敛保证——缩容并发归还时能把
     /// idle 永久顶在新上界之外（无任何再裁剪路径）。
-    fn return_to_shard(&self, home: usize, obj: T) -> Option<T> {
-        let weight = self.weight_of(&obj);
+    fn return_to_shard(&self, home: usize, obj: T, weight: usize) -> Option<T> {
         let shards = self.slots.len();
         let mut shard = lock(&self.slots[home]);
         take(&mut shard.borrowed, 1, "borrowed");
@@ -1331,6 +1365,7 @@ impl<T> ObjectPool<T> {
             shard.idle.push(IdleSlot {
                 obj,
                 last_used: Instant::now(),
+                weight,
             });
             return None;
         }
@@ -1350,6 +1385,7 @@ impl<T> ObjectPool<T> {
             candidate.idle.push(IdleSlot {
                 obj,
                 last_used: Instant::now(),
+                weight,
             });
             candidate.alive += 1;
             drop(candidate);
@@ -1378,9 +1414,12 @@ impl<T> ObjectPool<T> {
     }
 
     /// 单件字节计量（未启用字节配额的池恒 0——`weight`/`budget` 成对出现，
-    /// `budget: None` ⇒ `weight: None`）。调用点：借还/裁剪路径在片锁内，
-    /// **池析构路径在锁外**（`Drop` 先把槽位摘出来再计量）；两处钩子体内都禁
-    /// acquire 同一池（见 [`WeightHook`]）。
+    /// `budget: None` ⇒ `weight: None`）。调用点仅**入池计量**两处、都在片锁外：
+    /// [`Self::drop_handle`]（归还计量，panic ⇒ 账目回卷后传播）与
+    /// [`Self::push_inserted`]（插入计量）——值随 [`IdleSlot`] 存槽，释放路径
+    /// （`pop_idle` / prune / resize / 池析构）一律用存储值，不再对已记账对象
+    /// 调用户代码（issue#35）。钩子体内仍禁 acquire/insert 同一池（重入递归面，
+    /// 见 `WeightHook`）。
     fn weight_of(&self, obj: &T) -> usize {
         let Some(w) = self.weight.as_ref() else {
             return 0;
@@ -1419,8 +1458,9 @@ impl<T> Drop for ObjectPool<T> {
     ///
     /// 纪律：未启用字节预算的池**零行早退**（`budget: None` ⇒ 字段随后照常
     /// 析构，借还路径与本路径都不产生额外开销）；逐片取锁、**锁不嵌套**（预算锁
-    /// 是叶子锁，回卷在所有片锁释放后做一次）；对象**锁外**计量与析构（权重钩子
-    /// 是用户代码，不在片锁内跑）。
+    /// 是叶子锁，回卷在所有片锁释放后做一次）；对象**锁外**析构，字节按
+    /// `IdleSlot.weight` 的入池存储权重回卷——**不调 weight 钩子**（issue#35：
+    /// 释放已记账对象不再跑用户代码）。
     ///
     /// 片锁这里**直取**而不走内部 `lock` 助手：后者的 debug 重入防呆是「钩子体内再取
     /// 同一池片锁 ⇒ 自死锁」的检出，而析构期既无并发借用（`Pooled` 借住池、
@@ -1428,13 +1468,13 @@ impl<T> Drop for ObjectPool<T> {
     /// 「钩子体内 drop 掉另一个池」这种无死锁的合法路径误报 panic——析构期
     /// panic 不可接受。
     ///
-    /// **中毒片照样取回**（`PoisonError::into_inner`）：片锁中毒的来路是本 crate
-    /// 自己的 fail-fast——`weight` 钩子在 `pop_idle` / `prune_idle` / `resize` 的
-    /// 临界区内 panic，守卫 unwind 即毒化该片。此时数据可不可信已无关，**账本必须
-    /// 归还**（否则就是本单要修的「额度永久不可用」在异常路径上复现）；若析构正好
-    /// 发生在 unwind 中，沿用 `lock()` 的 panic 还会升级成**进程 abort**。这里**只**
-    /// 处理 `PoisonError`，其余 panic（含钩子再次 panic）照常传播——禁 `catch_unwind`
-    /// 吞一切，那会静默掩盖真实 bug。
+    /// **中毒片照样取回**（`PoisonError::into_inner`）：片锁中毒的来路只剩本
+    /// crate 自己的记账 fail-fast（`take` 下溢断言等片锁内 panic；issue#35 起
+    /// `weight` 钩子只在入池计量、不在片锁内跑，不再是毒源）。此时数据可不可信
+    /// 已无关，**账本必须归还**（否则就是 bd udf-frame-m34 修过的「额度永久
+    /// 不可用」在异常路径上复现）；若析构正好发生在 unwind 中，沿用 `lock()` 的
+    /// panic 还会升级成**进程 abort**。这里**只**处理 `PoisonError`，其余 panic
+    /// 照常传播——禁 `catch_unwind` 吞一切，那会静默掩盖真实 bug。
     fn drop(&mut self) {
         if self.budget.is_none() {
             return;
@@ -1447,14 +1487,11 @@ impl<T> Drop for ObjectPool<T> {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 std::mem::take(&mut shard.idle)
             };
-            idle_bytes += doomed
-                .iter()
-                .map(|slot| self.weight_of(&slot.obj))
-                .sum::<usize>();
+            idle_bytes += doomed.iter().map(|slot| slot.weight).sum::<usize>();
             drop(doomed); // 锁外析构
         }
         // 逐片累积 ⇒ 本行对所有片（含取锁失败的中毒片）都必达：中毒片经
-        // `into_inner` 拿到的槽位照样计重。
+        // `into_inner` 拿到的槽位照样按入池存储权重计账。
         self.budget_release(idle_bytes);
     }
 }

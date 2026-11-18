@@ -310,6 +310,32 @@ fn budget_pool(budget: &Arc<ByteBudget>) -> ObjectPool<Vec<u8>> {
         buf.len()
     })
 }
+/// tripwire 池装配：权重 = `len()`（`vec![0u8; 100]` ⇒ 100B）、armed 即炸的
+/// 计量钩子 + 调用计数——「释放路径不得调钩子」的 tripwire 测试共用
+/// （issue#35）。
+fn tripwire_pool(
+    max: usize,
+    idle_cap: usize,
+    budget: &Arc<ByteBudget>,
+    armed: &Arc<AtomicBool>,
+    calls: &Arc<AtomicUsize>,
+) -> ObjectPool<Vec<u8>> {
+    let armed = Arc::clone(armed);
+    let calls = Arc::clone(calls);
+    ObjectPool::with_shared_byte_quota(
+        max,
+        idle_cap,
+        || vec![0u8; 100],
+        Arc::clone(budget),
+        move |buf: &Vec<u8>| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            if armed.load(Ordering::Relaxed) {
+                panic!("weight hook boom");
+            }
+            buf.len()
+        },
+    )
+}
 
 /// drop 一个池必须把它 idle 占住的字节还给共享预算。
 #[test]
@@ -489,61 +515,221 @@ fn concurrent_drop_and_take_never_breach_the_cap() {
     assert_eq!(budget.available(), TOTAL);
 }
 
-/// 片锁中毒后析构：**不得 panic**，且中毒片里剩余的 idle 字节照样回卷。
+/// 释放路径（借出 / prune / resize / 池析构）一律用入池存储权重回卷、**不再调
+/// weight 钩子**（issue#35）：armed 钩子是 tripwire——任何释放路径碰用户代码
+/// 都会当场 panic（被 `catch_unwind` 抓住判红，绝不放它穿过测试帧——unwind 中
+/// 析构仍武装的池 = 二次 panic abort 面）。prune 全量释放后 `held == 0`，池
+/// 析构后仍是 0。
 ///
-/// 中毒怎么来（本 crate 自己的 fail-fast 造出来的）：片锁内跑用户 `weight` 钩子，
-/// 钩子 panic ⇒ 守卫 unwind ⇒ 该片锁中毒。此后任何 `lock()` 都会 panic；析构期
-/// 若沿用 `lock()`，则 ①`Drop` 中途 panic（若本就在 unwind 中 ⇒ **进程 abort**），
-/// ②本次要修的那个「额度永久不可用」在异常路径上复现。
+/// 旧契约（本单废止）：prune 在片锁内重算钩子，钩子 panic ⇒ 片锁中毒 + 已移出
+/// 件 100B 永久漏记（`held: 200 → 100`），池析构靠 `PoisonError::into_inner`
+/// 兜回剩余件。漏记面随「释放不调钩子」一并消灭。
 #[test]
-fn drop_survives_a_poisoned_shard_and_returns_its_idle_bytes() {
+fn release_paths_use_stored_weights_and_never_call_the_hook() {
     let budget = Arc::new(ByteBudget::new(1024));
     let armed = Arc::new(AtomicBool::new(false));
-    let pool = {
-        let armed = Arc::clone(&armed);
-        ObjectPool::with_shared_byte_quota(
-            16,
-            16,
-            || vec![0u8; 100],
-            Arc::clone(&budget),
-            move |buf: &Vec<u8>| {
-                if armed.load(Ordering::Relaxed) {
-                    panic!("weight hook boom");
-                }
-                buf.len()
-            },
-        )
-    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pool = tripwire_pool(16, 16, &budget, &armed, &calls);
 
-    // 两件都落在 main 的 home 片（idle_cap = 16 ⇒ 8 片 × 每片 2 槽）。
+    // 两件入 idle：入池计量各一次（200B 认领）。
     assert!(pool.insert(vec![0u8; 100]).is_none());
     assert!(pool.insert(vec![0u8; 100]).is_none());
     assert_eq!(budget.held(), 200);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
 
-    // 让钩子在**持片锁时**panic：`prune_idle` 先移出一件再计量 ⇒ 该片锁中毒，
-    // 且片里还剩 1 件（100B）待回卷。
+    // prune（ZERO 扫全量）：存储权重回卷，armed 钩子不得被调用。
     armed.store(true, Ordering::Relaxed);
-    let poisoned = catch_unwind(AssertUnwindSafe(|| {
-        pool.prune_idle_with_clock(Duration::ZERO, &SystemClock);
+    let pruned = catch_unwind(AssertUnwindSafe(|| {
+        pool.prune_idle_with_clock(Duration::ZERO, &SystemClock)
     }));
-    assert!(
-        poisoned.is_err(),
-        "钩子 panic 必须照常传播（禁 catch_unwind 吞掉）"
-    );
-    assert_eq!(
-        budget.held(),
-        200,
-        "panic 路径上已移出的那件不释放（既有行为，本单不动）"
-    );
+    // 先撤武装再断言：红相 unwind 析构池时不得二次 panic（abort 面）。
+    armed.store(false, Ordering::Relaxed);
+    let n = match pruned {
+        Ok(n) => n,
+        Err(_) => panic!("prune 不得调 weight 钩子（armed 触发 = 回归）"),
+    };
+    assert_eq!(n, 2);
+    assert_eq!(budget.held(), 0, "prune 用入池存储权重回卷，200B 必须全还");
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "prune 不得调 weight 钩子");
+    let m = pool.metrics();
+    assert_eq!((m.core.idle, m.core.borrowed), (0, 0), "prune 后账面清空");
+    assert_eq!(m.pruned, 2);
+    assert_eq!(m.core.dropped_overflow, 0, "老化走 pruned，不混容量因");
 
-    // 中毒后析构：只处理 PoisonError（取回槽位），其余 panic 照常传播。
-    armed.store(false, Ordering::Relaxed); // 场景是「锁中毒」，不是「钩子永远炸」
-    let dropped = catch_unwind(AssertUnwindSafe(move || drop(pool)));
-    assert!(dropped.is_ok(), "片锁中毒时 Drop 不得 panic");
+    // 池析构（重新武装）：同样只准用存储权重——不炸、无余额残留。
+    armed.store(true, Ordering::Relaxed);
+    let dropped = catch_unwind(AssertUnwindSafe(|| drop(pool)));
+    assert!(dropped.is_ok(), "池析构不得调 weight 钩子");
+    assert_eq!(budget.held(), 0, "池析构回卷后账目精确归零");
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "池析构不得调 weight 钩子");
+}
+
+/// 借出回卷（`pop_idle`）用入池存储权重：armed 钩子在借出路径不得被调用
+/// （panic 被 `catch_unwind` 抓住判红，绝不放它穿过测试帧——unwind 中析构仍
+/// 武装的池 = 二次 panic abort 面），`held` 精确回卷单件字节，`idle`/
+/// `borrowed`/`reused` 记账一致（issue#35）。
+#[test]
+fn pop_idle_releases_stored_weight_without_calling_the_hook() {
+    let budget = Arc::new(ByteBudget::new(1024));
+    let armed = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pool = tripwire_pool(4, 4, &budget, &armed, &calls);
+
+    for _ in 0..4 {
+        assert!(pool.insert(vec![0u8; 100]).is_none());
+    }
+    assert_eq!(budget.held(), 400);
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+
+    // 借出：pop_idle 用存储权重回卷 100B，armed 钩子不被触发。Result 在内层块
+    // 内消费——Pooled 对 pool 的借用不跨出块，不挡后续 `drop(pool)`。
+    armed.store(true, Ordering::Relaxed);
+    let handle = {
+        let popped = catch_unwind(AssertUnwindSafe(|| pool.acquire()));
+        // 先撤武装再断言：红相 unwind 析构池时不得二次 panic（abort 面）。
+        armed.store(false, Ordering::Relaxed);
+        match popped {
+            Ok(handle) => handle,
+            Err(_) => panic!("借出路径不得调 weight 钩子（armed 触发 = 回归）"),
+        }
+    };
+    assert_eq!(budget.held(), 300, "借出回卷单件存储字节");
     assert_eq!(
-        budget.held(),
-        100,
-        "中毒片里剩余的 idle 字节必须回卷（取锁失败也要计入）"
+        calls.load(Ordering::Relaxed),
+        4,
+        "借出路径不得调 weight 钩子"
     );
-    assert_eq!(budget.available(), 924);
+    let m = pool.metrics();
+    assert_eq!((m.core.idle, m.core.borrowed, m.reused), (3, 1, 1));
+
+    // 归还：归还路径是入池计量（钩子合法调用点），计数 +1、重新认领。
+    drop(handle);
+    assert_eq!(budget.held(), 400, "归还重新认领当前驻留字节");
+    assert_eq!(calls.load(Ordering::Relaxed), 5, "归还 = 入池计量，钩子 +1");
+
+    // 终态：池析构回卷驻留字节，账目精确归零。
+    drop(pool);
+    assert_eq!(budget.held(), 0, "终态账目精确归零");
+}
+
+/// 缩容裁剪（`resize`）用入池存储权重回卷被裁件：armed 钩子不得被调用（panic
+/// 被 `catch_unwind` 抓住判红，绝不放它穿过测试帧——unwind 中析构仍武装的池 =
+/// 二次 panic abort 面），`held` 精确回卷、`idle`/`dropped_overflow` 收敛到新
+/// 配额（issue#35）。
+#[test]
+fn resize_releases_stored_weight_without_calling_the_hook() {
+    let budget = Arc::new(ByteBudget::new(1024));
+    let armed = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pool = tripwire_pool(4, 4, &budget, &armed, &calls);
+
+    for _ in 0..4 {
+        assert!(pool.insert(vec![0u8; 100]).is_none());
+    }
+    assert_eq!(budget.held(), 400);
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+
+    // 缩容 idle_cap 4 → 2：4 片 × 片额（1,1,0,0）⇒ shard 2/3 的两件被裁。
+    armed.store(true, Ordering::Relaxed);
+    let resized = catch_unwind(AssertUnwindSafe(|| {
+        pool.resize(skeleton_infra::objpool::ObjectPoolTuning {
+            max: 2,
+            idle_cap: 2,
+        })
+    }));
+    // 先撤武装再断言：红相 unwind 析构池时不得二次 panic（abort 面）。
+    armed.store(false, Ordering::Relaxed);
+    let outcome = match resized {
+        Ok(outcome) => outcome,
+        Err(_) => panic!("resize 不得调 weight 钩子（armed 触发 = 回归）"),
+    };
+    outcome.expect("合法参数必须受理");
+    assert_eq!(budget.held(), 200, "被裁两件按入池存储权重回卷");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        4,
+        "resize 不得调 weight 钩子"
+    );
+    let m = pool.metrics();
+    assert_eq!((m.core.idle, m.core.borrowed), (2, 0), "idle 收敛到新配额");
+    assert_eq!(m.core.dropped_overflow, 2, "裁剪走容量因计数");
+}
+
+/// 归还路径的入池计量 panic（issue#35 语义）：对象不入池、字节从未认领、
+/// `borrowed`/`alive` 照 `release` 回卷（不得悬挂），payload 原样传播；池随后
+/// 照常全生命周期可用（宇宙账面没漏）。
+#[test]
+fn return_hook_panic_rejects_object_and_rolls_back_counts() {
+    let budget = Arc::new(ByteBudget::new(1024));
+    let armed = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    // 单片池（idle_cap = 1 ⇒ 1 片）+ max = 1：alive 悬挂直接可观测——未回卷的
+    // alive 会占满宇宙，后续 insert 被拒（Some）。
+    let pool = tripwire_pool(1, 1, &budget, &armed, &calls);
+
+    assert!(pool.insert(vec![0u8; 100]).is_none());
+    assert_eq!(budget.held(), 100);
+    let handle = pool.acquire();
+    let m = pool.metrics();
+    assert_eq!((m.core.idle, m.core.borrowed), (0, 1), "借出后 idle 清空");
+
+    armed.store(true, Ordering::Relaxed);
+    let panicked = catch_unwind(AssertUnwindSafe(|| drop(handle)));
+    // 先撤武装再断言：红相 unwind 析构池时不得二次 panic（abort 面）。
+    armed.store(false, Ordering::Relaxed);
+    assert!(panicked.is_err(), "计量 panic 必须照常传播（禁吞）");
+
+    // 字节：该件在借出时已回卷、归还计量 panic ⇒ 从未认领 ⇒ held 0。
+    assert_eq!(budget.held(), 0, "计量 panic 的对象不得认领字节");
+    // 计数：borrowed 必须随对象销毁回卷（悬挂 = 永远 1）。
+    let m = pool.metrics();
+    assert_eq!(m.core.borrowed, 0, "borrowed 必须随对象销毁回卷");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "panic 的那次计量已计数（1 入池 + 1 归还）"
+    );
+    // alive 回卷的可观测面：max = 1，未回卷的 alive 会占满宇宙 ⇒ insert 被拒。
+    assert!(
+        pool.insert(vec![0u8; 100]).is_none(),
+        "宇宙账面已回卷：新对象必须能入池（alive 悬挂时这里是 Some）"
+    );
+    assert_eq!(budget.held(), 100);
+
+    // 池照常跑完整生命周期（借 → 还 → 析构回卷，无残留账）。
+    let again = pool.acquire();
+    assert_eq!(budget.held(), 0);
+    drop(again);
+    assert_eq!(budget.held(), 100);
+    drop(pool);
+    assert_eq!(budget.held(), 0, "终态账目精确归零");
+}
+
+/// 插入路径的入池计量 panic：对象不入池、字节从未认领、账面零变更（插入件
+/// 从未借出，`borrowed`/`alive` 都不该动），payload 原样传播。
+#[test]
+fn insert_hook_panic_claims_nothing_and_pool_stays_consistent() {
+    let budget = Arc::new(ByteBudget::new(1024));
+    let armed = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pool = tripwire_pool(1, 1, &budget, &armed, &calls);
+
+    assert!(pool.insert(vec![0u8; 100]).is_none());
+    assert_eq!(budget.held(), 100);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    armed.store(true, Ordering::Relaxed);
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        assert!(pool.insert(vec![0u8; 100]).is_none());
+    }));
+    assert!(panicked.is_err(), "计量 panic 必须照常传播（禁吞）");
+    assert_eq!(budget.held(), 100, "插入计量 panic 不得认领字节");
+    let m = pool.metrics();
+    assert_eq!(m.core.idle, 1, "原驻留件不受影响");
+    assert_eq!(m.core.borrowed, 0, "插入件从未借出，borrowed 不动");
+    assert_eq!(m.core.dropped_overflow, 0, "钩子因不是容量因");
+
+    armed.store(false, Ordering::Relaxed);
+    drop(pool);
+    assert_eq!(budget.held(), 0, "终态账目精确归零");
 }
