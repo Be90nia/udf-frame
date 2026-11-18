@@ -4,6 +4,48 @@
 
 ## [Unreleased]
 
+### Fixed（reducer 事务边界：失败迁移的暂存效果不再执行，2026-11-18；GitHub issue#44）
+- **根因**：`drain_owned` 里 `reducer.reduce` 写入共享 `effect_buf`（在 `catch_unwind` 内）；reducer panic 时不清理该次调用的 effects，panic 在 `place_snapshot` 之前 resume（`next_state` 未提交），下次成功 dispatch 转发时旧后缀先发 ⇒ **一次失败的状态转换，其副作用在别的 action 里执行了**。
+- **修复**：新增私有结构 `EffectBufs<A, Op>{staged, pending}`——`staged` 是本次 reducer 调用的暂存区（每次调用级清零），`pending` 是已提交待转发队列；reducer 成功 ⇒ `commit()` 整段并入 `pending`（保持 action 序）；reducer panic ⇒ 只清 `staged`，不动 `pending`。
+- **严格保留 `EffectRuntime` panic 路径语义**：state 已提交后 runtime panic 仍留未转发后缀（不重放已成功前缀）——由变异验证守住。
+- **计数口径**：被丢弃的 `staged` effects 不计数（未提交的效果从未成为已提交效果；另立计数会把失败迁移的副作用混进已提交账，且新增公开计数 = 公共 API 扩张）；口径写死进 `reducer_panic_count` 文档。`reducer_panics` 计数与 `ReducerInterrupted` 事件语义未变（无 `Reduced`、action 丢失、+1、panic 照常上浮）。
+- **契约 crate `skeleton` 零改动**：`EffectBuf` 只有 push/pop_front/clear/is_empty（无 len/truncate），无法在单缓冲上做「只丢尾部」⇒ 必须在实现侧切两段。
+- **审计事件文档同步**：`ReducerInterrupted` 原写「panic 前已产效果原地留缓冲，由下一任排空先续转」——该语义已被本次推翻，改为「本次调用已产效果随未提交迁移一并丢弃，更早已提交待转发的效果原样留存」。
+- 测试：`tests/robust_panic_recovery.rs` +204（固定装置 + 4 条验收）；红阶段 `reducer_panic_discards_staged_effects` FAILED（left `[Staged,Own]` vs right `[Own]`）、`reducer_panic_preserves_committed_pending_effects` FAILED；绿后全套 461 passed / 0 failed。变异两则：reducer panic 时整队清空 `pending` ⇒ 红；reducer panic 时仍提交暂存 ⇒ 红。
+
+### Fixed（local 订阅通知改两阶段：不持表借用跑用户回调，2026-11-18；GitHub issue#42）
+- **根因**：`local_notify` 持 TLS `RefCell` 的 `borrow_mut` 遍历并调用户回调 ⇒ 回调内任何再入（跨 store 嵌套通知、callback-time subscribe/unregister）撞 `already borrowed`，被外层 `catch` 误判为「用户回调 panic」⇒ **健康订阅被静默摘除** + 嵌套 dispatch 通知阶段 abort。
+- **修法（两阶段）**：回调句柄改 `Rc<RefCell<Box<dyn LocalNotify>>>`；阶段一在表借用下只**快照句柄**（登记序即通知序）并立即释放借用；阶段二不持表借用逐个调回调；延迟增删在末段统一应用。
+- **契约点（本次拍定）**：回调期间新注册的本轮不可见、下一轮可见；本轮开始时在册、被调到之前已注销的跳过（Drop = 退订即时生效，不复活死订阅）；真用户 panic 照旧 fail-closed 摘除。
+- `catch_unwind` 只包用户回调调用，registry 访问不在其内 ⇒ 框架 `RefCell` 冲突不再被计为用户 panic。
+- 测试 5 条全绿（跨 store 嵌套 dispatch 不被误判 / callback-time subscribe 下一轮可见 / callback-time unsubscribe 跳过本轮 / drop 自身票据 / 真实用户 panic 仍 fail-closed）。变异验证：快照后加回持表借用（模拟旧行为）⇒ 首个测试即 panic `RefCell already mutably borrowed`，证明测试有鉴别力。
+
+### Fixed（`ObjectPool` 的 weight 计量改为入池一次性存槽，出池路径零钩子调用，2026-11-18；GitHub issue#35）
+- **根因**：pop/prune/resize/池 Drop 均「先移出槽再调 `weight_of`」——钩子 panic 发生在移出后、记账前 ⇒ 对象丢 + 字节不回卷 + alive/borrowed/idle 悬挂；既有测试曾把 100B 永久漏记断言为「预期行为」。
+- **修复**：`IdleSlot` 增 `weight: usize`（入池一次性计量，片锁外调用一次）；prune/resize/pop_idle/池 Drop 的释放回卷全部改用**存储权重**，出池路径不再调用户代码。
+- **承重假设退役**：「weight 钩子必须是留存对象的纯函数」不再成立——新契约 = 每次入池对当前状态计量一次，借出期改参数、归还重计量即新值，逐轮配平；片锁毒源随之消失（`PoisonError::into_inner` 保留为防御性 fail-fast）。
+- 修正 `return_to_shard` 语义：钩子 panic 时字节未认领（panic 在 `try_take` 之前）但 borrowed/alive 各悬挂 +1 ⇒ catch 后先 `release(home, true)` 再 `resume_unwind` 原样传播（与既有 reset-panic 路径同款；unwind 归还已在上游分流，不升级为 Drop 期 abort）。`drop_handle`：锁外 `catch_unwind` 包计量，panic ⇒ 回卷 borrowed/alive + 销毁 + 原样传播。
+- 测试：`byte_budget` 18/18（旧 `drop_survives_a_poisoned_shard` 重写为 `release_paths_use_stored_weights_and_never_call_the_hook`，`held == 0` 终点不变）；新增 prune/pop/resize 释放路径 armed-tripwire 测试 + return 路径计数悬挂测试（单片池 `max=1` 钉死：悬挂 ⇒ insert 被拒）；`object_pool` 51/51 回归。变异验证三形态：释放 +1@pop（红）、跳过 release@prune（红 `held 200 ≠ 0`）、释放多调钩子@resize（armed tripwire 红）。
+
+### Fixed（`ThreadPool` spawn 回滚不再留下 stale shrinking token，2026-11-18；GitHub issue#34）
+- **根因**：`resize` 把 in-flight 席位算进 workers 计算缩容差额；spawn 失败回滚只减 workers 不回收 shrinking；worker 退出只看 `shrinking > 0` 不看是否已低于 core ⇒ 确定性交错可把池打到 `workers = 0 < core = 1` 且队列任务无人接。
+- **修复（分册计数）**：`Inner` 新增 `reservations` 另册；`reserve_worker` +1、`create_worker` Ok 兑现 -1、两条 rollback 路径同步 -1；`resize` 的缩容差额/补建缺口按**真实存活** `workers - reservations` 计算。
+- **退出守卫**：worker 退役需 `shrinking > 0` **且** 真实存活 > core（shutdown / resize-to-0 语义不变）。
+- **读数口径统一**：`metrics().workers` 与 `SpawnFailed.workers` 读数改为真实存活（稳态等价，仅创建窗口内读数变小；公开 API 零变化）。
+- 测试：`BlockingFailGate` + 两条确定性交错复现（submitter 线程 / resizer 线程各一）；修复前红（`workers = 0 < core = 1`，`queue_len = 1`），修复后 32/32 绿。变异验证：完整回退两层修复 ⇒ 红；只回退口径层 ⇒ 绿（证明双层各司其职）。
+
+### Added（CI feature 隔离矩阵 + 集成测试/示例 `required-features` 门控，2026-11-18；GitHub issue#37）
+- `ci.yml` 新增 `feature-isolation` job：full 的 14 个子开关各跑 check + test（单 OS——feature 门是 cfg 维度、与平台正交，14×3 违背「small, intentional」）；runtime 面另加 **Tokio-free fail-closed 断言**（`cargo tree -e normal`，tree 失败与检出 tokio 均 exit 1），与蓝图 §13「sync-only consumer 无 Tokio」对齐。
+- **矩阵挖出两个真缺陷**（`cargo check` 探不到——它不编 example/test）：① 31 个集成测试全部无 `[[test]]` 段 ⇒ 隐式吃 default features（import `alloc_site`/`memgov`/`MAIN_*` 等 default-only 符号）⇒ 单开面 `cargo test` 14/14 全红（E0432/E0425）；现逐个补 `[[test]]` + `required-features`。② `compose = []` 声明零依赖，但 `src/compose.rs` 直接 import `skeleton_infra::runtime` ⇒ `--no-default-features --features compose` 编译失败；现 `compose = ["runtime"]`（runtime 零三方依赖，拉入成本为零）。
+- 示例门控：`snapshot_placement` 补 `[[example]]` + `required-features = ["memgov", "runtime"]`（此前自动发现，单开面编译失败）。
+- **覆盖零损失**：`required-features` 取 default 集（runtime+pool，pool 传递含 memgov）的子集 ⇒ default 与 `--all-features` 下 31 个集成测试二进制全部照跑（default run 实测 31/31），单开面则跳过不适用测试而非编译失败。
+
+### Changed（目标架构蓝图状态与实现同步，2026-11-18；GitHub issue#36）
+- §4：`ShutdownReport` 的过时缺口陈述划掉，改为实现实况（六桶 + `timed_out`/`still_running` 采样时点 + 钉住位置）。
+- §5：字节轴承重假设改写为 **stored-weight 模型**（#35 已落地）——weight 入池一次计量存槽、释放路径零钩子调用；「hook 必须是纯函数」对**释放**语义退役（逐轮配平），保留「对入池那一刻的对象须给确定值」；中毒容忍改为**防御性保留**（钩子已不在片锁内跑，毒源消失，但拒绝归还严格更差，故保留）。
+- §11 P0-1 标为 done-then-extended（#26 → #34：`reservations` 另册 + 不低于 core 的退出守卫）；§13 ThreadPool 行补 #34 的另册计数、退出守卫、两条确定性交错测试（修复前 `workers=0<core=1` 且队列有活）与变异验证。
+- 表格结构修复：承重假设段落曾插在表格中间打断 Markdown 渲染，已移至表后。
+
 ### Fixed（`ObjectPool` 析构不回卷 idle 字节额度，2026-11-17；bd udf-frame-m34）
 - 新增 `impl Drop for ObjectPool`：逐片摘下 idle 槽（片锁立即释放）→ 锁外按权重钩子汇总字节 → 循环外一次 `ByteBudget::give_back`。共享 `Arc<ByteBudget>` 场景下，此前丢弃一个池会让它占住的额度**永久不可用**直到进程结束；现在随池析构归还（`available()` 立即恢复）。
 - 未启用字节预算的池在 `Drop` 首行早退（零开销），字段随后照常析构；锁序沿用「池片锁 → 预算叶子锁」单向、锁不嵌套；析构路径**不复用**内部 `lock()` 助手（其 debug 重入防呆会在「钩子体内 drop 另一个池」这种无死锁路径误报 panic）。
