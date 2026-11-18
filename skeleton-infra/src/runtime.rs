@@ -8,7 +8,7 @@
 //!
 //! std-only：`runtime` feature 零三方依赖（cargo tree 证明口径见 crate 文档）。
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -28,6 +28,7 @@ use crate::audit::{AuditEvent, AuditEventKind, AuditSink, AuditTicket};
 mod audit_emit;
 mod local_subs;
 mod notify;
+mod receipt;
 // 蓝图 §9 证据面：排空权独占载体的 Mutex 对照实现（默认构建不编译，见
 // `ExclusiveCell` 与 `tests/unsafe_evidence.rs` 的差分测试）。
 #[cfg(feature = "unsafe-evidence")]
@@ -37,6 +38,7 @@ use audit_emit::{audit_emit, audit_enqueued};
 pub use local_subs::LocalSubscription;
 use local_subs::{local_notify, next_local_sub_id};
 use notify::{NotifySinkSlot, notify_async};
+use receipt::{Failure, Ledger, Outcome, Phase};
 
 /// std Mutex 取锁：中毒 = 持锁方已 panic、状态不可信——按 fail-fast 纪律传播
 /// panic，禁静默吞掉毒锁继续跑。（crate 内共享：testing 域 TestStore 同纪律取锁。）
@@ -58,19 +60,25 @@ fn back_sender<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         Some(inner) => {
             // 与 dispatch 同闸——闭门 sender dispatch 显式 false 并计数；
             // push/夺权/首 pop 同临界区（锁消融，论证同 enqueue/dispatch）。
-            // 同栈判定经 reentrant_origin——排空线程在 run 内回灌计深，
+            // 同栈判定经 admission_context——排空线程在 run 内回灌计深，
             // 他线程异步回灌=外部流量（环防护责任边界见 EffectRuntime::run）。
-            let origin = reentrant_origin(inner.store_id);
-            match enqueue(&inner, action, origin) {
+            let admission = admission_context(inner.store_id, false);
+            let origin = admission.origin;
+            match enqueue(&inner, action, admission) {
                 Enqueue::Rejected => {
                     audit_emit(&inner, AuditEventKind::Rejected);
                     false
                 }
-                Enqueue::Queued => {
+                Enqueue::Full => {
+                    // 容量满（issue#38）：显式拒绝（false）+ 计数留痕，不阻塞。
+                    audit_emit(&inner, AuditEventKind::Rejected);
+                    false
+                }
+                Enqueue::Queued(_) => {
                     audit_enqueued(&inner, origin);
                     true
                 }
-                Enqueue::Draining(first) => {
+                Enqueue::Draining(_, first) => {
                     audit_enqueued(&inner, origin);
                     drain_owned(&inner, first);
                     true
@@ -268,7 +276,25 @@ struct StoreInner<S, A, Op> {
     reducer: Arc<dyn Reducer<State = S, Action = A, Op = Op> + Send + Sync>,
     state: Mutex<Arc<S>>,
     runtime: Mutex<Box<dyn EffectRuntime<A, Op> + Send>>,
-    queue: Mutex<VecDeque<(A, ActionOrigin)>>,
+    queue: Mutex<VecDeque<ActionRecord<A>>>,
+    /// 入队序号计数器（queue 锁内分配，单调递增）：FIFO 序 = 序号序，回执按
+    /// 序号定位失败 action。
+    next_seq: AtomicU64,
+    /// 队列容量上限（issue#38）：等待被 reduce 的 action 数上限；`0` = 不限
+    /// （默认）。正在执行的 action 已出队 → 不计入。容量满 = typed reject
+    /// （[`SyncStore::try_dispatch`] 的 `Full`），绝不阻塞。
+    capacity: AtomicUsize,
+    /// 容量满拒绝计数（fail-visible）：读侧 [`SyncStore::admission_full_count`]。
+    admission_full: AtomicU64,
+    /// 完成账本复用池（issue#40 性能协议：稳态零分配）：空闲账本待取用，
+    /// 取出即复位、归还者唯一（防双重归还）。池容量 = 并发等待者数（有界）。
+    ledger_pool: Mutex<Vec<Arc<Ledger>>>,
+    /// 回灌预算止步的**停放队列**（issue#40）：超预算的 action 脱钩（续接
+    /// 账本）后停放在此，**不留在主队列**——留在主队列会让它顶在队首把外部
+    /// 流量反复顶住（饿死），且每任排空退出时都要重新脱钩（死循环）。
+    /// 停放记录保留序号与载荷（零丢失），等待显式恢复（`flush_deferred`
+    /// 尚未实现——本批只做停放与留痕）。
+    deferred_queue: Mutex<VecDeque<ActionRecord<A>>>,
     /// 订阅集（Arc 包裹：票据 Drop 经共享句柄即时摘表）
     subs: Arc<Mutex<Vec<Weak<SubscriptionSlot<S>>>>>,
     /// 回灌句柄缓存：每 store 构造一次；`sender()` 克隆、排空循环借用。
@@ -390,6 +416,7 @@ struct StoreInner<S, A, Op> {
 /// | 入口 | 闭门后行为 | fail-visible 面 |
 /// |---|---|---|
 /// | [`Self::dispatch`] | 恒 no-op（签名不引入 Err） | 计入 [`Self::rejected_after_close`] |
+/// | [`Self::try_dispatch`] | 返回 [`AdmissionOutcome::Closed`]（显式拒绝、不入队） | 返回值即信号；计入 [`Self::rejected_after_close`] |
 /// | [`ActionSender::dispatch`] | 返回 `false`（显式拒绝，`#[must_use]` 兜底） | 同一计数 |
 /// | [`Self::subscribe`] / [`Self::subscribe_local`] | 照常登记、票据照常注销，但闭门后永无 dispatch 触发——通知静默（已知取舍，见下） | 计入 [`Self::subscriptions_after_close`]；`subscriber_count` 仍可查 |
 /// | [`Self::try_subscribe`] | 返回 `Err(StoreClosed)`——显式拒绝、不登记（推荐停机序主路径） | 返回值即信号；登记未发生，[`Self::subscriptions_after_close`] 不计 |
@@ -465,6 +492,17 @@ impl std::fmt::Display for StoreClosed {
 
 impl std::error::Error for StoreClosed {}
 
+/// 有界准入结果（[`SyncStore::try_dispatch`] 的 typed 面，issue#38）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionOutcome {
+    /// 已准入（action 已入队；完成边界的同步面见 [`skeleton::Store::dispatch`]）。
+    Accepted,
+    /// 队列容量已满——action **未入队**（不部分插入）。过载显式化，绝不阻塞。
+    Full,
+    /// store 已闭门——action **未入队**。
+    Closed,
+}
+
 /// 回灌深度预算（const 64）：单任排空内连续处理的回灌链深度上限。
 /// 有界链（Undo→Replay、表单回写）深度个位数；自指回灌环（reducer 恒 Emit
 /// 自身、解释器经 [`ActionSender::dispatch`] 同栈回灌）属用户程序病理，预算点
@@ -474,7 +512,7 @@ const FEEDBACK_DEPTH_BUDGET: u64 = 64;
 /// 入队来源标签：外部流量 = [`ActionOrigin::External`]（深度清零）；
 /// 同栈回灌重入 = [`ActionOrigin::Feedback`]（携带入队时深度）。
 ///
-/// 「同栈」判定不看调用者身份，只看 [`REENTRANT_DEPTH`] 线程局部：排空线程
+/// 「同栈」判定不看调用者身份，只看排空帧栈（TLS）：排空线程
 /// 处理某 action 期间（store_id 匹配），该线程上发生的一切入队——Emit 回灌、
 /// 解释器 `back.dispatch`、订阅回调重入 dispatch——一律计深（预算按
 /// dispatch 调用栈深度统一计数，不分来源标签，back 通道不再绕预算）；他线程
@@ -487,54 +525,138 @@ enum ActionOrigin {
 }
 
 thread_local! {
-    /// 排空线程的在途回灌深度：键 = store_id，值 = 当前 action 处理期间
-    /// 产生的回灌应计的深度（= 该 action 深度 + 1）。由 [`ReentrantDepthGuard`]
-    /// 置位/恢复，嵌套排空（回调内 dispatch 另一 store）按栈配对。
-    static REENTRANT_DEPTH: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+    /// 排空帧栈（TLS）：本线程当前正在处理的 action 上下文（store_id、回灌
+    /// 深度、因果账本）。**栈**而非单槽——嵌套排空（A→B→A）时按 store_id
+    /// 自内向外查最近匹配帧：单槽形态会把 A 的同栈回灌误判为外部流量（因果
+    /// 父丢失 + 回灌深度被清零，预算失效）。RAII 出栈，panic 展开亦然。
+    static DRAIN_FRAMES: RefCell<Vec<DrainFrame>> = const { RefCell::new(Vec::new()) };
 }
 
-/// 在途回灌深度守卫：进入某 action 处理前置位，迭代末（或 panic 栈展开）恢复
-/// 原值——同线程嵌套排空按栈配对，TLS 不跨 action 泄漏。
-struct ReentrantDepthGuard {
-    prev: Option<(u64, u64)>,
+/// 排空帧：当前 action 的处理上下文。
+struct DrainFrame {
+    /// 所属 store（帧与 store 一一对应）。
+    store_id: u64,
+    /// 当前 action 的回灌深度（其同栈子代深度 = 本值 + 1）。
+    depth: u64,
+    /// 当前 action 所属账本（同栈回灌子代共享此账本 = 因果父）。
+    ledger: Arc<Ledger>,
 }
 
-impl ReentrantDepthGuard {
-    fn enter(store_id: u64, feedback_depth: u64) -> Self {
-        let prev = REENTRANT_DEPTH.with(|cell| cell.replace(Some((store_id, feedback_depth))));
-        Self { prev }
-    }
-}
+/// 排空帧守卫：出栈（panic 展开亦然）——TLS 栈不跨 action 泄漏。
+struct DrainFrameGuard;
 
-impl Drop for ReentrantDepthGuard {
+impl Drop for DrainFrameGuard {
     fn drop(&mut self) {
-        REENTRANT_DEPTH.with(|cell| cell.set(self.prev.take()));
+        DRAIN_FRAMES.with(|cell| {
+            cell.borrow_mut().pop();
+        });
     }
 }
 
-/// 入队来源判定：本线程正在排空同 store → 同栈回灌（计深）；
-/// 否则 → 外部流量（清零）。
-fn reentrant_origin(store_id: u64) -> ActionOrigin {
-    REENTRANT_DEPTH.with(|cell| match cell.get() {
-        Some((id, depth)) if id == store_id => ActionOrigin::Feedback(depth),
-        _ => ActionOrigin::External,
+/// 同栈回灌上下文：本线程正在排空同 store → (当前深度, 因果父账本)；
+/// 否则 → None（外部流量：自开新根账本，无因果父）。
+fn reentrant_context(store_id: u64) -> Option<(u64, Arc<Ledger>)> {
+    DRAIN_FRAMES.with(|cell| {
+        cell.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.store_id == store_id)
+            .map(|frame| (frame.depth, Arc::clone(&frame.ledger)))
     })
 }
 
-/// push 三态结果（锁消融：push/夺权/首 pop 同临界区一次获取）。
+/// 已准入的 action 记录（队列元素）：序号 + 载荷 + 来源 + 账本。
+///
+/// 序号在 queue 锁内分配（入队线性化点）——FIFO 序 = 序号序。
+/// `ledger` 是完成账本：外部根自持新账本；同栈回灌**共享**根账本（因果父）
+/// ——共享而非各持一份，是因果后代屏障（根账本在全部因果后代终局前不发布
+/// 终局）的实现基础。
+struct ActionRecord<A> {
+    /// store 内单调序号。
+    seq: u64,
+    /// action 载荷。
+    action: A,
+    /// 来源标签（外部流量 / 同栈回灌深度）。
+    origin: ActionOrigin,
+    /// 完成账本。
+    ledger: Arc<Ledger>,
+    /// 是否本账本的根（外部根 / 续接根 = true；因果后代 = false）。
+    root: bool,
+    /// 本记录是否有等待者（外部 dispatch = true）：决定账本归还复用池的时机
+    /// ——等待者归还（它先醒），无等待者由排空者结算后归还。
+    waiter: bool,
+}
+
+/// push 四态结果（锁消融：push/夺权/首 pop 同临界区一次获取）。
 enum Enqueue<A> {
     /// 闭门拒绝（已计入 [`SyncStore::rejected_after_close`]）
     Rejected,
-    /// 已入队，排空权归在任排空者（其循环必覆盖本 push，论证见 [`enqueue`]）
-    Queued,
-    /// 已入队且夺得排空权，`Some` 为同临界区内 pop 出的首个 action（带来源标签）
-    Draining(Option<(A, ActionOrigin)>),
+    /// 容量满拒绝（已计入 [`SyncStore::admission_full_count`]；action 未入队）
+    Full,
+    /// 已入队，排空权归在任排空者（其循环必覆盖本 push，论证见 [`enqueue`]）；
+    /// 载荷为完成账本（外部根据此等自己的完成边界）。
+    Queued(Arc<Ledger>),
+    /// 已入队且夺得排空权：账本 + 同临界区内 pop 出的首个记录。
+    Draining(Arc<Ledger>, Option<ActionRecord<A>>),
 }
 
-/// 共享 push 路径（[`SyncStore::dispatch`] 与 [`ActionSender::dispatch`] 同闸同窗）。
-/// 临界区一次获取：push、排空权 swap、首 pop 在同一 queue 锁内完成——
-/// 赢家路径免「push 锁→drain 入口锁」的二次加锁（-1 锁对/动作）。`origin`
-/// 由调用方按 [`reentrant_origin`] 判定传入（dispatch 与 back 通道同一收口）。
+/// 准入上下文：来源标签 + 因果父账本（`None` = 外部根，自开新账本）。
+struct Admission {
+    /// 来源标签。
+    origin: ActionOrigin,
+    /// 因果父账本（同栈回灌共享根账本）；`None` = 外部根。
+    parent: Option<Arc<Ledger>>,
+    /// 是否等待完成边界（外部 dispatch = true；sender / try_dispatch = false）。
+    wait: bool,
+}
+
+/// 准入上下文判定：本线程正在排空同 store → 同栈回灌（共享父账本 + 计深）；
+/// 否则 → 外部根（新账本 + 深度清零）。
+fn admission_context(store_id: u64, wait: bool) -> Admission {
+    match reentrant_context(store_id) {
+        Some((depth, ledger)) => Admission {
+            origin: ActionOrigin::Feedback(depth + 1),
+            parent: Some(ledger),
+            // 同栈回灌永不等待（等待 = 自死锁）；其结果由根账本承担。
+            wait: false,
+        },
+        None => Admission {
+            origin: ActionOrigin::External,
+            parent: None,
+            wait,
+        },
+    }
+}
+
+/// 账本复用池取用（issue#40 性能协议：稳态零分配）：池空则新建；取出即复位
+/// （终局 / 计数 / 失败摘要清零）。锁序 queue → pool（与入队同临界区）。
+fn acquire_ledger<S, A, Op>(inner: &Arc<StoreInner<S, A, Op>>) -> Arc<Ledger> {
+    let mut pool = lock(&inner.ledger_pool);
+    match pool.pop() {
+        Some(ledger) => {
+            ledger.reset();
+            ledger
+        }
+        None => Ledger::new(),
+    }
+}
+
+/// 账本归还复用池：首次归还者胜（`mark_released`）——同一账本只可能进池一次
+/// （双重归还 = 两个使用者共用一个账本 = 状态互毁）。
+///
+/// 归还时机：等待者醒后归还（它持有账本）；无等待者的记录由排空者结算后归还。
+/// 归还后仍可能有排空侧的克隆体在途（它只做引用计数递减，不再触碰账本状态）
+/// ——复用安全。
+fn release_ledger<S, A, Op>(inner: &Arc<StoreInner<S, A, Op>>, ledger: Arc<Ledger>) {
+    if ledger.mark_released() {
+        lock(&inner.ledger_pool).push(ledger);
+    }
+}
+
+/// 共享 push 路径（[`SyncStore::dispatch`] / [`SyncStore::try_dispatch`] 与
+/// [`ActionSender::dispatch`] 同闸同窗）。
+/// 临界区一次获取：容量闸、序号、账本、因果计数、push、排空权 swap、首 pop
+/// 全在 queue 锁内完成——准入的线性化点在此（序 → 计数 → 入队 → 夺权不可分）。
 ///
 /// 交接论证（M1 语义保持）：swap 在 queue 锁内判定——
 /// - 输给在任排空者：其尚未到出口（出口=持锁 pop None 后放旗），本 push 或被其
@@ -542,10 +664,14 @@ enum Enqueue<A> {
 ///   disarm 后的 false，走赢家路径自排空）。零孤儿。
 /// - 赢家 pop_front 取的是队首（可能非本 action）：全局 FIFO 由单队列单排空者
 ///   保证，先入先出序不因合并而变。
+///
+/// 容量闸（issue#38）：容量只约束**外部**准入；同栈回灌不受约束（回灌是已
+/// 接受 action 的内部延续，挡住它 = 排空环自锁）。容量满 = typed reject，
+/// 绝不阻塞（阻塞会与回调重入死锁）。
 fn enqueue<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
     inner: &Arc<StoreInner<S, A, Op>>,
     action: A,
-    origin: ActionOrigin,
+    admission: Admission,
 ) -> Enqueue<A> {
     let mut queue = lock(&inner.queue);
     // 持 queue 锁后复检 closed——close 的 store 与本复检经 queue 锁
@@ -557,13 +683,45 @@ fn enqueue<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'stat
         inner.rejected_after_close.fetch_add(1, Ordering::SeqCst);
         return Enqueue::Rejected;
     }
-    queue.push_back((action, origin));
+    // 容量闸（外部准入）：队列中等待被 reduce 的 action 数达上限即拒（不部分
+    // 插入）。正在执行的 action 已出队 → 不计入（口径见 [`SyncStore::set_capacity`]）。
+    if admission.parent.is_none() {
+        let cap = inner.capacity.load(Ordering::Relaxed);
+        if cap > 0 && queue.len() >= cap {
+            inner.admission_full.fetch_add(1, Ordering::SeqCst);
+            return Enqueue::Full;
+        }
+    }
+    // 序号 + 账本 + 因果计数：同一临界区内完成（入队即线性化点）。
+    let seq = inner.next_seq.fetch_add(1, Ordering::SeqCst);
+    let (ledger, root) = match &admission.parent {
+        Some(parent) => {
+            // 因果后代：共享父账本并累加未终局后代计数（锁序 queue → ledger）。
+            // 计数先于 push：父账本在后代可见前不可能发布终局。
+            parent.add_descendant();
+            (Arc::clone(parent), false)
+        }
+        None => {
+            // 外部根：自持账本（复用池取用——稳态零分配）。
+            (acquire_ledger(inner), true)
+        }
+    };
+    let record = ActionRecord {
+        seq,
+        action,
+        origin: admission.origin,
+        ledger: Arc::clone(&ledger),
+        root,
+        waiter: admission.wait,
+    };
+    queue.push_back(record);
     // AcqRel：RMW 恒见修改序最新值；Acquire 侧同步前任 Release 放旗，Release 侧
     // 发布本任排空权。
     if inner.draining.swap(true, Ordering::AcqRel) {
-        return Enqueue::Queued;
+        return Enqueue::Queued(ledger);
     }
-    Enqueue::Draining(queue.pop_front())
+    let first = queue.pop_front();
+    Enqueue::Draining(ledger, first)
 }
 
 // S: Sync：ActionSender 的回灌闭包跨线程共享（Send+Sync），Weak<StoreInner> 的
@@ -575,10 +733,20 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
     type Action = A;
     type Op = Op;
 
-    /// 唯一写入口；同步排空至 idle（同序 action 序列恒同终态）。
+    /// 唯一写入口；**同步到本 action 的完成边界**（issue#40）。
+    ///
+    /// 完成边界 = 本 action 自身各阶段完成（状态提交 → 效果转发 → 通知段返回）
+    /// **且**其全部因果后代（同栈回灌引发的子动作）终局。并发外部调用者不再
+    /// 只入队即返——返回即代表本 action 已生效（后继 `snapshot()` 可见新状态）。
+    ///
+    /// 例外（同栈重入）：本线程正在排空**同一** store 时（含嵌套排空 A→B→A
+    /// 的 A 帧命中），dispatch 只入队不等待——等待即自死锁；其结果由外层根
+    /// 调用者的账本承担（因果后代屏障）。
+    ///
     /// 闭门后恒 no-op 并计入 [`Self::rejected_after_close`]，签名不变（取舍
     /// 对照 [`ActionSender::dispatch`] 的显式 `false`——见类型文档「闭门后的
-    /// 入口对照」表）。
+    /// 入口对照」表）。容量满（配了 [`Self::set_capacity`]）按过载显式失败
+    /// ——typed 面见 [`Self::try_dispatch`]。
     fn dispatch(&self, action: A) {
         // 闸序（锁消融批论证）：closed 单调 false→true，load Acquire——见
         // [`SyncStore::close`] 的 Release 配对与锁内复检论证。
@@ -593,17 +761,59 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
         }
         #[cfg(test)]
         self.inner.in_flight.fetch_add(1, Ordering::SeqCst);
-        let origin = reentrant_origin(self.inner.store_id);
-        match enqueue(&self.inner, action, origin) {
-            Enqueue::Rejected => audit_emit(&self.inner, AuditEventKind::Rejected),
-            Enqueue::Queued => audit_enqueued(&self.inner, origin), // 在任排空者覆盖（交接论证见 enqueue）
-            Enqueue::Draining(first) => {
-                audit_enqueued(&self.inner, origin);
-                drain_owned(&self.inner, first)
+        // 准入上下文：同栈回灌（共享父账本、不等待）vs 外部根（新账本、等待）。
+        let admission = admission_context(self.inner.store_id, true);
+        let is_root = admission.parent.is_none();
+        let origin = admission.origin;
+        let ledger = match enqueue(&self.inner, action, admission) {
+            Enqueue::Rejected => {
+                audit_emit(&self.inner, AuditEventKind::Rejected);
+                #[cfg(test)]
+                self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+                return;
             }
-        }
+            Enqueue::Full => {
+                // 容量满（issue#38）：typed reject 不阻塞（阻塞会与回调重入死锁）；
+                // legacy dispatch 无失败面 → 过载显式失败（禁静默弃 action）。
+                audit_emit(&self.inner, AuditEventKind::Rejected);
+                #[cfg(test)]
+                self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+                panic!(
+                    "udf-frame: SyncStore dispatch 过载——队列容量已满（typed 面见 SyncStore::try_dispatch）"
+                );
+            }
+            Enqueue::Queued(ledger) => {
+                audit_enqueued(&self.inner, origin); // 在任排空者覆盖（交接论证见 enqueue）
+                ledger
+            }
+            Enqueue::Draining(ledger, first) => {
+                audit_enqueued(&self.inner, origin);
+                drain_owned(&self.inner, first);
+                ledger
+            }
+        };
         #[cfg(test)]
         self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+        // 同步等待本 action 的完成边界（外部根；同栈回灌不等待——自死锁）。
+        if is_root {
+            let outcome = ledger.wait();
+            // 账本归还复用池（等待者持有它——归还时机在此）。
+            release_ledger(&self.inner, ledger);
+            match outcome {
+                Outcome::Completed => {}
+                Outcome::Deferred => {
+                    // 回灌预算脱钩：本次边界以「未完成」收口（不是成功）。
+                    // 留痕读侧 = feedback_budget_exceeded。
+                }
+                Outcome::Failed(failure) => {
+                    // fail-visible：已接受但失败的 action 禁伪装成成功。
+                    panic!(
+                        "udf-frame: SyncStore dispatch 失败——seq={} phase={:?} state_committed={} cause={}",
+                        failure.seq, failure.phase, failure.state_committed, failure.cause
+                    );
+                }
+            }
+        }
     }
 
     /// 拉取式快照。
@@ -940,6 +1150,11 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             state: Mutex::new(Arc::new(state)),
             runtime: Mutex::new(Box::new(fx)),
             queue: Mutex::new(VecDeque::new()),
+            next_seq: AtomicU64::new(0),
+            capacity: AtomicUsize::new(0),
+            admission_full: AtomicU64::new(0),
+            ledger_pool: Mutex::new(Vec::new()),
+            deferred_queue: Mutex::new(VecDeque::new()),
             subs: Arc::new(Mutex::new(Vec::new())),
             back: back_sender(weak),
             effect_buf: cells.effect_buf,
@@ -1120,10 +1335,72 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     }
 
     /// 未处理 action 的队列深（状态可查读侧）。
-    /// 同步排空语义下 dispatch 返回即 idle（恒 0）；非 0 = 重入回灌在途或排空者
-    /// 尚未夺权的瞬态窗。采样即时值（queue 锁内 len）。
+    ///
+    /// 口径（issue#40）：`dispatch` 的同步面是**本 action 的完成边界**，不是
+    /// 全局队列空——返回时本 action 已被 reduce（且其引发的因果后代已终局），
+    /// 但其后被其他生产者准入的 action 可能仍在队（并发生产者的队列深非 0
+    /// 是正常态，不是「未排空」的证据）。采样即时值 = 主队列 + 停放队列
+    /// （回灌预算止步的残留，零丢失留痕）。
     pub fn pending_actions(&self) -> usize {
-        lock(&self.inner.queue).len()
+        // 主队列（等待被 reduce）+ 停放队列（预算止步的残留，零丢失留痕）
+        lock(&self.inner.queue).len() + lock(&self.inner.deferred_queue).len()
+    }
+
+    /// 有界准入（issue#38）：typed 准入判定面。
+    ///
+    /// 返回 [`AdmissionOutcome::Accepted`] = 已入队（可能由在任排空者消费，
+    /// 也可能稍后由后续排空消费）；[`AdmissionOutcome::Full`] = 队列容量已满，
+    /// action **未入队**（不部分插入）；[`AdmissionOutcome::Closed`] = 已闭门。
+    ///
+    /// 本方法**不等待**完成边界（纯准入判定；等待面见 [`Store::dispatch`]——
+    /// 它在返回前保证本 action 到达完成边界）。容量满绝不阻塞：阻塞会与回调
+    /// 重入（reducer / 解释器 / 订阅回调内 dispatch）死锁。
+    pub fn try_dispatch(&self, action: A) -> AdmissionOutcome {
+        if self.is_closed() {
+            self.inner
+                .rejected_after_close
+                .fetch_add(1, Ordering::SeqCst);
+            audit_emit(&self.inner, AuditEventKind::Rejected);
+            return AdmissionOutcome::Closed;
+        }
+        let admission = admission_context(self.inner.store_id, false);
+        let origin = admission.origin;
+        match enqueue(&self.inner, action, admission) {
+            Enqueue::Rejected => {
+                audit_emit(&self.inner, AuditEventKind::Rejected);
+                AdmissionOutcome::Closed
+            }
+            Enqueue::Full => {
+                // 过载显式化：计数 + 审计（不部分插入、不阻塞）。
+                audit_emit(&self.inner, AuditEventKind::Rejected);
+                AdmissionOutcome::Full
+            }
+            Enqueue::Queued(_) => {
+                audit_enqueued(&self.inner, origin);
+                AdmissionOutcome::Accepted
+            }
+            Enqueue::Draining(_, first) => {
+                audit_enqueued(&self.inner, origin);
+                drain_owned(&self.inner, first);
+                AdmissionOutcome::Accepted
+            }
+        }
+    }
+
+    /// 队列容量上限（issue#38）：`cap` = 等待被 reduce 的 action 数上限；
+    /// `0` = 不限（默认）。正在执行的 action 已出队 → **不计入**。
+    ///
+    /// 只约束**外部**准入（dispatch / try_dispatch / sender 的外部流量）；
+    /// 同栈回灌不受约束（回灌是已接受 action 的内部延续，挡住它 = 排空环
+    /// 自锁）。容量满 = typed reject（[`Self::try_dispatch`] 的 `Full`），
+    /// 绝不阻塞。调用于准入开始前（运行期调整与准入竞争 = 尽力而为）。
+    pub fn set_capacity(&self, cap: usize) {
+        self.inner.capacity.store(cap, Ordering::Relaxed);
+    }
+
+    /// 容量满拒绝计数（fail-visible）：读侧。
+    pub fn admission_full_count(&self) -> u64 {
+        self.inner.admission_full.load(Ordering::SeqCst)
     }
 
     /// 订阅回调 panic 摘除的累计次数（成因留痕读侧：`subscriber_count` 下跌
@@ -1348,6 +1625,11 @@ impl<S, A, Op> Drop for SyncStore<S, A, Op> {
             Ok(queue) => queue.len(),
             // 毒锁 = 此前已有 panic 上浮；取内层只读长度，drop 内不二次爆炸
             Err(poisoned) => poisoned.into_inner().len(),
+        }
+        // 停放队列（预算止步的残留）同样留痕——禁静默弃队。
+        + match self.inner.deferred_queue.lock() {
+            Ok(parked) => parked.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
         };
         if discarded > 0 {
             self.inner
@@ -1357,28 +1639,103 @@ impl<S, A, Op> Drop for SyncStore<S, A, Op> {
     }
 }
 
-/// 排空权守卫：Drop 复位 `draining` 旗——reducer/解释器/订阅回调任一
-/// panic 栈展开时旗必复位，杜绝「旗恒 true → dispatch 只入队不执行、零报错」的
-/// 静默变砖。`armed=false`（disarm 后）Drop 不动旗：旗已显式放行。
-/// 序：disarm/Drop 用 Release——旗的消费者只有后续排空者的 AcqRel swap（RMW 恒
-/// 读改写序最新值，无 stale 风险），Release 发布旗变更即足；旗保护的数据交接
-/// 经 queue 锁 happens-before 传导，不依赖旗本身承载同步。
-struct DrainGuard<'a> {
-    flag: &'a AtomicBool,
+/// 排空权守卫：正常出口**持锁放旗**（[`DrainGuard::disarm`]——调用点必持
+/// queue 锁，旗与队列状态的交接在同一临界区）；异常出口（panic 展开）只做
+/// **记账**：结算当前记录与队列残留的完成回执、摘队、放旗。
+///
+/// 展开路径纪律（issue#41）：Drop 内**绝不跑用户代码**（reducer / 解释器 /
+/// 订阅回调 / 审计回调）——展开中二次 panic = 进程 abort。载荷析构在 queue
+/// 锁之外发生（锁内只搬指针）。
+///
+/// 摘队与放旗同一临界区：生产者要么进本批（被结算为失败），要么在放旗之后
+/// 夺下新租约（不搁浅）。
+struct DrainGuard<'a, S, A, Op> {
+    inner: &'a Arc<StoreInner<S, A, Op>>,
+    /// 是否仍持排空权（正常出口 disarm 后为 false → Drop 不动旗）。
     armed: bool,
+    /// 当前在途记录（结算用；动作完成即清空）。
+    current: Option<CurrentMeta>,
+    /// 当前阶段（终局分类：提交前 / 提交后）。
+    phase: Phase,
+    /// 当前记录的状态是否已提交（单调 false→true）。
+    committed: bool,
 }
 
-impl DrainGuard<'_> {
+/// 在途记录元信息（结算回执用；不含 action 载荷——载荷随记录走）。
+struct CurrentMeta {
+    /// 在途记录序号。
+    seq: u64,
+    /// 完成账本。
+    ledger: Arc<Ledger>,
+    /// 是否账本的根。
+    root: bool,
+    /// 本记录是否有等待者（决定账本归还时机）。
+    waiter: bool,
+}
+
+impl<S, A, Op> DrainGuard<'_, S, A, Op> {
+    /// 正常出口放旗（调用点必持 queue 锁——放旗与队列空判定同临界区，
+    /// 晚到的 push 由其排空者自排空）。
     fn disarm(&mut self) {
-        self.flag.store(false, Ordering::Release);
+        self.inner.draining.store(false, Ordering::Release);
         self.armed = false;
     }
 }
 
-impl Drop for DrainGuard<'_> {
+impl<S, A, Op> Drop for DrainGuard<'_, S, A, Op> {
     fn drop(&mut self) {
-        if self.armed {
-            self.flag.store(false, Ordering::Release);
+        if !self.armed {
+            return;
+        }
+        // 展开路径：只做记账（禁跑用户代码、禁在锁内析构载荷）。
+        // 1. 当前在途记录：按最后已知阶段结算失败（状态已提交则如实标注——
+        //    提交后失败 ≠ reducer 失败）。
+        if let Some(meta) = self.current.take() {
+            let failure = Failure {
+                seq: meta.seq,
+                phase: self.phase,
+                state_committed: self.committed,
+                cause: "drain interrupted by panic",
+            };
+            if meta.root {
+                meta.ledger.finish_root(Some(failure));
+            } else {
+                meta.ledger.descendant_done(Some(failure));
+            }
+            // 无等待者的根账本归还复用池（等待者的由等待者归还）。
+            if meta.root && !meta.waiter {
+                release_ledger(self.inner, Arc::clone(&meta.ledger));
+            }
+        }
+        // 2. 队列残留：整批摘下并结算失败（不留在队列里无主，也不重放——
+        //    被中断的 action 可能已有部分外部副作用，重放会重复副作用）。
+        let detached: Vec<ActionRecord<A>> = {
+            let mut queue = match self.inner.queue.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let detached: Vec<ActionRecord<A>> = queue.drain(..).collect();
+            // 摘队与放旗同一临界区：生产者要么进本批（被结算），要么在放旗后
+            // 夺下新租约（不搁浅）。
+            self.inner.draining.store(false, Ordering::Release);
+            detached
+        };
+        // 3. 逐条结算（action 载荷随记录离开临界区即析构——锁外）。
+        for record in detached {
+            let failure = Failure {
+                seq: record.seq,
+                phase: Phase::Queued,
+                state_committed: false,
+                cause: "drain interrupted by panic",
+            };
+            if record.root {
+                record.ledger.finish_root(Some(failure));
+            } else {
+                record.ledger.descendant_done(Some(failure));
+            }
+            if record.root && !record.waiter {
+                release_ledger(self.inner, Arc::clone(&record.ledger));
+            }
         }
     }
 }
@@ -1408,35 +1765,38 @@ fn drain<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
 /// 监视测试与守恒竞速持续咬住）。
 fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
     inner: &Arc<StoreInner<S, A, Op>>,
-    first: Option<(A, ActionOrigin)>,
+    first: Option<ActionRecord<A>>,
 ) {
     let mut guard = DrainGuard {
-        flag: &inner.draining,
+        inner,
         armed: true,
+        current: None,
+        phase: Phase::Queued,
+        committed: false,
     };
     let mut first = first;
     loop {
-        let (action, origin) = match first.take() {
-            Some(pair) => pair,
+        let record = match first.take() {
+            Some(record) => record,
             None => {
                 // let-else 绑定：queue 守卫先于 action 使用释放，Emit 回灌再锁
                 // queue 不会自死锁
                 let mut queue = lock(&inner.queue);
-                let Some(pair) = queue.pop_front() else {
+                let Some(record) = queue.pop_front() else {
                     // 出口交接（M1）：持锁放旗——push 被锁外挡，锁内空即终局空；
                     // queue 守卫随 return 释放，晚到 push 由其排空者自排空
                     guard.disarm();
                     return;
                 };
                 drop(queue);
-                pair
+                record
             }
         };
         // 回灌深度随 action 携带（入队时定深，见 [`ActionOrigin`]）——
         // 外部 action 深度 0，同栈回灌 = 产生它的 action 深度 + 1。自指回灌环
         // 在预算点止步，dispatch 必返回（修复前排空环永不达空，dispatch 永挂；
         // 修复前 back 通道同栈回灌标 External 深度清零，预算永不触发）。
-        let feedback_depth = match origin {
+        let feedback_depth = match record.origin {
             ActionOrigin::External => 0,
             ActionOrigin::Feedback(depth) => depth,
         };
@@ -1445,15 +1805,41 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
             //（零丢失、无半执行态；队尾重排让位外部流量——队首退回会让深度
             // 饱和的残留卡住后续一切 action），本任排空停止——非 panic 非静默
             // no-op。残留链由后续 dispatch 有界重放（每次再计再浮）。
-            lock(&inner.queue).push_back((action, origin));
+            // 预算止步：脱钩（续接账本）+ **停放**到 deferred 队列。
+            // 不留在主队列——留在主队列会让它顶在队首把外部流量反复顶住
+            // （饿死健康流量），且每任排空都要重新脱钩（链停不下来）。
+            // 停放 = 保留序号与载荷（零丢失）+ 留痕，等待显式恢复。
+            let deferred = detach_deferred(record);
+            lock(&inner.deferred_queue).push_back(deferred);
             inner.feedback_exceeded.fetch_add(1, Ordering::SeqCst);
             // 取证时间线的病理终点（R1-2）：预算止步以事件收尾，环结构可重建。
             audit_emit(inner, AuditEventKind::FeedbackBudgetExceeded);
-            return;
+            // 主队列继续排空（外部流量照常推进——停放不吞健康流量）。
+            continue;
         }
         // 本 action 处理期间（reduce/效果转发/订阅回调）本线程的一切入队
         // 一律计深 feedback_depth+1；迭代末守卫恢复原值，panic 栈展开亦然。
-        let _reentrant = ReentrantDepthGuard::enter(inner.store_id, feedback_depth + 1);
+        // 排空帧（TLS 栈）：本 action 处理期间（reduce/效果转发/订阅回调）本线程
+        // 的一切入队 = 同栈回灌（共享本 action 的账本 = 因果父 + 计深 +1）。
+        let _frame = {
+            DRAIN_FRAMES.with(|cell| {
+                cell.borrow_mut().push(DrainFrame {
+                    store_id: inner.store_id,
+                    depth: feedback_depth,
+                    ledger: Arc::clone(&record.ledger),
+                });
+            });
+            DrainFrameGuard
+        };
+        // 当前在途记录登记（排空中断时按此结算回执）。
+        guard.current = Some(CurrentMeta {
+            seq: record.seq,
+            ledger: Arc::clone(&record.ledger),
+            root: record.root,
+            waiter: record.waiter,
+        });
+        guard.phase = Phase::Reducing;
+        guard.committed = false;
         let current = Arc::clone(&lock(&inner.state));
         // 效果缓冲排空权独占（[`ExclusiveCell`]）：take/还两对锁消融——reducer
         // 期间不持任何锁的契约不变：无锁可毒、reducer panic 时栈展开零残留，
@@ -1479,7 +1865,9 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
             // 暂存区入口清零：每次 reducer 调用独享（跨调用不串味）。
             bufs.staged.clear();
             match catch_unwind(AssertUnwindSafe(|| {
-                inner.reducer.reduce(&current, action, &mut bufs.staged)
+                inner
+                    .reducer
+                    .reduce(&current, record.action, &mut bufs.staged)
             })) {
                 Ok(next) => {
                     // 提交点（issue#44）：reducer 正常返回 ⇒ 本次调用的暂存输出
@@ -1536,7 +1924,12 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
             !cache.slots.is_empty()
         });
         // CoW 快照落位（快照分配税消除；析构在锁外——契约细节见 helper 文档）。
-        place_snapshot(inner, next_val);
+        // 退役快照交还调用方：阶段先推进到「状态已提交」，再析构旧值——旧值
+        // 析构 panic = 提交后失败（不是 reducer 失败）。
+        let retired = place_snapshot(inner, next_val);
+        guard.phase = Phase::StateCommitted;
+        guard.committed = true;
+        drop(retired);
         // 通知句柄：订阅态在落位后补一次 state 锁克隆新快照（回调锁外借用）；
         // 句柄随迭代末消亡，稳态计数回落 1，下一 action 的 make_mut 仍原地命中。
         let notified_next = if has_subscribers {
@@ -1545,12 +1938,15 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
             None
         };
         // 转发环（禁吞语义见 helper 文档）：Emit 回灌入队、Run/Cancel 交解释器。
-        inner
-            .effect_buf
-            .with_mut(|bufs| forward_effects(inner, &mut bufs.pending, feedback_depth));
+        guard.phase = Phase::ForwardingEffects;
+        inner.effect_buf.with_mut(|bufs| {
+            forward_effects(inner, &mut bufs.pending, feedback_depth, &record.ledger)
+        });
+        guard.phase = Phase::EffectsForwarded;
         // 异步投递段（ADR 0008）：排在同步回调之前——否则同步档慢订阅者会把
         // 异步消费者的可见延迟一并拖后。投递只发版本号：O(1)、门控短路
         // （零异步订阅者一次 Acquire load 即返）、锁外调用宿主代码。
+        guard.phase = Phase::Notifying;
         notify_async(inner);
         // 通知段（本地先行、跨线程随后；返回当拍是否有订阅者收到快照）。
         let snapshot_notified = inner
@@ -1561,7 +1957,33 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         if snapshot_notified {
             audit_emit(inner, AuditEventKind::Notified);
         }
+        // 结算本记录：自身阶段完成 → 账本终局判定（根账本在全部因果后代终局
+        // 前不发布终局——因果后代屏障：根调用者的同步边界覆盖其引发的子动作）。
+        if record.root {
+            record.ledger.finish_root(None);
+        } else {
+            record.ledger.descendant_done(None);
+        }
+        guard.current = None;
+        // 无等待者的根账本在此归还复用池（等待者的账本由等待者归还）。
+        if record.root && !record.waiter {
+            release_ledger(inner, Arc::clone(&record.ledger));
+        }
     }
+}
+
+/// 回灌预算止步的脱钩续接（issue#40）：把被脱钩的记录迁到**新**账本（续接
+/// 账本），原账本记「未完成」（终局 `Deferred`）并减后代计数——原账本的终局
+/// 一经发布不可变，续接记录的后续结果不得改写它。
+///
+/// 续接记录保留序号、载荷与 FIFO 位（队尾重排让位外部流量）。
+fn detach_deferred<A: Send + 'static>(mut record: ActionRecord<A>) -> ActionRecord<A> {
+    let origin_ledger = Arc::clone(&record.ledger);
+    let continuation = Ledger::new();
+    origin_ledger.detach_deferred(record.root);
+    record.ledger = continuation;
+    record.root = true;
+    record
 }
 
 /// CoW 快照落位（快照分配税消除）：稳态
@@ -1574,12 +1996,14 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
 fn place_snapshot<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
     inner: &Arc<StoreInner<S, A, Op>>,
     next_val: S,
-) {
+) -> S {
     let old_snapshot = {
         let mut slot = lock(&inner.state);
         std::mem::replace(Arc::make_mut(&mut slot), next_val)
     };
-    drop(old_snapshot);
+    // 退役快照交还调用方：析构在锁外，且**在调用方推进阶段之后**——旧值析构
+    // panic 是「状态已提交」之后的事，不得记成 reducer 失败。
+    old_snapshot
 }
 
 /// 转发环：逐条借出转发（只转发**已提交**的效果——暂存区在提交点已并入队列）。
@@ -1594,12 +2018,27 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
     inner: &Arc<StoreInner<S, A, Op>>,
     buf: &mut EffectBuf<A, Op>,
     feedback_depth: u64,
+    parent: &Arc<Ledger>,
 ) {
     while let Some(effect) = buf.pop_front() {
         match effect {
             Effect::Emit(a) => {
                 inner.feedback_emitted.fetch_add(1, Ordering::Relaxed);
-                lock(&inner.queue).push_back((a, ActionOrigin::Feedback(feedback_depth + 1)));
+                // 回灌入队 = 因果后代：共享父账本 + 未终局后代计数 +1（计数与入队
+                // 同一 queue 临界区，锁序 queue → ledger）——父账本在后代可见前
+                // 不可能发布终局。
+                let seq = inner.next_seq.fetch_add(1, Ordering::SeqCst);
+                let mut queue = lock(&inner.queue);
+                parent.add_descendant();
+                queue.push_back(ActionRecord {
+                    seq,
+                    action: a,
+                    origin: ActionOrigin::Feedback(feedback_depth + 1),
+                    ledger: Arc::clone(parent),
+                    root: false,
+                    waiter: false,
+                });
+                drop(queue);
                 // 回灌入队与外部入队同一事件节点（深度链 = 环结构重建键）
                 audit_emit(
                     inner,
@@ -1907,7 +2346,17 @@ mod tests {
         let store = SyncStore::new(TickFeature, NopRuntime);
         for _ in 0..3 {
             // 白盒注入：直推队列须带来源标签（回灌深度预算的入队纪律）
-            lock(&store.inner.queue).push_back((Tick::Tick, ActionOrigin::External));
+            // 白盒注入：直推队列须带完整记录（序号 + 账本 + 来源标签——回灌深度
+            // 预算与回执结算的入队纪律）
+            let ledger = Ledger::new();
+            lock(&store.inner.queue).push_back(ActionRecord {
+                seq: store.inner.next_seq.fetch_add(1, Ordering::SeqCst),
+                action: Tick::Tick,
+                origin: ActionOrigin::External,
+                ledger,
+                root: true,
+                waiter: false,
+            });
         }
         store.close();
         assert_eq!(*store.snapshot(), 3, "存量 action 必须被 close 排空执行");

@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+### Added（SyncStore dispatch 回执 + drain 恢复交接 + 有界准入，2026-11-18；GitHub issue#40 / #41 / #38）
+- **#40 并发 dispatch 回执**：新增公共面 `try_dispatch` / `set_capacity` / `admission_full_count` / `AdmissionOutcome`。**完成边界 = per-action**（状态提交 → 效果转发 → 通知返回）+ 全部因果后代终局——外部并发 dispatch 在**自己的** action 到达该边界前不返回；同线程/同 store 重入保持「仅入队不返回」以免自死锁。
+- **#41 drain owner 异常恢复交接**：`DrainGuard` 的 `Drop` **只记账**（当前记录按阶段失败 + 残留整批失败 + 摘队放旗同临界区），**零用户代码**——guard 的 drop 绝不跑用户代码，杜绝「unwind 中二次 panic ⇒ abort」。批次中断为 fail-visible：不重放、原 panic 照常上浮、等待者**恰好结算一次**。排空权判定由单槽改为 **TLS 帧栈**（修 A→B→A 同栈误判）。
+- **#38 有界准入**：容量 = **等待被 reduce 的 action 数**（执行中不计入），只约束外部准入，同栈回灌豁免；满时 **typed reject 不阻塞**（阻塞会与回调重入死锁），legacy `dispatch` 显式 panic。超反馈预算的动作**停放 deferred 队列**（零丢失留痕，外部流量不被饿死）。
+- **口径变更（相对 issue#44）**：反馈预算止步由「后续 dispatch 重放」改为「停放」——残留不再自动再执行，但**可查、可计数**。
+- **行为变更**：legacy `dispatch` 对**并发外部调用者会阻塞**（issue#40 拍板）。已知残余风险：若宿主在 drain 回调里 spawn 工作线程并 join、且该线程回调 store，会形成跨线程互等（本批未加防护）。
+- 机制：新增 `runtime/receipt.rs`（完成账本 `Ledger` + 阶段/失败分类），账本走复用池且**归还者唯一**（首发者胜）。
+- 测试：新增 `tests/dispatch_receipts.rs`（7 用例）与 `tests/bounded_admission.rs`（4 用例）；`memgov` 三个零分配硬锚照跑通过。
+- 变异三则：跳过 `ledger.wait()` ⇒ 红；中断批次误报成功 ⇒ 红；容量判定 off-by-one ⇒ 红（`left: Accepted, right: Full`）。
+- 未做（明示）：`close_and_wait()`、显式反馈纪元恢复（`flush_deferred` / `resume_deferred`）、`ActionSender::try_dispatch_with_receipt`；因果屏障只覆盖有等待者的根（无等待者的根不分配账本）。
+- PM 亲验：仓库级四门（test `--all-features` 串行 / clippy `-D warnings` / fmt `--check` / rustdoc `-D warnings`）全 exit 0。
+
 ### Changed（fx 三资源维度分离 + 准入上界 typed 化，2026-11-18；GitHub issue#39）
 - **破坏性**：`skeleton_infra::fx::expect_idle`（自由函数）**已删除**，拆为 `FxScope::expect_body_idle`（任务体结束口径）与 `FxScope::expect_fully_reaped_idle`（跟踪集合已完全收割，更强）；crate 根重导出同步移除，调用点全量迁移（`fx.rs` 13 处 / `testing.rs` 6 处 / `examples/end_to_end.rs` 2 处），**无 shim、无旧别名**。`docs/reference.md` 与 `docs/tutorials/thirty-min.md` 的 6 处引用同步更正。
 - 新增 `AdmissionError{Closed, PendingFull, TrackedFull}`（typed 过载/闸关）与 `FxCounts{active, waiting, completed_unreaped, rejected}`；新增 `FxScope::{with_max_pending, with_max_tracked, try_spawn_tracked, counts, expect_body_idle, expect_fully_reaped_idle}`。
