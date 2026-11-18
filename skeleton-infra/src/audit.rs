@@ -57,8 +57,10 @@ pub enum AuditEventKind {
     /// reduce 完成（状态迁移已产出，效果在缓冲）。
     Reduced,
     /// reduce 执行中断（reducer panic）：状态迁移未完成，本 action 已出队、
-    /// 随栈展开丢失（不回队——出队即离队是排空环的所有权契约）；panic 前已产
-    /// 效果原地留缓冲，由下一任排空先续转。panic 本体照常传播出 dispatch
+    /// 随栈展开丢失（不回队——出队即离队是排空环的所有权契约）；**本次调用
+    /// 已产效果随未提交迁移一并丢弃（不执行、不转发）**，而更早已提交待转发
+    /// 的效果原样留存、由后续排空续转（issue#44 的事务边界：只有已提交的
+    /// 效果才会被执行）。panic 本体照常传播出 dispatch
     /// （fail-visible 传播语义不变），计数读侧
     /// [`crate::runtime::SyncStore::reducer_panic_count`]。
     ReducerInterrupted,
