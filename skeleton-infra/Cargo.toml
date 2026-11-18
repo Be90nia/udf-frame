@@ -61,8 +61,12 @@ tracing = ["runtime", "dep:tracing", "dep:tracing-subscriber"]
 # 不开——埋点宏展开为空、tracing 依赖不进树（cargo tree 零 tracing 证明）；
 # tracingx/logx 桥不受本 feature 影响（观测栈仍由宿主自选）。
 log-embed = ["dep:tracing"]
-# compose：父子分片组合器（combine!/combine；宏已落地）。只需契约词汇。
-compose = []
+# compose：父子分片组合器（combine!/combine；宏已落地）。**依赖 runtime**——
+# 组合器落在 runtime 域内（compose.rs 直接引用 runtime 契约），故单开 compose 即
+# 拉入 runtime；runtime 本身零三方依赖 ⇒ 拉入成本为零。此前 compose=[] 单开面
+# 编译失败（compose.rs 内 unresolved import `skeleton_infra::runtime`），
+# 由 feature 隔离矩阵挖出（issue#37）。
+compose = ["runtime"]
 # config-json：配置文件分层读写面（拍板 2026-10-17 配置读写一等公民，报告
 # 配置文件面（本地留存，未入库））。serde_json 为统一值模型（journal 先例
 # optional 形态）；常驻核心保持零依赖格式盲（ConfigPort 契约不动）。
@@ -284,3 +288,101 @@ required-features = ["view", "runtime"]
 # M3 命名工件生成器（纯 std 零 feature 门——CI 一致性断言不带 --features 跑）。
 [[example]]
 name = "view_constants_gen"
+
+[[example]]
+name = "snapshot_placement"
+required-features = ["memgov", "runtime"]
+
+[[test]]
+name = "alloc_site"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "api_polish"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "async_notify"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "byte_budget"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "combine_teststore"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "config"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "conformance_lifecycle"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "counter_concurrency"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "drain_regressions"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "driver_port"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "effect_two_tier"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "fx_lifecycle"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "journal_port"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "local_subs_reentrancy"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "log_embed"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "log_file"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "logx_channels"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "memgov"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "memory_pool"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "minimal_loop"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "object_pool"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "pool_base"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "pooled_thread_pool"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "receive_panic_location"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "robust_panic_recovery"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "shutdown"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "size_class_pool"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "store_behavior_gaps"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "thread_pool"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "unsafe_evidence"
+required-features = ["runtime", "pool"]
+[[test]]
+name = "view_bridge_test"
+required-features = ["runtime", "pool"]

@@ -3,6 +3,7 @@
 #
 # Rust 版本 pin 1.96.0 对齐开发/验证基线，防工具链漂移；三 OS 矩阵。
 # 自持 workspace：members = udf-skeleton + udf-std-ext + udf-skeleton-infra。
+# 另含 feature 隔离矩阵 job（issue#37）：`full` 全部子开关各跑最小面 check+test。
 name: udf-frame CI
 
 on:
@@ -141,3 +142,56 @@ jobs:
 
       - name: Clippy infra (config-toml only)
         run: cargo clippy -p udf-skeleton-infra --no-default-features --features config-toml -- -D warnings
+
+  # ── feature 隔离矩阵闸（issue#37）────────────────────────────────
+  # --all-features 只证组合面：cfg 门挂错 feature、example/测试漏
+  # required-features 这类「借别的 feature 才编过」的耦合，单开面才爆
+  # （cargo tree 不编译、cargo check 不编 example/test，皆探不到）。
+  # 矩阵成员 = Cargo.toml `full` 的全部 14 个子开关，一一对应不挑选；
+  # unsafe-evidence 不在 full（证据专用开关，非消费能力）不入矩阵，其
+  # 行为由 --all-features 步覆盖。每面最小口径 check+test：
+  # --no-default-features --features <X>。
+  # runtime 面显式断言 Tokio-free（蓝图 §13 行 1「Sync-only consumer has
+  # no Tokio in its dependency tree」）：与上方 sync-only 步同款
+  # cargo tree -e normal + fail-closed 口径（tree 失败与检出 tokio 都
+  # exit 1）；该步置于本矩阵使 runtime 面闸门自包含，上方 sync-only 步
+  # 的三 OS 版本仍保留（平台维度照旧全覆盖）。
+  # 单 OS（ubuntu-latest）：feature 门是 cfg(feature) 维度，与平台正交；
+  # 平台维度由上方 3-OS 集成 job 承担（14×3 组合爆炸违背 issue 的
+  # "small, intentional" 约束）。
+  # 工具链经 dtolnay/rust-toolchain@1.96.0 安装，裸 cargo 即 1.96.0
+  # （本机 stable ICE 需 +1.96.0 前缀属本机适配，CI 无此问题）。
+  feature-isolation:
+    name: feature isolation (${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [runtime, pool, memgov, tokio, journal, testing, log-fs, log, tracing, log-embed, compose, view, config-json, config-toml]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.96.0 (pinned)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Check (no-default-features --features ${{ matrix.feature }})
+        run: cargo check -p udf-skeleton-infra --no-default-features --features ${{ matrix.feature }}
+
+      - name: Test (no-default-features --features ${{ matrix.feature }})
+        run: cargo test -p udf-skeleton-infra --no-default-features --features ${{ matrix.feature }}
+
+      - name: Runtime face is Tokio-free (normal dep graph)
+        if: matrix.feature == 'runtime'
+        shell: bash
+        run: |
+          if ! tree="$(cargo tree -p udf-skeleton-infra --no-default-features --features runtime -e normal 2>&1)"; then
+            echo "::error::cargo tree failed for: runtime face"
+            printf '%s\n' "$tree"
+            exit 1
+          fi
+          if printf '%s\n' "$tree" | grep -q tokio; then
+            echo "::error::runtime face dependency graph contains tokio:"
+            printf '%s\n' "$tree" | grep tokio
+            exit 1
+          fi
+          echo "ok: runtime face normal dep graph is tokio-free"
