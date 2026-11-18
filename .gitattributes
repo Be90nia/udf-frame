@@ -1,0 +1,15 @@
+# 仓库内文本一律 LF（Windows 开发 + 提交工具绕过 git clean filter 的场景下，
+# CRLF 会被原样写进仓库，污染行尾 diff）。eol=lf 同时固定工作树检出为 LF，
+# 使工作树与索引口径一致，不再出现「仅因行尾而 dirty」。
+* text=auto eol=lf
+
+# 二进制不参与任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.wasm binary
