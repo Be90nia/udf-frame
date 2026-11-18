@@ -17,6 +17,7 @@ use skeleton_infra::pool::{
     AbortPolicy, CallerRunsPolicy, DiscardOldestPolicy, DiscardPolicy, PoolHandle, RejectCause,
     RejectPolicy, SpawnGate, Task, ThreadPool, ThreadPoolTuning, ThreadSpawnError,
 };
+use std::sync::mpsc;
 
 /// 有界等待 + 现场诊断：超时 panic 并打印当时的快照（直接看出卡在什么状态）。
 ///
@@ -880,6 +881,220 @@ fn worker_count_matches_live_workers_after_spawn_failures() {
         "计数 = 实际成功创建的 worker 数（禁幻影）"
     );
     assert_eq!(m.spawn_failures, 1);
+    pool.shutdown();
+    join_bounded(&pool, "线程池停机排空");
+}
+// ── issue#34（bd udf-frame-5zv）：spawn 回滚残留 stale shrinking token 把
+//    core worker 退役 ─────────────────────────────────────────────────────
+//
+// 根因：席位预约发布进 `workers` 口径，并发 resize 的缩容差额按 `workers`
+// 计算会把「尚未创建成功的在途席位」误当可退役 worker 发令牌；spawn 失败
+// 回滚席位后令牌不回收，唯一的 real worker 完成任务即认领退出 → workers
+// 跌破 core、队列任务无人接。修复面：真实存活与在途席位分册 + 缩容差额只
+// 按真实存活计 + 退出守卫（真实存活不得跌破 core）。
+
+/// 阻塞闸（issue#34 复现专用）：`check_spawn` 先通知「已入闸」（此刻席位已
+/// 预约发布），再等测试放行，然后注入创建失败——给并发 resize 留出确定的
+/// 交错窗口（修复前 shrinking 恰在此窗口内误发）。构造期保活层创建（id=0）
+/// 直接放行，否则池构造本身就死锁在闸内。
+struct BlockingFailGate {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl SpawnGate for BlockingFailGate {
+    fn check_spawn(&self, worker_id: u64) -> Result<(), ThreadSpawnError> {
+        if worker_id == 0 {
+            // 构造期保活层创建：放行（本闸只拦测试编排触发的扩容/补建）。
+            return Ok(());
+        }
+        self.entered
+            .send(())
+            .expect("测试线程存活（recv 有界兜底）");
+        self.release
+            .lock()
+            .unwrap()
+            .recv()
+            .expect("测试线程放行信号");
+        Err(ThreadSpawnError::from(io::Error::other(
+            "injected worker spawn failure (issue#34)",
+        )))
+    }
+}
+
+/// issue#34 主交错（rollback_spawn 路径）：占忙 + 队列满 → 提交触发预约第 2
+/// 席位 → 闸内悬停 → 并发 resize（原参数）→ 放行闸门 spawn 失败 → 席位回滚
+/// 后 stale 令牌不得退役唯一的 real worker；队列任务必须被继续完成。
+#[test]
+fn spawn_rollback_must_not_retire_core_workers_via_stale_shrink_token() {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let gate = BlockingFailGate {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    };
+    let pool = Arc::new(
+        match ThreadPool::<BlockingFailGate>::try_with_gate(
+            tuning(1, 2, 1),
+            Arc::new(AbortPolicy),
+            gate,
+        ) {
+            Ok(p) => p,
+            Err(e) => panic!("首 worker 创建应成功: {e}"),
+        },
+    );
+
+    // ① 唯一 real worker 占忙；② 队列填满（cap=1）。
+    let (busy_gate, release_busy) = Gate::new();
+    pool.execute(busy_gate.blocker()).unwrap();
+    wait_until_diag(
+        "worker busy",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 1,
+        || format!("metrics={:?}", pool.metrics()),
+    );
+    pool.execute(|| {}).unwrap();
+    assert_eq!(pool.metrics().queue_len, 1, "前置：队列满");
+
+    // ③ 独立线程提交：队列满 + workers(1) < max(2) → 预约第 2 席位 → 卡闸。
+    let submitter = {
+        let pool = Arc::clone(&pool);
+        std::thread::spawn(move || pool.execute(|| {}))
+    };
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("spawn 触发提交未进入闸门（席位预约未发布）");
+
+    // ④ 并发 resize（原参数）：修复前 workers 口径含在途席位 → shrinking 误发 1。
+    pool.resize(tuning(1, 2, 1)).unwrap();
+
+    // ⑤ 放行闸门 → 注入失败 → rollback_spawn 撤销席位。
+    release_tx.send(()).expect("gate 线程存活");
+    let submitted = submitter.join().unwrap().unwrap_err();
+    assert!(
+        matches!(submitted.cause(), RejectCause::SpawnFailed(_)),
+        "spawn 失败必须按 typed 成因退还任务"
+    );
+
+    // ⑥ 原 worker 完成当前任务（修复前此处认领 stale 令牌退出）。
+    release_busy();
+    wait_until_diag(
+        "worker 处理完当前任务",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 0,
+        || format!("metrics={:?}", pool.metrics()),
+    );
+
+    // ⑦ 断言：workers 不得跌破 core；队列任务必须被做完（不只数 worker）。
+    let m = pool.metrics();
+    assert!(
+        m.workers >= m.core,
+        "issue#34: stale shrinking token 把 core worker 退役了 \
+         (workers={} < core={}; queue_len={}; completed={})",
+        m.workers,
+        m.core,
+        m.queue_len,
+        m.completed
+    );
+    wait_until_diag(
+        "队列任务被继续执行",
+        Duration::from_secs(5),
+        || pool.metrics().completed >= 2,
+        || format!("metrics={:?}", pool.metrics()),
+    );
+    assert_eq!(pool.metrics().queue_len, 0, "队列任务不得滞留");
+
+    pool.shutdown();
+    join_bounded(&pool, "线程池停机排空");
+}
+
+/// issue#34 第二交错面（rollback_reservations 路径）：resize 补建 2 席在途时
+/// 并发收缩——修复前缩容差额按含席位的 workers 口径误发 2 枚令牌；补建首个
+/// 失败走 rollback_spawn + rollback_reservations 后令牌仍残留，同样退役
+/// real worker。
+#[test]
+fn resize_rollback_must_not_retire_core_workers_via_stale_shrink_token() {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let gate = BlockingFailGate {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    };
+    let pool = Arc::new(
+        match ThreadPool::<BlockingFailGate>::try_with_gate(
+            tuning(1, 4, 4),
+            Arc::new(AbortPolicy),
+            gate,
+        ) {
+            Ok(p) => p,
+            Err(e) => panic!("首 worker 创建应成功: {e}"),
+        },
+    );
+
+    // ① worker 占忙 + 队列放一个任务（断言「工作真的被做了」的探针）。
+    let (busy_gate, release_busy) = Gate::new();
+    pool.execute(busy_gate.blocker()).unwrap();
+    wait_until_diag(
+        "worker busy",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 1,
+        || format!("metrics={:?}", pool.metrics()),
+    );
+    pool.execute(|| {}).unwrap();
+
+    // ② 补建 2 席（deficit=2）：首个创建卡在闸内（已预约，未建成）。
+    let resizer = {
+        let pool = Arc::clone(&pool);
+        std::thread::spawn(move || pool.resize(tuning(3, 4, 4)))
+    };
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("补建提交未进入闸门（席位预约未发布）");
+
+    // ③ 并发收缩 resize(core=1)：修复前 shrinking = workers(3) - 1 = 2（stale）。
+    pool.resize(tuning(1, 4, 4)).unwrap();
+
+    // ④ 放行 → create#1 失败 → rollback_spawn + rollback_reservations(1)。
+    release_tx.send(()).expect("gate 线程存活");
+    assert_eq!(
+        resizer.join().unwrap(),
+        Err(PoolResizeError::SpawnFailed {
+            kind: io::ErrorKind::Other,
+            target_core: 3,
+            workers: 1,
+        }),
+        "补建失败必须 typed 报错（部分生效状态自带）"
+    );
+
+    // ⑤ 原 worker 完成当前任务。
+    release_busy();
+    wait_until_diag(
+        "worker 处理完当前任务",
+        Duration::from_secs(5),
+        || pool.metrics().busy == 0,
+        || format!("metrics={:?}", pool.metrics()),
+    );
+
+    // ⑥ 断言同主交错：core 保活 + 队列排空 + 任务被做完。
+    let m = pool.metrics();
+    assert!(
+        m.workers >= m.core,
+        "issue#34(reservations 路径): stale shrinking token 把 core worker 退役了 \
+         (workers={} < core={}; queue_len={}; completed={})",
+        m.workers,
+        m.core,
+        m.queue_len,
+        m.completed
+    );
+    assert_eq!(m.spawn_failures, 1, "创建失败留痕");
+    wait_until_diag(
+        "队列任务被继续执行",
+        Duration::from_secs(5),
+        || pool.metrics().completed >= 2,
+        || format!("metrics={:?}", pool.metrics()),
+    );
+    assert_eq!(pool.metrics().queue_len, 0, "队列任务不得滞留");
+
     pool.shutdown();
     join_bounded(&pool, "线程池停机排空");
 }

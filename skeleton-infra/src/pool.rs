@@ -403,8 +403,9 @@ impl PoolBase {
 // worker 创建失败（§7 Runtime/infrastructure 类）：OS 线程创建失败 = 环境
 // 故障 → **typed 错误**（[`ThreadSpawnError`]），禁 panic、禁静默降级为「少
 // 一个 worker 也能用」。记账发布点 = **席位预留 → 创建失败即回滚席位**：
-// 存活计数恒等于真实存在的 worker（幻影 worker 消除），`join` 的等待条件
-// （workers>0）因此永不指向不存在的 worker（不挂死）。失败注入闸（[`SpawnGate`]）
+// 存活计数恒不指向不存在的 worker（幻影 worker 消除）：真实存活 =
+// `workers - reservations`（缩容差额/退出守卫/公开读数同一口径）；`join`
+// 等待条件含在途席位（不漏等）永不挂死。失败注入闸（[`SpawnGate`]）
 // 是类型参数——生产实例化零大小闸门后单态化消除（生产构建零开销）。
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -648,11 +649,17 @@ struct Inner {
     core: usize,
     max: usize,
     queue_cap: usize,
+    /// 存活 worker + 在途创建席位（保守上界：worker 退出递减不先于计数，禁
+    /// 下溢；真实存活 = `workers - reservations`）。
     workers: usize,
     busy: usize,
     idle: usize,
     /// 待退令牌数（缩容差额）。worker 手上无任务时认领即退；回扩时重算可撤销。
     shrinking: usize,
+    /// `workers` 中尚未兑现为真实线程的预留席位数（issue#34：缩容差额、退出
+    /// 守卫、公开读数只按 `workers - reservations`（真实存活）计——在途席位
+    /// 永不催生 stale 退出令牌）。
+    reservations: usize,
     completed: u64,
     rejected: u64,
     task_panics: u64,
@@ -663,13 +670,16 @@ struct Inner {
     shutdown: bool,
 }
 
-/// 预留一个 worker 席位（**锁内调用**）：计数 +1 并分配 worker id。
+/// 预留一个 worker 席位（**锁内调用**）：`workers` + `reservations` 各 +1
+/// 并分配 worker id。
 ///
 /// 席位先于创建发布——保证 worker 退出时的递减不会先于计数（禁下溢）；创建
-/// 窗口内计数含该席位（保守上界：join 因此不会漏等在途创建）；创建失败由
+/// 窗口内计数含该席位（保守上界：join 因此不会漏等在途创建）；席位同时进
+/// `reservations` 另册（真实存活的减数），创建失败由
 /// [`ThreadPool::rollback_spawn`] 回滚（幻影 worker 消除）。
 fn reserve_worker(g: &mut Inner) -> u64 {
     g.workers += 1;
+    g.reservations += 1;
     let id = g.next_id;
     g.next_id += 1;
     id
@@ -830,6 +840,7 @@ impl<G: SpawnGate> ThreadPool<G> {
                 busy: 0,
                 idle: 0,
                 shrinking: 0,
+                reservations: 0,
                 completed: 0,
                 rejected: 0,
                 task_panics: 0,
@@ -927,7 +938,8 @@ impl<G: SpawnGate> ThreadPool<G> {
     /// 病理面如实降档）。
     ///
     /// 生效语义：扩容补建至新 core（返回即到数）；缩容发退出令牌（差额 worker
-    /// 处理完当前任务即退）；回扩重算待退令牌（撤销未消费的缩容）；queue_cap
+    /// 处理完当前任务即退；差额按真实存活计——在途创建席位不计，issue#34
+    /// stale 令牌防护）；回扩重算待退令牌（撤销未消费的缩容）；queue_cap
     /// 只拦未来入队（既有积压照常排空）。
     ///
     /// **worker 创建失败**（§7 Runtime/infrastructure 类）：扩容补建时 OS 线程
@@ -947,9 +959,12 @@ impl<G: SpawnGate> ThreadPool<G> {
             g.core = t.core;
             g.max = t.max;
             g.queue_cap = t.queue_cap;
-            g.shrinking = g.workers.saturating_sub(t.core);
+            // 缩容差额按真实存活计（workers 剔除在途席位——issue#34：席位
+            // 不是可退役 worker，误发令牌会把 core worker 退役）。
+            let live = g.workers - g.reservations;
+            g.shrinking = live.saturating_sub(t.core);
             shrink_pending = g.shrinking > 0;
-            let deficit = t.core.saturating_sub(g.workers);
+            let deficit = t.core.saturating_sub(live);
             for _ in 0..deficit {
                 spawn_ids.push(reserve_worker(&mut g));
             }
@@ -971,9 +986,13 @@ impl<G: SpawnGate> ThreadPool<G> {
             None => Ok(()),
             Some(error) => {
                 // 部分生效报告：调参已落地但 worker 未建够——错误对象自带生效
-                // 状态（目标 core / 实际存活数），池保持有效（已建 worker 继续
-                // 服务，计数准确）。
-                let workers = lock(&self.shared.inner).workers;
+                // 状态（目标 core / 实际存活数——剔除在途席位，与 metrics/
+                // 缩容差额同一分母），池保持有效（已建 worker 继续服务，计数
+                // 准确）。
+                let workers = {
+                    let g = lock(&self.shared.inner);
+                    g.workers - g.reservations
+                };
                 Err(PoolResizeError::SpawnFailed {
                     kind: error.io_error().kind(),
                     target_core: t.core,
@@ -988,7 +1007,8 @@ impl<G: SpawnGate> ThreadPool<G> {
         let g = lock(&self.shared.inner);
         ThreadPoolMetrics {
             core: g.core,
-            workers: g.workers,
+            // 真实存活口径（剔除在途席位）：与缩容差额/退出守卫同一分母。
+            workers: g.workers - g.reservations,
             busy: g.busy,
             idle: g.idle,
             queue_len: g.queue.len(),
@@ -1071,7 +1091,11 @@ impl<G: SpawnGate> ThreadPool<G> {
                 worker_loop(worker_shared, first);
             });
         match spawned {
-            Ok(_handle) => Ok(()),
+            Ok(_handle) => {
+                // 席位兑现：真实线程已建成，从在途册转出（真实存活自此含它）。
+                lock(&self.shared.inner).reservations -= 1;
+                Ok(())
+            }
             Err(e) => {
                 let mut guard = lock(&slot);
                 let task = guard.take();
@@ -1086,6 +1110,7 @@ impl<G: SpawnGate> ThreadPool<G> {
         {
             let mut g = lock(&self.shared.inner);
             g.workers -= 1;
+            g.reservations -= 1;
             g.spawn_failures += 1;
         }
         // join 在 `retired` 上等 worker 退役：回滚后必须唤醒，否则 join 会
@@ -1102,6 +1127,7 @@ impl<G: SpawnGate> ThreadPool<G> {
         {
             let mut g = lock(&self.shared.inner);
             g.workers -= count;
+            g.reservations -= count;
         }
         self.shared.retired.notify_all();
     }
@@ -1137,14 +1163,17 @@ impl<G: SpawnGate> Drop for ThreadPool<G> {
 }
 
 /// worker 主循环：零自旋（condvar park）；退出令牌优先于取任务（缩容语义 =
-/// 处理完当前任务即退）；first-task 交接先跑再入环。
+/// 处理完当前任务即退；真实存活跌破 core 前禁认领令牌——issue#34）；
+/// first-task 交接先跑再入环。
 fn worker_loop(shared: Arc<Shared>, mut first: Option<Task>) {
     let mut g = lock(&shared.inner);
     loop {
         let next = if let Some(task) = first.take() {
             g.busy += 1;
             Some(task)
-        } else if g.shrinking > 0 {
+        } else if g.shrinking > 0 && g.workers - g.reservations > g.core {
+            // 退出守卫：真实存活不得跌破 core 才认领令牌（issue#34——stale
+            // 令牌禁退役保活层；shutdown 分支不受此限，停机清零是合法终点）。
             g.shrinking -= 1;
             g.workers -= 1;
             shared.retired.notify_all();
