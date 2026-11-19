@@ -83,7 +83,7 @@
 
 **feature**：`runtime`（默认）。**依赖面**：仅 `skeleton` 契约 crate（std-only，域面零三方——crate 树见 [§零依赖口径](#零依赖口径)）。
 
-`SyncStore<S, A, Op = Infallible>` 兑现 `skeleton::Store` 契约：单写者队列 + 同步排空环（dispatch 返回即 idle，同序 action 序列恒同终态）+ CoW 快照广播 + 停机闸 + 回灌深度预算。`Op` 缺省 `Infallible` → `Effect::Run` 不可构造，零效果程序编译期证明无副作用（配 `skeleton::NoFx`）。
+`SyncStore<S, A, Op = Infallible>` 兑现 `skeleton::Store` 契约：单写者队列 + 同步排空环（**dispatch 返回 = 本 action 的完成边界**——状态提交 → 效果转发 → 通知返回，且其全部**因果后代**终局；并发生产者下队列可能仍非空，同序 action 序列恒同终态）+ CoW 快照广播 + 停机闸 + 回灌深度预算 + **有界准入**（issue#38）+ **dispatch 回执**（issue#40）。`Op` 缺省 `Infallible` → `Effect::Run` 不可构造，零效果程序编译期证明无副作用（配 `skeleton::NoFx`）。
 
 ### 类型与签名
 
@@ -120,6 +120,24 @@ where S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
     pub fn subscribe_events(&self, capacity: usize,
         on_event: impl FnMut(&AuditEvent) + Send + 'static) -> AuditTicket;
     pub fn take_events(&self) -> Vec<AuditEvent>;
+
+    // ── issue#38 有界准入 ─────────────────────────────────────────────
+    /// 准入容量上限：**等待被 reduce 的 action 数**（执行中不计入；同栈回灌
+    /// 豁免）。满时 `try_dispatch` typed 拒绝、**不阻塞**（阻塞会与回调重入死锁）。
+    pub fn set_capacity(&self, cap: usize);
+    /// 有界准入判定：`Accepted` / `Full` / `Closed`。
+    pub fn try_dispatch(&self, action: A) -> AdmissionOutcome;
+    /// 因容量上界被拒的累计次数（闸关拒发不计入）。
+    pub fn admission_full_count(&self) -> u64;
+}
+
+/// 有界准入结果（issue#38）：`Accepted` = 已入队；`Full` = 容量满（**未入队**，
+/// 不部分插入）；`Closed` = 已闭门（**未入队**）。**非** `#[non_exhaustive]`
+/// ⇒ 跨 crate 可穷尽 match（漏变体即编译错）。
+pub enum AdmissionOutcome {
+    Accepted,
+    Full,
+    Closed,
 }
 
 // skeleton::Store trait 兑现面：
@@ -498,7 +516,7 @@ impl<T> Drop for Pooled<'_, T> { /* Drop 即还（禁手动还） */ }
 - **`core.borrowed` 含降级借出**：`idle + borrowed <= max` **不成立**——`max` 只约束宇宙部分（idle + 正常借出），降级件在宇宙之外（归还即释放、永不进 idle）；水位线 `borrowed / max` 因此可 > 1.0（形态合法，读数如实不钳位）。
 - **unwind 感知归还**：`Pooled::drop` 首查 `thread::panicking()`——panic 路径析构 ⇒ **不调 reset、不回池**，直接销毁 + `panic_dropped` +1（r2d2 #31 教训：归还不变量已破的对象会污染下一个借出方）。
 - **有界降级**：`acquire()` 无超时参数、结构上不存在等待——池宇宙（idle + 正常借出，硬上界 `max`）已满时**直接构造**（`degraded` +1），该对象**不入宇宙**、归还即释放、永不进 idle；**限额是留存限额，不是对象总数限额**（.NET 官方口径）。
-- **释放三路径**：`idle_cap` 满 ⇒ 归还即丢弃（`dropped_overflow`）；`prune_idle_with_clock(max_idle_age, clock)` 显式老化口（宿主按自己节奏调，**池不起后台线程**；`Instant` 版 `prune_idle` 已弃用）；池 `drop` ⇒ 全部 idle 析构 **+ 其认领的字节额度回卷**（`impl Drop`；共享 `Arc<ByteBudget>` 下不回卷会让额度在池死后永久不可用）。**两条析构期承重假设**：①`weight` 钩子必须是留存对象的**纯函数**——析构按钩子重算重量来归还，非纯钩子会使「归还合计 ≠ 认领合计」，表现为记账下溢 fail-fast 而非静默漂移；②片锁中毒时按 `PoisonError::into_inner` 尽力回卷、不 panic（析构期数据已不可信，「拒绝归还」严格更差；若在 unwind 中 panic 还会 abort 进程）——这是「记账 bug 一律 fail-fast」的唯一刻意例外。
+- **释放三路径**：`idle_cap` 满 ⇒ 归还即丢弃（`dropped_overflow`）；`prune_idle_with_clock(max_idle_age, clock)` 显式老化口（宿主按自己节奏调，**池不起后台线程**；`Instant` 版 `prune_idle` 已弃用）；池 `drop` ⇒ 全部 idle 析构 **+ 其认领的字节额度回卷**（`impl Drop`；共享 `Arc<ByteBudget>` 下不回卷会让额度在池死后永久不可用）。**两条析构期承重假设**：①（**issue#35 起退役**）析构**不调** `weight` 钩子——字节按**入池时的存储权重**（`IdleSlot.weight`）随件回卷；故「钩子必须是留存对象的纯函数」这一假设**已撤销**（钩子只在入池计量时调用一次；钩子 panic 不再让字节永久漏记、计数悬挂）；②片锁中毒时按 `PoisonError::into_inner` 尽力回卷、不 panic（析构期数据已不可信，「拒绝归还」严格更差；若在 unwind 中 panic 还会 abort 进程）——这是「记账 bug 一律 fail-fast」的唯一刻意例外。**另**：由于①，钩子已不在片锁内运行 ⇒ 片锁中毒的**毒源消失**，②保留为**防御性容忍**而非常规路径。
 - **分片与计数**：分片数构造期自适应 `clamp(idle_cap, 1, 8)`（不设旋钮）；每片一把 `Mutex`，`borrowed`/`alive`/`reused` 等**热路径计数下沉进片内**（普通 `usize`、锁内读写，无跨线程原子 RMW），且每片 `#[repr(align(64))]` 独占一条 cache line（相邻片伪共享同样把 8 线程扩展比压在 1 以下）。`max`/`idle_cap` **按片均分**（余数补给前几片，各片之和恰等于配置值 ⇒「总和 ≤ 配置值」硬上界不变；`resize` 后按新配额逐片裁剪）；**配额一律在目标片锁内读**——`resize` 先 `store` 新值再逐片加锁裁剪，于是并发归还的留存裁决要么读到新值、要么其入片被紧随其后的裁剪覆盖（锁外的陈旧快照没有这条收敛路径，缩容并发归还能把 idle 永久顶在新上界之外）；`metrics()` 逐片取锁求和（O(shards)，非热路径）。借用走**线程亲和片**（亲和表按池地址分槽、每 (线程, 池) 领一个片号后固定，首个领号者拿 0 号 ⇒ 单线程行为确定；同线程多池互不覆盖）、归还**优先回 home 片**（借出时的片，LIFO 热件常驻）；home 片 idle 满时**迁入有余量的片**（`alive` 随迁、先迁入再退 home ⇒ 账面守恒不低估；迁片只发生在归还且 home 满这一情形），全池余量为零才丢弃。`degraded` 与 `constructed` 是两个独立计数，不得混账；`constructed` 等**非每借还热路径**计数仍是全局原子（miss 路径打一次，dim4 计时窗内为 0 次）。**并发消费者调参**：`idle_cap` 按片均分 ⇒ `idle_cap = 16` 在 8 片下每片仅 2 槽，而每个线程通常「1 件在飞 + 1 件常驻」即占满本片，导致归还走迁片、借出走扫片（实测 `pop_iters/op` 2.00→14.06、`ret_steps/op` 1.00→4.26，每多一步 = 一次 mutex）。多线程消费者建议 `idle_cap >= 2 × 线程数` 以维持 home 片稳态；这是**调参建议不是正确性要求**（任何合法 `idle_cap` 都保证「总和 ≤ 配置值」硬上界）。
 - **调用方红线**：坏对象禁还池（判定权在调用方——池不知道 `T` 是什么，处置 = `detach` 带走，r2d2 `has_broken` / Commons Pool2 `invalidateObject` 动机）；池化对象应「等重」（reset 负责容量归一，大小悬殊对象混池 = 池毒化 DoS，golang/go#23199、#27735）；`prune_idle_with_clock` 尽力而为，不构成释放失败信号；**weight 钩子体内禁 acquire 同一池**（片锁内计量 = 死锁面；debug 构建 fail-fast 检出，release 零开销仍禁）。**字节配额**：`idle_bytes` 在共享预算池（`with_shared_byte_quota`）下是全局 held 读数、不构成按池归因——按池归因用池私有预算（`with_byte_quota`），本件刻意不引入池侧第二账本。
 - **与 `memgov::PoolGuard` 的关系**：两个**独立守卫类型**（非模式变体）——`Pooled` = 对象所有权移交式借用（`DerefMut` 改参数即复用 / RAII 归还 / `detach` 永久移交），`PoolGuard` = 缓冲借用（`acquire` 超时失败语义）。`Pooled<'p, T>` 借用池、非 `'static`，带不进 `'static` 任务闭包——用 `detach()` 移交后由任务/连接自持。尺寸分档不在本件（通用池单类型）；分档 = 组合层按档多实例，见下文 **`### SizeClassPool`**。

@@ -364,6 +364,12 @@ pub trait EffectRuntime<A, Op> {
     /// 解释执行一条效果。只收 [`Effect::Run`]/[`Effect::Cancel`]（[`Effect::Emit`]
     /// 由 store 直接回灌入队，不经此处）；转发顺序 = reducer 在 [`EffectBuf`]
     /// 的写入顺序。`back` 是回灌句柄：异步实现 spawn 后持它把 Action 重入队列。
+    ///
+    /// **panic 语义（当前事实，待拍板）**：`run` panic ⇒ 该效果**已被取出**（转发前
+    /// 即从缓冲摘走）且**不重放**——框架不保留已取出的效果。GitHub issue#43 的设计
+    /// 评审要求保留「正在转发的那一条」（`retain the current unforwarded item and
+    /// suffix exactly once`），**该语义待维护者拍板**；实现方若依赖重试该效果，
+    /// 须自行保证幂等。
     fn run(&mut self, effect: Effect<A, Op>, back: &ActionSender<A>);
 }
 
@@ -404,7 +410,8 @@ impl<A> ActionSender<A> {
         }
     }
 
-    /// 回灌 Action（入队并同步排空至 idle，与 [`Store::dispatch`] 同语义）。
+    /// 回灌 Action（入队并同步至**本 action 的完成边界**，与 [`Store::dispatch`]
+    /// 同语义；并发生产者下队列可能仍非空，非未排空证据）。
     /// 返回 `false` = store 已丢弃或已 close，action 被显式拒绝（停机静默窗
     /// 收口；闭门拒绝计入实现方的拒绝计数）。
     ///
@@ -525,8 +532,9 @@ pub trait Driver<S, A> {
 ///
 /// # 语义契约（实现必须兑现）
 ///
-/// 1. **同步排空**：`dispatch` 返回 = 队列 idle，效果已转发、Emit 回灌已折叠；
-///    同序 action 序列恒同终态（确定性）。
+/// 1. **同步边界**：`dispatch` 返回 = **本 action 的完成边界**（状态提交 → 效果转发
+///    → 通知返回，且其全部**因果后代**终局）；并发生产者场景下队列可能仍非空
+///    （正常态，**非**未排空证据）；同序 action 序列恒同终态（确定性）。
 /// 2. **快照一致性**：[`Store::snapshot`] 返回值语义 `Arc<State>`；同拍通知
 ///    共享同一 Arc（订阅者与快照持有者永见自洽状态）。
 /// 3. **订阅**：回调在 dispatch 线程同步执行；票据 Drop 即注销；`#[must_use]`
@@ -558,7 +566,8 @@ pub trait Store {
     type Action: Send;
     /// 效果词表（store 携带其解释器的词表；零效果 = [`Infallible`]）
     type Op;
-    /// 数据从哪进（唯一写入口）：同步排空至 idle。
+    /// 数据从哪进（唯一写入口）：同步至**本 action 的完成边界**（口径见类型文档①；
+    /// 并发生产者下队列可能仍非空，非未排空证据）。
     /// 闭门后恒 no-op（取舍论证见类型文档「闭门后的入口对照」）。
     fn dispatch(&self, action: Self::Action);
     /// 谁存储：拉取式值语义快照（快照一致性承诺见类型文档②）。
