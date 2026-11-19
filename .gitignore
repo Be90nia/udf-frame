@@ -1,6 +1,7 @@
 /target
 /target-iso
 target/
+target-*/
 .codebase-memory/
 verify/
 
