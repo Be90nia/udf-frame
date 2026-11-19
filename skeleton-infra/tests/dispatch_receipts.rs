@@ -8,6 +8,7 @@ use skeleton::{
 };
 use skeleton_infra::runtime::SyncStore;
 use std::convert::Infallible;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak, mpsc};
 use std::thread;
@@ -125,6 +126,136 @@ fn external_dispatch_waits_for_own_action_boundary() {
 
     // B 返回后其 action 必已 reduce（状态含 A、B 两次 +1）。
     assert_eq!(*store.snapshot(), 2, "B 返回时 B 的 action 必须已被 reduce");
+}
+
+// ── 因果后代屏障（#40）：外部 dispatch 必须等自己的因果后代终局 ────────────
+
+/// 因果后代场景的 action：
+/// - `Hold`：占住排空权（reducer 内等闸），放行后继续排空；
+/// - `Root`：外部根，reduce 时产出一条 `Emit` 后代；
+/// - `Child`：因果后代，reduce 时 panic（后代失败 ⇒ 根回执必须结算为失败）。
+enum DescendantAct {
+    Hold,
+    Root,
+    Child,
+}
+
+struct Descendant {
+    gate: Arc<Gate>,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Reducer for Descendant {
+    type State = u32;
+    type Action = DescendantAct;
+    type Op = Infallible;
+
+    fn initial(&self) -> u32 {
+        0
+    }
+
+    fn reduce(
+        &self,
+        s: &u32,
+        a: DescendantAct,
+        out: &mut EffectBuf<DescendantAct, Infallible>,
+    ) -> u32 {
+        match a {
+            DescendantAct::Hold => {
+                self.gate.mark_entered();
+                self.gate.wait_release();
+                *s
+            }
+            DescendantAct::Root => {
+                // 派生因果后代：它共享本根的账本 ⇒ 根的完成边界覆盖它。
+                out.push(Effect::Emit(DescendantAct::Child));
+                *s
+            }
+            DescendantAct::Child => {
+                self.events.lock().unwrap().push("child");
+                panic!("descendant reducer detonation (barrier test)");
+            }
+        }
+    }
+}
+
+/// issue#40 因果后代屏障：**外部 dispatch 必须等自己的因果后代终局才返回**。
+///
+/// 构造（跨线程，禁同栈平凡满足）：
+/// - A 线程 `dispatch(Hold)`：夺排空权后在 reducer 内等闸；
+/// - B 线程 `dispatch(Root)`（外部根）：A 持排空权 ⇒ B 只入队 ⇒ B 在账本上等；
+/// - `Root` 的 reducer 产 `Emit(Child)` ⇒ `Child` 是 `Root` 的因果后代
+///   （共享 `Root` 的账本、后代计数 +1）；
+/// - `Child` 的 reducer panic ⇒ 后代失败。
+///
+/// 判据（确定性，禁 sleep 竞速）：后代失败必须结算进**根的**回执 ⇒ B 的 dispatch
+/// 以「dispatch 失败」panic 上浮。若根账本在后代终局前就发布终局（终局谓词
+/// `root_done && outstanding == 0` 被削弱），B 会拿到「成功」回执并正常返回 ⇒ 判红。
+#[test]
+fn external_dispatch_waits_for_causal_descendant_failure() {
+    let gate = Gate::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let store = Arc::new(SyncStore::new(
+        Descendant {
+            gate: Arc::clone(&gate),
+            events: Arc::clone(&events),
+        },
+        NoFx,
+    ));
+
+    // A：夺排空权并在 reducer 内阻塞（B 的入队因此只入队、不排空）。
+    let store_a = Arc::clone(&store);
+    let handle_a = thread::spawn(move || store_a.dispatch(DescendantAct::Hold));
+    gate.wait_entered();
+
+    // B：外部 dispatch（外部根）⇒ 产出一条因果后代。B 的 dispatch 调用结束
+    // （正常返回或异常展开）后立刻记一笔 —— 与后代 reducer 的「终局」记一笔进
+    // 同一日志 ⇒ 「返回序」可断言（屏障：外部 dispatch 的返回必须晚于后代终局）。
+    let store_b = Arc::clone(&store);
+    let events_b = Arc::clone(&events);
+    let handle_b = thread::spawn(move || {
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            store_b.dispatch(DescendantAct::Root);
+        }));
+        events_b.lock().unwrap().push("b-ended");
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
+    });
+
+    // B 的记录确已入队（轮询可观测的队列深；禁 sleep 竞速）——否则 B 可能晚于
+    // A 放行才入队并自己夺排空权 ⇒ 屏障被平凡满足（本用例空转）。
+    wait_pending(&store, 1);
+
+    // 放行 A：A 继续排空 ⇒ 处理 `Root`（派生后代）⇒ 处理 `Child`（后代 reduce panic）。
+    gate.open();
+
+    // B 的回执必须结算为失败：后代失败上浮到根回执（因果后代屏障的可观测面）。
+    let panic_b = handle_b
+        .join()
+        .expect_err("外部 dispatch 必须等因果后代终局，并把后代失败结算进自己的回执（屏障被绕过）");
+    let text_b = panic_text(panic_b);
+    assert!(
+        text_b.contains("dispatch 失败"),
+        "B 必须收到显式失败结算（后代失败上浮）：{text_b}"
+    );
+
+    // A 的排空被后代 reducer 的 panic 打断（原样上浮，禁吞）。
+    let panic_a = handle_a
+        .join()
+        .expect_err("后代 reducer 的 panic 必须照常上浮到排空者");
+    assert!(
+        panic_text(panic_a).contains("descendant reducer detonation"),
+        "A 必须收到后代 reducer 的原始 panic 载荷"
+    );
+
+    // 后代确实被 reduce 过，且**先于** B 的 dispatch 结束抵达终局
+    // （防空转：后代没跑过 ⇒ 本用例无鉴别力；顺序倒置 ⇒ 屏障被绕过）。
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["child", "b-ended"],
+        "因果后代必须先于外部 dispatch 的结束抵达终局（屏障：返回 = 后代终局后）"
+    );
 }
 
 // ── 同栈回灌（重入）：仅入队不等待 ──────────────────────────────────────

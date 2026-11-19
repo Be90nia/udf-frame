@@ -564,6 +564,47 @@ fn release_paths_use_stored_weights_and_never_call_the_hook() {
     assert_eq!(calls.load(Ordering::Relaxed), 2, "池析构不得调 weight 钩子");
 }
 
+/// 池析构路径在 **idle 非空** 时同样不得调用户 weight 钩子（issue#35）。
+///
+/// 与 `release_paths_use_stored_weights_and_never_call_the_hook` 的差别：那条
+/// 先 prune 把 idle 清空**之后**才武装钩子析构 ⇒ 析构路径遍历的是空集合，
+/// 「析构不调钩子」永远为真（假绿：把析构改回调子，该断言仍绿）。本条
+/// **先入池使 idle 非空 → 再武装钩子 → 再析构** ⇒ 析构路径真的遍历 idle 槽位，
+/// 钩子一旦被调即当场 panic（被 `catch_unwind` 抓住判红）。
+///
+/// 字节面：idle 里两件各 100B 认领（held = 200）⇒ 析构必须按**入池存储权重**
+/// 精确回卷 ⇒ held 精确归零、available 复原。armed 钩子在 catch_unwind 之后
+/// 立即撤防：红相 unwind 期间若再触发一次钩子 panic 即二次 panic（abort 面）。
+#[test]
+fn pool_drop_with_nonempty_idle_never_calls_the_weight_hook() {
+    let budget = Arc::new(ByteBudget::new(1024));
+    let armed = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pool = tripwire_pool(16, 16, &budget, &armed, &calls);
+
+    // 两件入 idle：idle 非空 ⇒ 析构路径必遍历槽位（不是空集合）。
+    assert!(pool.insert(vec![0u8; 100]).is_none());
+    assert!(pool.insert(vec![0u8; 100]).is_none());
+    assert_eq!(budget.held(), 200, "入池计量各 100B");
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "入池计量调钩子各一次");
+
+    // 武装后析构：析构若调钩子 ⇒ panic（armed tripwire）。
+    armed.store(true, Ordering::Relaxed);
+    let dropped = catch_unwind(AssertUnwindSafe(|| drop(pool)));
+    armed.store(false, Ordering::Relaxed);
+    assert!(
+        dropped.is_ok(),
+        "池析构（idle 非空）不得调 weight 钩子（armed 触发 = 回归）"
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "池析构不得调 weight 钩子（入池计量之外零调用）"
+    );
+    assert_eq!(budget.held(), 0, "池析构按入池存储权重精确回卷 200B");
+    assert_eq!(budget.available(), 1024, "额度全数归还");
+}
+
 /// 借出回卷（`pop_idle`）用入池存储权重：armed 钩子在借出路径不得被调用
 /// （panic 被 `catch_unwind` 抓住判红，绝不放它穿过测试帧——unwind 中析构仍
 /// 武装的池 = 二次 panic abort 面），`held` 精确回卷单件字节，`idle`/
