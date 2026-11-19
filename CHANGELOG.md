@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### Changed（`EffectBuf` 内部改前向可读环形缓冲--摘队首零搬移，2026-11-19；GitHub issue#43）
+- `EffectBuf` 内部表示 `Vec<Effect>` → `VecDeque<Effect>`：追加在尾（`push_back`）、摘取在头（`pop_front`）⇒ 摘队首**只推进头指针、其余效果原地不动**（旧 `Vec::remove(0)` 每次把尾部整体前移一格 ⇒ 排空 k 条效果共 k(k-1)/2 次元素搬移，O(k²)）。
+- **公共 API 逐字不变**（`push`/`clear`/`is_empty`/`pop_front`）：`effects` 字段私有且仅在 `skeleton` crate 内部被访问（无 `size_of` 布局断言、无跨 crate 直访）⇒ 调用方零改动；容量行为不变（`clear` 仍保容量）、panic 语义不变（未转发效果仍留缓冲）、契约 crate 零依赖纪律未破（`VecDeque` 是 std）。
+- 实测（每拍 k 条效果，同机同口径 1.96.0，同码 dup 臂作噪声锚）：k=1 257→252 ns（无回归）· k=16 789→743 ns · k=64 2.66→2.39 µs · k=256 13.2→8.59 µs（−35%）· k=1024 116.9→33.7 µs（−71%）· k=4096 2.044 ms→134.8 µs（**−93.4%，15.2×**）。**规模律换了**：旧实现 k 涨 4096 倍时耗时涨 7960 倍（超线性），新实现只涨 536 倍。
+- 元素搬移解析式计数（旧 k(k-1)/2 → 新 0）：k=16 120→0 · k=64 2016→0 · k=256 32640→0 · k=1024 523776→0 · k=4096 8386560→0。
+- 分配面无回归：`Vec` 与 `VecDeque` 同为倍增扩容（分配次数 O(log k) 同量级）；探针实测多轮 push-k/pop-k 周期容量稳定、`clear` 保容量两者一致。
+- 测试：红阶段 `effect_buf_pop_front_does_not_relocate_remaining_effects` FAILED（地址差 0x10 = 一个 `Effect` 的大小，证明旧实现每次前移一格）→ 改后转绿；判据取**地址不变**而非计时（计时被布局噪声主导，不可作证据）。新增 `tests/batch_effects_order.rs`（k=1/4/64/1024 的条数与顺序——此前「k 条效果」这一面无覆盖）与 `tests/effect_forward_panic.rs`（中断在第 1/中间/最后一条：成功前缀不重放、未转发后缀按序续转不丢不重）。
+- **语义分歧（待拍板）**：#44 的 `EffectRuntime` panic 路径当前**丢弃**中断项，而 issue#43 的设计评审要求「retain the current unforwarded item and suffix exactly once」（**保留**它）——两者只差「正在转发的那一条」；新测试**不断言**该项去向，只钉无歧义部分，拍板后改一处断言即可。
+
 ### Added（SyncStore dispatch 回执 + drain 恢复交接 + 有界准入，2026-11-18；GitHub issue#40 / #41 / #38）
 - **#40 并发 dispatch 回执**：新增公共面 `try_dispatch` / `set_capacity` / `admission_full_count` / `AdmissionOutcome`。**完成边界 = per-action**（状态提交 → 效果转发 → 通知返回）+ 全部因果后代终局——外部并发 dispatch 在**自己的** action 到达该边界前不返回；同线程/同 store 重入保持「仅入队不返回」以免自死锁。
 - **#41 drain owner 异常恢复交接**：`DrainGuard` 的 `Drop` **只记账**（当前记录按阶段失败 + 残留整批失败 + 摘队放旗同临界区），**零用户代码**——guard 的 drop 绝不跑用户代码，杜绝「unwind 中二次 panic ⇒ abort」。批次中断为 fail-visible：不重放、原 panic 照常上浮、等待者**恰好结算一次**。排空权判定由单槽改为 **TLS 帧栈**（修 A→B→A 同栈误判）。

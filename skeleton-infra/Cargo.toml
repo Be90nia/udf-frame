@@ -303,6 +303,9 @@ required-features = ["runtime", "pool"]
 name = "async_notify"
 required-features = ["runtime", "pool"]
 [[test]]
+name = "batch_effects_order"
+required-features = ["runtime"]
+[[test]]
 name = "byte_budget"
 required-features = ["runtime", "pool"]
 [[test]]
