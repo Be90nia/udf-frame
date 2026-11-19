@@ -136,11 +136,11 @@ fn effect_batch_forward(c: &mut Criterion) {
         for _ in 0..10 {
             store.dispatch(1u64);
         }
-        group.bench_function(&format!("k{k}"), |b| {
+        group.bench_function(format!("k{k}"), |b| {
             b.iter(|| store.dispatch(black_box(1u64)))
         });
         // 同码 dup 臂作噪声锚（byte-budget 臂同款纪律）。
-        group.bench_function(&format!("k{k}_dup"), |b| {
+        group.bench_function(format!("k{k}_dup"), |b| {
             b.iter(|| store.dispatch(black_box(1u64)))
         });
     }
