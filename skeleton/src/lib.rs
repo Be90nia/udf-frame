@@ -88,6 +88,7 @@ pub mod parse;
 pub mod pool;
 pub mod view;
 
+use std::collections::VecDeque;
 pub use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -277,21 +278,25 @@ pub enum Effect<A, Op = Infallible> {
 /// 阅读面口径：reducer 只用 [`EffectBuf::push`]；`new`/`clear`/`is_empty`/
 /// `pop_front` 是跨 crate 实现面便利（实现方排空循环构造/复用/逐条转发），
 /// 不进十分钟阅读面。
+///
+/// **内部为前向可读的 FIFO 环形缓冲**（`VecDeque`）：追加在尾、摘取在头，摘队首
+/// **不搬动**其余效果——多效果批量转发的元素搬移从 O(k²) 降为 O(k)（issue#43）。
+/// 公共 API、语义与容量行为逐字不变（`clear` 仍保容量）。
 pub struct EffectBuf<A, Op = Infallible> {
-    effects: Vec<Effect<A, Op>>,
+    effects: VecDeque<Effect<A, Op>>,
 }
 
 impl<A, Op> EffectBuf<A, Op> {
     /// 空缓冲（实现面便利：排空循环构造一次，此后 clear 复用）。
     pub fn new() -> Self {
         Self {
-            effects: Vec::new(),
+            effects: VecDeque::new(),
         }
     }
 
     /// reducer 写入一条效果；写入顺序 = 解释器转发顺序。
     pub fn push(&mut self, effect: Effect<A, Op>) {
-        self.effects.push(effect);
+        self.effects.push_back(effect);
     }
 
     /// 清空保容量（实现面便利：容量留给下一次 reduce 复用）。
@@ -305,12 +310,16 @@ impl<A, Op> EffectBuf<A, Op> {
     }
 
     /// 摘取最早一条效果（实现面便利：实现方转发环逐条摘除——panic 时未转发
-    /// 效果原地留缓冲；容量语义与 `Vec::remove(0)` 同）。
+    /// 效果原地留缓冲）。
+    ///
+    /// **O(1) 零搬移**：内部为环形缓冲，摘队首只推进头指针，其余效果原地不动
+    /// ——旧实现每次把尾部整体前移一格 ⇒ 排空 k 条效果共 O(k²) 次元素搬移
+    /// （issue#43）。
     pub fn pop_front(&mut self) -> Option<Effect<A, Op>> {
         if self.effects.is_empty() {
             None
         } else {
-            Some(self.effects.remove(0))
+            self.effects.pop_front()
         }
     }
 }
