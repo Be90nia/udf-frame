@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Fixed（契约与文档面澄清：dispatch 完成边界 + 新面收录 + 两条回归闸补齐，2026-11-19；12 维独立复审）
+- **完成边界口径更正**：`skeleton::Store` trait 与 `docs/reference.md` 此前三处写「dispatch 返回 = 队列 idle / 同步排空至 idle」，与 #40 拍板的 **per-action 完成边界**冲突——并发生产者下队列**可能仍非空，这是正常态、不是未排空证据** ⇒ 契约 crate 与 reference.md 同步更正为「dispatch 返回 = 本 action 的完成边界（状态提交 → 效果转发 → 通知返回，且其全部**因果后代**终局）」。
+- **新面补收录**：`docs/reference.md` 此前**零收录** #38/#40 的四个公共面（`try_dispatch` / `set_capacity` / `AdmissionOutcome` / `admission_full_count`）⇒ 补入 runtime 章节，并写明容量口径：**等待被 reduce 的 action 数**（执行中不计入、同栈回灌豁免）、满时 typed 拒绝**不阻塞**（阻塞会与回调重入死锁）。
+- **panic 语义入契约**：`skeleton::EffectRuntime::run` 的 panic 语义此前只在实现侧、契约 crate 不可见 ⇒ 写进契约 rustdoc：该效果已被取出且**不重放**；实现方若依赖重试须自行保证幂等。**行为未改**（#43/#44 评审要求保留该语义）。
+- **退役假设改写**：`docs/reference.md` 的「weight 钩子必须是留存对象的纯函数、析构按钩子重算重量」假设已随 #35 退役 ⇒ 改写（照旧假设实现会重犯 #35 的 bug）。
+- **两条缺失的回归闸补齐**（对外行为未变）：`external_dispatch_waits_for_causal_descendant_failure`（#40 因果后代屏障——跨线程 + 确定性握手，禁 sleep）与 `pool_drop_with_nonempty_idle_never_calls_the_weight_hook`（#35 析构路径——旧断言因先 prune 清空 idle 而**遍历空集、空转恒真**）。变异验证：**旧闸在变异下全绿（exit 0）**，新闸判红且归因正确 ⇒ 新闸具备真实鉴别力。
+
 ### Changed（`EffectBuf` 内部改前向可读环形缓冲--摘队首零搬移，2026-11-19；GitHub issue#43）
 - `EffectBuf` 内部表示 `Vec<Effect>` → `VecDeque<Effect>`：追加在尾（`push_back`）、摘取在头（`pop_front`）⇒ 摘队首**只推进头指针、其余效果原地不动**（旧 `Vec::remove(0)` 每次把尾部整体前移一格 ⇒ 排空 k 条效果共 k(k-1)/2 次元素搬移，O(k²)）。
 - **公共 API 逐字不变**（`push`/`clear`/`is_empty`/`pop_front`）：`effects` 字段私有且仅在 `skeleton` crate 内部被访问（无 `size_of` 布局断言、无跨 crate 直访）⇒ 调用方零改动；容量行为不变（`clear` 仍保容量）、panic 语义不变（未转发效果仍留缓冲）、契约 crate 零依赖纪律未破（`VecDeque` 是 std）。
