@@ -104,13 +104,21 @@ pub enum AuditEventKind {
         /// `dispatch_action_seq`）。
         origin_action_seq: u64,
         /// 该效果在产出它的 action 的 reducer 输出序列中的 **0-based** 位置
-        /// （计数**包含** [`skeleton::Effect::Emit`]——Emit 也占位，故同一 action 内
-        /// 即便重复使用同一个 [`EffectId`] 也能定位到具体 occurrence）。
+        /// （计数**包含** [`skeleton::Effect::Emit`]——Emit 也占位）——它定位的是
+        /// 「该 action 产出的**第几条**效果」，与效果种类无关。
+        /// （[`skeleton::EffectId`] 在一个 store 内**全局唯一**，见
+        /// [`skeleton::EffectId`] 的唯一性纪律。）
         effect_index: u64,
         /// 效果的解释器侧种类（[`skeleton::EffectKind`]）。
         effect_kind: EffectKind,
-        /// 效果的逻辑句柄（[`skeleton::EffectId`]）——当前 `Run`/`Cancel`
+        /// 效果的**逻辑句柄**（[`skeleton::EffectId`]）——当前 `Run`/`Cancel`
         /// 恒 `Some`；未来无句柄的效果种类为 `None`。
+        /// ⚠️ **语义随种类而变**：`Run` 的 `effect_id` 是**该效果自己的**句柄；
+        /// `Cancel` 的 `effect_id` 是**被取消目标**的句柄（Cancel 效果自身没有
+        /// 句柄）⇒ 因此 `effect_id` **不可**单独当作「效果身份」用——同一 store
+        /// 内 `Run(id=N)` 与 `Cancel(id=N)` 会发出**相同**的 `effect_id`。
+        /// **唯一标识一个效果的是 `(effect_kind, effect_id, effect_index)` 三元组**
+        /// （或 `origin_action_seq` + `effect_index`）。
         effect_id: Option<EffectId>,
     },
     /// 状态通知已发出（本地或跨线程至少一个订阅者收到当拍快照）。

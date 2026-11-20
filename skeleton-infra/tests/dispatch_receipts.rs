@@ -89,8 +89,9 @@ impl Reducer for Gated {
 
 /// issue#40 核心契约：并发外部 dispatch 必须等**自己的** action 到达完成边界。
 ///
-/// 修复前：B 的 dispatch 在 A 持排空权时只入队即返（`Enqueue::Queued` 分支），
-/// B 返回后 B 的 action 尚未被 reduce——B 读到的是旧状态。
+/// 修复前（历史行为，非现行契约）：B 的 dispatch 在 A 持排空权时只入队即返
+/// （`Enqueue::Queued` 分支）⇒ 不等自己的完成边界；**在本测编排下**（A 卡在
+/// reducer 内、排空环不可能前进）B 返回时其 action 尚未被 reduce、B 读到旧状态。
 #[test]
 fn external_dispatch_waits_for_own_action_boundary() {
     let gate = Gate::new();

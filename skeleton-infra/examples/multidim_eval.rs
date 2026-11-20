@@ -66,7 +66,9 @@ impl RawQueue {
             state: Mutex::new(0),
         }
     }
-    /// 与 Store::dispatch 同形：入队→同步排空至 idle→状态更新。
+    /// 裸基线的 dispatch 形状——静默态（无在任排空者）：本线程夺得排空权并同步排空至
+    /// idle ⇒ 状态已更新；此路径**强于** `Store::dispatch` 的 per-action 完成边界契约
+    /// （后者不承诺队列为空）。
     fn dispatch(&self) {
         self.queue.lock().unwrap().push_back(());
         while self.queue.lock().unwrap().pop_front().is_some() {

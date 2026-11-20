@@ -87,7 +87,7 @@
 
 > **宿主意务（跨线程阻塞）**：外部 `dispatch` **阻塞**至自己的完成边界，而 drain 回调（`EffectRuntime::run`、订阅回调）**运行在排空环内**。宿主若在 drain 回调里 `join` 一个**用阻塞式 `dispatch` 回调同一 store** 的线程 ⇒ **确定性互等死锁**（排空环被 join 卡住，回执只由排空环兑现）。**安全写法**：回调派生的 worker 用**框架提供的** sender（`Store::sender()` 或回调收到的 `back`）的 `dispatch`——**在 drain 回调内该 sender 必处竞争态**（排空权在排空线程）⇒ **纯准入、不等回执**（返回 `true` 只表示**被接受**，不表示已完成）⇒ 回调可以 join 该 worker（worker 不等回执，不与排空环互等），排队的 action 在**回调返回后**按 FIFO 处理。若 worker 确实需要该 action 的**完成结果**才能返回，则它**不得**被跑在同一 store 排空环上的回调同步 join。**自建** sender（`ActionSender::new`）的语义由实现方决定，**不可假定**框架提供的 sender 的任一条路径语义。框架**无法**检测宿主侧的跨线程 join ⇒ **不提供**框架侧防护或超时（义务与规避路径在宿主侧）。可编译示例见 `skeleton_infra::runtime::SyncStore::new` 的文档示例；正向回归场景见 `skeleton-infra/tests/dispatch_receipts.rs`；负向复现（六场景矩阵）见 `verify/2026-11-20-residual-join-risk/`。
 >
-> **框架提供的 sender 的语义是条件性的（两条路径，`bool` 无二义）**：**竞争态**（调用瞬间已有在任排空者）= **纯准入**——立即返回，该 action 尚未 reduce、未达完成边界；**静默态**（无在任排空者）= 该线程**夺得排空权并同步排空至 idle**（与 `dispatch` 同形）——返回时该 action **已被 reduce、完成边界已达成**。**返回的 `bool` 只承载「被 store 接受（已入队）或被拒」**，**不承载**「是否已 reduce / 是否已达完成边界」（后者**路径相关**，调用方不可据 `bool` 推断）。机械闸（两态各一断言，确定性握手 + 有界超时）：`skeleton-infra/tests/drain_regressions.rs::framework_sender_admission_is_conditional_on_drain_state`。
+> **框架提供的 sender 的语义是条件性的（两条路径，`bool` 无二义）**：**竞争态**（调用瞬间已有在任排空者）= **纯准入**——框架**只保证**该 action 已入队、**不等**它的完成边界；**返回瞬间该 action 是否已被 reduce，框架不作任何保证**（取决于在任排空者的推进速度：可能尚未被 reduce，也可能已被 reduce 甚至已完成）⇒ 下游**不得**据「竞争态」推断「此刻读状态仍是旧值」。**静默态**（调用瞬间无在任排空者）= 该线程**夺得排空权并同步排空至 idle** ⇒ 返回时该 action **已被 reduce、其完成边界必然已达成**（此路径**强于** `Store::dispatch` 的 per-action 完成边界契约——后者**不**承诺队列为空）。**返回的 `bool` 只承载准入结果**（被 store 接受/已入队 = `true`，被拒 = `false`），**不承载完成状态**：竞争态下是否已被 reduce、静默态下是否已达成完成边界，均**不可**由 `bool` 推断。机械闸（两态各一断言，确定性握手 + 有界超时）：`skeleton-infra/tests/drain_regressions.rs::framework_sender_admission_is_conditional_on_drain_state`；**反向闸**（钉住「不保证」而非「恒未 reduce」——竞争态下该 action 最终被 reduce 且**恰好一次**，**刻意不断言**「返回瞬间是否已被 reduce」）：`skeleton-infra/tests/drain_regressions.rs::competitive_state_does_not_guarantee_reduction_timing`。
 
 ### 类型与签名
 
@@ -247,17 +247,21 @@ pub enum AuditEventKind {
 #[must_use = "审计票据被丢弃即立即关闭事件流……"] pub struct AuditTicket { /* Drop = 关流 */ }
 ```
 
+⚠️ **迁移**：`EffectInterrupted` 由单元变体改为结构变体 ⇒ 下游 `match` 该变体的分支须改为**解构形**（`AuditEventKind::EffectInterrupted { .. }`）；原先按**等值比较**该变体的写法（如 `e.kind == AuditEventKind::EffectInterrupted`）须改为 `matches!(e.kind, AuditEventKind::EffectInterrupted { .. })`；**派生 `PartialEq` 的语义随之变化**（该变体现在逐字段比较，不再与自身恒等）。
+
 **`EffectInterrupted` 的五个字段**（GitHub issue#48）：解释器 panic 时被中断的那条效果的**结构化身份**——消费方据此定位「**哪一个**效果处于 indeterminate 态（外部结果不确定）」。
 
 | 字段 | 含义 |
 |---|---|
-| `dispatch_action_seq` | **本次触发转发、并承接失败回执**的 action 的**入队序号**（store 内单调，队列锁内分配——FIFO 序 = 序号序） |
+| `dispatch_action_seq` | **本次触发转发、并承接失败回执**的 action 的**入队序号**（store 内单调；**外部入队**路径的序号在队列锁内分配，**`Effect::Emit` 回灌**路径的序号在取锁**之前**分配 ⇒ 序号序与全局 FIFO 序**不保证**恒等——见下方「已知张力」） |
 | `origin_action_seq` | **实际产出该效果**的 action 的入队序号——可能**早于** `dispatch_action_seq`（pending 效果跨 action 存活：A 产出的后缀在 A 的转发 panic 后留存，后来由 B 的 dispatch 触发续转并再次 panic ⇒ 来源是 A、触发者是 B） |
-| `effect_index` | 该效果在**产出它的 action** 的 reducer 输出序列中的 **0-based** 位置（计数**包含** `Emit`——Emit 也占位 ⇒ 同一 action 内重复使用同一 `EffectId` 也能定位到具体 occurrence） |
+| `effect_index` | 该效果在**产出它的 action** 的 reducer 输出序列中的 **0-based** 位置（计数**包含** `Emit`——Emit 也占位）——它定位的是「该 action 产出的**第几条**效果」，与效果种类无关（`EffectId` 在一个 store 内**全局唯一**，见 `skeleton::EffectId` 的唯一性纪律） |
 | `effect_kind` | 效果的解释器侧种类（`skeleton::EffectKind`：`Run` / `Cancel`） |
-| `effect_id` | 效果的逻辑句柄（`Option<skeleton::EffectId>`）——当前 `Run`/`Cancel` 恒 `Some`；未来无句柄的种类为 `None` |
+| `effect_id` | 效果的**逻辑句柄**（`Option<skeleton::EffectId>`）——当前 `Run`/`Cancel` 恒 `Some`；未来无句柄的种类为 `None`。⚠️ **语义随种类而变**：`Run` 的 `effect_id` 是**该效果自己的**句柄；`Cancel` 的 `effect_id` 是**被取消目标**的句柄（Cancel 效果自身没有句柄）⇒ 因此 `effect_id` **不可**单独当作「效果身份」用——同一 store 内 `Run(id=N)` 与 `Cancel(id=N)` 会发出**相同**的 `effect_id`。**唯一标识一个效果的是 `(effect_kind, effect_id, effect_index)` 三元组**（或 `origin_action_seq` + `effect_index`） |
 
-**边界**：⚠️ 两个序号都是**入队序号**，**不是**「dispatch 调用发生的时刻序」——外部调用方看到的是「我这次调用排在队列第几位」，并发下与调用时刻序不同。同一次 action 内两者相等；跨 action 续转时恒 `origin < dispatch`。事件**不携带** `Op` / Action / payload（可能很大、不可 Clone、可能含敏感业务数据）。`Effect::Emit` 不经解释器 ⇒ 不产生本事件。
+**边界**：⚠️ 两个序号都是**入队序号**，**不是**「dispatch 调用发生的时刻序」——外部调用方看到的是「我这次调用排在队列第几位」，并发下与调用时刻序不同。同一次 action 内两者相等；跨 action 续转时**通常** `origin < dispatch`（见下方「已知张力」）。事件**不携带** `Op` / Action / payload（可能很大、不可 Clone、可能含敏感业务数据）。`Effect::Emit` 不经解释器 ⇒ 不产生本事件。
+
+**已知张力（2026-11-20 第三轮对抗性审计登记）**：两个序号的**分配纪律不一致**——外部入队路径的序号在 `queue` 锁内分配（与入队同临界区），而 **`Effect::Emit` 回灌**路径的序号在**取锁之前**分配 ⇒ 理论上可能与并发入队的序号**交错**（外部 action 可能拿到更大序号却先入队）⇒ **不保证**全局 FIFO 序 = 序号序，跨 action 续转时的 `origin < dispatch` 亦**不保证**恒成立。**实测状态**：结构可证、经验未复现——探针（Emit 回灌 × 外部入队并发编排，20 秒 / 约 118 万外部轮次）实测 `origin_action_seq > dispatch_action_seq` 的事件数为 **0** ⇒ 窗口极窄，**未**实证该不变量被破坏。⇒ 登记为**已知张力**（登记缺口，非已证实缺陷），**本轮不改实现**（统一纪律需把 Emit 回灌路径的序号分配移入 `queue` 锁内 ⇒ 须先评估锁序与 `parent.add_descendant()` 的锁序约束，另行立项）。
 
 **配套公共面（`skeleton` crate）**：
 
@@ -272,7 +276,9 @@ impl EffectKind {
 
 `EffectKind::of` 是**效果 → (种类, 句柄) 的单一映射点**：匹配在本 crate 内对 `Effect` 词表**穷尽** ⇒ 词表演进（新增效果种类）时编译期强制同步，跨 crate 的下游免于各自补通配语义。
 
-**`EffectId` ≠ 投递身份**：`EffectId` 是 reducer/消费者定义的**逻辑效果句柄**（同义恒同值，可重复使用），**不是**框架生成的投递尝试身份。本批**不引入重试**、**不承诺** exactly-once；#45 拍板的 Option D 语义（至多一次调用尝试 · 外部结果不确定 · 不自动重放）**保持不变**，幂等/去重属消费方责任。
+⚠️ **演进约束（已知限制，2026-11-20 第三轮对抗性审计登记）**：`of` 的返回类型是 `Option<(EffectKind, Option<EffectId>)>`——**双层 `Option`**：外层 = 「非解释器可见」（今仅 `Emit`），内层 = 「无逻辑句柄」。`of` 的穷尽匹配保证的是「**覆盖 `Effect` 词表的所有变体**」，**不**保证「所有非 `Emit` 变体都必经解释器」⇒ 若将来新增一个**不经解释器**的效果种类并让 `of` 对它返回 `None`，实现侧那条「非 `Emit` 效果必经解释器」的 `expect` 不变式将**在运行时 panic**（编译器**不会**报错——`of` 的编译期强制同步只强制**改 `of`**，不强制**改成 `Some`**）。⇒ **新增不经解释器的效果种类时，实现侧必须同步处理 `of` 返回 `None` 的分支，不得依赖 `expect`**（类型级解法：拆成 `kind_of` / `handle_of` 两个函数，或给 `Effect` 加「解释器可见」的类型级标记——**本轮只登记，不改实现**）。
+
+**`EffectId` ≠ 投递身份**：`EffectId` 是 reducer/消费者定义的**逻辑效果句柄**（**一个 store 内全局唯一**——见 `skeleton::EffectId` 的唯一性纪律），**不是**框架生成的投递尝试身份。本批**不引入重试**、**不承诺** exactly-once；#45 拍板的 Option D 语义（至多一次调用尝试 · 外部结果不确定 · 不自动重放）**保持不变**，幂等/去重属消费方责任。
 
 生命周期重建协议：记账单位是 **action 而非 dispatch**——一笔 dispatch 主 action 走 `Enqueued(depth) → Reduced → [EffectForwarded* | EffectInterrupted] → Notified?`；Emit 回灌派生的每个动作各走一条同形链交错嵌进主链时间线。`Notified` 仅当拍确有状态快照订阅者收到快照时记录。`seq` 单调，订阅窗内**连续**——空洞 = 有界环溢出丢最旧的显式证据。默认关闭零开销：未订阅路径 = 每 emit 点一次 gate load 即返。多订阅者间逐字交错顺序不可预推；时间线断言用语义不变量（深度链/节点计数），勿钉逐字全局顺序。
 
@@ -355,7 +361,7 @@ pub trait Notify<S> {
 
 本域各池只有一个共同点：**每个配置值各自约束一个特定群体**。「把 `max` 当总对象数 / 总内存上限」是最常见的误读（蓝图 §5 的三轴口径即为此立）。下表逐参数回答四问：①cap 覆盖哪些对象/字节；②满容量时的动作与可观察读数；③是否存在合法的超配中间态、靠什么收敛；④各读数字段的口径，以及哪些读数**不是**准入面。
 
-行号口径：全篇行号锚为 **2026-11-17 落盘时的快照值**（本轮 #34/#35/#39/#40/#41/#42/#44 改动后**未逐个更新行号**）——**符号名恒准，行号随重构漂移**；代码变动后行号可能已过时，定位请按符号名（各处坐标均附符号名或所在函数）。路径均相对 `skeleton-infra/src/`。核心形字段定义见 `skeleton/src/pool.rs:42`。`ObjectPool` 的三轴见 [§ObjectPool](#objectpool--通用对象池有状态对象reset-钩子--有界降级--分片槽位)，`MemoryPool` / `BoundedRegistry` / `ByteBudget` 见 [§memgov 四问](#资源上限四问--memgov-三件)。
+行号口径：全篇行号锚为 **2026-11-17 落盘时的快照值**（本轮 #34/#35/#39/#40/#41/#42/#44/#45/#46/#47/#48 改动后**未逐个更新行号**）——**符号名恒准，行号随重构漂移**；代码变动后行号可能已过时，定位请按符号名（各处坐标均附符号名或所在函数）。路径均相对 `skeleton-infra/src/`。核心形字段定义见 `skeleton/src/pool.rs:42`。`ObjectPool` 的三轴见 [§ObjectPool](#objectpool--通用对象池有状态对象reset-钩子--有界降级--分片槽位)，`MemoryPool` / `BoundedRegistry` / `ByteBudget` 见 [§memgov 四问](#资源上限四问--memgov-三件)。
 
 #### PoolBase — 账本与裁决，不做准入
 

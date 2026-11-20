@@ -11,9 +11,47 @@ use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Condvar, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// 一次性信号（确定性握手，**禁 sleep 编排**）：`set()` 置位并唤醒全部等待者；
+/// `wait_set(timeout)` 在**有界超时**内等待置位（超时 ⇒ 返回 false，由调用方判红）。
+struct Latch {
+    set: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Latch {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            set: Mutex::new(false),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// 置位（幂等）。
+    fn set(&self) {
+        let mut set = self.set.lock().expect("latch lock");
+        *set = true;
+        self.cv.notify_all();
+    }
+
+    /// 有界等待置位（超时 ⇒ false；**禁无限等待**——失败必须表现为红而非挂死）。
+    fn wait_set(&self, timeout: Duration) -> bool {
+        let mut set = self.set.lock().expect("latch lock");
+        let deadline = Instant::now() + timeout;
+        while !*set {
+            let remain = deadline.saturating_duration_since(Instant::now());
+            if remain.is_zero() {
+                return false;
+            }
+            let (guard, _) = self.cv.wait_timeout(set, remain).expect("latch wait");
+            set = guard;
+        }
+        true
+    }
+}
 
 enum Act {
     Inc,
@@ -120,7 +158,9 @@ fn subscriber_panic_removed_and_store_survives() {
 ///
 /// 注：本测断言的「回灌已入队**并排空**」是**静默态**形态（无在任排空者 ⇒
 /// sender 夺得排空权并同步排空至 idle ⇒ 返回时该 action 已被 reduce）；框架
-/// 提供的 sender 在**竞争态**下则是纯准入（返回时该 action 尚未 reduce）——
+/// 提供的 sender 在**竞争态**下则是纯准入——**返回瞬间该 action 是否已被 reduce，
+/// 框架不作任何保证**（取决于在任排空者的推进速度：可能尚未被 reduce，也可能已被
+/// reduce 甚至已完成）⇒ 下游**不得**据「竞争态」推断「此刻读状态仍是旧值」。
 /// 两条路径的条件化语义见 `skeleton::ActionSender::dispatch` 的契约与
 /// `framework_sender_admission_is_conditional_on_drain_state`。
 #[test]
@@ -267,7 +307,11 @@ fn reducer_panic_is_counted_and_audited() {
 // 的语义**按调用瞬间有无在任排空者分两条路径**——
 //   静默态（无在任排空者）：夺得排空权并**同步排空至 idle** ⇒ 返回时该 action
 //     **已被 reduce**、完成边界已达成；
-//   竞争态（已有在任排空者）：**纯准入** ⇒ 立即返回，该 action **尚未被 reduce**。
+//   竞争态（已有在任排空者）：**纯准入** ⇒ 立即返回。**在本闸的编排下**（排空环被
+//   drain 回调同步等待挡住、同一线程不可能前进）该 action **尚未被 reduce**——这是
+//   **本编排内的确定事实**，**不是**框架对竞争态的无条件保证（框架只保证「不等该
+//   action 的完成边界」；返回瞬间是否已被 reduce 不作保证，见
+//   `skeleton::ActionSender::dispatch`）。
 // 本闸同时钉住两态（任一态退化 ⇒ 立即报红），是契约表述的机械闸（rustdoc 只查
 // 链接与编译，不查语义真伪）。
 //
@@ -319,7 +363,13 @@ impl Reducer for CondCounter {
 }
 
 /// drain 回调内派生 worker：worker 用**框架提供的** sender 提交 `Follow`，并在
-/// dispatch 返回的瞬间记录 reducer 计数（竞争态判据：此刻 `Follow` 尚未 reduce）。
+/// dispatch 返回的瞬间记录 reducer 计数。
+///
+/// ⚠️ 该计数读数是**本编排下**的事实（drain 回调在此同步等待 worker 完成 ⇒ 排空环
+/// 在该窗口内不可能推进 ⇒ `Follow` 此刻未被 reduce），**不是**框架对「竞争态 ⇒
+/// 未被 reduce」的无条件保证——框架对**返回瞬间是否已被 reduce 不作任何保证**
+/// （契约见 `skeleton::ActionSender::dispatch`；反向闸见同文件
+/// `competitive_state_does_not_guarantee_reduction_timing`）。
 struct CondSpawner {
     processed: Arc<AtomicUsize>,
     observed: Arc<AtomicUsize>,
@@ -333,7 +383,9 @@ impl EffectRuntime<CondAct, CondOp> for CondSpawner {
         let (tx, rx) = mpsc::channel();
         let worker = thread::spawn(move || {
             let ok = sender.dispatch(CondAct::Follow);
-            // dispatch 返回瞬间的 reducer 计数——竞争态下 `Follow` 尚未被 reduce。
+            // dispatch 返回瞬间的 reducer 计数——**本编排内**（排空环被 drain 回调的
+            // 同步等待挡住、同一线程不可能前进）`Follow` 尚未被 reduce；框架对竞争态
+            // **不**保证这一点。
             observed.store(processed.load(Ordering::SeqCst), Ordering::SeqCst);
             let _ = tx.send(ok);
         });
@@ -348,7 +400,10 @@ impl EffectRuntime<CondAct, CondOp> for CondSpawner {
 }
 
 /// 条件性准入闸：静默态 sender 返回时该 action **已被 reduce**；竞争态 sender
-/// 返回时该 action **尚未被 reduce**。
+/// 返回时该 action **尚未被 reduce**——⚠️ 后者是**本闸编排下**的读数（drain 回调
+/// 同步等待 worker 完成 ⇒ 排空环在该窗口内不可能推进），**不是**框架的无条件
+/// 保证；框架对**返回瞬间是否已被 reduce 不作任何保证**（反向闸见同文件
+/// `competitive_state_does_not_guarantee_reduction_timing`）。
 #[test]
 fn framework_sender_admission_is_conditional_on_drain_state() {
     // ── 静默态：无在任排空者 ⇒ sender 夺得排空权并同步排空 ⇒ 返回时已 reduce。
@@ -373,7 +428,9 @@ fn framework_sender_admission_is_conditional_on_drain_state() {
         "静默态：sender 返回时该 action 必须已被 reduce（完成边界已达成）"
     );
 
-    // ── 竞争态：已有在任排空者（drain 回调内）⇒ 纯准入 ⇒ 返回时尚未 reduce。
+    // ── 竞争态：已有在任排空者（drain 回调内）⇒ 纯准入 ⇒ **本编排内**返回时尚未
+    // reduce（编排限定：排空环被同步等待挡住、同一线程不可能前进；框架对竞争态
+    // **不**保证「尚未 reduce」——见 `skeleton::ActionSender::dispatch`）。
     let processed = Arc::new(AtomicUsize::new(0));
     let observed = Arc::new(AtomicUsize::new(0));
     let store = Store::new(
@@ -389,7 +446,9 @@ fn framework_sender_admission_is_conditional_on_drain_state() {
     assert_eq!(
         observed.load(Ordering::SeqCst),
         1,
-        "竞争态：sender 返回时该 action 必须尚未被 reduce（reducer 计数仍只有 Start）"
+        "竞争态（本编排：drain 回调同步等待 worker 完成 ⇒ 排空环无法推进）：\
+         sender 返回瞬间该 action 尚未被 reduce（reducer 计数仍只有 Start）——\
+         注意这是**本编排**的读数，不是框架的无条件保证"
     );
     store.dispatch(CondAct::Bump); // 排在 Follow 之后 ⇒ 其完成边界覆盖 Follow 的处理
     assert_eq!(
@@ -398,4 +457,137 @@ fn framework_sender_admission_is_conditional_on_drain_state() {
         "Start、Follow、Bump 三个动作各被处理恰好一次"
     );
     assert_eq!(store.pending_actions(), 0, "队列不得残留");
+}
+
+// ── 反向机械闸：竞争态「不保证尚未 reduce」 ──────────────────────────────
+//
+// 契约（skeleton::ActionSender::dispatch，2026-11-20 第三轮对抗审计更正）：
+// 竞争态（调用瞬间已有在任排空者）= **纯准入**——框架**只保证**该 action 已入队、
+// **不等**它的完成边界；**返回瞬间该 action 是否已被 reduce，框架不作任何保证**
+// （取决于在任排空者的推进速度：可能尚未被 reduce，也可能已被 reduce 甚至已完成）
+// ⇒ 下游**不得**据「竞争态」推断「此刻读状态仍是旧值」。
+//
+// 本闸**刻意不断言**「返回瞬间该 action 是否已被 reduce」：那是**竞态窗口内的读数**
+// （第三轮对抗审计的外部 crate 视角编排式探针实测：真竞争态 8/8 轮次中该 action 在
+// dispatch **返回之前**就已被他人 reduce ⇒「竞争态 ⇒ 尚未 reduce」**不是**框架保证）。
+// 把该读数写进断言 = 把竞态写成契约 ⇒ 那正是本闸要避免的。
+//
+// 本闸断言**只**针对框架**无条件保证**的事实：
+//   ① 该 action 最终被 reduce 且**恰好一次**（不丢不重）；
+//   ② 竞争态下 sender 是**纯准入**：dispatch 在有界超时内返回（不等完成边界）——
+//      退化为「同步等待完成边界」即与在任排空者互等（死锁形态）⇒ 超时判红。
+//
+// 确定性编排（禁 sleep）：排空线程在 reducer 内持闸（`Hold`）⇒ 排空权在他手里 ⇒
+// 发送方 enqueue 必见 `draining == true` ⇒ 必走 `Enqueue::Queued` 分支（真竞争态）；
+// 闸在**发送方返回之后**才开 ⇒ 发送方若等完成边界即与排空者互等（死锁形态）。
+// 有界超时：发送方完成信号走 channel + `recv_timeout`（10s）——失败不挂死。
+
+/// 反向闸的动作词表：`Hold` 在 reducer 内持闸（占住排空权）；`Probe` 是被观测的
+/// action（reduce 时计数）；`Fence` 是收尾屏障（其完成边界 ⇒ 排在其前的 `Probe`
+/// 必已被 reduce ⇒ 观测**无竞态**）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevAct {
+    Hold,
+    Probe,
+    Fence,
+}
+
+/// 反向闸的 reducer：`Hold` 阻塞在闸上（排空权在他手里 ⇒ 发送方必走竞争态分支）；
+/// `Probe` 只计数（reduce 计数 = 「已被 reduce」的读侧）；`Fence` 空转。
+struct RevReducer {
+    /// 「排空线程已进入 reducer」信号（证明排空权已在他手里）。
+    entered: Arc<Latch>,
+    /// 放行闸（**在发送方返回之后**才开 ⇒ 竞争态窗口成立）。
+    release: Arc<Latch>,
+    /// `Probe` 被 reduce 的次数（终局读侧）。
+    probed: Arc<AtomicUsize>,
+}
+
+impl Reducer for RevReducer {
+    type State = usize;
+    type Action = RevAct;
+    type Op = Infallible;
+
+    fn initial(&self) -> usize {
+        0
+    }
+
+    fn reduce(&self, s: &usize, a: RevAct, _out: &mut EffectBuf<RevAct, Infallible>) -> usize {
+        match a {
+            RevAct::Hold => {
+                self.entered.set();
+                // 有界等待（超时即返回——闸本就该由测试线程在发送方返回后才开）。
+                let _ = self.release.wait_set(Duration::from_secs(30));
+            }
+            RevAct::Probe => {
+                self.probed.fetch_add(1, Ordering::SeqCst);
+            }
+            RevAct::Fence => {}
+        }
+        s + 1
+    }
+}
+
+/// 反向机械闸：竞争态下 sender 是**纯准入**（不等该 action 的完成边界），且该
+/// action **最终被 reduce 且恰好一次**。刻意**不**断言「返回瞬间是否已被 reduce」。
+#[test]
+fn competitive_state_does_not_guarantee_reduction_timing() {
+    let entered = Latch::new();
+    let release = Latch::new();
+    let probed = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(Store::new(
+        RevReducer {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            probed: Arc::clone(&probed),
+        },
+        Nop::<RevAct> { _m: PhantomData },
+    ));
+
+    // 排空线程：dispatch(Hold) ⇒ 夺得排空权并停在 reducer 内（持闸）。
+    let drainer = {
+        let store = Arc::clone(&store);
+        thread::spawn(move || store.dispatch(RevAct::Hold))
+    };
+    assert!(
+        entered.wait_set(Duration::from_secs(10)),
+        "排空线程未在 10s 内进入 reducer（编排失效 ⇒ 竞争态窗口未成立）"
+    );
+
+    // 发送方：真竞争态（排空权在排空线程手里）⇒ 纯准入 ⇒ 有界超时内返回。
+    let sender = store.sender();
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let admitted = sender.dispatch(RevAct::Probe);
+        let _ = tx.send(admitted);
+    });
+    let admitted = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(admitted) => admitted,
+        Err(_) => {
+            // 放闸让排空线程收尾（避免残留阻塞线程），再判红。
+            release.set();
+            panic!(
+                "竞争态：sender 必须在 10s 内返回（纯准入、不等完成边界）——\
+                 若它同步等待完成边界即与在任排空者互等（死锁形态）"
+            );
+        }
+    };
+    assert!(
+        admitted,
+        "竞争态：sender 必须接受 action（bool = 准入结果，不承载完成状态）"
+    );
+    // ⚠️ 此处**刻意不**读 `probed`：返回瞬间该 action 是否已被 reduce 属竞态窗口
+    // 读数，框架不作保证（外部 crate 视角探针实测真竞争态 8/8 轮次返回前已被 reduce）。
+    worker.join().expect("发送线程");
+
+    // 放闸 ⇒ 排空线程续排 ⇒ `Probe` 被 reduce；`Fence` 排在其后 ⇒ `Fence` 的完成
+    // 边界达成时 `Probe` 必已被 reduce（观测无竞态）。
+    release.set();
+    store.dispatch(RevAct::Fence);
+    drainer.join().expect("排空线程");
+    assert_eq!(
+        probed.load(Ordering::SeqCst),
+        1,
+        "该 action 最终必须被 reduce 且恰好一次（不丢不重）"
+    );
 }

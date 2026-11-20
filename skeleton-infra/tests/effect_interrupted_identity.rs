@@ -14,7 +14,9 @@
 //!    事件的 `dispatch_action_seq` 逐字相等（回执不落到效果产出者头上）。
 //! 4. **Emit 置前 ordinal 不错位**：`Emit` 不经解释器，但**占** ordinal ⇒
 //!    其后的 `Run` 的 ordinal 是 1 而不是 0。
-//! 5. **tracing 与审计事件同值**：桥输出的五个字段与 `AuditEvent` 一致。
+//! 5. **tracing 与审计事件同值**：桥输出的五个字段与 `AuditEvent` 一致——
+//!    场景取**跨 action 续转**（两个 action 序号**值不同** ⇒ 桥里对调二者
+//!    必被本闸抓到；单 action 场景两序号同值 ⇒ 该闸**假绿**）。
 //!
 //! 判据用「事件面 + 回执文本」两处独立证据交叉核对，禁只看其一。
 
@@ -418,6 +420,13 @@ fn cancel_interruption_carries_its_target_effect_id() {
 
 /// tracing 桥输出的五个字段必须与 `AuditEvent` 同源同值（消费方按 tracing
 /// 过滤时不必再回查审计缓冲）。
+///
+/// ⚠️ **场景必须是跨 action 续转**（第三轮主审 P1：单 action 场景下
+/// `origin_action_seq` 与 `dispatch_action_seq` **同值** ⇒ 桥里对调两字段
+/// 不可见 ⇒ 本闸**假绿**）：编排复用同文件「跨 action 续转归因」用例的形状
+/// ——A 产 2 条 `Run` ⇒ 第一条转发即 panic（第二条留存）⇒ B 的 dispatch 触发
+/// 续转 ⇒ 续转那条的 `origin` / `dispatch` **值不同** ⇒ 桥里对调二者即被
+/// 逐字比对抓到。
 #[test]
 #[cfg(feature = "tracing")]
 fn tracing_bridge_reports_same_identity_fields_as_audit_event() {
@@ -493,7 +502,18 @@ fn tracing_bridge_reports_same_identity_fields_as_audit_event() {
 
 // ── ⑦ 既有语义不变（回归）：环形缓冲溢出 + 订阅关闭 ────────────────────
 
-/// 有界环溢出丢最旧（`seq` 留空洞）、订阅票据 Drop 即关流——既有语义不变。
+/// 有界环溢出丢最旧、订阅票据 Drop 即关流——既有语义不变。
+///
+/// 判据设计（**确证式**，非弱界）：本测必须能分辨「环真的在按最新 N 条留存」
+/// 与「审计事件面整体失能（一条都没记）」两种形态——故断言全部**确证**：
+///
+/// ① **回调先于环**：订阅回调（`on_event`）见到**全部**事件 ⇒ 事件面确实在记录
+///    （失能形态下回调零次 ⇒ 此断言先红）；
+/// ② **环留最新 N 条**：环内容（`take_events`）的 `seq` 必须等于回调所见序列的
+///    **最后 N 条**（不是最早 N 条）⇒ 钉住「溢出丢最旧、留最新」；
+/// ③ **seq 留空洞**：环内 `seq` 靠后且与回调序列首条不同 ⇒ 丢最旧的显式证据；
+/// ④ **关闭后不再收**：票据 Drop 后再 dispatch ⇒ 回调**不再被调用**（差分计数）、
+///    事件流为空 ⇒ 「从未记录」与「关闭后不再记录」可分辨。
 #[test]
 fn audit_ring_overflow_and_subscription_close_semantics_unchanged() {
     let store = SyncStore::new(
@@ -502,31 +522,54 @@ fn audit_ring_overflow_and_subscription_close_semantics_unchanged() {
         },
         AlwaysPanic,
     );
+    // 订阅回调见到**全部**事件（环只留最新 N 条 ⇒ 回调是「哪几条是最新的」的基准）。
+    let seen = Arc::new(Mutex::new(Vec::<u64>::new()));
     {
-        let _ticket = store.subscribe_events(2, |_| {});
+        let sink = Arc::clone(&seen);
+        let _ticket = store.subscribe_events(2, move |e: &AuditEvent| {
+            sink.lock().expect("seen lock").push(e.seq);
+        });
         for _ in 0..4 {
             let _ = catch_unwind(AssertUnwindSafe(|| store.dispatch(Act::Runs(1))));
         }
         let events = store.take_events();
+        let all = seen.lock().expect("seen lock").clone();
         assert!(
-            events.len() <= 2,
-            "环形缓冲容量 2 ⇒ 取出不超过 2 条（溢出丢最旧）：{}",
+            all.len() > 2,
+            "订阅回调必须见到多于环容量的事件数（否则溢出未被制造，判据退化）：{:?}",
+            all.len()
+        );
+        assert_eq!(
+            events.len(),
+            2,
+            "环形缓冲容量 2 ⇒ 恰好留存 2 条（溢出丢最旧）：{:?}",
             events.len()
         );
-        let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+        let ring: Vec<u64> = events.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            ring,
+            all[all.len() - 2..],
+            "环内留存的必须是**最新**的两条（而非最早两条）：环={:?} 全部={:?}",
+            ring,
+            all
+        );
         assert!(
-            seqs.windows(2).all(|w| w[0] < w[1]),
-            "留存事件按事件序号递增：{seqs:?}"
+            ring[0] > all[0],
+            "环内 seq 必须靠后（丢最旧的显式证据 ⇒ seq 留空洞）：环={:?} 全部={:?}",
+            ring,
+            all
         );
     }
-    // 票据已 Drop ⇒ 事件流关闭 ⇒ 取不到任何事件。
+    // 票据 Drop ⇒ 关流：后续 dispatch 既不回调也不记录。
+    let before = seen.lock().expect("seen lock").len();
+    let _ = catch_unwind(AssertUnwindSafe(|| store.dispatch(Act::Runs(1))));
+    assert_eq!(
+        seen.lock().expect("seen lock").len(),
+        before,
+        "票据 Drop 后订阅回调不得再被调用（差分断言：关闭前确有事件 ⇒ 关闭后无新增）"
+    );
     assert!(
         store.take_events().is_empty(),
         "票据 Drop 后事件流关闭（既有语义）"
-    );
-    let _ = catch_unwind(AssertUnwindSafe(|| store.dispatch(Act::Runs(1))));
-    assert!(
-        store.take_events().is_empty(),
-        "关闭后不再记录事件（既有语义）"
     );
 }

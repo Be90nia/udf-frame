@@ -75,15 +75,18 @@ fn back_sender<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                     false
                 }
                 Enqueue::Queued(_) => {
-                    // 竞争态（已有在任排空者）：纯准入——立即返回，不等该 action 的
-                    // 完成边界（该 action 由在任排空者随后处理）。
+                    // 竞争态（已有在任排空者）：纯准入——框架只保证该 action 已入队、
+                    // 不等它的完成边界。返回瞬间该 action 是否已被 reduce 不作任何
+                    // 保证（取决于在任排空者的推进速度）⇒ 下游不得据「竞争态」推断
+                    // 「此刻读状态仍是旧值」。契约口径见 skeleton::ActionSender::dispatch。
                     audit_enqueued(&inner, origin);
                     true
                 }
                 Enqueue::Draining(_, first) => {
                     // 静默态（无在任排空者）：本线程夺得排空权 ⇒ 同步排空至 idle
-                    // （与 Store::dispatch 同形）⇒ 返回时该 action 已被 reduce、
-                    // 完成边界已达成。契约（两条路径 + bool 的唯一含义）见
+                    // ⇒ 返回时该 action 已被 reduce、其完成边界必然已达成。此路径
+                    // 强于 Store::dispatch 的 per-action 完成边界契约——后者不承诺
+                    // 队列为空。契约（两条路径 + bool 的唯一含义）见
                     // skeleton::ActionSender::dispatch 的 rustdoc。
                     audit_enqueued(&inner, origin);
                     drain_owned(&inner, first);
@@ -221,8 +224,10 @@ struct EffectBufs<A, Op> {
 /// 后留存，后来由 B 的 dispatch 触发续转并再次 panic ⇒ 被中断效果的来源是 A，
 /// 而触发者是 B；只记「当前 drain 的 action」= 错误归因）。
 ///
-/// `effect_index` 计数**包含** [`Effect::Emit`]（Emit 也占位）——同一 action
-/// 内即便重复使用同一个 [`skeleton::EffectId`] 也能定位到具体 occurrence。
+/// `effect_index` 计数**包含** [`Effect::Emit`]（Emit 也占位）——它定位的是
+/// 「该 action 产出的**第几条**效果」，与效果种类无关。
+/// （[`skeleton::EffectId`] 在一个 store 内**全局唯一**，见
+/// [`skeleton::EffectId`] 的唯一性纪律。）
 struct PendingEffect<A, Op> {
     /// 效果本体。
     effect: Effect<A, Op>,
@@ -244,7 +249,9 @@ impl<A, Op> EffectBufs<A, Op> {
     /// 提交点：暂存区整段并入已提交待转发队列（保持 action 序——暂存区按写入
     /// 序出队，已提交队列按同序追加），并**逐条固化来源元数据**
     /// （`origin_action_seq` = 产出它的 action 的入队序号；`effect_index` =
-    /// 它在该 action 的 reducer 输出序列中的 0-based 位置，Emit 占位）。
+    /// 它在该 action 的 reducer 输出序列中的 0-based 位置，Emit 占位 ⇒ 定位
+    /// 「该 action 产出的**第几条**效果」，与效果种类无关；`EffectId` 在一个
+    /// store 内**全局唯一**，见 [`skeleton::EffectId`] 的唯一性纪律）。
     ///
     /// 逐条包装而非整体 `mem::swap`：pending 元素带来源元数据，类型与暂存区
     /// 不同 ⇒ 无法整体移交。n = 本 action 产出的效果数（典型 0~2）；两侧容器
@@ -1462,13 +1469,17 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 也可能稍后由后续排空消费）；[`AdmissionOutcome::Full`] = 队列容量已满，
     /// action **未入队**（不部分插入）；[`AdmissionOutcome::Closed`] = 已闭门。
     ///
-    /// 本方法**不阻塞等待**完成边界——但**不等待**≠**未达成**：与框架提供的 sender
-    /// 同形，语义**按调用瞬间的排空状态分两条路径**——**竞争态**（已有在任排空者）
-    /// = 纯准入（立即返回，该 action 尚未 reduce、未达完成边界）；**静默态**（无在任
-    /// 排空者）= 本线程夺得排空权并**同步排空至 idle**（返回时该 action 已被 reduce、
-    /// 完成边界已达成）。**等待面见 [`Store::dispatch`]**——它在返回前保证本 action
-    /// 到达完成边界。容量满绝不阻塞：阻塞会与回调重入（reducer / 解释器 / 订阅回调
-    /// 内 dispatch）死锁。
+    /// 本方法**不阻塞等待**完成边界——但**不等待**≠**未达成**：语义**按调用瞬间的
+    /// 排空状态分两条路径**——**竞争态**（调用瞬间已有在任排空者）= **纯准入**——
+    /// 只保证该 action 已入队、**不等**它的完成边界；**返回瞬间该 action 是否已被
+    /// reduce，框架不作任何保证**（取决于在任排空者的推进速度：可能尚未被 reduce，
+    /// 也可能已被 reduce 甚至已完成）⇒ 下游**不得**据「竞争态」推断「此刻读状态
+    /// 仍是旧值」。**静默态**（调用瞬间无在任排空者）= 本线程夺得排空权并**同步排空
+    /// 至 idle** ⇒ 返回时该 action **已被 reduce、其完成边界必然已达成**（此路径
+    /// **强于** [`Store::dispatch`] 的 per-action 完成边界契约——后者**不**承诺队列
+    /// 为空）。**等待面见 [`Store::dispatch`]**——它在返回前保证本 action 到达完成
+    /// 边界。容量满绝不阻塞：阻塞会与回调重入（reducer / 解释器 / 订阅回调内
+    /// dispatch）死锁。
     pub fn try_dispatch(&self, action: A) -> AdmissionOutcome {
         if self.is_closed() {
             self.inner
