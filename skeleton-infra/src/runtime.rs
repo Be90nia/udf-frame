@@ -1059,6 +1059,72 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// assert_eq!(*seen.lock().unwrap(), vec![Op::Ping]); // 装配后随处可读
     /// # store.close();
     /// ```
+    ///
+    /// # drain 回调里 join 的 worker ⇒ 用框架提供的 sender（准入-only）
+    ///
+    /// 回调（[`skeleton::EffectRuntime::run`]）运行在排空环内：若它 join 的 worker
+    /// 用**阻塞式** `Store::dispatch` 回调同一 store，则 worker 等回执、排空环等
+    /// worker ⇒ **确定性互等死锁**。安全写法是 worker 用**框架提供的** sender
+    /// （本例即回调收到的 `back`；准入-only、非阻塞）⇒ 回调可以 join 该 worker
+    /// （worker 不等回执，不与排空环互等），排队的 action 在**回调返回后**按 FIFO
+    /// 处理：
+    ///
+    /// ```
+    /// use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
+    /// use skeleton_infra::runtime::SyncStore;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    /// use std::sync::Arc;
+    /// use std::thread;
+    ///
+    /// #[derive(Debug, PartialEq)]
+    /// enum Op { Work }
+    ///
+    /// /// 每个 action 计数一次（证明「恰好处理一次」）；只有动作 1 产一条效果。
+    /// struct Start {
+    ///     processed: Arc<AtomicUsize>,
+    /// }
+    /// impl Reducer for Start {
+    ///     type State = u64; type Action = u64; type Op = Op;
+    ///     fn initial(&self) -> u64 { 0 }
+    ///     fn reduce(&self, s: &u64, a: u64, out: &mut EffectBuf<u64, Op>) -> u64 {
+    ///         self.processed.fetch_add(1, Ordering::SeqCst);
+    ///         if a == 1 {
+    ///             out.push(Effect::Run { id: EffectId::new(1), op: Op::Work });
+    ///         }
+    ///         *s
+    ///     }
+    /// }
+    ///
+    /// /// 解释器：派生 worker 并 join 它——worker 只**提交**动作（不等待完成）。
+    /// struct Spawner {
+    ///     admitted: Arc<AtomicUsize>,
+    /// }
+    /// impl EffectRuntime<u64, Op> for Spawner {
+    ///     fn run(&mut self, _effect: Effect<u64, Op>, back: &ActionSender<u64>) {
+    ///         let sender = back.clone();
+    ///         let admitted = Arc::clone(&self.admitted);
+    ///         let worker = thread::spawn(move || {
+    ///             // 框架提供的 sender = 准入-only：立即返回，不等该 action 的完成边界。
+    ///             if sender.dispatch(7) {
+    ///                 admitted.fetch_add(1, Ordering::SeqCst);
+    ///             }
+    ///         });
+    ///         worker.join().expect("worker 线程");
+    ///     }
+    /// }
+    ///
+    /// let processed = Arc::new(AtomicUsize::new(0));
+    /// let admitted = Arc::new(AtomicUsize::new(0));
+    /// let store = SyncStore::new(
+    ///     Start { processed: Arc::clone(&processed) },
+    ///     Spawner { admitted: Arc::clone(&admitted) },
+    /// );
+    /// store.dispatch(1); // 排空环转发效果 ⇒ 回调派生并 join worker（不死锁）
+    /// assert_eq!(admitted.load(Ordering::SeqCst), 1, "worker 的动作被准入");
+    /// store.dispatch(2); // 再排空一次 ⇒ worker 提交的动作被处理
+    /// assert_eq!(processed.load(Ordering::SeqCst), 3, "1、7、2 三个动作各处理一次");
+    /// # store.close();
+    /// ```
     pub fn new(
         root: impl Reducer<State = S, Action = A, Op = Op> + Send + Sync + 'static,
         fx: impl EffectRuntime<A, Op> + Send + 'static,

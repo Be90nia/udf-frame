@@ -353,9 +353,10 @@ impl<A, Op> Default for EffectBuf<A, Op> {
 /// 阻塞它即阻塞整个状态机（后续 action 与回灌链全部排队）。**另禁 join 会回调
 /// 同一 store 的线程**——`run` 内 join 一个用阻塞式 [`Store::dispatch`] 回调本
 /// store 的线程 ⇒ 排空环被 join 卡住，而回执只由排空环兑现 ⇒ 确定性互等死锁
-/// （详见 [`Store::dispatch`]「等待语义与宿主义务」）。禁为「API 对称」把
-/// `run` 改成 async：reducer 与核心恒同步，异步只住在边沿（适配层暴露自己的
-/// 惯用异步形）。
+/// （详见 [`Store::dispatch`]「等待语义与宿主意务」）。**回调派生的 worker 用框架
+/// 提供的 sender**（本回调收到的 `back`；准入-only、非阻塞；不等回执 ⇒ 可被 join）
+/// 提交——排队的 action 在**回调返回后**按 FIFO 处理。禁为「API 对称」把 `run` 改成
+/// async：reducer 与核心恒同步，异步只住在边沿（适配层暴露自己的惯用异步形）。
 ///
 /// # 回灌环责任边界
 ///
@@ -407,6 +408,14 @@ impl<A> EffectRuntime<A, Infallible> for NoFx {
 /// 内部持入队闭包（实现方以弱引用接线，不构成引用环）；store 丢弃或已
 /// [`Store::close`] 后 [`ActionSender::dispatch`] 返回 `false`——停机窗显式化，
 /// 禁静默丢弃（停机闸契约，对照表见 [`Store`] 类型文档）。
+///
+/// **两种来源，语义不同**：
+///
+/// - **框架提供的** sender（经 [`Store::sender`] 取到的、解释器回调收到的 `back`）
+///   是**准入-only**——只保证 action 已入队、**不等**它的完成边界。
+/// - **自建** sender（经 [`ActionSender::new`] 装配）语义**由实现方决定**：闭包
+///   是阻塞还是即时返回、`true` 意味什么，全由闭包负责；调用方须知其语义，
+///   **不可假定**准入-only。
 pub struct ActionSender<A> {
     push: Arc<dyn Fn(A) -> bool + Send + Sync>,
 }
@@ -422,14 +431,20 @@ impl<A> Clone for ActionSender<A> {
 impl<A> ActionSender<A> {
     /// 实现面便利：由 store 实现方在装配时构造（闭包返回 `false` = 已闭门或
     /// 已丢弃）。采用方经 [`Store::sender`] 取句柄，不直接调本构造。
+    ///
+    /// **闭包的语义即本句柄的语义**（是否阻塞、`true` 意味什么，由闭包决定）——
+    /// 框架提供的 sender 是准入-only；**自建** sender 的语义由实现方自证，调用方
+    /// 须知其语义、**不可假定**准入-only。
     pub fn new(push: impl Fn(A) -> bool + Send + Sync + 'static) -> Self {
         Self {
             push: Arc::new(push),
         }
     }
 
-    /// 回灌 Action（入队并同步至**本 action 的完成边界**，与 [`Store::dispatch`]
-    /// 同语义；并发生产者下队列可能仍非空，非未排空证据）。
+    /// 回灌 Action（**框架提供的** sender = **准入-only**：只保证 action 已入队，
+    /// **不等待**它的完成边界——与 [`Store::dispatch`] 的同步语义不同，后者才阻塞
+    /// 至完成边界；**自建** sender 的语义由实现方决定，见 [`ActionSender`] 类型
+    /// 文档「两种来源，语义不同」）。
     /// 返回 `false` = store 已丢弃或已 close，action 被显式拒绝（停机静默窗
     /// 收口；闭门拒绝计入实现方的拒绝计数）。
     ///
@@ -484,6 +499,17 @@ impl<A> ActionSender<A> {
     /// let accepted = toy.sender().dispatch(42);
     /// assert!(!accepted, "闭门后 dispatch 必须显式 false");
     /// ```
+    /// **框架提供的** sender：返回 `true` = 准入成功（不是「已完成」）——本方法只
+    /// 保证 action 已入队，**不等待**它的完成边界。需要「等完成」的调用方用
+    /// [`Store::dispatch`]；两者语义不同、**不可互换**。（**自建** sender 的返回值
+    /// 含义由其闭包决定，见 [`ActionSender`] 类型文档「两种来源，语义不同」。）
+    ///
+    /// **drain 回调里派生并 join 的 worker ⇒ 用框架提供的 sender**（回调收到的
+    /// `back` 或 [`Store::sender`]；准入-only、非阻塞）：回调运行在排空环内，若
+    /// worker 改用阻塞式 [`Store::dispatch`] 回调同一 store，则 worker 等回执、
+    /// 排空环等 worker ⇒ 确定性互等死锁（见 [`Store::dispatch`]「等待语义与宿主
+    /// 义务」）。worker 用它只提交、不等回执 ⇒ 回调可以 join 它（不与排空环互等），
+    /// 排队的 action 在**回调返回后**按 FIFO 处理。
     #[must_use = "返回 false = action 被闭门拒绝（store 已 drop 或已 close）；静默丢弃将掩盖停机窗——接收返回值或 `let _ =` 显式弃置"]
     pub fn dispatch(&self, action: A) -> bool {
         (self.push)(action)
@@ -595,8 +621,16 @@ pub trait Store {
     /// - **drain 回调内的跨线程阻塞**：drain 回调（[`EffectRuntime::run`]、订阅回调）
     ///   **运行在排空环内**——宿主在其中 **join 一个会回调同一 store 的线程**、而该
     ///   线程用阻塞式 `dispatch` ⇒ **确定性互等死锁**（排空环被 join 卡住，而回执
-    ///   只由排空环兑现）。此类派生工作必须走 [`ActionSender`]（准入-only、非阻塞）
-    ///   或不得 join。
+    ///   只由排空环兑现）。**安全写法**：回调派生的 worker 必须走**框架提供的**
+    ///   sender（回调收到的 `back` 或 [`Store::sender`]）的
+    ///   [`ActionSender::dispatch`]（准入-only、非阻塞；其 `bool` = **准入**而非完成）
+    ///   ——排队的 action 在**回调返回后**按 FIFO 处理。若 worker 确实需要该 action
+    ///   的**完成结果**才能返回，则它**不得**被跑在同一 store 排空环上的回调同步
+    ///   join。
+    ///   （**自建** sender 的语义由实现方决定，见 [`ActionSender`] 类型文档「两种
+    ///   来源，语义不同」——不可假定其准入-only。框架**无法**检测宿主侧的跨线程
+    ///   join ⇒ 本契约只规定**义务与规避路径**，**不提供**框架侧防护或超时；复现
+    ///   与场景矩阵见 `verify/2026-11-20-residual-join-risk/`。）
     fn dispatch(&self, action: Self::Action);
     /// 谁存储：拉取式值语义快照（快照一致性承诺见类型文档②）。
     fn snapshot(&self) -> std::sync::Arc<Self::State>;

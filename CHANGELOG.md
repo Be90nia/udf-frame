@@ -25,12 +25,20 @@
 - **#41 drain owner 异常恢复交接**：`DrainGuard` 的 `Drop` **只记账**（当前记录按阶段失败 + 残留整批失败 + 摘队放旗同临界区），**零用户代码**——guard 的 drop 绝不跑用户代码，杜绝「unwind 中二次 panic ⇒ abort」。批次中断为 fail-visible：不重放、原 panic 照常上浮、等待者**恰好结算一次**。排空权判定由单槽改为 **TLS 帧栈**（修 A→B→A 同栈误判）。
 - **#38 有界准入**：容量 = **等待被 reduce 的 action 数**（执行中不计入），只约束外部准入，同栈回灌豁免；满时 **typed reject 不阻塞**（阻塞会与回调重入死锁），legacy `dispatch` 显式 panic。超反馈预算的动作**停放 deferred 队列**（零丢失留痕，外部流量不被饿死）。
 - **口径变更（相对 issue#44）**：反馈预算止步由「后续 dispatch 重放」改为「停放」——残留不再自动再执行，但**可查、可计数**。
-- **行为变更**：legacy `dispatch` 对**并发外部调用者会阻塞**（issue#40 拍板）。**已知残余风险（2026-11-20 已复现并文档化）**：若宿主在 drain 回调（`EffectRuntime::run` / 订阅回调）里 spawn 工作线程并 join、且该线程用**阻塞式** `dispatch` 回调同一 store ⇒ **确定性互等死锁**（排空环被 join 卡住，而回执只由排空环兑现）。**规避**：派生工作走 `ActionSender`（准入-only、非阻塞）或不得 join；同线程重入仅入队不等待（不互等）。该义务已写进契约（`skeleton::Store::dispatch` 与 `EffectRuntime::run` 的 rustdoc）；**框架侧未加防护**（属宿主误用），复现证据见 `verify/2026-11-20-residual-join-risk/`。
+- **行为变更**：legacy `dispatch` 对**并发外部调用者会阻塞**（issue#40 拍板）。**已知残余风险（2026-11-20 已复现并文档化）**：若宿主在 drain 回调（`EffectRuntime::run` / 订阅回调）里 spawn 工作线程并 join、且该线程用**阻塞式** `dispatch` 回调同一 store ⇒ **确定性互等死锁**（排空环被 join 卡住，而回执只由排空环兑现）。**规避**：派生工作走**框架提供的** sender（`Store::sender()` 或回调收到的 `back`；准入-only、非阻塞）或不得 join；同线程重入仅入队不等待（不互等）。该义务已写进契约（`skeleton::Store::dispatch` 与 `EffectRuntime::run` 的 rustdoc）；**框架侧未加防护**（属宿主误用），复现证据见 `verify/2026-11-20-residual-join-risk/`。
 - 机制：新增 `runtime/receipt.rs`（完成账本 `Ledger` + 阶段/失败分类），账本走复用池且**归还者唯一**（首发者胜）。
 - 测试：新增 `tests/dispatch_receipts.rs`（7 用例）与 `tests/bounded_admission.rs`（4 用例）；`memgov` 三个零分配硬锚照跑通过。
 - 变异三则：跳过 `ledger.wait()` ⇒ 红；中断批次误报成功 ⇒ 红；容量判定 off-by-one ⇒ 红（`left: Accepted, right: Full`）。
 - 未做（明示）：`close_and_wait()`、显式反馈纪元恢复（`flush_deferred` / `resume_deferred`）、`ActionSender::try_dispatch_with_receipt`；因果屏障只覆盖有等待者的根（无等待者的根不分配账本）。
 - PM 亲验：仓库级四门（test `--all-features` 串行 / clippy `-D warnings` / fmt `--check` / rustdoc `-D warnings`）全 exit 0。
+
+### Fixed（契约表述更正 + 宿主意务入契约，2026-11-20；GitHub issue#46 / #40）
+- **`ActionSender::dispatch` 的契约表述更正（事实性错误）**：旧文档写「入队并同步至**本 action 的完成边界**，与 `Store::dispatch` 同语义」——**这是错的**：框架提供的 sender 自 #40 起就是**准入-only**（`wait=false`，不等回执；返回 `true` 只表示**准入**、不表示完成）。**实现从未变，变的是文档**（旧表述由 `df8d84b` 机械传播）⇒ 下游若照旧表述写过「sender dispatch 返回即已提交/已生效」的代码，是**潜在隐患**，建议核对。
+- **「准入-only」的适用范围收紧**：准入-only 只描述**框架提供的** sender（`Store::sender()` 与解释器回调收到的 `back`）；经 `ActionSender::new` **自建**的 sender 语义**由实现方决定**（闭包行为即语义：是否阻塞、`true` 意味什么），调用方须知其语义、**不可假定**准入-only。契约面新增 `ActionSender` 类型文档「两种来源，语义不同」与 `ActionSender::new` 的「闭包的语义即本句柄的语义」。
+- **#46 宿主机义务入契约**（GitHub issue#46 维护者拍板 **A + 现有 D**）：drain 回调（`EffectRuntime::run` / 订阅回调）**运行在排空环内**——宿主在其中 join 一个用**阻塞式** `dispatch` 回调同一 store 的线程 ⇒ **确定性互等死锁**（排空环被 join 卡住，而回执只由排空环兑现）。契约面新增/收紧四处：① `skeleton::Store::dispatch` 的「等待语义与宿主意务」段；② `skeleton::ActionSender::dispatch` 的「准入 ≠ 完成」与 joined worker 指引；③ `skeleton::EffectRuntime` 类型文档的边界铁律；④ `docs/reference.md` runtime 章节宿主意务块 + 边界规则第 4 条。**规避路径（唯一）**：回调派生的 worker 用**框架提供的** sender 提交（准入-only、不等回执 ⇒ 可被 join）；若 worker 确实需要该 action 的完成结果才能返回，则**不得**被同一 store 排空环上的回调同步 join。
+- **可编译示例 + 正向回归闸**：`skeleton-infra::runtime::SyncStore::new` 的第二个 doctest（回调克隆 sender → worker `sender.dispatch(action)` → 回调 join 该 worker；排队 action 在**回调返回后**按 FIFO 处理）；`skeleton-infra/tests/dispatch_receipts.rs::joined_worker_using_sender_does_not_deadlock_and_is_processed_once`（准入 / 回调返回 / 恰好处理一次；**超时保护** ⇒ 死锁形态是**失败**不是挂死）。变异验证：worker 改用阻塞式 `Store::dispatch` ⇒ 闸在 10s 后**超时失败**（基线绿 / 变异红 / 还原绿），证据与复现工程见 `verify/2026-11-20-pm-impl/`。
+- **框架侧不提供防护**：框架**无法**检测宿主侧的跨线程 join ⇒ **不加**框架侧防护或超时、**不加** drain-owner 可观测面、**不加** spawn/join helper（issue#46 决策：不实现 Option B/C/E；Option E 仅登记为 #40 的后续项 `ActionSender::try_dispatch_with_receipt` / `wait_timeout`，见上条「未做（明示）」）。
+- **口径**：**未新增任何公共 API**；#40 的 per-action 回执语义与 #45 的 Option D 效果 panic 语义**均未变**（本次只改文档与测试）。
 
 ### Changed（fx 三资源维度分离 + 准入上界 typed 化，2026-11-18；GitHub issue#39）
 - **破坏性**：`skeleton_infra::fx::expect_idle`（自由函数）**已删除**，拆为 `FxScope::expect_body_idle`（任务体结束口径）与 `FxScope::expect_fully_reaped_idle`（跟踪集合已完全收割，更强）；crate 根重导出同步移除，调用点全量迁移（`fx.rs` 13 处 / `testing.rs` 6 处 / `examples/end_to_end.rs` 2 处），**无 shim、无旧别名**。`docs/reference.md` 与 `docs/tutorials/thirty-min.md` 的 6 处引用同步更正。

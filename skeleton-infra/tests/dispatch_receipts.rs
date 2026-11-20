@@ -639,3 +639,124 @@ fn caught_subscriber_panic_does_not_strand_receipt() {
     assert_eq!(store.subscriber_count(), 0, "中毒订阅者必须被摘除");
     assert_eq!(store.subscriber_panics(), 1, "摘除必须留痕");
 }
+
+// ── 正向场景（GitHub issue#46）：drain 回调里 join 的 worker 用 ActionSender ─────
+//
+// 契约面：回调派生并 join 的 worker **必须**用**框架提供的** sender（本例 = 回调
+// 收到的 `back`；准入-only、非阻塞）的 `dispatch`——若改用阻塞式 `Store::dispatch`
+// 回调同一 store，则 worker 等回执、排空环等 worker ⇒ 确定性互等死锁。（**自建**
+// sender 的语义由实现方决定，不可假定准入-only。）负向复现（外部超时 + 状态探针，
+// 六场景矩阵）留在 `verify/2026-11-20-residual-join-risk/`，**仓内不复制**：观察
+// 死锁要求测试**挂死**，而挂死的测试不是闸（会卡住 CI）；故仓内只保本正向场景 +
+// 超时保护。
+//
+// 本测钉住**安全写法**的三件事：① worker 的动作被**准入**（`bool` = 准入非完成）；
+// ② 回调**返回**（不死锁）；③ 排队的 action 被**恰好处理一次**。
+//
+// **超时保护**：worker 的完成信号经 channel 回传，回调用 `recv_timeout` 而非裸
+// `join`——若误写成阻塞式 dispatch（死锁形态），worker 永不完成 ⇒ 本测**超时失败**
+// 而不是挂死整个测试进程。
+
+/// 正向场景的 action 词表：`Start` 产一条效果；`Follow` 由 worker 提交；`Bump` 收尾。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinAct {
+    Start,
+    Follow,
+    Bump,
+}
+
+/// 效果载荷（解释器只用它触发派生）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinOp {
+    Work,
+}
+
+/// 计数器 reducer：每个 action 计数一次（证明「恰好处理一次」）。
+struct JoinCounter {
+    processed: Arc<AtomicU32>,
+}
+
+impl Reducer for JoinCounter {
+    type State = u64;
+    type Action = JoinAct;
+    type Op = JoinOp;
+
+    fn initial(&self) -> u64 {
+        0
+    }
+
+    fn reduce(&self, _s: &u64, action: JoinAct, out: &mut EffectBuf<JoinAct, JoinOp>) -> u64 {
+        self.processed.fetch_add(1, Ordering::SeqCst);
+        if let JoinAct::Start = action {
+            out.push(Effect::Run {
+                id: EffectId::new(1),
+                op: JoinOp::Work,
+            });
+        }
+        0
+    }
+}
+
+/// 解释器：派生 worker 并等它完成——worker 只**提交**动作（框架提供的 sender =
+/// 准入-only、不等完成）。
+struct JoinSpawner {
+    admitted: Arc<AtomicU32>,
+}
+
+impl EffectRuntime<JoinAct, JoinOp> for JoinSpawner {
+    fn run(&mut self, _effect: Effect<JoinAct, JoinOp>, back: &ActionSender<JoinAct>) {
+        let sender = back.clone();
+        let admitted = Arc::clone(&self.admitted);
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let ok = sender.dispatch(JoinAct::Follow);
+            if ok {
+                admitted.fetch_add(1, Ordering::SeqCst);
+            }
+            let _ = tx.send(ok);
+        });
+        // 用带超时的完成握手代替裸 join（裸 join 会把死锁形态变成挂死的测试进程）。
+        let ok = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker 未在 10s 内完成——若 worker 改用阻塞式 Store::dispatch，即死锁形态");
+        assert!(
+            ok,
+            "worker 的动作必须被准入（框架提供的 sender 的 dispatch 返回 true）"
+        );
+        worker.join().expect("worker 线程"); // 已收到完成信号 ⇒ worker 随即退出
+    }
+}
+
+/// 正向场景：回调派生的 worker 用 `ActionSender::dispatch` ⇒ 回调不死锁，排队的
+/// action 恰好处理一次。
+#[test]
+fn joined_worker_using_sender_does_not_deadlock_and_is_processed_once() {
+    let processed = Arc::new(AtomicU32::new(0));
+    let admitted = Arc::new(AtomicU32::new(0));
+    let store = SyncStore::new(
+        JoinCounter {
+            processed: Arc::clone(&processed),
+        },
+        JoinSpawner {
+            admitted: Arc::clone(&admitted),
+        },
+    );
+
+    // ① 外部 dispatch 正常返回（回调派生并等 worker ⇒ 若误用阻塞式 dispatch 则挂死）。
+    store.dispatch(JoinAct::Start);
+    assert_eq!(
+        admitted.load(Ordering::SeqCst),
+        1,
+        "worker 的动作必须被准入"
+    );
+
+    // ② 再排空一次 ⇒ worker 提交的动作被处理（Start + Follow + Bump 各一次）。
+    store.dispatch(JoinAct::Bump);
+    assert_eq!(
+        processed.load(Ordering::SeqCst),
+        3,
+        "Start、Follow、Bump 三个动作各被处理恰好一次"
+    );
+    assert_eq!(store.pending_actions(), 0, "队列不得残留");
+    store.close();
+}
