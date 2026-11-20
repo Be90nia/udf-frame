@@ -25,7 +25,7 @@
 - **#41 drain owner 异常恢复交接**：`DrainGuard` 的 `Drop` **只记账**（当前记录按阶段失败 + 残留整批失败 + 摘队放旗同临界区），**零用户代码**——guard 的 drop 绝不跑用户代码，杜绝「unwind 中二次 panic ⇒ abort」。批次中断为 fail-visible：不重放、原 panic 照常上浮、等待者**恰好结算一次**。排空权判定由单槽改为 **TLS 帧栈**（修 A→B→A 同栈误判）。
 - **#38 有界准入**：容量 = **等待被 reduce 的 action 数**（执行中不计入），只约束外部准入，同栈回灌豁免；满时 **typed reject 不阻塞**（阻塞会与回调重入死锁），legacy `dispatch` 显式 panic。超反馈预算的动作**停放 deferred 队列**（零丢失留痕，外部流量不被饿死）。
 - **口径变更（相对 issue#44）**：反馈预算止步由「后续 dispatch 重放」改为「停放」——残留不再自动再执行，但**可查、可计数**。
-- **行为变更**：legacy `dispatch` 对**并发外部调用者会阻塞**（issue#40 拍板）。已知残余风险：若宿主在 drain 回调里 spawn 工作线程并 join、且该线程回调 store，会形成跨线程互等（本批未加防护）。
+- **行为变更**：legacy `dispatch` 对**并发外部调用者会阻塞**（issue#40 拍板）。**已知残余风险（2026-11-20 已复现并文档化）**：若宿主在 drain 回调（`EffectRuntime::run` / 订阅回调）里 spawn 工作线程并 join、且该线程用**阻塞式** `dispatch` 回调同一 store ⇒ **确定性互等死锁**（排空环被 join 卡住，而回执只由排空环兑现）。**规避**：派生工作走 `ActionSender`（准入-only、非阻塞）或不得 join；同线程重入仅入队不等待（不互等）。该义务已写进契约（`skeleton::Store::dispatch` 与 `EffectRuntime::run` 的 rustdoc）；**框架侧未加防护**（属宿主误用），复现证据见 `verify/2026-11-20-residual-join-risk/`。
 - 机制：新增 `runtime/receipt.rs`（完成账本 `Ledger` + 阶段/失败分类），账本走复用池且**归还者唯一**（首发者胜）。
 - 测试：新增 `tests/dispatch_receipts.rs`（7 用例）与 `tests/bounded_admission.rs`（4 用例）；`memgov` 三个零分配硬锚照跑通过。
 - 变异三则：跳过 `ledger.wait()` ⇒ 红；中断批次误报成功 ⇒ 红；容量判定 off-by-one ⇒ 红（`left: Accepted, right: Full`）。

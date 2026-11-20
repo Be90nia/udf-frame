@@ -85,6 +85,8 @@
 
 `SyncStore<S, A, Op = Infallible>` 兑现 `skeleton::Store` 契约：单写者队列 + 同步排空环（**dispatch 返回 = 本 action 的完成边界**——状态提交 → 效果转发 → 通知返回，且其全部**因果后代**终局；并发生产者下队列可能仍非空，同序 action 序列恒同终态）+ CoW 快照广播 + 停机闸 + 回灌深度预算 + **有界准入**（issue#38）+ **dispatch 回执**（issue#40）。`Op` 缺省 `Infallible` → `Effect::Run` 不可构造，零效果程序编译期证明无副作用（配 `skeleton::NoFx`）。
 
+> **宿主义务（跨线程阻塞）**：外部 `dispatch` **阻塞**至自己的完成边界，而 drain 回调（`EffectRuntime::run`、订阅回调）**运行在排空环内**。宿主若在 drain 回调里 `join` 一个**用阻塞式 `dispatch` 回调同一 store** 的线程 ⇒ **确定性互等死锁**（排空环被 join 卡住，回执只由排空环兑现）。此类派生工作必须走 `ActionSender`（准入-only、非阻塞）或不得 join；同线程重入仅入队不等待（不互等）。复现工程：`verify/2026-11-20-residual-join-risk/`。
+
 ### 类型与签名
 
 ```rust
@@ -198,11 +200,12 @@ pub enum AdmissionOutcome {
 | **同步档**（内联） | 排空环转发段，在 `dispatch` 调用方线程内联执行 | 有界、非阻塞、不等待外部完成的工作；**禁 `await`、禁阻塞 IO**（内联耗时直接计入 dispatch 延迟，并阻塞整个状态机） | 解释器 `run` panic：`catch_unwind` 只观察不吞（审计 `EffectInterrupted`，`runtime.rs:1587-1589`）后 `resume_unwind`——**panic 原样从 `dispatch` 上浮**（`runtime.rs:1590`）。实例不报废：毒锁在下一次效果转发时 `into_inner` 恢复 + `clear_poison` + `runtime_panic_count` +1（`runtime.rs:1574-1580`）；读数口径 = **毒位被观察到时才计**（`runtime.rs:1141-1144`），首轮 panic 后不再产效果则读 0。panic 的那条效果随转发丢弃、不再重投（重投会恒 panic 死循环）；同批未转发的效果原地留缓冲，由下一任排空续转（`runtime.rs:1529-1536` 逐条 `pop_front` 摘除形）。 |
 | **托管档**（异步） | `FxScope` 生命周期集内的 tokio 任务 | IO / 长任务 / 需与核心解耦的等待 | 完成/失败/取消经 `Spawned::join` → `TaskError::{Cancelled, Panicked, TimedOut}`（`fx.rs:577-591`）与停机排空报告（`fx.rs:251-303`）分桶可见：`completed` / `cancelled` / `panicked` / `failed`（+`errors` 逐条）/ `still_running` 终局桶互斥穷尽，`timed_out` 是与终局桶正交的截止事件计数。句柄被丢也不丢载荷：panic 消息进生命周期集，`join` 与停机排空双重可见（诊断面非 exactly-once）。 |
 
-**边界规则（三条，两档共用）**：
+**边界规则（四条，两档共用）**：
 
 1. **核心永不阻塞等待异步完成**（蓝图 §3 原句）：`run` 是同步 trait 方法（`skeleton/src/lib.rs:354-358`），排空环调用它时既不 `await` 也没有「等句柄」路径——托管档的 `run` 只 `spawn_tracked` 入集（`fx.rs:417`；闸关返回 `Err(ScopeClosed)`，`fx.rs:429-432`，fail-closed 禁静默丢弃 future）后立即返回。**`dispatch` 返回 ≠ 效果完成**：这是托管档的文档化时序，不是缺陷。
 2. **异步结果回灌必须经 `ActionSender`**（显式消息边界）：任务完成后调 `back.dispatch(action)` 把结果变成普通 action 重入队列，状态仍只由 reducer 推进。跨线程回灌不是 dispatch 调用栈的一部分（按外部流量计，`reentrant_origin` 判定见 `runtime.rs:63`、深度归零见 `runtime.rs:1395`）——**跨线程回灌环的环防护责任在解释器/宿主自身**（契约注见 `skeleton::EffectRuntime`「回灌环责任边界」）。闭门后回灌显式返回 `false`（不静默）。
 3. **同步档内禁 `await`/禁阻塞 IO**：`run` 在排空环内、持排空权执行，阻塞它 = 阻塞整个状态机（后续 action 与回灌链全部排队）。需要等待就换托管档，而不是在同步档里「小睡一下」。
+4. **禁 join 会回调同一 store 的线程**（跨线程形态，2026-11-20 确定性复现）：`run`（或订阅回调）内 join 一个用**阻塞式** `dispatch` 回调**同一 store** 的线程 ⇒ **确定性互等死锁**——排空环被 join 卡住，而回执只由排空环兑现。规避：派生工作走 `ActionSender`（准入-only、非阻塞）或不 join；同线程重入仅入队不等待（不互等）。复现工程与场景矩阵：`verify/2026-11-20-residual-join-risk/`（6 场景：3 死锁 / 3 不死锁）。
 
 **与 ADR 0008 的承继关系**（同一「两档并存 + 同一语义」在两个面上的对照）：
 
