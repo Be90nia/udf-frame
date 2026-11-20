@@ -130,7 +130,7 @@ fn interrupted_forward_resumes_suffix_exactly_once(per_action: u64, fail_at: usi
     let interrupted_events = store
         .take_events()
         .into_iter()
-        .filter(|e| e.kind == AuditEventKind::EffectInterrupted)
+        .filter(|e| matches!(e.kind, AuditEventKind::EffectInterrupted { .. }))
         .count();
     assert_eq!(
         interrupted_events, 1,

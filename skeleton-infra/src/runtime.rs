@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use skeleton::notify::{Notify, NotifySink};
 use skeleton::{
-    ActionSender, Effect, EffectBuf, EffectRuntime, Infallible, Reducer, Restore, Store,
-    Subscription,
+    ActionSender, Effect, EffectBuf, EffectKind, EffectRuntime, Infallible, Reducer, Restore,
+    Store, Subscription,
 };
 
 use crate::audit::{AuditEvent, AuditEventKind, AuditSink, AuditTicket};
@@ -210,7 +210,26 @@ struct EffectBufs<A, Op> {
     staged: EffectBuf<A, Op>,
     /// 已提交待转发队列：提交点把暂存区整段并入队尾（保持 action 序）；解释器
     /// panic ⇒ 只留未转发的后缀（已转发前缀不重放），下一任成功排空续转。
-    pending: EffectBuf<A, Op>,
+    pending: VecDeque<PendingEffect<A, Op>>,
+}
+
+/// 已提交待转发效果 + 其**来源元数据**（issue#48）。
+///
+/// 来源在**提交点固化**：产出该效果的 action 的入队序号 + 该效果在 reducer
+/// 输出序列中的位置，在效果进入已提交队列的**那一刻**写入——不可在 panic
+/// 时反推（pending 效果**跨 action 存活**：A 产出的效果后缀在 A 的转发 panic
+/// 后留存，后来由 B 的 dispatch 触发续转并再次 panic ⇒ 被中断效果的来源是 A，
+/// 而触发者是 B；只记「当前 drain 的 action」= 错误归因）。
+///
+/// `effect_index` 计数**包含** [`Effect::Emit`]（Emit 也占位）——同一 action
+/// 内即便重复使用同一个 [`skeleton::EffectId`] 也能定位到具体 occurrence。
+struct PendingEffect<A, Op> {
+    /// 效果本体。
+    effect: Effect<A, Op>,
+    /// 产出该效果的 action 的入队序号（store 内单调，队列锁内分配）。
+    origin_action_seq: u64,
+    /// 该效果在产出它的 action 的 reducer 输出序列中的 0-based 位置（含 Emit）。
+    effect_index: u64,
 }
 
 impl<A, Op> EffectBufs<A, Op> {
@@ -218,20 +237,27 @@ impl<A, Op> EffectBufs<A, Op> {
     fn new() -> Self {
         Self {
             staged: EffectBuf::new(),
-            pending: EffectBuf::new(),
+            pending: VecDeque::new(),
         }
     }
 
     /// 提交点：暂存区整段并入已提交待转发队列（保持 action 序——暂存区按写入
-    /// 序出队，已提交队列按同序追加）。已提交队列为空时整段移交（O(1)）；非空
-    /// （解释器 panic 遗留了未转发后缀）时把暂存区追加到队尾。
-    fn commit(&mut self) {
-        if self.pending.is_empty() {
-            std::mem::swap(&mut self.pending, &mut self.staged);
-        } else {
-            while let Some(effect) = self.staged.pop_front() {
-                self.pending.push(effect);
-            }
+    /// 序出队，已提交队列按同序追加），并**逐条固化来源元数据**
+    /// （`origin_action_seq` = 产出它的 action 的入队序号；`effect_index` =
+    /// 它在该 action 的 reducer 输出序列中的 0-based 位置，Emit 占位）。
+    ///
+    /// 逐条包装而非整体 `mem::swap`：pending 元素带来源元数据，类型与暂存区
+    /// 不同 ⇒ 无法整体移交。n = 本 action 产出的效果数（典型 0~2）；两侧容器
+    /// 各自复用容量 ⇒ 稳态零新增分配（分配锚见 `tests/memgov.rs`）。
+    fn commit(&mut self, origin_action_seq: u64) {
+        let mut effect_index = 0u64;
+        while let Some(effect) = self.staged.pop_front() {
+            self.pending.push_back(PendingEffect {
+                effect,
+                origin_action_seq,
+                effect_index,
+            });
+            effect_index += 1;
         }
     }
 }
@@ -1961,8 +1987,9 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                     // 提交点（issue#44）：reducer 正常返回 ⇒ 本次调用的暂存输出
                     // 整段并入已提交待转发队列（按 action 序）。提交点落在状态
                     // 发布之前——旧快照析构 panic（状态已发布）时，已提交效果
-                    // 不得随之丢失。
-                    bufs.commit();
+                    // 不得随之丢失。**来源在此固化**（issue#48）：产出这些效果
+                    // 的 action = 当前被 reduce 的 `record` ⇒ 其入队序号。
+                    bufs.commit(record.seq);
                     Ok(next)
                 }
                 Err(payload) => {
@@ -2026,9 +2053,18 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
             None
         };
         // 转发环（禁吞语义见 helper 文档）：Emit 回灌入队、Run/Cancel 交解释器。
+        // `dispatch_action_seq` = 本次触发转发的 action（= 承接失败回执的那个
+        // action）的入队序号——与 pending 效果各自的来源序号（可能更早）区分
+        // （issue#48）。
         guard.phase = Phase::ForwardingEffects;
         inner.effect_buf.with_mut(|bufs| {
-            forward_effects(inner, &mut bufs.pending, feedback_depth, &record.ledger)
+            forward_effects(
+                inner,
+                &mut bufs.pending,
+                feedback_depth,
+                &record.ledger,
+                record.seq,
+            )
         });
         guard.phase = Phase::EffectsForwarded;
         // 异步投递段（ADR 0008）：排在同步回调之前——否则同步档慢订阅者会把
@@ -2102,13 +2138,25 @@ fn place_snapshot<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send 
 /// 是次生路径。正在转发的一条随 panic 丢弃：其失败已显式传播+计数，重投
 /// 会恒 panic 死循环。remove(0) 稳态（单效果）零搬移，保容量。
 /// 回灌句柄为 StoreInner 缓存字段，禁每 action 新建 Arc 闭包。
+///
+/// **来源元数据**（issue#48）：每条已提交效果自带「产出它的 action 的入队序号」
+/// 与「它在该 action 的 reducer 输出序列中的位置」——提交点固化，panic 时
+/// 原样带出。`dispatch_action_seq` = **本次触发转发**的 action 的入队序号
+/// （调用方传入，与失败回执的 action 同一个）；`origin_action_seq` = 该效果
+/// **产出者**的序号（可能更早——pending 效果跨 action 存活）。
 fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
     inner: &Arc<StoreInner<S, A, Op>>,
-    buf: &mut EffectBuf<A, Op>,
+    buf: &mut VecDeque<PendingEffect<A, Op>>,
     feedback_depth: u64,
     parent: &Arc<Ledger>,
+    dispatch_action_seq: u64,
 ) {
-    while let Some(effect) = buf.pop_front() {
+    while let Some(pending) = buf.pop_front() {
+        let PendingEffect {
+            effect,
+            origin_action_seq,
+            effect_index,
+        } = pending;
         match effect {
             Effect::Emit(a) => {
                 inner.feedback_emitted.fetch_add(1, Ordering::Relaxed);
@@ -2136,6 +2184,12 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                 );
             }
             effect => {
+                // 效果身份（kind + 逻辑 id）：**单一映射点** `EffectKind::of`
+                // （skeleton crate 内穷尽匹配 Effect 词表 ⇒ 词表演进时编译期
+                // 强制同步）。非 Emit ⇒ 恒 `Some`（`of` 仅对 Emit 返回 `None`，
+                // 而 Emit 已在上方分支分流）。
+                let (effect_kind, effect_id) = EffectKind::of(&effect)
+                    .expect("非 Emit 效果必经解释器（EffectKind::of 仅对 Emit 返回 None）");
                 // Cancel 寻址校验（fail-visible 留痕，不改转发语义）：
                 // Run 发出即登记 id；Cancel 引用未见过的 id 只计数不拦截——
                 // 拦截（panic/丢弃）会把「Cancel 语义由解释器自证」的契约
@@ -2171,13 +2225,24 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                         guard
                     }
                 };
-                // 解释器 panic 在时间线留痕
-                // （EffectInterrupted）——catch_unwind 只观察不吞：发完事件
-                // 原样 resume（payload/传播面不变；runtime 守卫在闭包外存活，
-                // 随外层展开照常毒化，恢复路径与 fail-visible 均不受影响）。
+                // 解释器 panic 在时间线留痕（EffectInterrupted）——catch_unwind
+                // 只观察不吞：发完事件原样 resume（payload/传播面不变；runtime
+                // 守卫在闭包外存活，随外层展开照常毒化，恢复路径与 fail-visible
+                // 均不受影响）。事件携带结构化效果身份：消费方据此定位「**哪
+                // 一个**效果处于 indeterminate 态」并与失败回执对齐
+                // （issue#48）。
                 let run = catch_unwind(AssertUnwindSafe(|| runtime.run(effect, &inner.back)));
                 if let Err(payload) = run {
-                    audit_emit(inner, AuditEventKind::EffectInterrupted);
+                    audit_emit(
+                        inner,
+                        AuditEventKind::EffectInterrupted {
+                            dispatch_action_seq,
+                            origin_action_seq,
+                            effect_index,
+                            effect_kind,
+                            effect_id,
+                        },
+                    );
                     std::panic::resume_unwind(payload);
                 }
                 audit_emit(inner, AuditEventKind::EffectForwarded);

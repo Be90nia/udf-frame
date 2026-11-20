@@ -232,7 +232,13 @@ pub enum AuditEventKind {
     Reduced,
     ReducerInterrupted,
     EffectForwarded,
-    EffectInterrupted,
+    EffectInterrupted {
+        dispatch_action_seq: u64,
+        origin_action_seq: u64,
+        effect_index: u64,
+        effect_kind: skeleton::EffectKind,
+        effect_id: Option<skeleton::EffectId>,
+    },
     Notified,
     Rejected,
     FeedbackBudgetExceeded,
@@ -240,6 +246,33 @@ pub enum AuditEventKind {
 
 #[must_use = "审计票据被丢弃即立即关闭事件流……"] pub struct AuditTicket { /* Drop = 关流 */ }
 ```
+
+**`EffectInterrupted` 的五个字段**（GitHub issue#48）：解释器 panic 时被中断的那条效果的**结构化身份**——消费方据此定位「**哪一个**效果处于 indeterminate 态（外部结果不确定）」。
+
+| 字段 | 含义 |
+|---|---|
+| `dispatch_action_seq` | **本次触发转发、并承接失败回执**的 action 的**入队序号**（store 内单调，队列锁内分配——FIFO 序 = 序号序） |
+| `origin_action_seq` | **实际产出该效果**的 action 的入队序号——可能**早于** `dispatch_action_seq`（pending 效果跨 action 存活：A 产出的后缀在 A 的转发 panic 后留存，后来由 B 的 dispatch 触发续转并再次 panic ⇒ 来源是 A、触发者是 B） |
+| `effect_index` | 该效果在**产出它的 action** 的 reducer 输出序列中的 **0-based** 位置（计数**包含** `Emit`——Emit 也占位 ⇒ 同一 action 内重复使用同一 `EffectId` 也能定位到具体 occurrence） |
+| `effect_kind` | 效果的解释器侧种类（`skeleton::EffectKind`：`Run` / `Cancel`） |
+| `effect_id` | 效果的逻辑句柄（`Option<skeleton::EffectId>`）——当前 `Run`/`Cancel` 恒 `Some`；未来无句柄的种类为 `None` |
+
+**边界**：⚠️ 两个序号都是**入队序号**，**不是**「dispatch 调用发生的时刻序」——外部调用方看到的是「我这次调用排在队列第几位」，并发下与调用时刻序不同。同一次 action 内两者相等；跨 action 续转时恒 `origin < dispatch`。事件**不携带** `Op` / Action / payload（可能很大、不可 Clone、可能含敏感业务数据）。`Effect::Emit` 不经解释器 ⇒ 不产生本事件。
+
+**配套公共面（`skeleton` crate）**：
+
+```rust
+pub enum EffectKind { Run, Cancel }              // #[non_exhaustive]
+
+impl EffectKind {
+    /// 效果的解释器侧身份：`(种类, 逻辑句柄)`；`Emit` ⇒ `None`。
+    pub fn of<A, Op>(effect: &Effect<A, Op>) -> Option<(EffectKind, Option<EffectId>)>;
+}
+```
+
+`EffectKind::of` 是**效果 → (种类, 句柄) 的单一映射点**：匹配在本 crate 内对 `Effect` 词表**穷尽** ⇒ 词表演进（新增效果种类）时编译期强制同步，跨 crate 的下游免于各自补通配语义。
+
+**`EffectId` ≠ 投递身份**：`EffectId` 是 reducer/消费者定义的**逻辑效果句柄**（同义恒同值，可重复使用），**不是**框架生成的投递尝试身份。本批**不引入重试**、**不承诺** exactly-once；#45 拍板的 Option D 语义（至多一次调用尝试 · 外部结果不确定 · 不自动重放）**保持不变**，幂等/去重属消费方责任。
 
 生命周期重建协议：记账单位是 **action 而非 dispatch**——一笔 dispatch 主 action 走 `Enqueued(depth) → Reduced → [EffectForwarded* | EffectInterrupted] → Notified?`；Emit 回灌派生的每个动作各走一条同形链交错嵌进主链时间线。`Notified` 仅当拍确有状态快照订阅者收到快照时记录。`seq` 单调，订阅窗内**连续**——空洞 = 有界环溢出丢最旧的显式证据。默认关闭零开销：未订阅路径 = 每 emit 点一次 gate load 即返。多订阅者间逐字交错顺序不可预推；时间线断言用语义不变量（深度链/节点计数），勿钉逐字全局顺序。
 

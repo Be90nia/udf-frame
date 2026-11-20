@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+### Changed（**破坏性**：`EffectInterrupted` 事件携带结构化效果身份 + 新增 `EffectKind`，2026-11-20；GitHub issue#48）
+- **破坏性变更**：`skeleton_infra::audit::AuditEventKind::EffectInterrupted` 由**单元变体**改为**结构变体**，携带五个字段：
+  - `dispatch_action_seq: u64`——**本次触发转发、并承接失败回执**的 action 的**入队序号**；
+  - `origin_action_seq: u64`——**实际产出该效果**的 action 的入队序号（可能**早于**前者：pending 效果跨 action 存活——A 产出的后缀在 A 的转发 panic 后留存，后来由 B 的 dispatch 触发续转并再次 panic ⇒ 来源是 A、触发者是 B）；
+  - `effect_index: u64`——该效果在**产出它的 action** 的 reducer 输出序列中的 **0-based** 位置（计数**包含** `Emit`——Emit 也占位）；
+  - `effect_kind: skeleton::EffectKind`——效果的解释器侧种类；
+  - `effect_id: Option<skeleton::EffectId>`——效果的逻辑句柄（当前 `Run`/`Cancel` 恒 `Some`）。
+
+  **迁移**：下游对 `AuditEventKind` 做 match 的代码，`EffectInterrupted` 分支须改为解构形（`AuditEventKind::EffectInterrupted { .. }` 或逐字段绑定）；原先按「等值比较该变体」的写法（如 `e.kind == AuditEventKind::EffectInterrupted`）须改为 `matches!(e.kind, AuditEventKind::EffectInterrupted { .. })`。**无旧形状 shim**（0.1.0 首发准备态 ⇒ 未发布前破坏性直迁）。
+- **新增公共面**：`skeleton::EffectKind`（`#[non_exhaustive]` 枚举，`Run` / `Cancel`）与 `skeleton::EffectKind::of(&Effect) -> Option<(EffectKind, Option<EffectId>)>`——后者是**效果 → (种类, 句柄) 的单一映射点**：匹配在 `skeleton` crate 内对 `Effect` 词表**穷尽** ⇒ 词表演进时编译期强制同步，下游免于各自补通配语义。**`Effect`/`EffectId`/`Reducer`/`EffectRuntime`/`Store`/`ActionSender` 的 trait 与签名零变更**；`Cargo.toml`/`Cargo.lock` 零 diff（无新依赖）。
+- **实现要点**：来源元数据在**提交点固化**（`commit()` 时写入产出该效果的 action 序号与 ordinal）——**不可在 panic 时反推**（panic 时的「当前 drain 的 action」未必是效果的产出者）。已提交待转发队列的元素由裸 `Effect` 改为携带来源记录的内部结构（容器仍为 `VecDeque`——摘队首零搬移的 #43 优化不回退）。
+- **已知代价（如实登记）**：新 `commit()` **无法再走 `mem::swap` 的 O(1) 整体移交**——`staged` 的类型被公共 `Reducer::reduce` 签名钉死为 `EffectBuf`，而 `pending` 的元素是携带来源元数据的私有 `PendingEffect` ⇒ 两者类型不同、不可交换 ⇒ 改为**逐条包装**（n = 本 action 产出的效果数，典型 0~2）。实测（同机同口径、基线取改动前的 `HEAD` 导出）：`effect_steady_state` 中位数 364.92 ns ⇒ 374.91 ns（**+10.0 ns / +2.7%**，区间大幅重叠 ⇒ 统计不显著）；**分配面不回归**——memgov 三个零分配硬锚与稳态分配锚全绿（两侧容器各自复用容量 ⇒ 逐条包装不引入新分配）。
+- **`EffectId` ≠ 投递身份**：`EffectId` 是 reducer/消费者定义的**逻辑效果句柄**（同义恒同值，可重复使用），**不是**框架生成的投递尝试身份。**本批不引入重试**、**不承诺** exactly-once；**#45 拍板的 Option D 语义（至多一次调用尝试 · 外部结果不确定 · 不自动重放）保持不变**，幂等/去重属消费方责任。
+- **不选 C/D**：效果明细**不进回执**（回执仍只答「当前 dispatch 是否完成 / 在哪个阶段失败」，`Failure.seq` 仍是**动作**序号）；**不新建查询面**（无历史索引/保留期/快照语义）。
+- 测试：新增 `skeleton-infra/tests/effect_interrupted_identity.rs`（7 用例：kind/id/ordinal 逐条可辨 · **跨 action 续转归因**（来源 = 产出者、触发者更晚、且 `origin < dispatch`）· **失败回执的 seq 与事件 `dispatch_action_seq` 逐字相等** · `Emit` 置前 ordinal 不错位 · `Cancel` 中断携带其目标 `EffectId` · tracing 桥五字段与事件同值 · 环形缓冲溢出/订阅关闭既有语义回归）；既有 `tests/effect_forward_panic.rs` 的等值比较迁移为 `matches!`。
+- 文档：`docs/reference.md` 的 audit 章节同步登记事件 shape、五个字段语义、两个序号的口径（**入队序号**而非调用时刻序）与新增公共面（`EffectKind` + `of()`）。
+
 ### Fixed（契约与文档面澄清：dispatch 完成边界 + 新面收录 + 两条回归闸补齐，2026-11-19；12 维独立复审）
 - **完成边界口径更正**：`skeleton::Store` trait 与 `docs/reference.md` 此前三处写「dispatch 返回 = 队列 idle / 同步排空至 idle」，与 #40 拍板的 **per-action 完成边界**冲突——并发生产者下队列**可能仍非空，这是正常态、不是未排空证据** ⇒ 契约 crate 与 reference.md 同步更正为「dispatch 返回 = 本 action 的完成边界（状态提交 → 效果转发 → 通知返回，且其全部**因果后代**终局）」。
 - **新面补收录**：`docs/reference.md` 此前**零收录** #38/#40 的四个公共面（`try_dispatch` / `set_capacity` / `AdmissionOutcome` / `admission_full_count`）⇒ 补入 runtime 章节，并写明容量口径：**等待被 reduce 的 action 数**（执行中不计入、同栈回灌豁免）、满时 typed 拒绝**不阻塞**（阻塞会与回调重入死锁）。

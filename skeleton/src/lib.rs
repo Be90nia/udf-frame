@@ -273,6 +273,53 @@ pub enum Effect<A, Op = Infallible> {
     },
 }
 
+/// 效果种类：解释器可见的效果分类（`Effect` 的可执行子集）。
+///
+/// [`Effect::Emit`] **不经解释器**（由 store 核心直接回灌入队），故不在本
+/// 词表内；`Run` 与 `Cancel` 是当前仅有的两种解释器可见种类。
+///
+/// 词表按真实采用面渐进扩：`#[non_exhaustive]` 使加变体属非破坏演进——
+/// 跨 crate 的 match 必须带通配臂（同 crate 豁免），采用方在编译期被强制
+/// 面对「未知效果种类」的分支而非静默漏配（纪律同 [`Effect`] 词表）。
+///
+/// 与 [`EffectId`] 的分工：`EffectId` 是**逻辑效果句柄**（reducer/消费者
+/// 定义的寻址键，同一 action 内可重复使用同一值），`EffectKind` 是**效果
+/// 形态**——二者正交，审计事件同时携带二者（种类 + 句柄）方能定位到
+/// 「哪一个效果」。
+///
+/// ```
+/// use skeleton::{Effect, EffectId, EffectKind};
+/// let effect = Effect::<(), u8>::Run { id: EffectId::new(3), op: 1 };
+/// let (kind, id) = EffectKind::of(&effect).expect("Run 经解释器");
+/// assert_eq!(kind, EffectKind::Run);
+/// assert_eq!(id, Some(EffectId::new(3)));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EffectKind {
+    /// 描述式副作用（对应 [`Effect::Run`]）：携带逻辑效果句柄。
+    Run,
+    /// 取消在途效果（对应 [`Effect::Cancel`]）：携带被取消效果的句柄。
+    Cancel,
+}
+
+impl EffectKind {
+    /// 效果的解释器侧身份：`(种类, 逻辑句柄)`。
+    ///
+    /// [`Effect::Emit`] 不经解释器 ⇒ `None`；其余种类恒 `Some`。
+    /// 逻辑句柄缺失时内层为 `None`（未来无句柄的效果种类）。
+    ///
+    /// 匹配在本 crate 内对 [`Effect`] 词表**穷尽**——词表演进（新增效果
+    /// 种类）时本函数编译期强制同步，下游 crate 免于各自补通配语义。
+    pub fn of<A, Op>(effect: &Effect<A, Op>) -> Option<(EffectKind, Option<EffectId>)> {
+        match effect {
+            Effect::Emit(_) => None,
+            Effect::Run { id, .. } => Some((EffectKind::Run, Some(*id))),
+            Effect::Cancel { id } => Some((EffectKind::Cancel, Some(*id))),
+        }
+    }
+}
+
 /// 效果缓冲：reducer 的效果出参位。
 ///
 /// 阅读面口径：reducer 只用 [`EffectBuf::push`]；`new`/`clear`/`is_empty`/

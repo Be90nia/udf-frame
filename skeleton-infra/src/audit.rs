@@ -12,6 +12,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use skeleton::{EffectId, EffectKind};
+
 /// std Mutex 取锁：中毒 = 持锁方已 panic——fail-fast 传播（同 runtime::lock 纪律）。
 fn lock_audit<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -70,7 +72,47 @@ pub enum AuditEventKind {
     /// 一条效果转发解释器时解释器 panic：本条效果随转发丢弃，未转发的残留由
     /// 下一任排空续转（续转仍以 [`AuditEventKind::EffectForwarded`] 入账）——
     /// 时间线上「谁 panic、什么被续转」可归因。
-    EffectInterrupted,
+    ///
+    /// **携带结构化效果身份**（GitHub issue#48）：消费方据此定位「**哪一个**
+    /// 效果处于 indeterminate 态（外部结果不确定）」，并把它与失败回执对齐。
+    /// 五个字段缺一不可：两个 action 序号回答「谁触发、谁产出」，`effect_index`
+    /// 回答「该 action 产出的第几条」，`effect_kind` + `effect_id` 回答「哪种
+    /// 效果、哪个逻辑句柄」。
+    ///
+    /// **两个序号的语义**（store 内单调序号，**入队线性化点**分配——FIFO 序 =
+    /// 序号序）：
+    ///
+    /// - `dispatch_action_seq`：**本次触发转发、并承接失败回执**的 action 的
+    ///   入队序号（= 效果转发失败发生在哪个 action 的转发段内）。
+    /// - `origin_action_seq`：**实际产出该效果**的 action 的入队序号——可能
+    ///   **早于** `dispatch_action_seq`（pending 效果跨 action 存活：action A
+    ///   产出的效果后缀在 A 的转发 panic 后留存，后来由 action B 的 dispatch
+    ///   触发续转并再次 panic ⇒ 被中断效果的来源是 A，触发者是 B）。
+    ///   同一次 action 内两者相等；跨 action 续转时恒 `origin < dispatch`。
+    ///
+    /// ⚠️ 这是**入队序号**，不是「dispatch 调用发生的时刻序」——外部调用方看到
+    /// 的是「我这次调用排在队列第几位」，并发下与调用时刻序不同。
+    ///
+    /// **不携带** `Op` / Action / payload（可能很大、不可 Clone、可能含敏感
+    /// 业务数据）——事件面只留定位所需的身份信息。
+    ///
+    /// [`skeleton::Effect::Emit`] 不经解释器 ⇒ 不产生本事件。
+    EffectInterrupted {
+        /// 本次触发转发、并承接失败回执的 action 的**入队序号**。
+        dispatch_action_seq: u64,
+        /// 实际产出该效果的 action 的**入队序号**（可能早于
+        /// `dispatch_action_seq`）。
+        origin_action_seq: u64,
+        /// 该效果在产出它的 action 的 reducer 输出序列中的 **0-based** 位置
+        /// （计数**包含** [`skeleton::Effect::Emit`]——Emit 也占位，故同一 action 内
+        /// 即便重复使用同一个 [`EffectId`] 也能定位到具体 occurrence）。
+        effect_index: u64,
+        /// 效果的解释器侧种类（[`skeleton::EffectKind`]）。
+        effect_kind: EffectKind,
+        /// 效果的逻辑句柄（[`skeleton::EffectId`]）——当前 `Run`/`Cancel`
+        /// 恒 `Some`；未来无句柄的效果种类为 `None`。
+        effect_id: Option<EffectId>,
+    },
     /// 状态通知已发出（本地或跨线程至少一个订阅者收到当拍快照）。
     Notified,
     /// 闭门拒绝（dispatch no-op / sender dispatch `false` 的共享计数路径）。

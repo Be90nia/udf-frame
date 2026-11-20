@@ -74,9 +74,31 @@ fn emit(event: &AuditEvent) {
             let kind = "effect_forwarded";
             tracing::event!(target: "skeleton::audit", tracing::Level::INFO, seq, kind);
         }
-        AuditEventKind::EffectInterrupted => {
+        AuditEventKind::EffectInterrupted {
+            dispatch_action_seq,
+            origin_action_seq,
+            effect_index,
+            effect_kind,
+            effect_id,
+        } => {
             let kind = "effect_interrupted";
-            tracing::event!(target: "skeleton::audit", tracing::Level::INFO, seq, kind);
+            // 效果身份四字段与 `AuditEvent` 同源同值（issue#48）：消费方据此
+            // 定位「哪一个效果 + 来自哪个 action」。`effect_kind` 用 Debug 形态
+            // （`Run`/`Cancel`）——不引入第二套 kind 映射（单一映射点在
+            // `EffectKind::of`）；`effect_id` 取 `EffectId::get()` 的数值形态
+            // （`None` 时为 `None`，可判读）。
+            let effect_id = effect_id.map(|id| id.get());
+            tracing::event!(
+                target: "skeleton::audit",
+                tracing::Level::INFO,
+                seq,
+                kind,
+                dispatch_action_seq,
+                origin_action_seq,
+                effect_index,
+                effect_kind = ?effect_kind,
+                effect_id = ?effect_id,
+            );
         }
         AuditEventKind::Notified => {
             let kind = "notified";
