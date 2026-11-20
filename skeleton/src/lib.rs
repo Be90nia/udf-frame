@@ -365,11 +365,26 @@ pub trait EffectRuntime<A, Op> {
     /// 由 store 直接回灌入队，不经此处）；转发顺序 = reducer 在 [`EffectBuf`]
     /// 的写入顺序。`back` 是回灌句柄：异步实现 spawn 后持它把 Action 重入队列。
     ///
-    /// **panic 语义（当前事实，待拍板）**：`run` panic ⇒ 该效果**已被取出**（转发前
-    /// 即从缓冲摘走）且**不重放**——框架不保留已取出的效果。GitHub issue#43 的设计
-    /// 评审要求保留「正在转发的那一条」（`retain the current unforwarded item and
-    /// suffix exactly once`），**该语义待维护者拍板**；实现方若依赖重试该效果，
-    /// 须自行保证幂等。
+    /// **panic 语义：至多一次调用尝试（at-most-once attempt）· 外部结果不确定**：
+    /// `run` panic ⇒ 本次调用**退出自动重放**——框架**不会**再次调用它。
+    /// 但**不得**据此认为该效果「未执行」：`run` 可能在 panic 之前**已产生外部
+    /// 副作用**；框架按值取走效果，**无法区分**「panic 前未执行 / 执行中 panic /
+    /// 执行完成后在本地清理或汇报时 panic」⇒ 该效果的**外部结果不确定
+    /// （indeterminate）**。
+    /// **不承诺** exactly-once 投递或 exactly-once 副作用，也**不承诺**「未执行」。
+    ///
+    /// **中断可见**：同一路径发出 `EffectInterrupted` 审计事件（`skeleton_infra`
+    /// 的 `AuditEventKind`），转发失败回执仍报 `Failed(EffectsForwarding)` +
+    /// `state_committed=true`。
+    ///
+    /// **既有保证不变**：已成功转发的**前缀不重放**；已提交但未调用的**后缀保留**
+    /// 并按 FIFO 续转（恰好一次）。
+    ///
+    /// **幂等性属消费方责任**：框架不替消费方重试一个可能已执行的效果。若将来
+    /// 需要可重试投递，应作为**显式 opt-in 能力**引入（稳定的 delivery identity
+    /// **并且**适配器侧提供持久幂等/去重、结果为三态（acknowledged /
+    /// definitely-not-started / indeterminate），而非改写本默认契约
+    /// （GitHub issue#45，2026-11-20 拍板：Option D）。
     fn run(&mut self, effect: Effect<A, Op>, back: &ActionSender<A>);
 }
 

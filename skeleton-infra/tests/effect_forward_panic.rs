@@ -3,7 +3,9 @@
 //! 语义（#44 的事务边界定下的）：
 //! - **已成功转发的前缀不重放**（转发成功即消费，不可重复执行）；
 //! - **未转发的后缀保留**，由后续 dispatch 续转；
-//! - 后缀**恰好保留一次**（不多、不少、不乱序）。
+//! - 后缀**恰好保留一次**（不多、不少、不乱序）；
+//! - **被中断的那一条：不被自动再次调用**（issue#45 拍板 Option D：至多一次调用
+//!   尝试 · 外部结果不确定 · 不自动重放），且该中断**可观测**（审计事件）。
 //!
 //! 判据用「最终收到的 op 序列逐条等于 0..k」——它同时钉住三件事：前缀没被重放
 //! （否则前缀元素出现两次）、后缀没丢（否则缺尾）、后缀没被复制（否则元素重复）。
@@ -13,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store};
+use skeleton_infra::audit::AuditEventKind;
 use skeleton_infra::runtime::SyncStore;
 
 /// 每拍产 `per_action` 条 Run 效果的根特征（op 编码「拍序号×10000 + 条序号」）。
@@ -82,6 +85,9 @@ fn interrupted_forward_resumes_suffix_exactly_once(per_action: u64, fail_at: usi
             seen: Arc::clone(&seen),
         },
     );
+    // 审计闸：**订阅后才入账**（`take_events` 未订阅 = 空 Vec）⇒ 中断可观测性
+    // 断言依赖它；ticket 持到断言之后（Drop 即关闸）。
+    let _ticket = store.subscribe_events(64, |_| {});
 
     // 第一次 dispatch：在第 fail_at 个效果处中断（panic 原样上浮 = fail-visible）。
     let first = catch_unwind(AssertUnwindSafe(|| store.dispatch(1u64)));
@@ -103,24 +109,32 @@ fn interrupted_forward_resumes_suffix_exactly_once(per_action: u64, fail_at: usi
     let final_seen = seen.lock().expect("recorder mutex").clone();
     let all: Vec<u64> = (0..per_action).map(|i| 10_000 + i).collect();
     let interrupted = 10_000 + fail_at as u64;
-    // **中断项（panic 掉的那一条）的去向是待拍板的语义**，本测试**不断言**它：
-    //   · #44 的 EffectRuntime panic 路径当前**丢弃**它；
-    //   · issue#43 的设计评审原文要求「retain the current unforwarded item and
-    //     suffix exactly once」（**保留**它）。
-    // 两种语义下本断言都成立 ⇒ 语义一旦拍板，改这里即可，不必重写整条测试。
-    let without_interrupted: Vec<u64> = final_seen
-        .iter()
-        .copied()
-        .filter(|op| *op != interrupted)
-        .collect();
+    // **被中断的那一条：不被自动再次调用**（issue#45 拍板 Option D：至多一次调用
+    // 尝试 · 外部结果不确定 · 不自动重放）。**代价**：该效果可能永不发生，也可能
+    // 已发生到一半（框架无法判定）⇒ 不得据此声称「未执行」。
+    assert!(
+        !final_seen.contains(&interrupted),
+        "被中断的那一条**不得被自动再次调用**（Option D：至多一次调用尝试，不自动重放）"
+    );
+    // 其余部分逐条精确：成功前缀不重放、未转发后缀按序续转恰好一次。
     let expected_without: Vec<u64> = all
         .iter()
         .copied()
         .filter(|op| *op != interrupted)
         .collect();
     assert_eq!(
-        without_interrupted, expected_without,
-        "除中断项外：已成功的前缀不得重放、未转发的后缀不得丢、不得乱序、不得被复制"
+        final_seen, expected_without,
+        "已成功的前缀不得重放、未转发的后缀不得丢、不得乱序、不得被复制；被中断项不在其中"
+    );
+    // **中断可观测**（D：不得静默）——审计事件流里恰好一条 `EffectInterrupted`。
+    let interrupted_events = store
+        .take_events()
+        .into_iter()
+        .filter(|e| e.kind == AuditEventKind::EffectInterrupted)
+        .count();
+    assert_eq!(
+        interrupted_events, 1,
+        "解释器 panic 的转发路径必须发出且只发出一条 EffectInterrupted 审计事件（中断可观测、不得静默）"
     );
 }
 

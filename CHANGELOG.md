@@ -18,7 +18,7 @@
 - 元素搬移解析式计数（旧 k(k-1)/2 → 新 0）：k=16 120→0 · k=64 2016→0 · k=256 32640→0 · k=1024 523776→0 · k=4096 8386560→0。
 - 分配面无回归：`Vec` 与 `VecDeque` 同为倍增扩容（分配次数 O(log k) 同量级）；探针实测多轮 push-k/pop-k 周期容量稳定、`clear` 保容量两者一致。
 - 测试：红阶段 `effect_buf_pop_front_does_not_relocate_remaining_effects` FAILED（地址差 0x10 = 一个 `Effect` 的大小，证明旧实现每次前移一格）→ 改后转绿；判据取**地址不变**而非计时（计时被布局噪声主导，不可作证据）。新增 `tests/batch_effects_order.rs`（k=1/4/64/1024 的条数与顺序——此前「k 条效果」这一面无覆盖）与 `tests/effect_forward_panic.rs`（中断在第 1/中间/最后一条：成功前缀不重放、未转发后缀按序续转不丢不重）。
-- **语义分歧（待拍板）**：#44 的 `EffectRuntime` panic 路径当前**丢弃**中断项，而 issue#43 的设计评审要求「retain the current unforwarded item and suffix exactly once」（**保留**它）——两者只差「正在转发的那一条」；新测试**不断言**该项去向，只钉无歧义部分，拍板后改一处断言即可。⇒ **已开 issue#45 专门承载该决策**（三个选项 A/B/C + 各自代价 + 影响面清单 + 非约束性推荐）。
+- **panic 语义已定（GitHub issue#45 拍板：Option D——非 A/B/C 原文）**：`EffectRuntime::run` panic 时**该次调用退出自动重放**（框架**不再调用**它 ⇒ **至多一次调用尝试**），但**不得**据此认为该效果「未执行」——`run` 可能在 panic 前**已产生外部副作用**（框架按值取走效果，**无法区分**「panic 前未执行 / 执行中 panic / 执行完后在清理或汇报时 panic」）⇒ 该效果的**外部结果不确定（indeterminate）**。**不承诺** exactly-once 投递或 exactly-once 副作用。**中断可见**：同一路径发出 `EffectInterrupted` 审计事件，转发失败回执仍报 `Failed(EffectsForwarding)` + `state_committed=true`。**既有保证不变**：成功前缀不重放、已提交未调用的后缀按 FIFO 续转恰好一次。**幂等性属消费方责任**；将来若需可重试投递，作为**显式 opt-in 能力**引入（稳定 delivery identity + 适配器侧持久幂等/去重 + 三态结果），**不**作为默认契约。
 
 ### Added（SyncStore dispatch 回执 + drain 恢复交接 + 有界准入，2026-11-18；GitHub issue#40 / #41 / #38）
 - **#40 并发 dispatch 回执**：新增公共面 `try_dispatch` / `set_capacity` / `admission_full_count` / `AdmissionOutcome`。**完成边界 = per-action**（状态提交 → 效果转发 → 通知返回）+ 全部因果后代终局——外部并发 dispatch 在**自己的** action 到达该边界前不返回；同线程/同 store 重入保持「仅入队不返回」以免自死锁。
