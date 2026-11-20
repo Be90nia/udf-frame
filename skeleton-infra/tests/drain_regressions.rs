@@ -3,7 +3,7 @@
 //! 死 Weak 回收与并发孤儿压力测试需私有态断言，在 src/runtime.rs 单测模块
 //! （不变量监视线程 + 去 barrier 自由竞争）。
 
-use skeleton::{ActionSender, Effect, EffectBuf, EffectRuntime, Reducer, Store as _};
+use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
 use skeleton_infra::audit::AuditEventKind;
 use skeleton_infra::runtime::SyncStore as Store;
 use std::convert::Infallible;
@@ -11,6 +11,9 @@ use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 enum Act {
     Inc,
@@ -114,12 +117,22 @@ fn subscriber_panic_removed_and_store_survives() {
 
 /// send 显式化——store 存活返回 true；store 丢弃后返回 false（停机窗显式
 /// 拒绝，禁静默丢弃）。
+///
+/// 注：本测断言的「回灌已入队**并排空**」是**静默态**形态（无在任排空者 ⇒
+/// sender 夺得排空权并同步排空至 idle ⇒ 返回时该 action 已被 reduce）；框架
+/// 提供的 sender 在**竞争态**下则是纯准入（返回时该 action 尚未 reduce）——
+/// 两条路径的条件化语义见 `skeleton::ActionSender::dispatch` 的契约与
+/// `framework_sender_admission_is_conditional_on_drain_state`。
 #[test]
 fn send_reports_delivery_explicitly() {
     let store = Store::new(Counting, Nop::<Act> { _m: PhantomData });
     let sender = store.sender();
     assert!(sender.dispatch(Act::Inc));
-    assert_eq!(*store.snapshot(), 1, "回灌已入队并排空");
+    assert_eq!(
+        *store.snapshot(),
+        1,
+        "静默态：回灌已入队并同步排空（已被 reduce）"
+    );
     drop(store);
     assert!(
         !sender.dispatch(Act::Inc),
@@ -246,4 +259,143 @@ fn reducer_panic_is_counted_and_audited() {
         1,
         "正常 dispatch 不得推进 panic 计数"
     );
+}
+
+// ── 条件性准入闸：框架提供的 sender 语义按「调用瞬间的排空状态」分两态 ──────
+//
+// 契约（skeleton::ActionSender::dispatch）：框架提供的 sender（Store::sender()）
+// 的语义**按调用瞬间有无在任排空者分两条路径**——
+//   静默态（无在任排空者）：夺得排空权并**同步排空至 idle** ⇒ 返回时该 action
+//     **已被 reduce**、完成边界已达成；
+//   竞争态（已有在任排空者）：**纯准入** ⇒ 立即返回，该 action **尚未被 reduce**。
+// 本闸同时钉住两态（任一态退化 ⇒ 立即报红），是契约表述的机械闸（rustdoc 只查
+// 链接与编译，不查语义真伪）。
+//
+// 确定性编排（禁 sleep）：竞争态窗口用「drain 回调内派生 worker」——回调运行在
+// 排空环内 ⇒ 排空权在排空线程 ⇒ worker 的 sender 必处竞争态；回调**同步等待**
+// worker 的完成信号后才返回 ⇒ worker 观察 reducer 计数的瞬间排空环不可能前进
+// （同一线程）⇒ 「尚未 reduce」是确定判据而非竞速读数。
+// 失败不挂死：worker 完成信号经 channel + `recv_timeout`（10s）。
+
+/// 条件性准入闸的动作词表：`Start` 产一条效果（打开竞争态窗口）；`Follow` 由
+/// worker 经框架提供的 sender 提交；`Bump` 收尾（排在 `Follow` 之后）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CondAct {
+    Start,
+    Follow,
+    Bump,
+}
+
+/// 条件性准入闸的效果载荷（解释器只用它触发派生 worker）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CondOp {
+    Work,
+}
+
+/// 计数 reducer：每个 action 计数一次（计数即「是否已被 reduce」的读侧）。
+struct CondCounter {
+    processed: Arc<AtomicUsize>,
+}
+
+impl Reducer for CondCounter {
+    type State = usize;
+    type Action = CondAct;
+    type Op = CondOp;
+
+    fn initial(&self) -> usize {
+        0
+    }
+
+    fn reduce(&self, s: &usize, a: CondAct, out: &mut EffectBuf<CondAct, CondOp>) -> usize {
+        self.processed.fetch_add(1, Ordering::SeqCst);
+        if let CondAct::Start = a {
+            out.push(Effect::Run {
+                id: EffectId::new(1),
+                op: CondOp::Work,
+            });
+        }
+        s + 1
+    }
+}
+
+/// drain 回调内派生 worker：worker 用**框架提供的** sender 提交 `Follow`，并在
+/// dispatch 返回的瞬间记录 reducer 计数（竞争态判据：此刻 `Follow` 尚未 reduce）。
+struct CondSpawner {
+    processed: Arc<AtomicUsize>,
+    observed: Arc<AtomicUsize>,
+}
+
+impl EffectRuntime<CondAct, CondOp> for CondSpawner {
+    fn run(&mut self, _effect: Effect<CondAct, CondOp>, back: &ActionSender<CondAct>) {
+        let sender = back.clone();
+        let processed = Arc::clone(&self.processed);
+        let observed = Arc::clone(&self.observed);
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let ok = sender.dispatch(CondAct::Follow);
+            // dispatch 返回瞬间的 reducer 计数——竞争态下 `Follow` 尚未被 reduce。
+            observed.store(processed.load(Ordering::SeqCst), Ordering::SeqCst);
+            let _ = tx.send(ok);
+        });
+        // 带超时的完成握手（禁裸 join：裸 join 会把死锁形态变成挂死的测试进程）。
+        let ok = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "worker 未在 10s 内完成——竞争态下框架提供的 sender 必须纯准入（立即返回）；\
+             若它改为等完成边界即死锁形态",
+        );
+        assert!(ok, "worker 的动作必须被准入（框架提供的 sender 返回 true）");
+        worker.join().expect("worker 线程");
+    }
+}
+
+/// 条件性准入闸：静默态 sender 返回时该 action **已被 reduce**；竞争态 sender
+/// 返回时该 action **尚未被 reduce**。
+#[test]
+fn framework_sender_admission_is_conditional_on_drain_state() {
+    // ── 静默态：无在任排空者 ⇒ sender 夺得排空权并同步排空 ⇒ 返回时已 reduce。
+    let quiet_processed = Arc::new(AtomicUsize::new(0));
+    let quiet_store = Store::new(
+        CondCounter {
+            processed: Arc::clone(&quiet_processed),
+        },
+        CondSpawner {
+            processed: Arc::clone(&quiet_processed),
+            observed: Arc::new(AtomicUsize::new(0)),
+        },
+    );
+    let sender = quiet_store.sender();
+    assert!(
+        sender.dispatch(CondAct::Follow),
+        "静默态：框架提供的 sender 必须接受 action（bool = 被接受）"
+    );
+    assert_eq!(
+        quiet_processed.load(Ordering::SeqCst),
+        1,
+        "静默态：sender 返回时该 action 必须已被 reduce（完成边界已达成）"
+    );
+
+    // ── 竞争态：已有在任排空者（drain 回调内）⇒ 纯准入 ⇒ 返回时尚未 reduce。
+    let processed = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(AtomicUsize::new(0));
+    let store = Store::new(
+        CondCounter {
+            processed: Arc::clone(&processed),
+        },
+        CondSpawner {
+            processed: Arc::clone(&processed),
+            observed: Arc::clone(&observed),
+        },
+    );
+    store.dispatch(CondAct::Start); // 排空环转发效果 ⇒ 回调内派生 worker（竞争态窗口）
+    assert_eq!(
+        observed.load(Ordering::SeqCst),
+        1,
+        "竞争态：sender 返回时该 action 必须尚未被 reduce（reducer 计数仍只有 Start）"
+    );
+    store.dispatch(CondAct::Bump); // 排在 Follow 之后 ⇒ 其完成边界覆盖 Follow 的处理
+    assert_eq!(
+        processed.load(Ordering::SeqCst),
+        3,
+        "Start、Follow、Bump 三个动作各被处理恰好一次"
+    );
+    assert_eq!(store.pending_actions(), 0, "队列不得残留");
 }

@@ -643,14 +643,15 @@ fn caught_subscriber_panic_does_not_strand_receipt() {
 // ── 正向场景（GitHub issue#46）：drain 回调里 join 的 worker 用 ActionSender ─────
 //
 // 契约面：回调派生并 join 的 worker **必须**用**框架提供的** sender（本例 = 回调
-// 收到的 `back`；准入-only、非阻塞）的 `dispatch`——若改用阻塞式 `Store::dispatch`
+// 收到的 `back`；回调运行在排空环内 ⇒ 该 sender 必处**竞争态** = 纯准入、不等
+// 回执）的 `dispatch`——若改用阻塞式 `Store::dispatch`
 // 回调同一 store，则 worker 等回执、排空环等 worker ⇒ 确定性互等死锁。（**自建**
-// sender 的语义由实现方决定，不可假定准入-only。）负向复现（外部超时 + 状态探针，
+// sender 的语义由实现方决定，不可假定框架提供的 sender 的任一条路径语义。）负向复现（外部超时 + 状态探针，
 // 六场景矩阵）留在 `verify/2026-11-20-residual-join-risk/`，**仓内不复制**：观察
 // 死锁要求测试**挂死**，而挂死的测试不是闸（会卡住 CI）；故仓内只保本正向场景 +
 // 超时保护。
 //
-// 本测钉住**安全写法**的三件事：① worker 的动作被**准入**（`bool` = 准入非完成）；
+// 本测钉住**安全写法**的三件事：① worker 的动作被**接受**（`bool` = 被接受，非完成）；
 // ② 回调**返回**（不死锁）；③ 排队的 action 被**恰好处理一次**。
 //
 // **超时保护**：worker 的完成信号经 channel 回传，回调用 `recv_timeout` 而非裸
@@ -697,8 +698,8 @@ impl Reducer for JoinCounter {
     }
 }
 
-/// 解释器：派生 worker 并等它完成——worker 只**提交**动作（框架提供的 sender =
-/// 准入-only、不等完成）。
+/// 解释器：派生 worker 并等它完成——worker 只**提交**动作（框架提供的 sender 在
+/// drain 回调内 = **竞争态** ⇒ 纯准入、不等完成）。
 struct JoinSpawner {
     admitted: Arc<AtomicU32>,
 }

@@ -75,10 +75,16 @@ fn back_sender<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                     false
                 }
                 Enqueue::Queued(_) => {
+                    // 竞争态（已有在任排空者）：纯准入——立即返回，不等该 action 的
+                    // 完成边界（该 action 由在任排空者随后处理）。
                     audit_enqueued(&inner, origin);
                     true
                 }
                 Enqueue::Draining(_, first) => {
+                    // 静默态（无在任排空者）：本线程夺得排空权 ⇒ 同步排空至 idle
+                    // （与 Store::dispatch 同形）⇒ 返回时该 action 已被 reduce、
+                    // 完成边界已达成。契约（两条路径 + bool 的唯一含义）见
+                    // skeleton::ActionSender::dispatch 的 rustdoc。
                     audit_enqueued(&inner, origin);
                     drain_owned(&inner, first);
                     true
@@ -1060,21 +1066,27 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// # store.close();
     /// ```
     ///
-    /// # drain 回调里 join 的 worker ⇒ 用框架提供的 sender（准入-only）
+    /// # drain 回调里 join 的 worker ⇒ 用框架提供的 sender（回调内 = 竞争态）
     ///
     /// 回调（[`skeleton::EffectRuntime::run`]）运行在排空环内：若它 join 的 worker
     /// 用**阻塞式** `Store::dispatch` 回调同一 store，则 worker 等回执、排空环等
     /// worker ⇒ **确定性互等死锁**。安全写法是 worker 用**框架提供的** sender
-    /// （本例即回调收到的 `back`；准入-only、非阻塞）⇒ 回调可以 join 该 worker
-    /// （worker 不等回执，不与排空环互等），排队的 action 在**回调返回后**按 FIFO
-    /// 处理：
+    /// （本例即回调收到的 `back`）：**回调运行在排空环内 ⇒ 该 sender 必处竞争态**
+    /// ⇒ **纯准入**（立即返回、不等该 action 的完成边界）⇒ 回调可以 join 该 worker
+    /// （worker 不与排空环互等），排队的 action 在**回调返回后**按 FIFO 处理。
+    ///
+    /// 语义**条件性**（勿当无条件「准入-only」）：框架提供的 sender 只在**竞争态**
+    /// （已有在任排空者）纯准入；**静默态**（无在任排空者）它会夺得排空权并
+    /// **同步排空至 idle**——此时返回即该 action 的完成边界。逐条规格见
+    /// `skeleton::ActionSender::dispatch` 的契约。
     ///
     /// ```
     /// use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
     /// use skeleton_infra::runtime::SyncStore;
     /// use std::sync::atomic::{AtomicUsize, Ordering};
-    /// use std::sync::Arc;
+    /// use std::sync::{Arc, mpsc};
     /// use std::thread;
+    /// use std::time::Duration;
     ///
     /// #[derive(Debug, PartialEq)]
     /// enum Op { Work }
@@ -1103,12 +1115,18 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ///     fn run(&mut self, _effect: Effect<u64, Op>, back: &ActionSender<u64>) {
     ///         let sender = back.clone();
     ///         let admitted = Arc::clone(&self.admitted);
+    ///         let (tx, rx) = mpsc::channel();
     ///         let worker = thread::spawn(move || {
-    ///             // 框架提供的 sender = 准入-only：立即返回，不等该 action 的完成边界。
+    ///             // 本回调运行在排空环内 ⇒ 竞争态 ⇒ 纯准入：立即返回，不等该 action 的完成边界。
     ///             if sender.dispatch(7) {
     ///                 admitted.fetch_add(1, Ordering::SeqCst);
     ///             }
+    ///             let _ = tx.send(());
     ///         });
+    ///         // 带超时的完成握手（禁裸 join：裸 join 会把死锁形态变成挂死的 doctest，
+    ///         // 而带超时握手让同一退化**报红**而非卡住 CI）。
+    ///         rx.recv_timeout(Duration::from_secs(10))
+    ///             .expect("worker 未在 10s 内完成——若 worker 改用阻塞式 Store::dispatch，即死锁形态");
     ///         worker.join().expect("worker 线程");
     ///     }
     /// }
@@ -1418,9 +1436,13 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 也可能稍后由后续排空消费）；[`AdmissionOutcome::Full`] = 队列容量已满，
     /// action **未入队**（不部分插入）；[`AdmissionOutcome::Closed`] = 已闭门。
     ///
-    /// 本方法**不等待**完成边界（纯准入判定；等待面见 [`Store::dispatch`]——
-    /// 它在返回前保证本 action 到达完成边界）。容量满绝不阻塞：阻塞会与回调
-    /// 重入（reducer / 解释器 / 订阅回调内 dispatch）死锁。
+    /// 本方法**不阻塞等待**完成边界——但**不等待**≠**未达成**：与框架提供的 sender
+    /// 同形，语义**按调用瞬间的排空状态分两条路径**——**竞争态**（已有在任排空者）
+    /// = 纯准入（立即返回，该 action 尚未 reduce、未达完成边界）；**静默态**（无在任
+    /// 排空者）= 本线程夺得排空权并**同步排空至 idle**（返回时该 action 已被 reduce、
+    /// 完成边界已达成）。**等待面见 [`Store::dispatch`]**——它在返回前保证本 action
+    /// 到达完成边界。容量满绝不阻塞：阻塞会与回调重入（reducer / 解释器 / 订阅回调
+    /// 内 dispatch）死锁。
     pub fn try_dispatch(&self, action: A) -> AdmissionOutcome {
         if self.is_closed() {
             self.inner
@@ -2354,7 +2376,7 @@ mod tests {
             lock(&inner.queue).is_empty(),
             "静止态队列必须空：滞留即孤儿"
         );
-        // 全部 dispatch 返回 = 排空至 idle：滞留即少计
+        // 全部 dispatch 返回 ⇒ 各自的 action 均已终局（滞留即少计）
         assert_eq!(*store.snapshot(), (THREADS * ITERS) as u32);
         done.store(true, Ordering::SeqCst);
         monitor.join().expect("监视线程不得 panic");
@@ -2611,7 +2633,11 @@ mod tests {
             1,
             "回调内重入入队后队列深必须可见为 1"
         );
-        assert_eq!(store.pending_actions(), 0, "dispatch 返回即同步排空至 idle");
+        assert_eq!(
+            store.pending_actions(),
+            0,
+            "dispatch 返回后队列深为 0（本例单动作 ⇒ 完成边界与排空至 idle 同形）"
+        );
         assert_eq!(*store.snapshot(), 2, "重入 action 被同一排空循环执行");
     }
 
