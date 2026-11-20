@@ -213,28 +213,30 @@ struct EffectBufs<A, Op> {
     staged: EffectBuf<A, Op>,
     /// 已提交待转发队列：提交点把暂存区整段并入队尾（保持 action 序）；解释器
     /// panic ⇒ 只留未转发的后缀（已转发前缀不重放），下一任成功排空续转。
-    pending: VecDeque<PendingEffect<A, Op>>,
+    pending: VecDeque<PendingSegment<A, Op>>,
 }
 
-/// 已提交待转发效果 + 其**来源元数据**（issue#48）。
+/// 已提交待转发**段**（j9q 零搬移移交）：一个 action 在提交点产出的全部效果。
 ///
-/// 来源在**提交点固化**：产出该效果的 action 的入队序号 + 该效果在 reducer
-/// 输出序列中的位置，在效果进入已提交队列的**那一刻**写入——不可在 panic
-/// 时反推（pending 效果**跨 action 存活**：A 产出的效果后缀在 A 的转发 panic
-/// 后留存，后来由 B 的 dispatch 触发续转并再次 panic ⇒ 被中断效果的来源是 A，
-/// 而触发者是 B；只记「当前 drain 的 action」= 错误归因）。
-///
-/// `effect_index` 计数**包含** [`Effect::Emit`]（Emit 也占位）——它定位的是
-/// 「该 action 产出的**第几条**效果」，与效果种类无关。
-/// （[`skeleton::EffectId`] 在一个 store 内**全局唯一**，见
-/// [`skeleton::EffectId`] 的唯一性纪律。）
-struct PendingEffect<A, Op> {
-    /// 效果本体。
-    effect: Effect<A, Op>,
-    /// 产出该效果的 action 的入队序号（store 内单调，队列锁内分配）。
+/// 来源元数据在**段级固化**（issue#48 语义不变）：段内每条效果的
+/// `origin_action_seq` = 产出该段的 action 的入队序号（store 内单调，队列锁内
+/// 分配）；`effect_index` = **段内偏移**（一个 action 恰提交一段、reducer 输出序
+/// 从 0 连续 ⇒ 偏移即「该 action 产出的第几条效果」，含 `Effect::Emit` 占位，
+/// 与效果种类无关）。来源在提交点写入——不可在 panic 时反推（pending 效果
+/// **跨 action 存活**：A 产出的段在 A 的转发 panic 后留存，后来由 B 的 dispatch
+/// 触发续转并再次 panic ⇒ 被中断效果的来源是 A，而触发者是 B；只记「当前
+/// drain 的 action」= 错误归因）。
+/// （`EffectId` 在一个 store 内**全局唯一**，见 `skeleton::EffectId` 的唯一性
+/// 纪律；它是逻辑句柄 ≠ 投递身份，见 `EffectKind` 文档。）
+struct PendingSegment<A, Op> {
+    /// 产出该段全部效果的 action 的入队序号（store 内单调，队列锁内分配）。
     origin_action_seq: u64,
-    /// 该效果在产出它的 action 的 reducer 输出序列中的 0-based 位置（含 Emit）。
-    effect_index: u64,
+    /// 段内下一条待转发效果的 0-based 位置（含回灌变体占位）。转发逐条推进，
+    /// panic 时随段留存 ⇒ 续转的后缀从断点继续编号（与逐条包装版同值）。
+    next_index: u64,
+    /// 段内待转发效果。缓冲本体在 `staged` ↔ 段之间 `mem::swap` 循环
+    /// （提交点移交、摘壳点回收）⇒ 稳态零新增分配（分配锚见 `tests/memgov.rs`）。
+    buf: EffectBuf<A, Op>,
 }
 
 impl<A, Op> EffectBufs<A, Op> {
@@ -246,26 +248,23 @@ impl<A, Op> EffectBufs<A, Op> {
         }
     }
 
-    /// 提交点：暂存区整段并入已提交待转发队列（保持 action 序——暂存区按写入
-    /// 序出队，已提交队列按同序追加），并**逐条固化来源元数据**
-    /// （`origin_action_seq` = 产出它的 action 的入队序号；`effect_index` =
-    /// 它在该 action 的 reducer 输出序列中的 0-based 位置，Emit 占位 ⇒ 定位
-    /// 「该 action 产出的**第几条**效果」，与效果种类无关；`EffectId` 在一个
-    /// store 内**全局唯一**，见 [`skeleton::EffectId`] 的唯一性纪律）。
-    ///
-    /// 逐条包装而非整体 `mem::swap`：pending 元素带来源元数据，类型与暂存区
-    /// 不同 ⇒ 无法整体移交。n = 本 action 产出的效果数（典型 0~2）；两侧容器
-    /// 各自复用容量 ⇒ 稳态零新增分配（分配锚见 `tests/memgov.rs`）。
+    /// 提交点：暂存区**整段并入**已提交待转发队列（j9q：`mem::swap` O(1) 三
+    /// 指针整体移交，替代逐条包装——旧版每条一次 move，成本 O(n·sizeof(Op))，
+    /// 512B/4096B 载荷实测约 +50%；来源元数据固化在段级，逐条版的
+    /// `(origin_action_seq, effect_index)` 语义零变化——审计事件/失败回执/
+    /// 探针全部同值）。swap 后 `staged` 留空壳（容量 0），摘壳点把满缓冲换回
+    /// （稳态零新增分配，分配锚见 `tests/memgov.rs`）。
     fn commit(&mut self, origin_action_seq: u64) {
-        let mut effect_index = 0u64;
-        while let Some(effect) = self.staged.pop_front() {
-            self.pending.push_back(PendingEffect {
-                effect,
-                origin_action_seq,
-                effect_index,
-            });
-            effect_index += 1;
+        if self.staged.is_empty() {
+            return;
         }
+        let mut seg = PendingSegment {
+            origin_action_seq,
+            next_index: 0,
+            buf: EffectBuf::new(),
+        };
+        std::mem::swap(&mut seg.buf, &mut self.staged);
+        self.pending.push_back(seg);
     }
 }
 
@@ -2139,32 +2138,73 @@ fn place_snapshot<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send 
 }
 
 /// 转发环：逐条借出转发（只转发**已提交**的效果——暂存区在提交点已并入队列）。
-/// 成功才从缓冲摘除——panic 时未转发的效果原地留在已提交待转发队列，由下一任
-/// 成功排空续转（禁吞：已提交效果零丢失；已转发前缀不重放）。不能用
-/// `drain(..)`：其 Drop 语义是「完成排空」（未消费元素被 drop，drain_keep_rest
-/// 才回填且 unstable）——`drain(..)` 的静默蒸发本体在此，「clear 吞掉」
-/// 是次生路径。正在转发的一条随 panic 丢弃：其失败已显式传播+计数，重投
-/// 会恒 panic 死循环。remove(0) 稳态（单效果）零搬移，保容量。
+/// 成功才从段内摘除——panic 时正在转发的一条已离段（随帧丢弃，不回填），
+/// 未转发后缀原地留在段内、段原地留在队首，由下一任成功排空续转（禁吞：
+/// 已提交效果零丢失；已转发前缀不重放）。不能用 `drain(..)`：其 Drop 语义是
+/// 「完成排空」（未消费元素被 drop，drain_keep_rest 才回填且 unstable）——
+/// `drain(..)` 的静默蒸发本体在此，「clear 吞掉」是次生路径。段壳只在段空时
+/// 出队（j9q 段化）⇒ panic 路径段带后缀留存，语义与逐条包装版等价。
 /// 回灌句柄为 StoreInner 缓存字段，禁每 action 新建 Arc 闭包。
 ///
-/// **来源元数据**（issue#48）：每条已提交效果自带「产出它的 action 的入队序号」
-/// 与「它在该 action 的 reducer 输出序列中的位置」——提交点固化，panic 时
-/// 原样带出。`dispatch_action_seq` = **本次触发转发**的 action 的入队序号
-/// （调用方传入，与失败回执的 action 同一个）；`origin_action_seq` = 该效果
-/// **产出者**的序号（可能更早——pending 效果跨 action 存活）。
+/// **来源元数据**（issue#48）：每段自带「产出它的 action 的入队序号」，段内
+/// 偏移即 `effect_index`（见 `PendingSegment`——j9q 段化后逐条元数据收进段级，
+/// 逐条 `(origin, index)` 语义零变化）。`dispatch_action_seq` = **本次触发转发**
+/// 的 action 的入队序号（调用方传入，与失败回执的 action 同一个）；
+/// `origin_action_seq` = 该效果**产出者**的序号（可能更早——pending 效果跨
+/// action 存活）。
+///
+/// **缓冲回收**（j9q）：段空摘壳时把满缓冲 `mem::swap` 回 `staged`（稳态零
+/// 新增分配）；panic 路径不经过摘壳臂 ⇒ 不影响该不变量（毒化半砖后的一次性
+/// 分配不在稳态口径内）。
 fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
     inner: &Arc<StoreInner<S, A, Op>>,
-    buf: &mut VecDeque<PendingEffect<A, Op>>,
+    bufs: &mut EffectBufs<A, Op>,
     feedback_depth: u64,
     parent: &Arc<Ledger>,
     dispatch_action_seq: u64,
 ) {
-    while let Some(pending) = buf.pop_front() {
-        let PendingEffect {
-            effect,
-            origin_action_seq,
-            effect_index,
-        } = pending;
+    // 单步转发决策：把「段内弹出一条」与「段空摘壳」从借用区带出——
+    // `bufs.pending` 与 `bufs.staged` 的 &mut 互斥 ⇒ 决策与执行分段借用。
+    enum Step<A, Op> {
+        Forward {
+            effect: Effect<A, Op>,
+            origin_action_seq: u64,
+            effect_index: u64,
+        },
+        Retire,
+    }
+    loop {
+        let step = {
+            let seg = match bufs.pending.front_mut() {
+                Some(seg) => seg,
+                None => break,
+            };
+            match seg.buf.pop_front() {
+                Some(effect) => {
+                    let effect_index = seg.next_index;
+                    seg.next_index += 1;
+                    Step::Forward {
+                        effect,
+                        origin_action_seq: seg.origin_action_seq,
+                        effect_index,
+                    }
+                }
+                None => Step::Retire,
+            }
+        };
+        let (origin_action_seq, effect_index, effect) = match step {
+            Step::Retire => {
+                // 段空摘壳：满缓冲换回 staged（稳态零新增分配），空壳出队 drop。
+                let mut seg = bufs.pending.pop_front().expect("front_mut 判空后队首必存");
+                std::mem::swap(&mut seg.buf, &mut bufs.staged);
+                continue;
+            }
+            Step::Forward {
+                effect,
+                origin_action_seq,
+                effect_index,
+            } => (origin_action_seq, effect_index, effect),
+        };
         match effect {
             Effect::Emit(a) => {
                 inner.feedback_emitted.fetch_add(1, Ordering::Relaxed);
