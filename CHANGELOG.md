@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+### Performance（`commit` 路径零搬移段化——逐条包装的载荷线性成本消除（bd j9q），2026-11-20）
+- **变更**：已提交待转发队列由 `VecDeque<PendingEffect>`（逐条携带来源元数据）改为 `VecDeque<PendingSegment>`（**按 action 分段**：段 = `origin_action_seq` + `next_index` + 段内 `EffectBuf`）。提交点恢复 **`mem::swap` O(1) 三指针整体移交**（#48 时期待的方案：#48 的来源元数据收进**段级**，段内偏移即 `effect_index`——一个 action 恒提交一段、输出序从 0 连续 ⇒ 逐条 `(origin, index)` 语义零变化，审计事件/失败回执/探针全部同值）；转发环段内逐条借出、**段壳只在段空时出队** ⇒ panic 时未转发后缀原地留段、段原地留队首，续转从断点继续编号（禁吞语义与逐条版逐字节等价）；段空摘壳时满缓冲 `swap` 回 `staged`（缓冲在 staged ↔ 段之间循环复用 ⇒ **稳态零新增分配不破锚**）。
+- **实测**（外部 crate 视角载荷探针、独占机器、同口径三方对比、median ns/effect、点估计）：**P=512** 125.86 ⇒ **76.02**（−39.6%）· **P=4096** 337.89 ⇒ **220.89**（−34.6%）· P=0 / P=64 回落基线水平（53.84 / 55.38）——#48 Changed 段登记的「已知代价（逐条包装 +50%）」**已消除**，回到 swap 时代基线。O(n·sizeof(Op)) ⇒ O(1)。
+- **公共面零变更**（`PendingSegment` 为 infra 私有；`EffectBuf`/`Effect`/审计事件 shape 全部不动）；门禁：五门全 exit 0（串行全量 0 FAILED，`memgov` 零分配锚全绿）。证据：`verify/2026-11-20-j9q/`（三方探针日志 + 五门日志）。
+
 ### Changed（**破坏性**：`EffectInterrupted` 事件携带结构化效果身份 + 新增 `EffectKind`，2026-11-20；GitHub issue#48）
 - **破坏性变更**：`skeleton_infra::audit::AuditEventKind::EffectInterrupted` 由**单元变体**改为**结构变体**，携带五个字段：
   - `dispatch_action_seq: u64`——**本次触发转发、并承接失败回执**的 action 的**入队序号**；

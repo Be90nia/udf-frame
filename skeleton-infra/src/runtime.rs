@@ -2072,13 +2072,7 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // （issue#48）。
         guard.phase = Phase::ForwardingEffects;
         inner.effect_buf.with_mut(|bufs| {
-            forward_effects(
-                inner,
-                &mut bufs.pending,
-                feedback_depth,
-                &record.ledger,
-                record.seq,
-            )
+            forward_effects(inner, bufs, feedback_depth, &record.ledger, record.seq)
         });
         guard.phase = Phase::EffectsForwarded;
         // 异步投递段（ADR 0008）：排在同步回调之前——否则同步档慢订阅者会把
