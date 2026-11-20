@@ -461,43 +461,69 @@ fn tracing_bridge_reports_same_identity_fields_as_audit_event() {
         .with_writer(Capture(Arc::clone(&buf)))
         .finish();
     let _ticket = skeleton_infra::tracingx::bridge_events_to_tracing(&store, 64);
-    let result = tracing::subscriber::with_default(subscriber, || {
-        catch_unwind(AssertUnwindSafe(|| store.dispatch(Act::Runs(1))))
+    // **跨 action 续转**编排（复用同文件「跨 action 续转归因」用例的形状）：
+    // A 产 2 条 `Run` ⇒ 转发第一条即 panic（第二条留存于已提交待转发队列）⇒
+    // B 的 dispatch 触发续转 ⇒ 第二条再次 panic。
+    // ⚠️ **必须跨 action**：单 action 场景下 `origin_action_seq` 与
+    // `dispatch_action_seq` **同值** ⇒ 桥里对调两字段不可见 ⇒ 本闸假绿
+    // （第三轮主审 P1 实证：变异下旧闸仍 exit 0）。
+    let outcome = tracing::subscriber::with_default(subscriber, || {
+        let a = catch_unwind(AssertUnwindSafe(|| store.dispatch(Act::Runs(2))));
+        let b = catch_unwind(AssertUnwindSafe(|| store.dispatch(Act::Noop)));
+        (a.is_err(), b.is_err())
     });
-    assert!(result.is_err(), "解释器 panic 必须原样上浮");
+    assert!(outcome.0, "A 的转发 panic 必须原样上浮（fail-visible）");
+    assert!(outcome.1, "续转时解释器 panic 必须原样上浮");
 
     let out = String::from_utf8(buf.lock().expect("capture buffer lock").clone())
         .expect("fmt 输出恒 UTF-8");
     let ids = identities(&store);
-    assert_eq!(ids.len(), 1, "恰好一条中断事件");
-    let (dispatch_seq, origin_seq, index, kind, id) = ids[0];
+    assert_eq!(ids.len(), 2, "A 一次 + 续转一次 ⇒ 两条中断事件");
+    let (dispatch_a, origin_a, _, _, _) = ids[0];
+    assert_eq!(
+        origin_a, dispatch_a,
+        "A 内转发 ⇒ 产出者与触发者同一个 action"
+    );
+    let (dispatch_b, origin_b, _, _, _) = ids[1];
+    assert!(
+        dispatch_b > origin_b,
+        "跨 action 续转 ⇒ 触发者序号 > 产出者序号（两个字段**值不同** ⇒ 桥里对调二者必被本闸抓到）"
+    );
     assert!(
         out.contains("kind=\"effect_interrupted\""),
         "桥必须转译中断节点：{out}"
     );
-    assert!(
-        out.contains(&format!("dispatch_action_seq={dispatch_seq}")),
-        "桥的 dispatch_action_seq 与事件一致：{out}"
-    );
-    assert!(
-        out.contains(&format!("origin_action_seq={origin_seq}")),
-        "桥的 origin_action_seq 与事件一致：{out}"
-    );
-    assert!(
-        out.contains(&format!("effect_index={index}")),
-        "桥的 effect_index 与事件一致：{out}"
-    );
-    assert!(
-        out.contains(&format!("effect_kind={kind:?}")),
-        "桥的 effect_kind 与事件一致：{out}"
-    );
-    // 桥输出 `effect_id` 的**数值形态**（`Some(u64)`；None 时为 `None`）——
-    // 与事件的 `Option<EffectId>` 同值不同形（EffectId 的 Debug 是 `EffectId(10)`）。
-    let id_num = id.map(|i| i.get());
-    assert!(
-        out.contains(&format!("effect_id={id_num:?}")),
-        "桥的 effect_id 与事件一致：{out}"
-    );
+    // 逐条比对两条事件的五个字段（第一条 = 同 action 转发，第二条 = 跨 action 续转）。
+    let check = |label: &str, (dispatch_seq, origin_seq, index, kind, id): Identity| {
+        // 四个字段在桥输出里都**不是行尾字段**（其后必有分隔空格）⇒ 断言带
+        // **尾随空格**锚定 ⇒ 杜绝「=1」误匹配「=10/11」的**前缀式假绿**
+        // （行尾字段 `effect_id` 不加锚：其值在本测中定长 10/11 ⇒ 无前缀歧义）。
+        assert!(
+            out.contains(&format!("dispatch_action_seq={dispatch_seq} ")),
+            "桥的 dispatch_action_seq 与事件一致（{label}）：{out}"
+        );
+        assert!(
+            out.contains(&format!("origin_action_seq={origin_seq} ")),
+            "桥的 origin_action_seq 与事件一致（{label}）：{out}"
+        );
+        assert!(
+            out.contains(&format!("effect_index={index} ")),
+            "桥的 effect_index 与事件一致（{label}）：{out}"
+        );
+        assert!(
+            out.contains(&format!("effect_kind={kind:?} ")),
+            "桥的 effect_kind 与事件一致（{label}）：{out}"
+        );
+        // 桥输出 `effect_id` 的**数值形态**（`Some(u64)`；None 时为 `None`）——
+        // 与事件的 `Option<EffectId>` 同值不同形（EffectId 的 Debug 是 `EffectId(10)`）。
+        let id_num = id.map(|i| i.get());
+        assert!(
+            out.contains(&format!("effect_id={id_num:?}")),
+            "桥的 effect_id 与事件一致（{label}）：{out}"
+        );
+    };
+    check("A 内转发", ids[0]);
+    check("跨 action 续转", ids[1]);
 }
 
 // ── ⑦ 既有语义不变（回归）：环形缓冲溢出 + 订阅关闭 ────────────────────
