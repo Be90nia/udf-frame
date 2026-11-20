@@ -257,7 +257,7 @@ pub enum AuditEventKind {
 | `origin_action_seq` | **实际产出该效果**的 action 的入队序号——可能**早于** `dispatch_action_seq`（pending 效果跨 action 存活：A 产出的后缀在 A 的转发 panic 后留存，后来由 B 的 dispatch 触发续转并再次 panic ⇒ 来源是 A、触发者是 B） |
 | `effect_index` | 该效果在**产出它的 action** 的 reducer 输出序列中的 **0-based** 位置（计数**包含** `Emit`——Emit 也占位）——它定位的是「该 action 产出的**第几条**效果」，与效果种类无关（`EffectId` 在一个 store 内**全局唯一**，见 `skeleton::EffectId` 的唯一性纪律） |
 | `effect_kind` | 效果的解释器侧种类（`skeleton::EffectKind`：`Run` / `Cancel`） |
-| `effect_id` | 效果的**逻辑句柄**（`Option<skeleton::EffectId>`）——当前 `Run`/`Cancel` 恒 `Some`；未来无句柄的种类为 `None`。⚠️ **语义随种类而变**：`Run` 的 `effect_id` 是**该效果自己的**句柄；`Cancel` 的 `effect_id` 是**被取消目标**的句柄（Cancel 效果自身没有句柄）⇒ 因此 `effect_id` **不可**单独当作「效果身份」用——同一 store 内 `Run(id=N)` 与 `Cancel(id=N)` 会发出**相同**的 `effect_id`。**唯一标识一个效果的是 `(effect_kind, effect_id, effect_index)` 三元组**（或 `origin_action_seq` + `effect_index`） |
+| `effect_id` | 效果的**逻辑句柄**（`Option<skeleton::EffectId>`）——当前 `Run`/`Cancel` 恒 `Some`；未来无句柄的种类为 `None`。⚠️ **语义随种类而变**：`Run` 的 `effect_id` 是**该效果自己的**句柄；`Cancel` 的 `effect_id` 是**被取消目标**的句柄（Cancel 效果自身没有句柄）⇒ 因此 `effect_id` **不可**单独当作「效果身份」用——同一 store 内 `Run(id=N)` 与 `Cancel(id=N)` 会发出**相同**的 `effect_id`；两条指向同一目标的 `Cancel` 效果也会发出**相同**的 `effect_id`（合法时序，非误用）。**唯一标识一个效果的作用域**：在**同一个产出 action 内**，`(effect_kind, effect_id, effect_index)` 三元组唯一标识一个效果；**跨 action** 时唯一标识一个效果的是 **`(origin_action_seq, effect_index)`**（= 哪个 action 产出的第几条）——`effect_index` 是**产出 action 内**的序号，不跨 action 唯一 |
 
 **边界**：⚠️ 两个序号都是**入队序号**，**不是**「dispatch 调用发生的时刻序」——外部调用方看到的是「我这次调用排在队列第几位」，并发下与调用时刻序不同。同一次 action 内两者相等；跨 action 续转时**通常** `origin < dispatch`（见下方「已知张力」）。事件**不携带** `Op` / Action / payload（可能很大、不可 Clone、可能含敏感业务数据）。`Effect::Emit` 不经解释器 ⇒ 不产生本事件。
 

@@ -289,9 +289,13 @@ pub enum Effect<A, Op = Infallible> {
 /// ⚠️ **句柄的语义随种类而变**：审计事件里的 `effect_id` 对 `Run` 是**该效果
 /// 自己的**句柄，对 `Cancel` 是**被取消目标**的句柄（`Cancel` 效果自身没有
 /// 句柄）⇒ `effect_id` **不可**单独当作「效果身份」用——同一 store 内
-/// `Run(id=N)` 与 `Cancel(id=N)` 会发出**相同**的 `effect_id` ⇒ **唯一标识
-/// 一个效果的是 `(effect_kind, effect_id, effect_index)` 三元组**（或
-/// `origin_action_seq` + `effect_index`）。
+/// `Run(id=N)` 与 `Cancel(id=N)` 会发出**相同**的 `effect_id`；两条指向同一
+/// 目标的 `Cancel` 效果也会发出**相同**的 `effect_id`（合法时序，非误用）。
+/// **唯一标识一个效果的作用域**：在**同一个产出 action 内**，`(effect_kind,
+/// effect_id, effect_index)` 三元组唯一标识一个效果；**跨 action** 时唯一
+/// 标识一个效果的是 **`(origin_action_seq, effect_index)`**（=
+/// 哪个 action 产出的第几条）——`effect_index` 是**产出 action 内**的序号，
+/// 不跨 action 唯一。
 ///
 /// ```
 /// use skeleton::{Effect, EffectId, EffectKind};

@@ -79,8 +79,10 @@ pub enum AuditEventKind {
     /// 回答「该 action 产出的第几条」，`effect_kind` + `effect_id` 回答「哪种
     /// 效果、哪个逻辑句柄」。
     ///
-    /// **两个序号的语义**（store 内单调序号，**入队线性化点**分配——FIFO 序 =
-    /// 序号序）：
+    /// **两个序号的语义**（store 内单调序号，**入队线性化点**分配——⚠️
+    /// **序号序与全局 FIFO 序不保证恒等**：外部入队路径的序号在 `queue` 锁内
+    /// 分配，而 `Effect::Emit` 回灌路径的序号在取锁**之前**分配 ⇒ 理论上可能
+    /// 与并发入队的序号**交错** ⇒ 详见 `docs/reference.md` 的「已知张力」登记）：
     ///
     /// - `dispatch_action_seq`：**本次触发转发、并承接失败回执**的 action 的
     ///   入队序号（= 效果转发失败发生在哪个 action 的转发段内）。
@@ -88,7 +90,8 @@ pub enum AuditEventKind {
     ///   **早于** `dispatch_action_seq`（pending 效果跨 action 存活：action A
     ///   产出的效果后缀在 A 的转发 panic 后留存，后来由 action B 的 dispatch
     ///   触发续转并再次 panic ⇒ 被中断效果的来源是 A，触发者是 B）。
-    ///   同一次 action 内两者相等；跨 action 续转时恒 `origin < dispatch`。
+    ///   同一次 action 内两者相等；跨 action 续转时**通常** `origin < dispatch`
+    ///   （**不保证**恒成立——见「已知张力」）。
     ///
     /// ⚠️ 这是**入队序号**，不是「dispatch 调用发生的时刻序」——外部调用方看到
     /// 的是「我这次调用排在队列第几位」，并发下与调用时刻序不同。
@@ -116,9 +119,14 @@ pub enum AuditEventKind {
         /// ⚠️ **语义随种类而变**：`Run` 的 `effect_id` 是**该效果自己的**句柄；
         /// `Cancel` 的 `effect_id` 是**被取消目标**的句柄（Cancel 效果自身没有
         /// 句柄）⇒ 因此 `effect_id` **不可**单独当作「效果身份」用——同一 store
-        /// 内 `Run(id=N)` 与 `Cancel(id=N)` 会发出**相同**的 `effect_id`。
-        /// **唯一标识一个效果的是 `(effect_kind, effect_id, effect_index)` 三元组**
-        /// （或 `origin_action_seq` + `effect_index`）。
+        /// 内 `Run(id=N)` 与 `Cancel(id=N)` 会发出**相同**的 `effect_id`；两条
+        /// 指向同一目标的 `Cancel` 效果也会发出**相同**的 `effect_id`（合法时序，
+        /// 非误用）。
+        /// **唯一标识一个效果的作用域**：在**同一个产出 action 内**，`(effect_kind,
+        /// effect_id, effect_index)` 三元组唯一标识一个效果；
+        /// **跨 action** 时唯一标识一个效果的是 **`(origin_action_seq, effect_index)`**
+        /// （= 哪个 action 产出的第几条）——`effect_index` 是**产出 action 内**
+        /// 的序号，不跨 action 唯一。
         effect_id: Option<EffectId>,
     },
     /// 状态通知已发出（本地或跨线程至少一个订阅者收到当拍快照）。

@@ -316,8 +316,9 @@ struct StoreInner<S, A, Op> {
     state: Mutex<Arc<S>>,
     runtime: Mutex<Box<dyn EffectRuntime<A, Op> + Send>>,
     queue: Mutex<VecDeque<ActionRecord<A>>>,
-    /// 入队序号计数器（queue 锁内分配，单调递增）：FIFO 序 = 序号序，回执按
-    /// 序号定位失败 action。
+    /// 入队序号计数器（store 内单调递增）：**外部入队**路径在 queue 锁内分配，
+    /// **`Effect::Emit` 回灌**路径在取锁之前分配 ⇒ 序号序与全局 FIFO 序**不保证**
+    /// 恒等（已知张力，见 `docs/reference.md`）；回执按序号定位失败 action。
     next_seq: AtomicU64,
     /// 队列容量上限（issue#38）：等待被 reduce 的 action 数上限；`0` = 不限
     /// （默认）。正在执行的 action 已出队 → 不计入。容量满 = typed reject
@@ -606,7 +607,9 @@ fn reentrant_context(store_id: u64) -> Option<(u64, Arc<Ledger>)> {
 
 /// 已准入的 action 记录（队列元素）：序号 + 载荷 + 来源 + 账本。
 ///
-/// 序号在 queue 锁内分配（入队线性化点）——FIFO 序 = 序号序。
+/// 序号 store 内单调；**外部入队**路径在 queue 锁内分配（入队线性化点），
+/// **`Effect::Emit` 回灌**路径在取锁之前分配 ⇒ 序号序与全局 FIFO 序**不保证**
+/// 恒等（已知张力，见 `docs/reference.md`）。
 /// `ledger` 是完成账本：外部根自持新账本；同栈回灌**共享**根账本（因果父）
 /// ——共享而非各持一份，是因果后代屏障（根账本在全部因果后代终局前不发布
 /// 终局）的实现基础。
