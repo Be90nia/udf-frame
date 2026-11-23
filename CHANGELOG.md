@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Tests: 补 #60 未订阅零分配锚 + #61 首/中/末 panic 三档 + 不重试断言,2026-11-23;bd udf-frame-u11)
+- **#60 零分配机械锚**（新 `tests/audit_no_subscriber_alloc.rs`）：未订阅时 32 连发（含 `Effect::Run`）**分配事件 == 0**——伴随断言「32 条效果全到解释器 + `take_events()` 为空」防「没干活」假零；**不恒真**由三条控制臂证明（冷启动框架分配 / 订阅激活 / 订阅态回调确定性 `with_capacity`），另断言弃票后回落 0（gate 真关断）。「一次 gate load、无锁」仍为结构保证（分配器观测不到锁）。
+- **#61 三档 panic 轴**（`tests/close_report_contract.rs`）：`PanicOnFirst` → 参数化 `PanicOnNth`，新增 **middle**（`effects==2` + 段身份精确 + `calls==3` 不变）与 **final**（中断在段末 ⇒ `effects==0`、无段、空壳段被跳过；再次报告同值）两档。
+- **不重试直接断言**：`close` → `close_wait_with_report` → `discard_pending_effects` 全程宿主 `run` 调用**恒 == 1**（任一步重放即红）。
+- 纯测试增量，无行为/公共面改动。
+
 ### Added(runtime): result-bearing 完成面 + deferred 有界恢复,2026-11-23;GitHub issue#57 / #49)
 - **#57 可等待完成面（加法，不动 `Store` trait）**：`SyncStore::dispatch_with_receipt(action) -> Result<DispatchReceipt, AdmissionOutcome>`——`wait()`（可重复）返回 `DispatchOutcome::{Completed, Deferred{retained}, CapacityRejected{retained, rejected}, Failed}`。语义：正常根子因果树完成 ⇒ `Completed`；后代被回灌深度预算停放 ⇒ **`Deferred`（不是成功）**；deferred 队列满导致续接无法保留 ⇒ **独立非成功容量结局 + 专用计数**（不报 `Completed`、不把被拒记录算成 retained）。`try_dispatch` 与 `ActionSender` 仍 admission-only；`DispatchFailure`/`DispatchPhase` 公开化。**硬约束**：禁止在排空回调内等待该收据（自死锁）——rustdoc 写明 + 代码侧 fail-visible 断言。
 - **#49 有界续接**：`resume_deferred(limit) -> DeferredResume{resumed, remaining, deferred_again, capacity_rejected}`——FIFO 取最旧、持队列锁搬运（与 close/准入串行、不插队）、每条开**新回灌深度 epoch** 并保留原 action 序号与 deferral 来源；恢复出的工作拿**独立续接收据**，**原根收据保持终局不可变（`Deferred`）**；闭门后恢复返回 `resumed=0` + `remaining`（可观测而非静默）。

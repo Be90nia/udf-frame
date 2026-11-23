@@ -322,6 +322,8 @@ impl EffectKind {
 
 **当前状态（2026-11-23）**：**`SyncStore` 审计实时回调与池域审计流均已升级为「串行派发」**——并发发射事件入队补投（`SyncStore` 侧 #65 主路线① / 池域 #75）、FIFO 有界、**独立的投递丢弃计数**（`SyncStore::audit_delivery_drops()` / `PoolBase::audit_delivery_drops()` / `ObjectPool::audit_delivery_drops()`，与 ring 溢出**分账**）、回调 panic **fail-close 本代次**（排队事件不投递给替换订阅）。权威历史 = 环 + `seq`（`seq` 在入环临界区内分配 ⇒ 环序 = `seq` 序）。状态订阅 / 异步 `NotifySink` 两面**仍为 best-effort 观测面**，其契约与计数以各自 rustdoc 为准，词表统一按本节。
 
+**零分配与 panic 轴的机械锚（#60/#61 证据补强）**：未订阅路径的「一次 gate load、**零分配**」由 `tests/audit_no_subscriber_alloc.rs` 机械锚定（分配器仪器自检 + 冷启动/订阅态三条控制臂 + 弃票后回落 0；「**无锁**」仍为结构保证——分配器观测不到锁）。效果转发中断覆盖**首/中/末**三档（末档 = 中断恰在段末 ⇒ 空壳段被 `summarize_pending` 跳过），并由 `tests/close_report_contract.rs` 直接钉死「**被中断效果绝不重试**」（`close` → `close_wait_with_report` → `discard_pending_effects` 全程宿主 `run` 调用计数恒 == 1）。
+
 **回调内 dispatch 的因果归属（issue#59）**：夺得排空租约的那次调用，在投递**首条 pop 记录**的 `Enqueued` 回调**之前**即建立临时同栈帧（装帧与闸判是**同一次** load ⇒ 不存在「判闸未订阅、随后并发订阅装上、回调却无帧」的窗口）。回调内的同 store dispatch 因此归为该首条记录的**因果后代**——共享其账本、回灌深度 +1、**只入队即返**（不等待外层排空；外层排空环在回调返回后覆盖它）。缺这一帧 = 嵌套 dispatch 被判外部根而 `draining` 已置 ⇒ 调用方在无界账本等待上**等自己 = 确定性死锁**。**因果父 = 正在投递其 `Enqueued` 回调的首条记录**，不一定是夺得排空权的外部调用点（回调先于该记录 reduce 投递，首条记录甚至可能不是调用者的 action）。首条记录自身的深度不因临时帧被重复计（嵌套 dispatch 深度 = 首条记录深度 + 1，环内 `Enqueued` 深度序列 = `[0, 1]`）。本规则**先于** #65 的待投递 FIFO 生效（事件序不变，FIFO 只改并发 emitter 间的补投顺序）。
 
 ### 最小示例

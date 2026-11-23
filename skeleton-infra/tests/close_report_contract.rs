@@ -15,6 +15,11 @@
 //! 另钉「四个 population 分离」：停放的 deferred action 非零也**不影响**
 //! `Drained`（它不在 #64 谓词里），且不与效果后缀合并成同一个计数。
 //!
+//! 转发中断按**段内位置**分三档钉：首（既有用例）/ 中（⑦）/ 末（⑧，末档 =
+//! 中断恰在段末，报告侧必须跳过空壳段——真实盲区）。另直接钉「中断效果绝不被
+//! 重试」（⑨：close → report → discard 全程宿主 `run` 调用计数恒 1，不靠 #45 的
+//! 续传语义间接覆盖）。
+//!
 //! 全程握手/有界超时驱动，零 sleep。
 
 #![cfg(feature = "runtime")]
@@ -97,17 +102,20 @@ impl Reducer for Producer {
     }
 }
 
-/// 解释器：第 0 次调用 panic（模拟 `EffectRuntime::run` 中断），其余记录收到的 op。
-struct PanicOnFirst {
+/// 解释器：第 `panic_at` 次调用 panic（模拟 `EffectRuntime::run` 中断），其余
+/// 记录收到的 op。`panic_at = 0` = 首个效果档（既有用例）；middle/final 档由
+/// 参数选段内位置。
+struct PanicOnNth {
+    panic_at: usize,
     calls: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<u64>>>,
 }
 
-impl EffectRuntime<u64, u64> for PanicOnFirst {
+impl EffectRuntime<u64, u64> for PanicOnNth {
     fn run(&mut self, effect: Effect<u64, u64>, _back: &ActionSender<u64>) {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        if n == 0 {
-            panic!("第 0 个效果转发中断（测试注入：提交后缀必须留存）");
+        if n == self.panic_at {
+            panic!("第 {n} 个效果转发中断（测试注入：提交后缀必须留存）");
         }
         if let Effect::Run { op, .. } = effect {
             self.seen.lock().expect("recorder").push(op);
@@ -124,6 +132,12 @@ struct Fixture {
 
 /// 受闸 store：`per_action` 条效果，第 0 条转发中断。
 fn gated_fixture(per_action: u64) -> Fixture {
+    gated_fixture_panicking_at(per_action, 0)
+}
+
+/// 受闸 store：`per_action` 条效果，第 `panic_at` 条转发中断（0 = 首个 / 段中 /
+/// 段末由参数选）。
+fn gated_fixture_panicking_at(per_action: u64, panic_at: usize) -> Fixture {
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -136,7 +150,8 @@ fn gated_fixture(per_action: u64) -> Fixture {
             }),
             reentrant: None,
         },
-        PanicOnFirst {
+        PanicOnNth {
+            panic_at,
             calls: Arc::clone(&calls),
             seen: Arc::new(Mutex::new(Vec::new())),
         },
@@ -232,7 +247,8 @@ fn reentrant_close_report_claims_no_final_snapshot_and_closes_admission() {
             gate: None,
             reentrant: Some((Arc::clone(&slot), Arc::clone(&seen))),
         },
-        PanicOnFirst {
+        PanicOnNth {
+            panic_at: 0,
             calls: Arc::new(AtomicUsize::new(0)),
             seen: Arc::new(Mutex::new(Vec::new())),
         },
@@ -403,4 +419,202 @@ fn deferred_actions_are_a_separate_population_from_pending_effects() {
         "停放记录不是效果后缀（两个 population 分账）"
     );
     assert!(report.interrupted_effect.is_none(), "本例无转发中断");
+}
+
+/// ⑦ panic 轴（middle）：中断落在段中 ⇒ 后缀 = 中断之后的条目，段身份从
+/// 中断的下一条起；legacy close 与报告都不重跑宿主代码。
+///
+/// 鉴别力：若 `next_index` 在中断时被多推/少推，或后缀被当成整段，条数/段身份
+/// 必错；若 close 序试图「补完」后缀，calls 增长 ⇒ 红。
+#[test]
+fn middle_effect_panic_reports_the_remaining_suffix_with_correct_segment_identity() {
+    let fx = gated_fixture_panicking_at(5, 2);
+    let worker = spawn_gated_dispatch(&fx.store);
+    fx.entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reducer 未进场");
+    fx.release.send(()).expect("放行 reducer");
+    assert!(
+        worker.join().expect("worker 线程"),
+        "效果转发 panic 必须原样上浮"
+    );
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        3,
+        "前置：0/1 已转发，第 2 条中断（中断那次也算一次调用）"
+    );
+
+    fx.store.close(); // legacy close：准入关闭 + best-effort 排空（主队列已空）
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        3,
+        "legacy close 绝不重放中断效果（禁重试）"
+    );
+
+    let report = drained(fx.store.close_wait_with_report(Duration::from_secs(5)));
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        3,
+        "报告/等静止不得执行宿主效果代码"
+    );
+    assert_eq!(
+        report.pending_effects.effects, 2,
+        "5 条中 0/1 已转发、2 中断 ⇒ 后缀是 3/4 两条（close 不动后缀）"
+    );
+    assert_eq!(
+        report.pending_effects.segments,
+        vec![PendingSegmentSummary {
+            origin_action_seq: 0,
+            next_effect_index: 3, // 中断的下一条（#48 的 effect_index 起点口径）
+            effects: 2,
+        }],
+        "段身份从被中断的下一条起，不是从段首/中断条重算"
+    );
+
+    let interrupted = report.interrupted_effect.expect("必须留下中断归属");
+    assert_eq!(interrupted.effect_index, 2, "中断的是段内第 2 条");
+    assert_eq!(interrupted.effect_kind, EffectKind::Run);
+    assert_eq!(interrupted.effect_id, Some(EffectId::new(3)));
+    assert_eq!(interrupted.origin_action_seq, 0);
+    assert_eq!(
+        interrupted.origin_action_seq, interrupted.dispatch_action_seq,
+        "同一 action 内产者/触发者序号相等"
+    );
+}
+
+/// ⑧ panic 轴（final）：中断恰在段末 ⇒ 后缀为空，**空壳段不得报成 0 条段的
+/// 身份**（`summarize_pending` 的 skip 分支；真实盲区）。
+///
+/// 鉴别力：删掉空壳段跳过 ⇒ `segments` 会多出一条 `{effects: 0,
+/// next_effect_index: 4}` ⇒ 本断言红；中断归属仍须保留（它是历史，不是后缀）。
+#[test]
+fn final_effect_panic_leaves_no_suffix_and_skips_the_empty_shell_segment() {
+    let fx = gated_fixture_panicking_at(4, 3);
+    let worker = spawn_gated_dispatch(&fx.store);
+    fx.entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reducer 未进场");
+    fx.release.send(()).expect("放行 reducer");
+    assert!(
+        worker.join().expect("worker 线程"),
+        "效果转发 panic 必须原样上浮"
+    );
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        4,
+        "前置：0..2 已转发，段末第 3 条中断"
+    );
+
+    fx.store.close();
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        4,
+        "legacy close 不得重放中断的段末效果"
+    );
+
+    let report = drained(fx.store.close_wait_with_report(Duration::from_secs(5)));
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        4,
+        "报告不得执行宿主效果代码"
+    );
+    assert_eq!(
+        report.pending_effects.effects, 0,
+        "中断恰在段末 ⇒ 无待转发条目（段壳仍在，但不是后缀）"
+    );
+    assert!(
+        report.pending_effects.segments.is_empty(),
+        "空壳段必须被跳过（否则报告会给出 0 条段的伪造身份）"
+    );
+
+    let interrupted = report.interrupted_effect.expect("必须留下中断归属");
+    assert_eq!(interrupted.effect_index, 3, "中断的是段内第 3 条（段末）");
+    assert_eq!(interrupted.effect_kind, EffectKind::Run);
+    assert_eq!(interrupted.effect_id, Some(EffectId::new(4)));
+    assert_eq!(interrupted.origin_action_seq, 0);
+
+    // 报告只读：空壳段不因一次报告消失（再次报告仍同值）。
+    let again = drained(fx.store.close_wait_with_report(Duration::from_secs(5)));
+    assert_eq!(again, report, "报告必须是幂等的只读快照");
+
+    // 显式丢弃：精确摘要 = 空（0 条 0 段），随后报告仍空，宿主代码零调用。
+    let discarded = fx
+        .store
+        .discard_pending_effects()
+        .expect("关闭且静止后必须可显式丢弃");
+    assert_eq!(
+        discarded, report.pending_effects,
+        "空后缀的丢弃摘要 = 报告的 0 条 0 段"
+    );
+    let after = drained(fx.store.close_wait_with_report(Duration::from_secs(5)));
+    assert_eq!(after.pending_effects.effects, 0);
+    assert!(after.pending_effects.segments.is_empty());
+    assert_eq!(
+        after.interrupted_effect, report.interrupted_effect,
+        "被中断效果是历史归属，不随后缀丢弃而消失"
+    );
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        4,
+        "报告/丢弃全程不得执行宿主效果代码"
+    );
+}
+
+/// ⑨ 中断效果绝不被重试（#61 的直接断言）：close → report → discard 全程宿主
+/// `EffectRuntime::run` 调用计数恒 == 1。
+///
+/// 既有覆盖只到「报告/关闭不跑宿主代码」的局部断言与 #45 的续传语义；本测把
+/// 「被中断那条」在完整关闭序里逐段计数，若任何一步重试（重放后缀/补完中断
+/// 效果），calls 必 > 1 ⇒ 红。
+#[test]
+fn interrupted_effect_is_never_retried_across_close_report_and_discard() {
+    let fx = gated_fixture(3);
+    let worker = spawn_gated_dispatch(&fx.store);
+    fx.entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reducer 未进场");
+    fx.release.send(()).expect("放行 reducer");
+    assert!(
+        worker.join().expect("worker 线程"),
+        "效果转发 panic 必须原样上浮"
+    );
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        1,
+        "前置：第 0 条中断后没有任何转发（后缀不动）"
+    );
+
+    fx.store.close();
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        1,
+        "legacy close 不重试中断效果"
+    );
+
+    let report = drained(fx.store.close_wait_with_report(Duration::from_secs(5)));
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        1,
+        "close_wait_with_report 不重试中断效果"
+    );
+    assert_eq!(report.pending_effects.effects, 2, "前置：后缀两条仍在");
+
+    let discarded = fx
+        .store
+        .discard_pending_effects()
+        .expect("关闭且静止后必须可显式丢弃");
+    assert_eq!(discarded, report.pending_effects);
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        1,
+        "显式丢弃不转发（含被中断那条）"
+    );
+
+    let after = drained(fx.store.close_wait_with_report(Duration::from_secs(5)));
+    assert_eq!(after.pending_effects.effects, 0);
+    assert_eq!(
+        fx.calls.load(Ordering::SeqCst),
+        1,
+        "close → report → discard 全程 run 调用计数恒 == 1"
+    );
 }
