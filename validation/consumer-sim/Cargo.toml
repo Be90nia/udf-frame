@@ -1,0 +1,19 @@
+[package]
+name = "consumer-sim"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "模拟下游采用方的编译夹具：独立 workspace，path 依赖指向仓库三 crate"
+
+# 独立 workspace 根（空表）：不并入 udf-frame 根 workspace——否则被根 workspace
+# 吸收（members 之外路径报错），且本夹具的 Cargo.lock/target 不污染仓库。
+[workspace]
+
+[dependencies]
+# 三 crate 的 path 依赖（发布名 udf-*，lib 名 skeleton / std_ext / skeleton_infra——
+# 与仓库内互相引用同形：`use skeleton::` / `use std_ext::` / `use skeleton_infra::`）。
+udf-skeleton = { path = "../../skeleton" }
+udf-std-ext = { path = "../../std-ext" }
+udf-skeleton-infra = { path = "../../skeleton-infra", features = ["compose", "tokio", "memgov", "pool"] }
+# tokio：FxScope 面需要运行时上下文（spawn_tracked 在 tokio 任务里跑）。
+tokio = { version = "1", features = ["rt", "macros", "time"] }

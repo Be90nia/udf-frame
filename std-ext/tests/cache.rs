@@ -535,16 +535,21 @@ fn expired_entries_bounded_by_capacity_and_maintenance() {
 }
 
 // ---- armor B3④：poison = fail-fast panic 带因（拍板：禁静默续跑）----
+//
+// #71 契约变更：用户析构（`K::drop`/`V::drop`）在**解锁之后**才跑 ⇒ 析构
+// panic **不投毒** cache（用户代码的锅不牵连 cache 不变量）；**临界区内**的
+// panic（此处用 `V::clone`——`get` 的取值克隆跑在锁内）仍投毒 ⇒ 后续访问
+// fail-fast 带因（poison 面不得弱化）。
 
 #[test]
 fn poisoned_lock_fails_visible() {
-    // Drop 炸弹：被逐值在临界区内析构 panic → poison。armed 标志保证只有
-    // 被逐的旧值起爆（新值随 unwind 再爆 = double panic abort，测试自身躲开）。
+    // Drop 炸弹：析构 panic（解锁后跑）⇒ 不投毒。armed 标志保证只有被逐的
+    // 旧值起爆（新值随 unwind 再爆 = double panic abort，测试自身躲开）。
     struct Boom(bool);
     impl Drop for Boom {
         fn drop(&mut self) {
             if self.0 {
-                panic!("boom inside lock");
+                panic!("boom in drop (outside lock)");
             }
         }
     }
@@ -552,9 +557,38 @@ fn poisoned_lock_fails_visible() {
     let c = SyncLruCache::new(1);
     c.insert("a", Boom(true));
     let r = catch_unwind(AssertUnwindSafe(|| c.insert("b", Boom(false))));
-    assert!(r.is_err(), "持锁 panic 应原样爆出");
-    let r = catch_unwind(AssertUnwindSafe(|| c.len()));
-    assert!(r.is_err(), "poison 后任何访问必须 fail-fast，禁静默续跑");
+    assert!(r.is_err(), "析构 panic 应原样爆出");
+    // 不投毒：析构在解锁之后 ⇒ 锁未被毒，缓存照常可用（#71 新契约）。
+    assert_eq!(c.len(), 1, "析构 panic 不投毒：缓存照常可用");
+    assert!(c.remove(&"b").is_some(), "不投毒：后续写面照常可用");
+
+    // TtlCache 同一面（独立锁路径）：机制逐字一致。
+    let clock = Arc::new(MockClock::new());
+    let t = SyncTtlCache::new(clock, 1);
+    t.insert("a", Boom(true), Duration::from_secs(1));
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        t.insert("b", Boom(false), Duration::from_secs(1));
+    }));
+    assert!(r.is_err(), "TtlCache 析构 panic 应原样爆出");
+    assert_eq!(t.len(), 1, "TtlCache 析构 panic 不投毒：缓存照常可用");
+
+    // 锁内 panic（`get` 的取值克隆跑在临界区内）⇒ 投毒 ⇒ 后续访问 fail-fast
+    // 带因（poison 面不得弱化：锁内 panic 仍必须可见）。
+    struct CloneBoom;
+    impl Clone for CloneBoom {
+        fn clone(&self) -> Self {
+            panic!("boom inside lock");
+        }
+    }
+    let p = SyncLruCache::new(2);
+    p.insert("k", CloneBoom);
+    let r = catch_unwind(AssertUnwindSafe(|| p.get(&"k")));
+    assert!(r.is_err(), "锁内 panic 应原样爆出");
+    let r = catch_unwind(AssertUnwindSafe(|| p.len()));
+    assert!(
+        r.is_err(),
+        "锁内 panic 后任何访问必须 fail-fast，禁静默续跑"
+    );
     let msg = r
         .unwrap_err()
         .downcast_ref::<String>()
@@ -562,16 +596,14 @@ fn poisoned_lock_fails_visible() {
         .unwrap_or_default();
     assert!(msg.contains("poison"), "poison panic 必须带因: {msg:?}");
 
-    // TtlCache 同一 poison 面（独立锁路径）：机制逐字一致。
-    let clock = Arc::new(MockClock::new());
-    let t = SyncTtlCache::new(clock, 1);
-    t.insert("a", Boom(true), Duration::from_secs(1));
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        t.insert("b", Boom(false), Duration::from_secs(1));
-    }));
-    assert!(r.is_err(), "TtlCache 持锁 panic 应原样爆出");
-    let r = catch_unwind(AssertUnwindSafe(|| t.len()));
-    assert!(r.is_err(), "TtlCache poison 后访问必须 fail-fast");
+    // TtlCache 锁内 panic 面：机制逐字一致。
+    let clock2 = Arc::new(MockClock::new());
+    let tp = SyncTtlCache::new(clock2, 2);
+    tp.insert("k", CloneBoom, Duration::from_secs(60));
+    let r = catch_unwind(AssertUnwindSafe(|| tp.get(&"k")));
+    assert!(r.is_err(), "TtlCache 锁内 panic 应原样爆出");
+    let r = catch_unwind(AssertUnwindSafe(|| tp.len()));
+    assert!(r.is_err(), "TtlCache 锁内 panic 后访问必须 fail-fast");
 }
 
 // ---- 调用期校验在取锁前：fail-closed 不投毒（与 poison 面区分）----

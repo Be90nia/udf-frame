@@ -164,6 +164,61 @@ const NONE: u32 = u32::MAX;
 /// map→live 槽不变量（所有 mutator 共同维护：free 槽不入 map、live 槽键值恒存在）。
 const INV_LIVE: &str = "cache 不变量：map 索引恒指向 live 槽（键值恒存在）";
 
+/// 退休批（issue#71）：已从 cache 摘除、但**尚未析构**的用户键值所有权。
+///
+/// 共享面（[`SyncLruCache`]/[`SyncTtlCache`]）的临界区内就**本批退休面**而言只做
+/// 簿记与所有权转移——本批在**解锁之后**才析构：用户 `K::drop`/`V::drop` 不再跑在
+/// cache 锁内（重入析构不再自锁死；析构 panic 也不投毒 cache）。**本条只覆盖
+/// 析构**：临界区内仍跑用户键 trait 与读侧 `V::clone`（见模块文档「锁边界契约」）。
+///
+/// 三件套各自至多一件（单次 mutator 的退休面）：
+/// - `map_key`：map 侧键副本（`HashMap::remove_entry` 取回，未析构）；共享面
+///   插入竞态落败时也含「备好但未被采用」的 map 侧键副本（issue#80）；
+/// - `slot_key`：arena 侧槽键；覆盖路径也含「未被采用」的传入键副本（issue#80）；
+/// - `value`：值（覆盖旧值 / 淘汰值 / 清扫回收值）。
+struct Retired<K, V> {
+    map_key: Option<K>,
+    slot_key: Option<K>,
+    value: Option<V>,
+}
+
+impl<K, V> Retired<K, V> {
+    /// 空批（本次 mutator 无退休件）。
+    const fn empty() -> Self {
+        Self {
+            map_key: None,
+            slot_key: None,
+            value: None,
+        }
+    }
+
+    /// 退休件析构（共享面在**解锁之后**调用）：顺序固定 = map 键 → arena 键 → 值。
+    ///
+    /// 显式拆走三件套再析构（不靠字段自动 drop 的隐式顺序）：析构顺序写在
+    /// 代码里，且「所有权已转移、析构时机由调用方掌控」是本类型的全部语义。
+    fn retire(self) {
+        let Self {
+            map_key,
+            slot_key,
+            value,
+        } = self;
+        drop(map_key);
+        drop(slot_key);
+        drop(value);
+    }
+}
+
+/// 共享面插入的**阶段 1** 结果（issue#80 两阶段插入）。
+///
+/// - `Replaced`：键已存在 ⇒ 临界区内已完成覆盖（值 + touch，**不 clone**）；
+///   退休批交还调用方在解锁后析构。
+/// - `Absent`：键不存在 ⇒ 调用方**出锁**备 map 侧键副本（锁外 `K::clone`），
+///   再进阶段 2（重取锁 + 重查 = 线性化点）。
+enum InsertPhase1<K, V> {
+    Replaced(Retired<K, V>),
+    Absent(K, V),
+}
+
 /// arena 槽：键值取 `Option` 承载「腾位」（零 unsafe 下键值出槽的占位代价，
 /// `Option` 无 niche 时各多 1 字节标签——用安全换掉裸指针自指链）。
 #[derive(Debug)]
@@ -269,18 +324,130 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
     }
 
     /// 逐 LRU 尾（最旧）：返回 (键, 值)；空链 `None`。map 条目同步清除。
-    fn pop_lru(&mut self) -> Option<(K, V)> {
+    ///
+    /// map 侧键副本用 `remove_entry` **取回**（不析构）——map 键与 arena 键是
+    /// 两份所有权，map 那份进退休批（共享面解锁后才析构，issue#71）。
+    fn pop_lru(&mut self) -> (Option<(K, V)>, Retired<K, V>) {
         let idx = self.tail;
         if idx == NONE {
-            return None;
+            return (None, Retired::empty());
         }
         self.unlink(idx);
-        let slot = &mut self.slots[idx as usize];
-        let key = slot.key.take().expect(INV_LIVE);
-        let value = slot.value.take().expect(INV_LIVE);
-        self.map.remove(&key);
+        let (key, value) = {
+            let slot = &mut self.slots[idx as usize];
+            (
+                slot.key.take().expect(INV_LIVE),
+                slot.value.take().expect(INV_LIVE),
+            )
+        };
+        let map_key = self.map.remove_entry::<K>(&key).map(|(mk, _)| mk);
         self.free.push(idx);
-        Some((key, value))
+        (
+            Some((key, value)),
+            Retired {
+                map_key,
+                slot_key: None,
+                value: None,
+            },
+        )
+    }
+
+    /// 逐 LRU 尾并**全额退休**（arena 键 + 值 + map 键副本全进退休批，不交还
+    /// 调用方）。
+    ///
+    /// 容量淘汰面用本方法：被逐者的两份键所有权与值全部延后到解锁后析构
+    /// （issue#71——用户析构不在临界区内跑）。
+    fn evict_tail(&mut self) -> Retired<K, V> {
+        let (pair, mut retired) = self.pop_lru();
+        if let Some((slot_key, value)) = pair {
+            retired.slot_key = Some(slot_key);
+            retired.value = Some(value);
+        }
+        retired
+    }
+
+    /// 存在即覆盖（更新值 + touch；len 不变、不触发淘汰）；**不存在则原样退回**
+    /// `(键, 值)` 交还调用方。
+    ///
+    /// 退回而非就地处理：共享面需在**出锁**状态下备 map 侧键副本（issue#80：
+    /// 用户 `K::clone` 不得在 cache 锁内跑）。键与值在临界区内不得析构 ⇒
+    /// 不存在时所有权原样退回（调用方仍握有它们）。
+    fn overwrite_if_present(&mut self, k: K, v: V) -> Result<Retired<K, V>, (K, V)> {
+        let idx = self.map.get(&k).copied();
+        match idx {
+            Some(idx) => {
+                let old = self.slots[idx as usize].value.replace(v);
+                self.move_to_front(idx);
+                Ok(Retired {
+                    map_key: None,
+                    // 传入键未被采用（缓存里存的是旧键）⇒ 退休（解锁后析构）。
+                    slot_key: Some(k),
+                    value: old,
+                })
+            }
+            None => Err((k, v)),
+        }
+    }
+
+    /// 新键插入（map 侧键副本**已备好** ⇒ 锁内不调 `K::clone`）。
+    ///
+    /// 容量淘汰 → 取槽 → map 侧用备好的键副本 → 挂链。退休批（被逐键值）
+    /// 交还调用方在解锁后析构（issue#71）。
+    fn insert_new(&mut self, k: K, map_key: K, v: V) -> (bool, Retired<K, V>) {
+        let mut evicted = false;
+        let mut retired = Retired::empty();
+        if self.map.len() >= self.cap {
+            // 埋点「容量淘汰」：被逐者恒 LRU 尾（order 字段=选择策略留痕）。
+            retired = self.evict_tail();
+            evicted = true;
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "capacity",
+                key_hash = retired.slot_key.as_ref().map(|k| key_fingerprint(k)),
+                order = "lru_tail",
+                len_at_evict = self.map.len() as u64
+            );
+        }
+        let idx = match self.free.pop() {
+            Some(i) => i,
+            None => {
+                let i = self.slots.len();
+                assert!(
+                    i <= (u32::MAX - 1) as usize,
+                    "cache 槽号溢出（cap 断言漏网）"
+                );
+                self.slots.push(Slot {
+                    key: None,
+                    value: None,
+                    prev: NONE,
+                    next: NONE,
+                });
+                i as u32
+            }
+        };
+        self.map.insert(map_key, idx);
+        let slot = &mut self.slots[idx as usize];
+        slot.key = Some(k);
+        slot.value = Some(v);
+        self.push_front(idx);
+        (evicted, retired)
+    }
+
+    /// 插入/覆盖（map 侧键副本**已备好** ⇒ **锁内永不调 `K::clone`**，issue#80）。
+    ///
+    /// 键已存在（竞态：另一线程在阶段 1 与阶段 2 之间插入了它）⇒ 走普通覆盖
+    /// 路径；**未被采用**的传入键与备好的键副本都进退休批（解锁后析构，
+    /// issue#71）。键不存在 ⇒ 新键插入（[`Self::insert_new`]）。
+    fn insert_with_map_key(&mut self, k: K, map_key: K, v: V) -> (bool, Retired<K, V>) {
+        match self.overwrite_if_present(k, v) {
+            Ok(mut retired) => {
+                // 备好的键副本未被采用（键已被他人插入）⇒ 一并退休（解锁后析构）。
+                retired.map_key = Some(map_key);
+                (false, retired)
+            }
+            Err((k, v)) => self.insert_new(k, map_key, v),
+        }
     }
 
     /// 不 touch 读（只读借用面）。
@@ -311,73 +478,61 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
     }
 
     /// 插入/覆盖：已存在=更新值+touch（len 不变，不触发淘汰——BoundedRegistry
-    /// 同款语义）；新键满=先逐 LRU 尾再插。返回是否发生容量淘汰（Sync 面原子
-    /// 计数用；单线程面忽略）。
-    fn insert(&mut self, k: K, v: V) -> bool {
-        if let Some(&idx) = self.map.get(&k) {
-            self.slots[idx as usize].value = Some(v);
-            self.move_to_front(idx);
-            return false;
-        }
-        let mut evicted = false;
-        if self.map.len() >= self.cap {
-            // 埋点「容量淘汰」：被逐者恒 LRU 尾（order 字段=选择策略留痕）。
-            let _evicted_pair = self.pop_lru();
-            evicted = true;
-            embed_event!(
-                debug,
-                target: "skeleton::cache::evict",
-                kind = "capacity",
-                key_hash = _evicted_pair.as_ref().map(|(k, _)| key_fingerprint(k)),
-                order = "lru_tail",
-                len_at_evict = self.map.len() as u64
-            );
-        }
-        let idx = match self.free.pop() {
-            Some(i) => i,
-            None => {
-                let i = self.slots.len();
-                assert!(
-                    i <= (u32::MAX - 1) as usize,
-                    "cache 槽号溢出（cap 断言漏网）"
-                );
-                self.slots.push(Slot {
-                    key: None,
-                    value: None,
-                    prev: NONE,
-                    next: NONE,
-                });
-                i as u32
+    /// 同款语义）；新键满=先逐 LRU 尾再插。返回 (是否容量淘汰, 退休批)。
+    ///
+    /// 退休批（覆盖旧值 / 淘汰键值）**不在本方法内析构**——共享面解锁后才析构
+    /// （issue#71）。
+    ///
+    /// 覆盖路径**不调 `K::clone`**（现有可观察语义）；新键才 clone 一份 map 侧
+    /// 键副本（单线程面无共享锁 ⇒ clone 不在临界区内；共享面走
+    /// [`Self::insert_with_map_key`]——锁内永不 clone，issue#80）。
+    fn insert(&mut self, k: K, v: V) -> (bool, Retired<K, V>) {
+        match self.overwrite_if_present(k, v) {
+            Ok(retired) => (false, retired),
+            Err((k, v)) => {
+                let map_key = k.clone();
+                self.insert_new(k, map_key, v)
             }
-        };
-        self.map.insert(k.clone(), idx);
-        let slot = &mut self.slots[idx as usize];
-        slot.key = Some(k);
-        slot.value = Some(v);
-        self.push_front(idx);
-        evicted
+        }
     }
 
     /// 摘除（返回值；不判过期不 touch——物理面）。
-    fn remove<Q>(&mut self, k: &Q) -> Option<V>
+    ///
+    /// 返回 (值, 退休批)：键的两份所有权（arena 键 + map 键副本）进退休批，
+    /// 值交还调用方。
+    fn remove<Q>(&mut self, k: &Q) -> (Option<V>, Retired<K, V>)
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let idx = self.idx_of(k)?;
+        let Some(idx) = self.idx_of(k) else {
+            return (None, Retired::empty());
+        };
         self.unlink(idx);
-        let slot = &mut self.slots[idx as usize];
-        let key = slot.key.take().expect(INV_LIVE);
-        let value = slot.value.take().expect(INV_LIVE);
-        self.map.remove::<K>(&key);
+        let (key, value) = {
+            let slot = &mut self.slots[idx as usize];
+            (
+                slot.key.take().expect(INV_LIVE),
+                slot.value.take().expect(INV_LIVE),
+            )
+        };
+        let map_key = self.map.remove_entry::<K>(&key).map(|(mk, _)| mk);
         self.free.push(idx);
-        Some(value)
+        (
+            Some(value),
+            Retired {
+                map_key,
+                slot_key: Some(key),
+                value: None,
+            },
+        )
     }
 
     /// 条件清扫：`keep` 返回 false 的条目回收（arena 序遍历，确定序）。
-    /// 返回回收数。
-    fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) -> usize {
+    /// 返回 (回收数, 退休批)：被回收条目的键值所有权全部进退休批。
+    fn retain(&mut self, mut keep: impl FnMut(&K, &mut V) -> bool) -> (usize, Vec<Retired<K, V>>) {
         let mut purged = 0;
+        let mut retired = Vec::new();
         for idx in 0..self.slots.len() {
             if self.slots[idx].key.is_none() {
                 continue;
@@ -392,15 +547,24 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
             if !keep_it {
                 let idx32 = idx as u32;
                 self.unlink(idx32);
-                let slot = &mut self.slots[idx];
-                let key = slot.key.take().expect(INV_LIVE);
-                slot.value = None;
-                self.map.remove(&key);
+                let (key, value) = {
+                    let slot = &mut self.slots[idx];
+                    (
+                        slot.key.take().expect(INV_LIVE),
+                        slot.value.take().expect(INV_LIVE),
+                    )
+                };
+                let map_key = self.map.remove_entry::<K>(&key).map(|(mk, _)| mk);
                 self.free.push(idx32);
                 purged += 1;
+                retired.push(Retired {
+                    map_key,
+                    slot_key: Some(key),
+                    value: Some(value),
+                });
             }
         }
-        purged
+        (purged, retired)
     }
 
     /// recency 序迭代（最新→最旧；arena 链确定序）。
@@ -449,7 +613,8 @@ impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
     /// 插入/覆盖。已存在键=更新值+touch（len 不变，不触发淘汰）；
     /// 新键满=先逐 LRU 尾再插（被逐者静默丢弃，需要看见用 [`Self::pop_lru`]）。
     pub fn insert(&mut self, k: K, v: V) {
-        self.core.insert(k, v);
+        let (_, retired) = self.core.insert(k, v);
+        retired.retire();
     }
 
     /// 读（**touch**：命中刷新 recency，故需 `&mut self`）。只读共享场景用
@@ -480,13 +645,17 @@ impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
     /// 摘除并返回值。
     #[must_use]
     pub fn remove(&mut self, k: &K) -> Option<V> {
-        self.core.remove(k)
+        let (value, retired) = self.core.remove(k);
+        retired.retire();
+        value
     }
 
     /// 逐出 LRU 尾（最旧）并返回。
     #[must_use]
     pub fn pop_lru(&mut self) -> Option<(K, V)> {
-        self.core.pop_lru()
+        let (pair, retired) = self.core.pop_lru();
+        retired.retire();
+        pair
     }
 
     /// 当前条目数。
@@ -591,7 +760,7 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
         if self.core.idx_of(&k).is_none() && self.core.len() >= self.core.capacity() {
             // 双界拍板：先过期先淘汰（单次 now 快照判定，确定性），仍满再逐 LRU 尾。
             let now = self.clock.now_instant();
-            let purged = self.core.retain(|_, e| e.expires > now);
+            let (purged, purge_retired) = self.core.retain(|_, e| e.expires > now);
             self.expired += purged as u64;
             // 埋点「TTL 过期驱逐（满插清扫）」：真回收才发（僵尸数+触发键指纹；
             // 零僵尸路径由容量淘汰事件承载）。
@@ -607,18 +776,21 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
             }
             if self.core.len() >= self.core.capacity() {
                 // 埋点「容量淘汰」（TtlCache 站点）：被逐者恒 LRU 尾。
-                let _evicted = self.core.pop_lru();
+                let retired = self.core.evict_tail();
                 embed_event!(
                     debug,
                     target: "skeleton::cache::evict",
                     kind = "capacity",
-                    key_hash = _evicted.as_ref().map(|(evicted, _)| key_fingerprint(evicted)),
+                    key_hash = retired.slot_key.as_ref().map(|k| key_fingerprint(k)),
                     order = "lru_tail",
                     len_at_evict = self.core.len() as u64
                 );
+                retired.retire();
             }
+            drop(purge_retired);
         }
-        self.core.insert(k, TtlEntry { expires, value: v });
+        let (_, retired) = self.core.insert(k, TtlEntry { expires, value: v });
+        retired.retire();
     }
 
     /// 读（touch + 惰性过期）。过期触碰即回收并计入 [`Self::expired`]。
@@ -661,20 +833,25 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
     /// 摘除并返回值（物理面：不判过期）。
     #[must_use]
     pub fn remove(&mut self, k: &K) -> Option<V> {
-        self.core.remove(k).map(|e| e.value)
+        let (value, retired) = self.core.remove(k);
+        retired.retire();
+        value.map(|e| e.value)
     }
 
     /// 逐出 LRU 尾（最旧；**物理面**：不判过期——过期与否不影响逐出序）。
     #[must_use]
     pub fn pop_lru(&mut self) -> Option<(K, V)> {
-        self.core.pop_lru().map(|(k, e)| (k, e.value))
+        let (pair, retired) = self.core.pop_lru();
+        retired.retire();
+        pair.map(|(k, e)| (k, e.value))
     }
 
     /// 显式清扫全部过期条目（arena 序确定遍历；单次 now 快照判定）。
     /// 返回回收数，计入 [`Self::expired`]。
     pub fn purge_expired(&mut self) -> usize {
         let now = self.clock.now_instant();
-        let n = self.core.retain(|_, e| e.expires > now);
+        let (n, retired) = self.core.retain(|_, e| e.expires > now);
+        drop(retired);
         self.expired += n as u64;
         // 埋点「purge」：显式清扫动作 info（回收数/残留）。
         embed_event!(
@@ -719,7 +896,10 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
     fn expire_if_due(&mut self, k: &K, now: Instant) -> bool {
         let due = matches!(self.core.peek_mut(k), Some(e) if e.expires <= now);
         if due {
-            self.core.remove(k);
+            let (value, mut retired) = self.core.remove(k);
+            // 值（含用户 V）一并进退休批 ⇒ 析构时机归调用方（issue#71）。
+            retired.value = value;
+            retired.retire();
             self.expired += 1;
             // 埋点「TTL 过期驱逐（惰性单条）」：触碰即回收留痕（键指纹+累计）。
             embed_event!(
@@ -739,10 +919,17 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
 ///
 /// - **取值返 owned**（`V: Clone`）：`&V` 引用不可跨越锁边界——守卫外泄等于把
 ///   全局锁交到调用方手里（非重入锁自锁死 + 临界区失控），moka 同款约定；
-///   同理 `iter`/`peek_mut` 引用面不设（诊断面走 [`Debug`]）；
-/// - **poison = fail-fast panic 带因**（拍板）：持锁 panic 后 LRU 链不变量可能
-///   已破，`into_inner` 静默续跑 = 破链读写放大，禁（与 logx 的 `into_inner`
-///   先例区分——cache 不变量耦合度高）。
+///   同理 `iter`/`peek_mut` 引用面不设（诊断面走 [`Debug`]）。**该 `V::clone`
+///   在锁内执行**（见下节「锁内用户代码契约」，issue#83）；
+/// - **析构在锁外**（issue#71）：就**退休面**而言临界区内只做簿记与所有权转移
+///   ——被覆盖/被淘汰/被摘除的键值所有权在**解锁之后**才析构（用户 `K::drop`/
+///   `V::drop` 可能很慢、可能重入、可能 panic：跑在锁内 = 重入析构自锁死 +
+///   析构 panic 投毒 cache）。**本条只覆盖析构**——锁内仍跑用户键 trait 与读侧
+///   `V::clone`（见下节「锁内用户代码契约」）；
+/// - **poison = fail-fast panic 带因**（拍板）：**临界区内的内部簿记** panic
+///   （不变量破坏）后 LRU 链可能已破，`into_inner` 静默续跑 = 破链读写放大，禁
+///   （与 logx 的 `into_inner` 先例区分——cache 不变量耦合度高）；用户析构 panic
+///   发生在解锁之后 ⇒ **不投毒**（用户代码的锅不牵连 cache 不变量）。
 ///
 /// # 锁内用户代码契约（issue#82/#83）
 ///
@@ -806,6 +993,9 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
     /// 插入/覆盖。已存在键=更新值+touch（不触发淘汰）；新键满=先逐 LRU 尾
     /// 再插（计入 [`Self::evictions`]）。
     ///
+    /// 临界区内只做簿记与所有权转移：被覆盖/被淘汰的键值所有权在**解锁之后**
+    /// 才析构（用户 `K::drop`/`V::drop` 不在 cache 锁内跑，issue#71）。
+    ///
     /// **用户 `K::clone` 在锁外**（issue#80）：两阶段插入——① 持锁查存在，存在
     /// 即更新值 + touch（**不 clone**，覆盖语义不变）；② 不存在 ⇒ **放锁** →
     /// clone map 侧键副本（此刻无锁、无任何变更 ⇒ clone panic 不投毒 cache）→
@@ -817,7 +1007,32 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
     /// 项/删除/rehash）与读路径的 `V::clone` ⇒ 见类型文档「锁内用户代码契约」
     /// （issue#82/#83）。
     pub fn insert(&self, k: K, v: V) {
-        let evicted = self.lock_core().insert(k, v);
+        // 阶段 1：持锁查存在 —— 存在即更新值 + touch（**不 clone**）。
+        let phase1 = {
+            let mut g = self.lock_core();
+            match g.overwrite_if_present(k, v) {
+                Ok(retired) => InsertPhase1::Replaced(retired),
+                Err((k, v)) => InsertPhase1::Absent(k, v),
+            }
+        };
+        let (k, v) = match phase1 {
+            InsertPhase1::Replaced(retired) => {
+                retired.retire();
+                return;
+            }
+            InsertPhase1::Absent(k, v) => (k, v),
+        };
+        // 锁外 clone map 侧键副本：此刻**无 cache 锁持有、未发生任何变更**
+        // ⇒ clone panic 在此展开（不投毒 cache，issue#80）。
+        let map_key = k.clone();
+        // 阶段 2：重取锁 + 重查（**第二次锁定检查 = 线性化点**）⇒ 锁内不调
+        // `K::clone`；竞态落败（键已被他人插入）⇒ 走普通覆盖路径，未被采用的
+        // 候选键**解锁后**才析构（issue#71/#80）。
+        let (evicted, retired) = {
+            let mut g = self.lock_core();
+            g.insert_with_map_key(k, map_key, v)
+        };
+        retired.retire();
         if evicted {
             self.evictions.fetch_add(1, Ordering::Relaxed);
         }
@@ -861,15 +1076,29 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
     }
 
     /// 摘除并返回值。
+    ///
+    /// 摘除的两份键所有权在**解锁之后**才析构（issue#71）；值交还调用方。
     #[must_use]
     pub fn remove(&self, k: &K) -> Option<V> {
-        self.lock_core().remove(k)
+        let (value, retired) = {
+            let mut g = self.lock_core();
+            g.remove(k)
+        };
+        retired.retire();
+        value
     }
 
     /// 逐出 LRU 尾（最旧）并返回。
+    ///
+    /// map 侧键副本在**解锁之后**才析构（issue#71）；键值对交还调用方。
     #[must_use]
     pub fn pop_lru(&self) -> Option<(K, V)> {
-        self.lock_core().pop_lru()
+        let (pair, retired) = {
+            let mut g = self.lock_core();
+            g.pop_lru()
+        };
+        retired.retire();
+        pair
     }
 
     /// 当前条目数。
@@ -911,8 +1140,35 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
 /// 满插逐尾计数均为原子单点（锁内无第二套）。
 ///
 /// 调用期校验（`ttl == 0`、`now + ttl` 溢出）在**取锁前**完成：调用方 bug 的
-/// fail-closed 不触碰内部不变量，panic 后缓存照常可用（与临界区内 Drop panic
-/// 的 poison 面相区分）。
+/// fail-closed 不触碰内部不变量，panic 后缓存照常可用（与临界区内内部簿记
+/// panic 的 poison 面相区分）。
+///
+/// 析构在锁外（issue#71，同 [`SyncLruCache`]）：就**退休面**而言临界区内只做簿记
+/// 与所有权转移，被清扫/被淘汰/被摘除的键值所有权在解锁之后才析构（用户析构
+/// panic 不投毒 cache）。**本条只覆盖析构**——锁内仍跑用户键 trait 与读侧
+/// `V::clone`（见下节「锁内用户代码契约」）。
+///
+/// # 锁内用户代码契约（issue#82/#83）
+///
+/// 「析构在锁外」「`K::clone` 在锁外」**只覆盖那两条边界**——共享面仍有用户
+/// 代码跑在内部 mutex 下：
+///
+/// - **键 trait 在锁内**（issue#82）：`HashMap<K, u32>` 作权威索引 ⇒
+///   `K::Hash`、`K::Eq` 与借用键 `Q::Hash`/`Q::Eq`（`Borrow<Q>` 路径，由调用方
+///   控制）**可能在内部 mutex 下执行**（查表 `idx_of`→`HashMap::get`、插入
+///   `map.get`/`map.insert`、删除 `map.remove`、`HashMap` 扩容/rehash）⇒ 键实现
+///   必须**快、不 panic、不得重入同一个缓存**（重入 = 非重入 mutex 自死锁；
+///   panic = 投毒锁 ⇒ 后续访问全部 fail-fast）。
+/// - **读路径 `V::clone` 在锁内**（issue#83）：[`Self::get`]（过期检查 + LRU
+///   touch 之后 `e.value.clone()`）与 [`Self::peek`]（过期检查之后
+///   `e.value.clone()`）返 owned 值 ⇒ `V::clone` **在内部 mutex 下执行** ⇒ 值
+///   实现必须**快、不 panic、不得重入同一个缓存**。
+/// - **与 #71 的精确对照**（两句并列，勿互相误读）：#71 移出锁的是**退休值的
+///   析构**；读侧 **`Clone` 仍在锁内**。#71/#80 **都没有**让 `Hash`/`Eq` 或
+///   读侧 `Clone` 变成无锁执行。
+/// - **既有 API 属性未被改动**：[`Self::remove`]/[`Self::pop_lru`] 仍**移动出
+///   owned `V`**、**不需要 `V: Clone`**；只有返回 owned 值的 `get`/`peek`
+///   要求 `V: Clone`。
 pub struct SyncTtlCache<K, V> {
     clock: Arc<dyn Clock>,
     core: Mutex<LruCore<K, TtlEntry<V>>>,
@@ -970,6 +1226,9 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
     /// 取锁前校验——不投毒）。新键满插：先清过期（计入 [`Self::expired`]），
     /// 仍满逐 LRU 尾（计入 [`Self::evictions`]）。
     ///
+    /// 临界区内只做簿记与所有权转移：被清扫/被淘汰/被覆盖的键值所有权在
+    /// **解锁之后**才析构（issue#71）。
+    ///
     /// **用户 `K::clone` 在锁外**（issue#80）：与 [`SyncLruCache::insert`] 同款
     /// 两阶段插入——① 持锁查存在，存在即更新值 + 重置过期 + touch（**不
     /// clone**）；② 不存在 ⇒ **放锁** → clone map 侧键副本（此刻无锁、无任何
@@ -991,22 +1250,6 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         let expires = now.checked_add(ttl).expect(
             "TtlCache::insert: now + ttl 溢出 Instant 表示范围（fail-closed，clock armor 同款）",
         );
-        let mut g = self.lock_core();
-        if g.idx_of(&k).is_none() && g.len() >= g.capacity() {
-            // 双界拍板：先过期先淘汰（单次 now 快照判定，确定性），仍满再逐 LRU 尾。
-            let now = self.clock.now_instant();
-            let purged = g.retain(|_, e| e.expires > now);
-            self.expired.fetch_add(purged as u64, Ordering::Relaxed);
-            // 埋点「TTL 过期驱逐（满插清扫）」：真回收才发（僵尸数+触发键指纹）。
-            #[cfg(feature = "log-embed")]
-            if purged > 0 {
-                embed_event!(
-                    debug,
-                    target: "skeleton::cache::evict",
-                    kind = "ttl_sweep",
-                    key_hash = key_fingerprint(&k),
-                    zombies = purged as u64
-                );
         // 阶段 1：持锁查存在 —— 存在即更新值 + 重置过期 + touch（**不 clone**）。
         let phase1 = {
             let mut g = self.lock_core();
@@ -1027,27 +1270,58 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         let map_key = k.clone();
         // 阶段 2：重取锁 + 重查（**第二次锁定检查 = 线性化点**；重查**早于**
         // 过期清扫/淘汰 ⇒ panic 的 clone 不会造成部分清扫/变更）。
-            if g.len() >= g.capacity() {
-                // 埋点「容量淘汰」（TtlCache 站点）：被逐者恒 LRU 尾。
-                let _evicted = g.pop_lru();
-                self.evictions.fetch_add(1, Ordering::Relaxed);
-                embed_event!(
-                    debug,
-                    target: "skeleton::cache::evict",
-                    kind = "capacity",
-                    key_hash = _evicted.as_ref().map(|(evicted, _)| key_fingerprint(evicted)),
-                    order = "lru_tail",
-                    len_at_evict = g.len() as u64
-                );
+        let (purge_retired, evict_retired, insert_retired) = {
+            let mut g = self.lock_core();
+            let mut purge_retired = Vec::new();
+            let mut evict_retired = Retired::empty();
+            if g.idx_of(&k).is_none() && g.len() >= g.capacity() {
+                // 双界拍板：先过期先淘汰（单次 now 快照判定，确定性），仍满再逐 LRU 尾。
+                let now = self.clock.now_instant();
+                let (purged, retired) = g.retain(|_, e| e.expires > now);
+                purge_retired = retired;
+                self.expired.fetch_add(purged as u64, Ordering::Relaxed);
+                // 埋点「TTL 过期驱逐（满插清扫）」：真回收才发（僵尸数+触发键指纹）。
+                #[cfg(feature = "log-embed")]
+                if purged > 0 {
+                    embed_event!(
+                        debug,
+                        target: "skeleton::cache::evict",
+                        kind = "ttl_sweep",
+                        key_hash = key_fingerprint(&k),
+                        zombies = purged as u64
+                    );
+                }
+                if g.len() >= g.capacity() {
+                    // 埋点「容量淘汰」（TtlCache 站点）：被逐者恒 LRU 尾。
+                    let retired = g.evict_tail();
+                    evict_retired = retired;
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
+                    embed_event!(
+                        debug,
+                        target: "skeleton::cache::evict",
+                        kind = "capacity",
+                        key_hash = evict_retired.slot_key.as_ref().map(|k| key_fingerprint(k)),
+                        order = "lru_tail",
+                        len_at_evict = g.len() as u64
+                    );
+                }
             }
-        }
-        g.insert(k, TtlEntry { expires, value: v });
+            // 锁内不调 `K::clone`（备好的键副本直接用）；竞态落败（键已被他人
+            // 插入）⇒ 走普通覆盖路径，未被采用的候选键**解锁后**才析构。
+            let (_, retired) = g.insert_with_map_key(k, map_key, entry);
+            (purge_retired, evict_retired, retired)
+        };
+        drop(purge_retired);
+        evict_retired.retire();
+        insert_retired.retire();
     }
 
     /// 读（touch + 惰性过期 + 命中计数）。过期条目按 miss（不计命中）。
     ///
     /// 借用键面（`K: Borrow<Q>`）：`K = String` 时可直接用 `&str` 查，热路径
     /// 零分配（`HashMap::get` 的借用查询不透支键类型）。
+    ///
+    /// 过期回收的键值所有权在**解锁之后**才析构（issue#71）。
     ///
     /// ⚠️ 锁内用户代码（issue#83）：过期检查 + LRU touch 之后的 `V::clone`
     /// （`e.value.clone()`）与键的 `Hash`/`Eq`（查表；借用键面由调用方控制
@@ -1060,18 +1334,26 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         Q: Hash + Eq + ?Sized,
     {
         let now = self.clock.now_instant();
-        let mut g = self.lock_core();
-        if Self::expire_if_due(&mut g, &self.expired, k, now) {
-            return None;
-        }
-        let hit = g.get_mut(k).map(|e| e.value.clone());
-        if hit.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-        }
+        let (hit, retired) = {
+            let mut g = self.lock_core();
+            let (due, retired) = Self::expire_if_due(&mut g, &self.expired, k, now);
+            if due {
+                (None, retired)
+            } else {
+                let hit = g.get_mut(k).map(|e| e.value.clone());
+                if hit.is_some() {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                }
+                (hit, retired)
+            }
+        };
+        retired.retire();
         hit
     }
 
     /// 读（不 touch + 惰性过期；无命中计数——纯读面）。
+    ///
+    /// 过期回收的键值所有权在**解锁之后**才析构（issue#71）。
     ///
     /// ⚠️ 锁内用户代码（issue#83）：过期检查之后的 `V::clone`（`e.value.clone()`）
     /// 与键的 `Hash`/`Eq`（查表）**都在内部 mutex 下执行** ⇒ `V` 与 `K` 的实现
@@ -1082,11 +1364,17 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         V: Clone,
     {
         let now = self.clock.now_instant();
-        let mut g = self.lock_core();
-        if Self::expire_if_due(&mut g, &self.expired, k, now) {
-            return None;
-        }
-        g.peek(k).map(|e| e.value.clone())
+        let (hit, retired) = {
+            let mut g = self.lock_core();
+            let (due, retired) = Self::expire_if_due(&mut g, &self.expired, k, now);
+            if due {
+                (None, retired)
+            } else {
+                (g.peek(k).map(|e| e.value.clone()), retired)
+            }
+        };
+        retired.retire();
+        hit
     }
 
     /// 物理存在判定（**含僵尸**：过期未回收条目也算在——不 touch 不判定过期）。
@@ -1097,31 +1385,51 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
     }
 
     /// 摘除并返回值（物理面：不判过期）。
+    ///
+    /// 摘除的两份键所有权在**解锁之后**才析构（issue#71）。
     #[must_use]
     pub fn remove(&self, k: &K) -> Option<V> {
-        self.lock_core().remove(k).map(|e| e.value)
+        let (value, retired) = {
+            let mut g = self.lock_core();
+            g.remove(k)
+        };
+        retired.retire();
+        value.map(|e| e.value)
     }
 
     /// 逐出 LRU 尾（最旧；**物理面**：不判过期）。
+    ///
+    /// map 侧键副本在**解锁之后**才析构（issue#71）。
     #[must_use]
     pub fn pop_lru(&self) -> Option<(K, V)> {
-        self.lock_core().pop_lru().map(|(k, e)| (k, e.value))
+        let (pair, retired) = {
+            let mut g = self.lock_core();
+            g.pop_lru()
+        };
+        retired.retire();
+        pair.map(|(k, e)| (k, e.value))
     }
 
     /// 显式清扫全部过期条目（arena 序确定遍历；单次 now 快照判定）。
     /// 返回回收数，计入 [`Self::expired`]。
+    ///
+    /// 被回收条目的键值所有权在**解锁之后**才析构（issue#71）。
     pub fn purge_expired(&self) -> usize {
         let now = self.clock.now_instant();
-        let mut g = self.lock_core();
-        let n = g.retain(|_, e| e.expires > now);
-        self.expired.fetch_add(n as u64, Ordering::Relaxed);
-        // 埋点「purge」：显式清扫动作 info（回收数/残留）。
-        embed_event!(
-            info,
-            target: "skeleton::cache::purge",
-            purged = n as u64,
-            len_after = g.len() as u64
-        );
+        let (n, retired) = {
+            let mut g = self.lock_core();
+            let (n, retired) = g.retain(|_, e| e.expires > now);
+            self.expired.fetch_add(n as u64, Ordering::Relaxed);
+            // 埋点「purge」：显式清扫动作 info（回收数/残留）。
+            embed_event!(
+                info,
+                target: "skeleton::cache::purge",
+                purged = n as u64,
+                len_after = g.len() as u64
+            );
+            (n, retired)
+        };
+        drop(retired);
         n
     }
 
@@ -1164,19 +1472,24 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
     /// 惰性过期判定（语义同单线程版 [`TtlCache`]）：到期则回收+计数，返回
     /// 是否回收。计数走 [`AtomicU64`] 单点（free fn 形：guard 与计数分属
     /// 结构体字段，借参避免跨字段借用冲突）。
+    ///
+    /// 返回 (是否回收, 退休批)：被回收条目的键值所有权交还调用方，由共享面
+    /// 在**解锁之后**才析构（issue#71）。
     fn expire_if_due<Q>(
         g: &mut LruCore<K, TtlEntry<V>>,
         expired: &AtomicU64,
         k: &Q,
         now: Instant,
-    ) -> bool
+    ) -> (bool, Retired<K, TtlEntry<V>>)
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         let due = matches!(g.peek_mut(k), Some(e) if e.expires <= now);
         if due {
-            g.remove(k);
+            let (value, mut retired) = g.remove(k);
+            // 值（含用户 V）一并进退休批 ⇒ 解锁后才析构（issue#71）。
+            retired.value = value;
             expired.fetch_add(1, Ordering::Relaxed);
             // 埋点「TTL 过期驱逐（惰性单条）」：触碰即回收留痕（键指纹+累计）。
             #[cfg(feature = "log-embed")]
@@ -1187,8 +1500,9 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
                 key_hash = key_fingerprint(k),
                 expired_total = expired.load(Ordering::Relaxed)
             );
+            return (true, retired);
         }
-        due
+        (false, Retired::empty())
     }
 }
 

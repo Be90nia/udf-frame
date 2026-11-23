@@ -8,6 +8,7 @@
 //! feature 面：scheduler 域为 std-ext 十三域零门常驻件（本文件只触及
 //! scheduler 面，无 json/log-embed/random 依赖）⇒ 无需文件头 feature gate。
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};

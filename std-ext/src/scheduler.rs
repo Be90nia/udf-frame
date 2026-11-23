@@ -99,8 +99,8 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrd};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrd};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -127,6 +127,45 @@ impl fmt::Display for Closed {
 
 impl std::error::Error for Closed {}
 
+/// 有界准入的 typed 拒绝（issue#58）：过载**不** panic、**不**静默丢回调。
+///
+/// 与既有 admission 面同族：`SyncStore::try_dispatch` 的
+/// `AdmissionOutcome::{Accepted, Full, Closed}`、`FxScope` 的
+/// `AdmissionError::{Closed, PendingFull, TrackedFull}`——本域只取关闸与
+/// 触顶两个成因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionError {
+    /// 关闸后注册（与 [`Closed`] 同义）。
+    Closed,
+    /// 活跃注册数达上界（[`Scheduler::set_capacity`]）——任务**未入堆**
+    /// （不部分插入）；拒绝计数见 [`Scheduler::rejected_registrations`]。
+    Full,
+}
+
+impl fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed => write!(
+                f,
+                "scheduler closed: registration rejected（关闸后注册显式拒绝）"
+            ),
+            Self::Full => write!(
+                f,
+                "scheduler registration capacity exhausted（活跃注册数达上界）"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionError {}
+
+/// 墓碑清扫阈值（#52）——绝对下限：墓碑数达此值才可能触发清扫（少量取消
+/// 不触发 O(n) 堆重建）。
+const TOMBSTONE_FLOOR: usize = 16;
+
+/// 墓碑清扫阈值（#52）——比例阈值：墓碑数 × 此值 ≥ 堆条目数 ⇒ 触发清扫
+/// （大堆里的少量墓碑不长期滞留，也不频繁重建）。
+const TOMBSTONE_RATIO: usize = 4;
 /// 任务胞：状态词 + 任务体（cancel 的线性化点就是 `state` 上的 CAS）。
 struct TaskCell {
     state: AtomicU8,
@@ -188,10 +227,24 @@ struct Shared {
     // 语义；驱动线程单线程形态下注册竞争非热路径，分片锁/无锁堆留待真实
     // 多注册方负载出现再升。
     state: Mutex<HeapState>,
-    /// 注册/关闭唤醒（驱动线程 park 唯一早醒源；cancel 不唤醒=惰性墓碑）。
+    /// 注册/关闭/取消唤醒（驱动线程 park 早醒源；取消唤醒只为墓碑清扫后
+    /// 重算 park 锚——#52）。
     signal: Condvar,
     panics: AtomicU64,
     worker_passes: AtomicU64,
+    /// 活跃注册数（#58）：未退役的注册数——堆内待执行条目 + **执行中**的
+    /// 周期任务（它仍持有一条注册，除非被取消否则会被重臂）。
+    ///
+    /// **不等于 `heap.len()`**：堆内还含已取消的惰性墓碑（#52 清扫前）。
+    live: AtomicUsize,
+    /// 活跃注册数上限（#58）：0 = 无界（默认形态——不盲设有界默认值，#56
+    /// 是默认资源策略的评审触发点）。与 `SyncStore::set_capacity` 同款口径。
+    capacity: AtomicUsize,
+    /// 因容量上界被拒的注册次数（#58；闸关拒发不计入，同 `FxCounts::rejected`）。
+    rejected: AtomicU64,
+    /// 已取消但可能仍在堆内的条目数（#52，近似计数）：取消 O(1) 递增，
+    /// 清扫后归零——漂移至多「清扫期间落地的那次取消」，良性。
+    tombstones: AtomicUsize,
 }
 
 /// 埋点 kind 字段值（公开入口名：Once=after / Every=every）。log-embed 门内
@@ -211,6 +264,21 @@ fn lock(state: &Mutex<HeapState>) -> MutexGuard<'_, HeapState> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+impl Shared {
+    /// 退役一次注册（#58）：CAS `PENDING`→终态；**CAS 赢家释放额度**
+    /// （恰好一次——取消 / 点火 / 关闸 / panic 四条退役路径共用此闸门，
+    /// 杜绝重复释放与漏释放）。
+    fn retire(&self, cell: &TaskCell, terminal: u8) -> bool {
+        let won = cell
+            .state
+            .compare_exchange(PENDING, terminal, AtomicOrd::SeqCst, AtomicOrd::SeqCst)
+            .is_ok();
+        if won {
+            self.live.fetch_sub(1, AtomicOrd::SeqCst);
+        }
+        won
+    }
+}
 /// 同步任务调度器（`Arc` 内脏，[`Clone`] 廉价共享；注册/点火/关闭线程安全）。
 ///
 /// 见[模块文档](self)双层形态与语义拍板。
@@ -242,6 +310,10 @@ impl Scheduler {
                 signal: Condvar::new(),
                 panics: AtomicU64::new(0),
                 worker_passes: AtomicU64::new(0),
+                live: AtomicUsize::new(0),
+                capacity: AtomicUsize::new(0), // 0 = 无界（默认）
+                rejected: AtomicU64::new(0),
+                tombstones: AtomicUsize::new(0),
             }),
         }
     }
@@ -256,15 +328,22 @@ impl Scheduler {
     ///
     /// `delay` 过大致 `now + delay` 溢出 Instant 表示范围（clock.rs armor
     /// 同款 fail-closed 带因 panic）。
+    ///
+    /// 触顶（[`Scheduler::set_capacity`] 配了上界且活跃注册数达上界）：
+    /// **panic**（fail-visible，禁静默丢回调）——需要 typed 拒绝的调用方走
+    /// [`Scheduler::try_after`]。
     pub fn after(
         &self,
         delay: Duration,
         task: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<TaskHandle, Closed> {
-        self.register(
-            delay,
-            TaskKind::Once(std::sync::Mutex::new(Some(Box::new(task)))),
-        )
+        match self.try_after(delay, task) {
+            Ok(handle) => Ok(handle),
+            Err(AdmissionError::Closed) => Err(Closed),
+            // 触顶 = 过载（fail-visible）：禁静默丢回调（issue#58）——typed
+            // 拒绝面走 `try_after`/`try_every`。
+            Err(AdmissionError::Full) => self.panic_capacity_full(),
+        }
     }
 
     /// 登记周期任务：首火在 `period` 后（非注册即火），此后按锚定周期重臂
@@ -278,11 +357,51 @@ impl Scheduler {
     ///
     /// `period` 为零：零周期=忙等风暴，fail-closed 拒绝（RetryPolicy 零退避
     /// 同款）。
+    ///
+    /// 触顶（[`Scheduler::set_capacity`] 配了上界且活跃注册数达上界）：
+    /// **panic**（fail-visible，禁静默丢回调）——需要 typed 拒绝的调用方走
+    /// [`Scheduler::try_every`]。
     pub fn every(
         &self,
         period: Duration,
         task: impl Fn() + Send + Sync + 'static,
     ) -> Result<TaskHandle, Closed> {
+        match self.try_every(period, task) {
+            Ok(handle) => Ok(handle),
+            Err(AdmissionError::Closed) => Err(Closed),
+            // 触顶 = 过载（fail-visible）：禁静默丢回调（issue#58）——typed
+            // 拒绝面走 `try_after`/`try_every`。
+            Err(AdmissionError::Full) => self.panic_capacity_full(),
+        }
+    }
+    /// 登记一次性任务（typed 拒绝面，issue#58）：容量触顶 ⇒
+    /// [`AdmissionError::Full`]（任务**不入堆**，不部分插入，禁静默丢回调）；
+    /// 关闸 ⇒ [`AdmissionError::Closed`]。
+    ///
+    /// 与 [`Scheduler::after`] 的差别只在拒绝面：`after` 的错误类型是既有
+    /// 的 `Closed`（公开面不变），触顶时 **panic**（fail-visible）⇒ 需要
+    /// typed 拒绝的调用方走本方法。
+    pub fn try_after(
+        &self,
+        delay: Duration,
+        task: impl FnOnce() + Send + Sync + 'static,
+    ) -> Result<TaskHandle, AdmissionError> {
+        self.register(
+            delay,
+            TaskKind::Once(std::sync::Mutex::new(Some(Box::new(task)))),
+        )
+    }
+
+    /// 登记周期任务（typed 拒绝面，issue#58）：语义同 [`Scheduler::try_after`]。
+    ///
+    /// # Panics
+    ///
+    /// `period` 为零：零周期=忙等风暴，fail-closed 拒绝。
+    pub fn try_every(
+        &self,
+        period: Duration,
+        task: impl Fn() + Send + Sync + 'static,
+    ) -> Result<TaskHandle, AdmissionError> {
         assert!(
             period > Duration::ZERO,
             "every 零周期=忙等风暴，fail-closed 拒绝（RetryPolicy 零退避同款）"
@@ -295,10 +414,53 @@ impl Scheduler {
             },
         )
     }
+    /// 触顶 fail-visible（issue#58）：既有 `after`/`every` 的错误类型是
+    /// `Closed`（公开面不变）⇒ 触顶只能 panic（禁静默丢回调）；typed 拒绝
+    /// 面走 `try_after`/`try_every`。
+    fn panic_capacity_full(&self) -> ! {
+        panic!(
+            "scheduler registration capacity exhausted (capacity={} live={})：\
+             需要 typed 拒绝请用 try_after/try_every",
+            self.shared.capacity.load(AtomicOrd::SeqCst),
+            self.shared.live.load(AtomicOrd::SeqCst),
+        );
+    }
+
+    /// 活跃注册数上限（issue#58）：`cap` = 未退役注册数上限；**0 = 无界**
+    /// （默认形态——不盲设有界默认值，#56 是默认资源策略的评审触发点）。
+    ///
+    /// 计数口径（含什么、不含什么）：
+    ///
+    /// - **含**：堆内待执行条目；**执行中**的周期任务（它仍持有一条注册，
+    ///   除非被取消否则会被重臂）；
+    /// - **不含**：已点火 / 已取消 / 已 panic 退役的条目（额度已释放）；
+    /// - **≠ `heap.len()`**：堆内还含已取消的惰性墓碑（#52 清扫前）。
+    ///
+    /// 与 `SyncStore::set_capacity` 同款口径（0 = 无界）；调低到当前活跃数
+    /// 以下不驱逐既有注册，只让后续注册被拒。
+    pub fn set_capacity(&self, cap: usize) {
+        self.shared.capacity.store(cap, AtomicOrd::SeqCst);
+    }
+
+    /// 当前活跃注册数上限（0 = 无界）。
+    pub fn capacity(&self) -> usize {
+        self.shared.capacity.load(AtomicOrd::SeqCst)
+    }
+
+    /// 活跃注册数（issue#58 诊断面）：未退役的注册数（口径见
+    /// [`Scheduler::set_capacity`]）。
+    pub fn live_registrations(&self) -> usize {
+        self.shared.live.load(AtomicOrd::SeqCst)
+    }
+
+    /// 因容量上界被拒的注册次数（issue#58 诊断面；累计；闸关拒发不计入）。
+    pub fn rejected_registrations(&self) -> u64 {
+        self.shared.rejected.load(AtomicOrd::SeqCst)
+    }
 
     /// 注册内窥（after/every 共用）：deadline 锁外合成（时钟锁与状态锁零
     /// 嵌套，序=state→clock 单向），入堆+序号在锁内。
-    fn register(&self, delay: Duration, kind: TaskKind) -> Result<TaskHandle, Closed> {
+    fn register(&self, delay: Duration, kind: TaskKind) -> Result<TaskHandle, AdmissionError> {
         // deadline 锁外合成：时钟锁与状态锁零嵌套（序=state→clock 单向）。
         let now = self.shared.clock.now_instant();
         let deadline = now
@@ -317,7 +479,16 @@ impl Scheduler {
                 // 异常路径（拒绝）：先放锁再发事件（订阅方 IO 不持锁）。
                 drop(s);
                 embed_event!(warn, target: "skeleton::scheduler::register", kind = kind_name, reason = "closed");
-                return Err(Closed);
+                return Err(AdmissionError::Closed);
+            }
+            // 有界准入（#58）：活跃注册数达上界 ⇒ 显式拒绝，任务**不入堆**
+            // （不部分插入）。检查与计数同在状态锁内 ⇒ 并发注册不越上界。
+            let cap = self.shared.capacity.load(AtomicOrd::SeqCst);
+            if cap > 0 && self.shared.live.load(AtomicOrd::SeqCst) >= cap {
+                drop(s);
+                self.shared.rejected.fetch_add(1, AtomicOrd::SeqCst);
+                embed_event!(warn, target: "skeleton::scheduler::register", kind = kind_name, reason = "capacity_full");
+                return Err(AdmissionError::Full);
             }
             seq = s.next_seq;
             s.next_seq += 1;
@@ -326,17 +497,26 @@ impl Scheduler {
                 seq,
                 task: Arc::clone(&cell),
             }));
+            // 额度占用：注册成功即占一条（退役时恰好释放一次，#58）。
+            self.shared.live.fetch_add(1, AtomicOrd::SeqCst);
         }
         embed_event!(debug, target: "skeleton::scheduler::register", seq = seq, kind = kind_name, delay_ms = delay.as_millis() as u64);
         // 唤醒驱动线程：更早 deadline 的注册即时生效（非睡满旧锚）。
         self.shared.signal.notify_all();
-        Ok(TaskHandle { cell })
+        Ok(TaskHandle {
+            cell,
+            armed: true,
+            sched: Arc::downgrade(&self.shared),
+        })
     }
 
     /// 确定性内核：点火全部到期任务（`deadline <= now`，按注入钟口径），
     /// 返回实际点火数（惰性墓碑不计）。回调在调用线程**锁外**执行（重入
     /// 安全）；回调内推进虚拟钟（MockClock）⇒ 后续到期条目同轮继续火。
     pub fn tick(&self) -> usize {
+        // 墓碑清扫（#52）：取消密集时把堆内已取消条目提前回收（不等原
+        // deadline）；阈值未达 ⇒ O(1) 早退。
+        self.reclaim_cancelled();
         let mut fired = 0;
         loop {
             // 每轮重读 now：回调内推进虚拟钟（MockClock）⇒ 后续到期条目同轮续火。
@@ -378,12 +558,9 @@ impl Scheduler {
                     }
                 }
                 // 终态 DONE：此后 cancel 返 false（测试 cancel_after_fire）。
-                let _ = entry.task.state.compare_exchange(
-                    PENDING,
-                    DONE,
-                    AtomicOrd::SeqCst,
-                    AtomicOrd::SeqCst,
-                );
+                // 退役赢家释放额度（#58，恰好一次）：CAS 失败 = 检查-执行
+                // 窗口内被 cancel ⇒ 额度已由取消方释放。
+                self.shared.retire(&entry.task, DONE);
                 // CAS 失败=检查-执行窗口内被 cancel：本次照跑（文档化语义）。
             }
             TaskKind::Every { period, fire } => {
@@ -391,6 +568,8 @@ impl Scheduler {
                     // panic 摘除不再臂（JDK 语义）；留痕 fail-visible。
                     self.shared.panics.fetch_add(1, AtomicOrd::SeqCst);
                     embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "panic");
+                    // 退役（不再臂）⇒ 释放额度（#58，恰好一次）。
+                    self.shared.retire(&entry.task, DONE);
                     return true;
                 }
                 // 重臂锚取回调完成后的当前时刻：超载（完成时已越下锚）⇒
@@ -412,6 +591,10 @@ impl Scheduler {
                 // 该条目到点被墓碑逻辑吃掉。
                 let mut s = lock(&self.shared.state);
                 if s.closed || entry.task.state.load(AtomicOrd::SeqCst) != PENDING {
+                    drop(s);
+                    // 退役（关闸或执行中取消 ⇒ 不再重臂）⇒ 释放额度（#58）：
+                    // CAS 赢家释放（取消已赢 ⇒ 额度已由取消方释放）。
+                    self.shared.retire(&entry.task, DONE);
                     return true;
                 }
                 s.heap.push(Reverse(Entry {
@@ -426,8 +609,42 @@ impl Scheduler {
         true
     }
 
-    /// 最近到期时刻（堆顶，**含惰性墓碑**——驱动 park 依据，空堆 None）。
+    /// 最近到期时刻（堆顶，**含惰性墓碑**——公共面口径：堆顶原样可见，
+    /// 空堆 None）。
+    ///
+    /// 驱动面用「跳过堆顶墓碑」的口径（内部 park 锚计算）：墓碑不是有效
+    /// deadline，驱动不该为它多醒一拍——两口径的差异是刻意的（公共面答
+    /// 「堆顶是什么」，驱动面答「下一个要醒的 deadline」）。
     pub fn next_deadline(&self) -> Option<Instant> {
+        let s = lock(&self.shared.state);
+        s.heap.peek().map(|Reverse(e)| e.deadline)
+    }
+    /// 驱动 park 锚（#52）：堆顶若是被取消的墓碑 ⇒ 跳过并即时回收——墓碑
+    /// 不是有效 deadline，驱动不该为它多醒一拍（取消最早 deadline 后驱动
+    /// 须重算 park 锚）。
+    ///
+    /// 与公共面 [`Scheduler::next_deadline`] 的口径差异是刻意的：公共面
+    /// 答「堆顶是什么」（含惰性墓碑），本方法答「下一个要醒的 deadline」。
+    fn next_pending_deadline(&self) -> Option<Instant> {
+        loop {
+            let tombstone = {
+                let mut s = lock(&self.shared.state);
+                let is_tombstone = s
+                    .heap
+                    .peek()
+                    .is_some_and(|Reverse(e)| e.task.state.load(AtomicOrd::SeqCst) == CANCELLED);
+                if is_tombstone {
+                    s.heap.pop().map(|Reverse(e)| e)
+                } else {
+                    None
+                }
+            };
+            match tombstone {
+                // 锁外析构：捕获闭包的析构不得持堆锁。
+                Some(entry) => drop(entry),
+                None => break,
+            }
+        }
         let s = lock(&self.shared.state);
         s.heap.peek().map(|Reverse(e)| e.deadline)
     }
@@ -447,22 +664,64 @@ impl Scheduler {
             // 清 pending：堆内全部标 Cancelled（句柄侧可见）；已出堆在途条目
             // 不在堆里，回调跑完为止（同步代码无中断面）。
             let drained = std::mem::take(&mut s.heap);
+            // 堆已清空 ⇒ 无墓碑残留（#52 计数归零）。
+            self.shared.tombstones.store(0, AtomicOrd::SeqCst);
             drop(s); // CAS 是原子操作，锁外逐个标记不持锁
             #[cfg(feature = "log-embed")]
             let cleared = drained.len() as u64;
             for Reverse(e) in drained {
-                let _ = e.task.state.compare_exchange(
-                    PENDING,
-                    CANCELLED,
-                    AtomicOrd::SeqCst,
-                    AtomicOrd::SeqCst,
-                );
+                // 全部标 Cancelled（句柄侧可见）；退役赢家释放额度（#58，
+                // 恰好一次）。
+                self.shared.retire(&e.task, CANCELLED);
             }
             // 终态（close）：清 pending 计数留痕；幂等重入（已 closed 早退）不发。
             embed_event!(info, target: "skeleton::scheduler::close", cleared = cleared);
         }
         // 唤醒驱动线程：close 即退（park 中早醒重算）。
         self.shared.signal.notify_all();
+    }
+    /// 墓碑清扫（#52）：已取消但仍在堆内的条目在原 deadline 之前被回收。
+    ///
+    /// 触发条件：墓碑计数同时越过**绝对下限**（[`TOMBSTONE_FLOOR`]）与
+    /// **比例阈值**（墓碑数 × [`TOMBSTONE_RATIO`] ≥ 堆条目数）——少量取消
+    /// 不触发 O(n) 堆重建；大堆里的少量墓碑也不长期滞留。
+    ///
+    /// 清扫在状态锁内重建堆（只保留 PENDING 条目），被摘条目**移出锁外**
+    /// 析构（回调捕获的析构不得在堆锁内跑）。返回被回收的条目数。
+    fn reclaim_cancelled(&self) -> usize {
+        let removed = {
+            let mut s = lock(&self.shared.state);
+            let tombstones = self.shared.tombstones.load(AtomicOrd::SeqCst);
+            if tombstones < TOMBSTONE_FLOOR
+                || tombstones.saturating_mul(TOMBSTONE_RATIO) < s.heap.len()
+            {
+                return 0;
+            }
+            // 重建堆：只保留 PENDING 条目（取消/终态条目即刻回收）。
+            let old = std::mem::take(&mut s.heap);
+            let mut kept = Vec::with_capacity(old.len());
+            let mut removed = Vec::new();
+            for Reverse(e) in old {
+                if e.task.state.load(AtomicOrd::SeqCst) == PENDING {
+                    kept.push(Reverse(e));
+                } else {
+                    removed.push(e);
+                }
+            }
+            s.heap = BinaryHeap::from(kept);
+            removed
+        };
+        let reclaimed = removed.len();
+        // 锁外析构：捕获闭包的析构不得持堆锁（issue#52 硬要求）。
+        drop(removed);
+        // 堆内已无墓碑 ⇒ 计数归零（清扫期间落地的那次取消可能漂移，良性）。
+        self.shared.tombstones.store(0, AtomicOrd::SeqCst);
+        if reclaimed > 0 {
+            embed_event!(debug, target: "skeleton::scheduler::fire", reclaimed = reclaimed as u64);
+            // 唤醒驱动线程：park 锚（堆顶 deadline）可能提前 ⇒ 重算。
+            self.shared.signal.notify_all();
+        }
+        reclaimed
     }
 
     pub fn is_closed(&self) -> bool {
@@ -490,7 +749,7 @@ impl Scheduler {
             move || worker_loop(sched)
         });
         WorkerHandle {
-            thread,
+            thread: Some(thread),
             sched: Arc::clone(self),
         }
     }
@@ -515,6 +774,12 @@ fn rearm_deadline(prev: Instant, period: Duration, now: Instant) -> Instant {
 /// [`TaskHandle::detach`]。`Send + Sync`（任意线程取消）。
 pub struct TaskHandle {
     cell: Arc<TaskCell>,
+    /// Drop-cancel 开关（#55）：detach 置 false ⇒ Drop 只释放 Arc 不
+    /// 取消——「抑制 cancel 语义」与「释放所有权」解耦，TaskCell 不泄漏。
+    armed: bool,
+    /// 调度器弱引用（#52）：取消路径据此释放额度（#58）、登记墓碑并唤醒
+    /// 驱动线程——弱引用 ⇒ 不构成引用环（调度器释放后任务胞随之回收）。
+    sched: Weak<Shared>,
 }
 
 impl TaskHandle {
@@ -523,30 +788,56 @@ impl TaskHandle {
     /// 撤（本次照跑，模块头注「cancel 线性化点」节）；执行中取消 ⇒ 周期
     /// 任务不再重臂。
     pub fn cancel(&self) -> bool {
-        let cancelled = self
-            .cell
-            .state
-            .compare_exchange(PENDING, CANCELLED, AtomicOrd::SeqCst, AtomicOrd::SeqCst)
-            .is_ok();
+        let cancelled = match self.sched.upgrade() {
+            Some(shared) => {
+                // 退役（PENDING→CANCELLED）：CAS 赢家释放额度（#58，恰好一次）。
+                let won = shared.retire(&self.cell, CANCELLED);
+                if won {
+                    // 墓碑计数（#52）：取消 O(1) 递增（不摘堆、不扫堆）。
+                    shared.tombstones.fetch_add(1, AtomicOrd::SeqCst);
+                    // 唤醒驱动线程：park 锚可能需重算（墓碑被清扫后锚提前）。
+                    shared.signal.notify_all();
+                }
+                won
+            }
+            None => {
+                // 调度器已释放（无共享状态可退）⇒ 仅置位（额度随调度器消失）。
+                self.cell
+                    .state
+                    .compare_exchange(PENDING, CANCELLED, AtomicOrd::SeqCst, AtomicOrd::SeqCst)
+                    .is_ok()
+            }
+        };
         embed_event!(debug, target: "skeleton::scheduler::cancel", cancelled = cancelled);
         cancelled
     }
 
     /// 消费句柄且不触发 Drop-cancel（fire-and-forget 逃生门）。
-    pub fn detach(self) {
-        std::mem::forget(self);
+    ///
+    /// **不泄漏**（#55）：取消语义与所有权释放解耦——只置 `armed=false`
+    /// （Drop 不再 cancel），`Arc<TaskCell>` 照常释放。此前用
+    /// `mem::forget` 抑制 cancel，连带永久泄漏 TaskCell 分配（周期任务的
+    /// 回调与捕获图随之永久留存）。
+    pub fn detach(mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for TaskHandle {
     fn drop(&mut self) {
-        let _ = self.cancel();
+        // 仅 armed 才取消：detach 置 armed=false ⇒ 只释放 Arc，不取消。
+        if self.armed {
+            let _ = self.cancel();
+        }
     }
 }
 
-/// 驱动线程句柄：[`WorkerHandle::join`] = close + 等线程退出（优雅停机）。
+/// 驱动线程句柄：[`WorkerHandle::join`] = close + 等线程退出（优雅停机）；
+/// 丢弃句柄（Drop）= close 不 join（#72：驱动线程必随之退出）。
 pub struct WorkerHandle {
-    thread: JoinHandle<()>,
+    /// Option 化：`join` 需把 JoinHandle 移出（类型有 Drop impl 时禁止
+    /// 移出字段）；`None` = 已 join。
+    thread: Option<JoinHandle<()>>,
     sched: Arc<Scheduler>,
 }
 
@@ -555,12 +846,29 @@ impl WorkerHandle {
     /// worker 侧 panic 原样重抛（fail-visible，禁静默吞 JoinError）。
     ///
     /// 禁在驱动回调内 join 同一 worker（自等死锁）。
-    pub fn join(self) {
+    pub fn join(mut self) {
         self.sched.close();
-        if let Err(panic) = self.thread.join() {
-            // worker 侧 panic 原样重抛（fail-visible，禁静默吞 JoinError）。
-            std::panic::resume_unwind(panic);
+        if let Some(thread) = self.thread.take() {
+            if let Err(panic) = thread.join() {
+                // worker 侧 panic 原样重抛（fail-visible，禁静默吞 JoinError）。
+                std::panic::resume_unwind(panic);
+            }
         }
+    }
+}
+
+impl Drop for WorkerHandle {
+    /// drop = 请求停机（关闸），**不 join**（#72）：`worker_loop` 持
+    /// `Arc<Scheduler>`，丢弃句柄而不关闸 ⇒ 驱动线程永远 park 在 condvar
+    /// 上，且再无公开句柄能关它（线程+调度器双泄漏）。关闸唤醒 worker 退出。
+    ///
+    /// 禁 join：句柄可能在 worker 自身回调内被 drop ⇒ 自等死锁。
+    ///
+    /// 丢弃路径**不确认**线程终止、**不传播** worker panic（仅
+    /// [`WorkerHandle::join`] 确认终止并原样重抛 panic）。
+    fn drop(&mut self) {
+        self.sched.close();
+        // thread（Option<JoinHandle>）随之 drop ⇒ std 语义 = detach（非阻塞）。
     }
 }
 
@@ -573,8 +881,11 @@ fn worker_loop(sched: Arc<Scheduler>) {
             embed_event!(info, target: "skeleton::scheduler::worker", reason = "closed");
             return;
         }
-        // park 锚 = 堆顶（含惰性墓碑——远期取消多醒一拍，语义正确）。
-        let park_until = sched.next_deadline();
+        // 墓碑清扫（#52）：取消后尽快回收，避免驱动为墓碑多醒一拍。
+        sched.reclaim_cancelled();
+        // park 锚 = 最近**有效** deadline（跳过堆顶墓碑——墓碑不是有效
+        // deadline，驱动不该为它多醒一拍，#52）。
+        let park_until = sched.next_pending_deadline();
         let now = sched.shared.clock.now_instant();
         match park_until {
             Some(d) if d <= now => {
@@ -632,5 +943,33 @@ fn worker_loop(sched: Arc<Scheduler>) {
                 drop(guard);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #55：detach 抑制 cancel 但**不得**泄漏 TaskCell 分配——句柄释放后
+    /// 调度器清堆 ⇒ 弱引用升级失败（TaskCell 已回收）。
+    ///
+    /// 断言非恒真：清堆前弱引用必可升级（堆条目持强引用）。
+    #[test]
+    fn detach_releases_task_cell_after_scheduler_drains_entry() {
+        let sched = Scheduler::new(Arc::new(skeleton::clock::MockClock::new()));
+        let handle = sched
+            .after(Duration::from_secs(3600), || {})
+            .expect("未关闸注册必成");
+        let weak = Arc::downgrade(&handle.cell);
+        handle.detach();
+        assert!(
+            weak.upgrade().is_some(),
+            "堆条目持强引用：此时 TaskCell 必在（断言非恒真）"
+        );
+        sched.close();
+        assert!(
+            weak.upgrade().is_none(),
+            "detach 后 TaskCell 必被回收（不泄漏分配）"
+        );
     }
 }

@@ -986,6 +986,7 @@ impl<G: SpawnGate> ThreadPool<G> {
             inner: Mutex::new(Inner {
                 queue: VecDeque::with_capacity(tuning.queue_cap),
                 core: tuning.core,
+                target_epoch: 0,
                 max: tuning.max,
                 queue_cap: tuning.queue_cap,
                 // 计数随 worker 真实创建发布（禁预挂幻影 worker——join 会等它）。
@@ -1003,6 +1004,7 @@ impl<G: SpawnGate> ThreadPool<G> {
             }),
             work: Condvar::new(),
             retired: Condvar::new(),
+            next_epoch: AtomicU64::new(0),
         });
         let pool = Self {
             base,

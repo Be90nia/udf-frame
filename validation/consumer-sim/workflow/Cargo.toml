@@ -1,0 +1,15 @@
+[package]
+name = "workflow_consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "第二消费方（#56 Stage A）：CLI/workflow 型，sync-only 面——只经公开 API"
+
+# 独立 workspace 根（与 ../Cargo.toml 同机制）：不被上级夹具 workspace 吸收。
+# 依赖面刻意不开 tokio：本 crate 是「sync-only 依赖树」的证据源。
+[workspace]
+
+[dependencies]
+# 只取 infra 默认 feature（runtime + pool）：`cargo tree -e normal` 必然无 tokio。
+udf-skeleton = { path = "../../../skeleton" }
+udf-skeleton-infra = { path = "../../../skeleton-infra" }

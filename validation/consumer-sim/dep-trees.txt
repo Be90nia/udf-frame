@@ -1,0 +1,49 @@
+# 依赖树两面证据（#56 Stage A）——由 `validation/consumer-sim/gen-dep-trees.py` 生成
+# 夹具本体入库（受版本控制路径）：fresh clone 必须能重建下列两面并复现同样的 tokio 判定。
+
+## 面 1: sync-only（`workflow/` —— CLI/workflow 型消费方，只用默认 feature）
+
+$ cd validation/consumer-sim/workflow && cargo tree -e normal
+
+workflow_consumer v0.0.0 (E:\Projcet\udf-frame\validation\consumer-sim\workflow)
+├── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+└── udf-skeleton-infra v0.1.0 (E:\Projcet\udf-frame\skeleton-infra)
+    ├── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+    └── udf-std-ext v0.1.0 (E:\Projcet\udf-frame\std-ext)
+        └── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+
+## 面 1b: sync-only 依赖树里 tokio 出现次数（期望：**0** —— sync-only 面无 Tokio）
+
+```
+0
+```
+
+## 面 2: async（`validation/consumer-sim/` —— 消费方 A，显式点亮 `udf-skeleton-infra/tokio`）
+
+$ cd validation/consumer-sim && cargo tree -e normal
+
+consumer-sim v0.0.0 (E:\Projcet\udf-frame\validation\consumer-sim)
+├── tokio v1.54.1
+│   ├── pin-project-lite v0.2.17
+│   └── tokio-macros v2.7.2 (proc-macro)
+│       ├── proc-macro2 v1.0.107
+│       │   └── unicode-ident v1.0.27
+│       ├── quote v1.0.47
+│       │   └── proc-macro2 v1.0.107 (*)
+│       └── syn v3.0.9
+│           ├── proc-macro2 v1.0.107 (*)
+│           ├── quote v1.0.47 (*)
+│           └── unicode-ident v1.0.27
+├── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+├── udf-skeleton-infra v0.1.0 (E:\Projcet\udf-frame\skeleton-infra)
+│   ├── tokio v1.54.1 (*)
+│   ├── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+│   └── udf-std-ext v0.1.0 (E:\Projcet\udf-frame\std-ext)
+│       └── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+└── udf-std-ext v0.1.0 (E:\Projcet\udf-frame\std-ext) (*)
+
+## 面 2b: async 面里 tokio 出现次数（期望：>0）
+
+```
+3
+```

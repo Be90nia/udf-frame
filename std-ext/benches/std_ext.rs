@@ -47,6 +47,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::future::{Future, ready};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 

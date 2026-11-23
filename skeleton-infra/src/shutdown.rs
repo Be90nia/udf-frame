@@ -300,8 +300,8 @@ fn run_timed(
                     kind: OutcomeKind::Failed {
                         reason: format!("watchdog 线程创建失败: {e}"),
                     },
-                    Ok(handle) => await_watchdog(name, d, rx, handle),
-                }
+                },
+                Ok(handle) => await_watchdog(name, timeout, rx, handle),
             }
         }
     }
