@@ -757,7 +757,11 @@ pub trait Store {
     fn subscribe(&self, f: impl FnMut(&Self::State) + Send + 'static) -> Subscription<Self::State>;
     /// 回灌缝出口：可克隆句柄（解释器异步回灌的唯一通道）。
     fn sender(&self) -> ActionSender<Self::Action>;
-    /// 停机闸：单向（幂等），置位后排空至 idle（drop 不静默弃队）。
+    /// 停机闸：单向（幂等），置位后 best-effort 排空（drop 不静默弃队）。
+    ///
+    /// **不承诺 quiescence**：本线程夺得排空租约时同步排至 idle；他线程已持
+    /// 租约时只完成交接即返（排空仍在进行）。要显式等静止见
+    /// `skeleton_infra::runtime::SyncStore::close_wait` / `close_wait_timeout`。
     fn close(&self);
     /// 停机闸状态。
     fn is_closed(&self) -> bool;

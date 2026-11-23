@@ -165,6 +165,8 @@ pub enum AdmissionOutcome {
 | `ActionSender::dispatch` | 返回 `false`（`#[must_use]` 兜底） | 同一计数 |
 | `subscribe` / `subscribe_local` | 照常登记、票据照常注销，但永无触发——通知静默（已知取舍；需要显式拒绝面时用 `try_subscribe`，闭门后返回 `Err(StoreClosed)`） | 计入 `subscriptions_after_close`；`subscriber_count` 可交叉查证 |
 
+**停机等待（#64）**：`close()` 是 **best-effort**——静默态（本调用夺得排空租约）同步排至 idle；**竞争态**（他线程已持租约）只完成交接即返，返回时排空可能仍在进行。要「等静止」用 `close_wait()` / `close_wait_timeout(d)`，结果 `Drained` / `TimedOutStillRunning` / `Reentrant`（同栈重入不自等）。谓词 = 租约释放 + 活跃队列空，**不计 deferred 停放记录**（#49 口径）；timeout 只界等待、不取消同步 reducer。宿主要真屏障（flush/drop 依赖前）用此等待面，勿依赖 `close()` 的返回时机。
+
 ### 订阅双档
 
 - `subscribe`（跨线程档）：回调需 `Send`，槽位 Mutex 串行化；返回 `Subscription<S>`（`#[must_use]`，Drop=注销即时摘表，无「一拍滞后」）。

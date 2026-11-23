@@ -12,7 +12,7 @@ use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
 use skeleton::notify::{Notify, NotifySink};
 use skeleton::{
@@ -26,6 +26,7 @@ use crate::audit::{AuditEvent, AuditEventKind, AuditSink, AuditTicket};
 // 与审计发射沿自然缝独立成子模块（对内 pub(super)，公共面经本模块 re-export
 // 原路不变）。
 mod audit_emit;
+mod close_wait;
 mod local_subs;
 mod notify;
 mod receipt;
@@ -35,6 +36,7 @@ mod receipt;
 mod evidence;
 
 use audit_emit::{audit_emit, audit_enqueued};
+pub use close_wait::CloseWaitOutcome;
 pub use local_subs::LocalSubscription;
 use local_subs::{local_notify, next_local_sub_id};
 use notify::{NotifySinkSlot, notify_async};
@@ -436,6 +438,11 @@ struct StoreInner<S, A, Op> {
     /// `subscribe_events` 落槽时槽内已有订阅即 +1——单槽二次订阅静默杀掉
     /// 前订的显形。
     audit_preempted: AtomicU64,
+    /// 停机等待广播（配对 `queue` 锁）：排空租约释放的两个点各 notify 一次
+    /// （正常出口 [`DrainGuard::disarm`] + unwind 臂 [`DrainGuard::drop`]）。
+    /// 谓词读的「租约已释放 + 队列空」两点同受 `queue` 锁保护，故与本锁配对；
+    /// 本字段只做通知，不持状态——禁用作状态来源（防轮询旗复活）。
+    stop_wait: Condvar,
     /// 测试专用：在途 dispatch 计数。0=无任何
     /// dispatch 在执行，此刻「draining=false 且队列非空」即孤儿 action（无人
     /// 排空、无人即将排空）。push 方先 +1 再入队、返回前 -1，使监视线程可用
@@ -940,10 +947,12 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
         self.inner.back.clone()
     }
 
-    /// 停机闸：置 closed 后同步排空至 idle（与宿主装配序「解释器 close→排空
-    /// idle→flush→drop」对齐）——drop 不再静默弃队。
-    /// 在途他线程 drain 持排空权时本调用交由其排至 idle（闭门后无新入队，其
-    /// 循环必达空，自指回灌环受回灌深度预算止步），交接语义同 drain 出口协议。
+    /// 停机闸：置 closed 后 best-effort 排空（与宿主装配序「解释器 close→排空
+    /// idle→flush→drop」对齐）——drop 不静默弃队，但**不承诺 quiescence**。
+    /// 本调用夺得排空租约时同步排至 idle（静默态，最常见路径）；他线程已持
+    /// 租约时仅完成交接（闭门后 push 恒拒，其循环必达空）即返——**该路返回时
+    /// 排空仍在进行**，要等静止请用 [`Self::close_wait`] /
+    /// [`Self::close_wait_timeout`]（#64 拍板：close 保持现状，等待面独立）。
     /// 幂等。闭门后 push 恒拒：dispatch no-op、send 显式 `false`、subscribe
     /// 照常登记但永不触发——三入口对照见类型文档「闭门后的入口对照」表。
     fn close(&self) {
@@ -1304,6 +1313,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             audit_seq: AtomicU64::new(0),
             audit_gen: AtomicU64::new(0),
             audit_preempted: AtomicU64::new(0),
+            stop_wait: Condvar::new(),
             #[cfg(test)]
             in_flight: AtomicUsize::new(0),
         });
@@ -1809,6 +1819,9 @@ impl<S, A, Op> DrainGuard<'_, S, A, Op> {
     fn disarm(&mut self) {
         self.inner.draining.store(false, Ordering::Release);
         self.armed = false;
+        // 状态（放旗）已发布，且调用点持 queue 锁——等待者被唤醒后重取锁即可见
+        // 「队列空 + 无租约」的终局谓词。
+        self.inner.stop_wait.notify_all();
     }
 }
 
@@ -1848,6 +1861,9 @@ impl<S, A, Op> Drop for DrainGuard<'_, S, A, Op> {
             // 摘队与放旗同一临界区：生产者要么进本批（被结算），要么在放旗后
             // 夺下新租约（不搁浅）。
             self.inner.draining.store(false, Ordering::Release);
+            // unwind 臂是放旗的第二点：不放通知会让 close_wait 永久等一个已
+            // 不存在的租约持有者。
+            self.inner.stop_wait.notify_all();
             detached
         };
         // 3. 逐条结算（action 载荷随记录离开临界区即析构——锁外）。

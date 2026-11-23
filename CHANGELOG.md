@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+### Added（显式停机等待面 `close_wait` / `close_wait_timeout`，2026-11-23；GitHub issue#64）
+- **新增公共面**：`SyncStore::close_wait() -> CloseWaitOutcome` 与 `close_wait_timeout(Duration) -> CloseWaitOutcome`（`Drained` / `TimedOutStillRunning` / `Reentrant`）。`close()` 语义**不变**（准入关闭 + best-effort 排空，静默态同步排至 idle、竞争态仅交接即返）——只是其 rustdoc 改为**不承诺 quiescence** 并指向等待面（此前文档高估了竞争路径的保证）。
+- **语义**：等待谓词 = 排空租约已释放 且 活跃队列已空（**不计** #49 deferred 停放记录——非活跃排空工作）。timeout **只界调用方等待**，不取消同步 reducer、不声称已停。同栈重入（本 store 排空帧内调用）立即返回 `Reentrant`，不自等。
+- **实现**：`Condvar` 与 `queue` 锁配对；排空租约释放的两个点（正常出口 + panic unwind 臂）各 `notify_all` 一次，无轮询旗。测试 4 条（阻塞至 gated reducer 退出 / timeout typed 且不取消 / 重入 / panic unwind 后可达 Drained）；legacy 兼容由既有 drain 回归面覆盖。
+
 ### Performance（`commit` 路径零搬移段化——逐条包装的载荷线性成本消除（bd j9q），2026-11-20）
 - **变更**：已提交待转发队列由 `VecDeque<PendingEffect>`（逐条携带来源元数据）改为 `VecDeque<PendingSegment>`（**按 action 分段**：段 = `origin_action_seq` + `next_index` + 段内 `EffectBuf`）。提交点恢复 **`mem::swap` O(1) 三指针整体移交**（#48 时期待的方案：#48 的来源元数据收进**段级**，段内偏移即 `effect_index`——一个 action 恒提交一段、输出序从 0 连续 ⇒ 逐条 `(origin, index)` 语义零变化，审计事件/失败回执/探针全部同值）；转发环段内逐条借出、**段壳只在段空时出队** ⇒ panic 时未转发后缀原地留段、段原地留队首，续转从断点继续编号（禁吞语义与逐条版逐字节等价）；段空摘壳时满缓冲 `swap` 回 `staged`（缓冲在 staged ↔ 段之间循环复用 ⇒ **稳态零新增分配不破锚**）。
 - **实测**（外部 crate 视角载荷探针、独占机器、同口径三方对比、median ns/effect、点估计）：**P=512** 125.86 ⇒ **76.02**（−39.6%）· **P=4096** 337.89 ⇒ **220.89**（−34.6%）· P=0 / P=64 回落基线水平（53.84 / 55.38）——#48 Changed 段登记的「已知代价（逐条包装 +50%）」**已消除**，回到 swap 时代基线。O(n·sizeof(Op)) ⇒ O(1)。
