@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Fix(设计对照整改): #72 per-worker 停信标 / #64 闭门先于重入 / #53 示例 / bench 注释纠偏,2026-11-23;reports/2026-11-23-design-conformance.md)
+- **#72（blocker，设计偏离）**：`WorkerHandle::drop` 由「scheduler-wide `close()`」改为 **per-worker 停信标**（`Arc<AtomicBool>`，Drop 在状态锁内置位 + `notify_all`；置位持锁、判定持锁 ⇒ 无丢唤醒）。丢一个句柄**不关闸**、不影响其他 worker 与既有登记；`join` 仍是显式 scheduler-wide 停机；全部句柄丢弃而调度器仍开 ⇒ 注册入堆不点火。测试：新 two-worker 用例（通道握手证明既有/新登记都点火）+ 三条旧用例改写为 worker-local 语义 + 10 次防 flaky；变异（改回 `close()`）3 用例红。
+- **#64（blocker，设计偏离）**：`wait_quiescent` 的 `{lock(sub_gate); closed.store(true)}` 上移到重入判定**之前** ⇒ `Reentrant` 返回时准入已关（外部 `try_dispatch` 得 `Closed`）；重入路径仍不回调 `drain()`；`close_wait`/`close_wait_timeout`/`Reentrant` 三处 rustdoc 对齐。回归：既有重入用例尾部加外层 `try_dispatch == Closed` 断言（**修复前实跑红**：`left: Accepted / right: Closed`）。
+- **#53 验收第 1 条（F5）**：新 `skeleton-infra/examples/state_layout.rs`（132 行，整体 vs 分片布局的真实深拷贝字节数；4 臂 + 3 条主张闸 + `Arc::ptr_eq` 结构断言；变异实测红）+ `Cargo.toml` 的 `required-features = ["runtime"]`（单开面不编译）。`docs/reference.md` #53 节加示例指针。
+- **bench 注释纠偏**：`PartitionedReducer::reduce` 的「无快照钉住则原地写」为误——`s.clone()` 已使每片 `Arc` 计数 ≥2 ⇒ **被碰分片必深拷贝，与持快照无关**（示例实测持/不持同为 65,536 B）；快照只决定旧世代留存。`RetainShape::None` 说明同步收窄为「根发布原地写」。
+- **#25 证据回贴**：Stage A/B/C + 资源表决定已贴在 issue#25。
+
 ### Ci+Docs: 挂死护栏、零/default 面闸、停机依赖序、资源表决定回写,2026-11-23;外部对标 F-11-1/F-11-4 + 设计对照 F3/F4)
 - **CI 挂死护栏**：3-OS 主 job `timeout-minutes: 20`、矩阵/MSRV/夹具 job 各 15 —— 2026-11-23 实测一次 lib 测试在 ubuntu 挂死 >16min（Windows 全绿），默认 6h 上限会把 flaky 变成半天排队。
 - **fx 串行复跑步**：`--lib fx:: -- --test-threads=1` 与主步（并行）互为对照——主步红本步绿 ⇒ 并发挤占复现；两步都红 ⇒ 真逻辑（自旋/计时类测试在 4 核 runner 上与其它多线程测试互相挤占）。
@@ -228,13 +235,13 @@
 
 ### Fixed(scheduler): `TaskHandle::detach` 不再泄漏 TaskCell + 丢弃 `WorkerHandle` 即关闸,2026-11-23;GitHub issue#55/#72)
 - **#55 修复(泄漏)**:`TaskHandle::detach` 原用 `mem::forget(self)` 抑制 Drop-cancel,**连带永久泄漏 `Arc<TaskCell>`**——调度器移除堆条目后泄漏引用仍保活 TaskCell 分配(周期任务的回调与捕获图随之永久留存)。现**取消语义与所有权释放解耦**:新增私有 `armed` 标志,detach 只置 `armed=false`(Drop 不再 cancel),`Arc<TaskCell>` 照常释放。公共面零破坏(`detach`/`cancel` 签名不变,调用方语义不变)。
-- **#72 修复(线程+调度器双泄漏)**:丢弃 `WorkerHandle` 而不 `join` 时,`worker_loop` 持 `Arc<Scheduler>` ⇒ 驱动线程永远 park 在 condvar 上,且**再无公开句柄能关闭它**。现 `WorkerHandle` 增 `Drop`:**drop = 关闸不 join**——关闸唤醒驱动线程退出;**不 join**(句柄可能在 worker 自身回调内被 drop ⇒ 自等死锁),因此该路径**不确认线程终止、不传播 worker panic**(仅 `join` 确认终止并原样重抛 panic)。**行为变更**:丢弃句柄后调度器已关闸,后续注册返回 `Err(Closed)`。
+- **#72 修复(线程+调度器双泄漏)**:丢弃 `WorkerHandle` 而不 `join` 时,`worker_loop` 持 `Arc<Scheduler>` ⇒ 驱动线程永远 park 在 condvar 上,且**再无公开句柄能关闭它**。现 `WorkerHandle` 增 `Drop`:**drop = 关闸不 join**——关闸唤醒驱动线程退出;**不 join**(句柄可能在 worker 自身回调内被 drop ⇒ 自等死锁),因此该路径**不确认线程终止、不传播 worker panic**(仅 `join` 确认终止并原样重抛 panic)。**行为变更**:丢弃句柄后调度器已关闸,后续注册返回 `Err(Closed)`。〔2026-11-23 设计对照修正：维护者 03:59 定稿为 **per-worker 停信标**，本「全局关闸」形态已废止——见同日「设计对照整改」条目〕
 - **实现**:`WorkerHandle.thread` 改 `Option<JoinHandle<()>>`(类型有 `Drop` impl 时禁止移出字段),`join(mut self)` + `take()` 移出;`close()` 幂等(join 与 drop 两条路径各触发一次,无副作用叠加)。
 - **测试**(新 `std-ext/tests/scheduler_handle_lifecycle.rs`,8 条):detach 后 TaskCell 被回收(`Weak::upgrade` 由 `Some` 转 `None`,断言非恒真)/ 周期任务捕获不滞留 / 丢句柄即关闸 / 回调内丢句柄不自等死锁 / 在途回调中丢句柄仍停线程 / 显式 join 仍关闸并等退出。既有 23 条 scheduler 回归全绿;公共面零破坏(无 pub 签名变化、零新依赖、`Cargo.toml`/`Cargo.lock` 零 diff)。
 
 ### Added(显式停机等待面 `close_wait` / `close_wait_timeout`,2026-11-23;GitHub issue#64)
 - **新增公共面**：`SyncStore::close_wait() -> CloseWaitOutcome` 与 `close_wait_timeout(Duration) -> CloseWaitOutcome`（`Drained` / `TimedOutStillRunning` / `Reentrant`）。`close()` 语义**不变**（准入关闭 + best-effort 排空，静默态同步排至 idle、竞争态仅交接即返）——只是其 rustdoc 改为**不承诺 quiescence** 并指向等待面（此前文档高估了竞争路径的保证）。
-- **语义**：等待谓词 = 排空租约已释放 且 活跃队列已空（**不计** #49 deferred 停放记录——非活跃排空工作）。timeout **只界调用方等待**，不取消同步 reducer、不声称已停。同栈重入（本 store 排空帧内调用）立即返回 `Reentrant`，不自等。
+- **语义**：等待谓词 = 排空租约已释放 且 活跃队列已空（**不计** #49 deferred 停放记录——非活跃排空工作）。timeout **只界调用方等待**，不取消同步 reducer、不声称已停。同栈重入（本 store 排空帧内调用）立即返回 `Reentrant`，不自等。〔2026-11-23 设计对照修正：**闭门先于重入判定**——`Reentrant` 返回时准入已关，外部 `try_dispatch` 得 `Closed`（原实现先返后闭，与维护者 06:59 定稿相反）〕
 - **实现**：`Condvar` 与 `queue` 锁配对；排空租约释放的两个点（正常出口 + panic unwind 臂）各 `notify_all` 一次，无轮询旗。测试 4 条（阻塞至 gated reducer 退出 / timeout typed 且不取消 / 重入 / panic unwind 后可达 Drained）；legacy 兼容由既有 drain 回归面覆盖。
 
 ### Performance（`commit` 路径零搬移段化——逐条包装的载荷线性成本消除（bd j9q），2026-11-20）

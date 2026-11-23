@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
-use skeleton_infra::runtime::{CloseWaitOutcome, SyncStore};
+use skeleton_infra::runtime::{AdmissionOutcome, CloseWaitOutcome, SyncStore};
 
 type GatedStore = Arc<SyncStore<u64, u64, Infallible>>;
 /// reducer 内的自我句柄槽（构造期注入：SyncStore 需要先存在才能被 reducer 拿到）。
@@ -158,6 +158,14 @@ fn close_wait_from_own_drain_frame_is_reentrant() {
     store.dispatch(1); // 若自等，本条测试挂死
     assert_eq!(*seen.lock().unwrap(), Some(CloseWaitOutcome::Reentrant));
     assert_eq!(*store.snapshot(), 1);
+
+    // 闭门先于重入判定（#64 06:59 定稿）：拿到 `Reentrant` 时准入**已关**——
+    // 重入只跳过自等，不跳过闭门。
+    assert_eq!(
+        store.try_dispatch(2),
+        AdmissionOutcome::Closed,
+        "Reentrant 的语义是「准入已关、但不能自等」"
+    );
 }
 
 /// ④ panic unwind 臂是租约释放的第二点：不 notify 会让等待面永久悬挂。

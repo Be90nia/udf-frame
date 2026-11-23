@@ -24,11 +24,17 @@ pub enum CloseWaitOutcome {
     TimedOutStillRunning,
     /// 本线程正处在**本 store** 的排空帧内（reducer / 订阅回调 / 效果转发中）
     /// ——等待即自等（排空环在等本次调用返回），故立即返回、不等待。
+    ///
+    /// **准入已关**：闭门先于重入判定，本结果只表示「不能等」，不表示「没关门」
+    /// ——此后外部准入一律得 `AdmissionOutcome::Closed`。
     Reentrant,
 }
 
 impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> SyncStore<S, A, Op> {
     /// 关闭准入并等待排空至静止（无超时）。语义见 [`CloseWaitOutcome`]。
+    ///
+    /// **闭门先于重入判定**：即使同栈重入返回 [`CloseWaitOutcome::Reentrant`]，
+    /// 准入也已关闭——重入只跳过自等，不跳过闭门。
     ///
     /// 与 [`Store::close`](skeleton::Store::close) 的差别只有等待：两者都置停机闸并做
     /// best-effort 排空，本方法**额外**等到「租约释放 + 队列空」为止，故他线程
@@ -39,21 +45,25 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
 
     /// 关闭准入并等待排空至静止，至多 `timeout`。超时只结束**本次等待**，不
     /// 取消在跑的同步 reducer、也不声称已停。
+    ///
+    /// 与 [`Self::close_wait`] 同序：**闭门先于重入判定**（`Reentrant` 时准入已关）。
     pub fn close_wait_timeout(&self, timeout: Duration) -> CloseWaitOutcome {
         self.wait_quiescent(Instant::now().checked_add(timeout))
     }
 
     fn wait_quiescent(&self, deadline: Option<Instant>) -> CloseWaitOutcome {
-        // 同栈重入：本线程正在排空本 store（TLS 排空帧栈），等待即自死锁。
-        if reentrant_context(self.inner.store_id).is_some() {
-            return CloseWaitOutcome::Reentrant;
-        }
         // 闭门翻转与订阅登记互斥（issue#63）：与 `Store::close` 取同一把订阅
         // 闸 ⇒ try_subscribe 与本翻转线性化互斥（不会「已登记但 store 已关」）。
         // 闸在排空前释放：排空/回调期间不持闸。
         {
             let _gate = lock(&self.inner.sub_gate);
             self.inner.closed.store(true, Ordering::Release);
+        }
+        // 闭门**先于**重入判定（#64 06:59 定稿）：同栈重入只跳过自等（排空环在
+        // 等本次调用返回，等待即死锁），不跳过闭门——`Reentrant` 是合法返回值，
+        // 不能把「未闭门」静默留给调用方。
+        if reentrant_context(self.inner.store_id).is_some() {
+            return CloseWaitOutcome::Reentrant;
         }
         // 静默态：本调用夺租约并排至 idle，随后谓词立即可满足；竞争态：只交接
         // 即返（他线程的循环必达空），本方法接着进等待。

@@ -683,8 +683,10 @@ impl skeleton::Reducer for PartitionedReducer {
         }
     }
 
-    /// 两段税：根浅拷贝（逐片 `Arc` 计数 +1）恒发生；深拷贝只落在被
-    /// `Arc::make_mut` 触碰**且**被快照钉住的分片上（无快照钉住则原地写）。
+    /// 两段税：根浅拷贝（逐片 `Arc` 计数 +1）恒发生；深拷贝落在被 `Arc::make_mut`
+    /// 触碰的分片上——**但 `s.clone()` 已使每片计数 ≥2 ⇒ 被碰分片必深拷贝，与是否
+    /// 持快照无关**（`examples/state_layout.rs` 实测：持/不持快照同为 65,536 B）。
+    /// 快照只决定旧世代是否继续存活（留存成本），不决定这一拍拷不拷。
     fn reduce(
         &self,
         s: &PartitionedState,
@@ -827,7 +829,7 @@ fn print_churn(title: &str, rows: &[ChurnRow]) {
 /// 留存形态（④ 的自变量）。
 #[derive(Clone, Copy)]
 enum RetainShape {
-    /// 不持快照（发布原地写）
+    /// 不持快照（根发布原地写；分片深拷贝规则见 `PartitionedReducer::reduce`）
     None,
     /// 一份快照长持不刷新（陈旧世代；只有首拍触发发布克隆）
     Stale,

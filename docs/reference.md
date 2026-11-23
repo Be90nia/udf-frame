@@ -383,6 +383,8 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 
 计量口径（读 bench 数据前必读）：分配计数只见**事件**不见 memcpy 字节；单次分配跨过分配器 mmap 阈值（≥1 MiB）后每字节成本跳变（本机 1 MiB ≈ 210 µs vs 64 KiB ≈ 2.3 µs），故跨布局倍数里含**分配器类别效应**，不是纯带宽差。**不要**把上述倍数外推成「分片总是更快」。
 
+可运行示例：`cargo run -p udf-skeleton-infra --example state_layout`（同一逻辑数据的整体 vs 分片布局，用真实深拷贝字节数演示「碰过的片必深拷贝、未碰片与旧快照同址」——输出不含墙钟/分配事件，那两项以 bench 为准）。
+
 ---
 
 ## 资源上限与默认值（决策载体）
@@ -1221,7 +1223,9 @@ pub struct WorkerHandle { /* … */ }
 impl WorkerHandle {
     pub fn join(self);   // = close + 等线程退出；worker 侧 panic 原样重抛
 }                        // 禁在驱动回调内 join 同一 worker（自等死锁）
-                        // #72：丢弃句柄（Drop）= close 不 join——驱动线程随之退出，不留「无句柄可关闸」的孤儿线程
+                        // #72（维护者 03:59 定稿）：丢弃句柄（Drop）= **只停该 worker**（per-worker 停信标）
+                        // ——调度器不关闸、其他 worker 与既有登记不受影响；不 join（句柄可在 worker 回调内被丢）
+                        // ⇒ 不确认线程终止、不传播 worker panic。全部句柄丢弃而调度器仍开 ⇒ 注册入堆但不点火。
 
 pub struct Closed;                  // 关闸后注册的显式拒绝
 pub enum AdmissionError { Closed, Full }   // #58：拒绝原因（Full = 容量触顶）
@@ -1234,7 +1238,7 @@ pub enum AdmissionError { Closed, Full }   // #58：拒绝原因（Full = 容量
 - **close = 关闸 + 清 pending + 在途跑完**：注册显式 `Err(Closed)`；pending 全部标 Cancelled（句柄侧可见）；驱动线程随后退出。
 - **回调 panic 不杀驱动**：点火 catch_unwind 摘除 + `panic_count` 留痕；周期任务 panic 后摘除不再臂。
 - **detach = 解除取消，不接管所有权**（#55）：此前用 `mem::forget` 抑制 Drop-cancel，连带永久泄漏 `Arc<TaskCell>`（周期任务的回调与捕获图随之留存）。现取消语义与所有权释放解耦——detach 后句柄照常释放，任务仍按调度照跑。
-- **丢弃 WorkerHandle = 关闸不 join**（#72）：`worker_loop` 持 `Arc<Scheduler>`，丢弃句柄而不关闸 ⇒ 驱动线程永远 park 在 condvar 上，且再无公开句柄能关它（线程+调度器双泄漏）。Drop 路径只 `close`（唤醒退出），**不 join**（句柄可能在 worker 自身回调内被 drop ⇒ 自等死锁）；因此该路径**不确认线程终止、不传播 worker panic**（仅 `join` 确认终止并原样重抛）。
+- **丢弃 WorkerHandle = 只停该 worker**（#72，维护者 03:59 定稿；旧「关闸不 join」形态已废止）：句柄持 `Arc<AtomicBool>` 停信标，Drop 在状态锁内置位 + `notify_all`（置位持锁、判定持锁 ⇒ 无丢唤醒）；**调度器不关闸**，其他 worker 与既有登记照常。`join` 仍是显式 scheduler-wide 停机。drop **不 join**（句柄可能在 worker 自身回调内被 drop ⇒ 自等死锁）⇒ 不确认线程终止、不传播 worker panic。**无 worker 态**：全部句柄丢弃而调度器仍开 ⇒ 注册继续入堆但不点火，直到再起 worker 或 `close()`。
 - **惰性墓碑**：cancel 不摘堆（O(1)），死亡条目到点弹出时摘除——远期取消的墓碑多醒一拍（语义正确，代价一次空醒）。
 - **有界准入**（#58）：`capacity` 默认 **0 = 无界**⇒ 既有行为零变化；**不预设**有界默认值（#56 第二消费方验证前不盲设）。触顶时 legacy `after`/`every` **panic**（fail-visible；返回 `Err(Closed)` 会撒谎），typed 面用 `try_after`/`try_every` 返回 `AdmissionError::Full` 且**无部分插入**。活跃注册数口径 = 堆内待执行条目 **+ 执行中周期任务**（后者仍可能重臂）——**不等同 `heap.len()`**（墓碑不计入）。额度**恰好一次**释放：一次性点火终态、周期任务取消·关闸·panic 四条退役路径共用单一 CAS 闸门（赢家释放）。取消仍 **O(1)**（零锁零扫堆）；容量检查与计数同在状态锁内 ⇒ 并发注册不越上界；被拒回调**不入堆**，其捕获在堆锁外析构。
 - **远期取消条目提前回收**（#52）：取消路径仍 O(1)（弱引用记账 + 墓碑计数）；**清扫独立触发**（不在 cancel 路径），按绝对下限 16 / 比例阈值 4 在状态锁内重建堆只留 PENDING 条目，被摘条目**移出锁外**析构。取消 earliest-deadline 时通知驱动并**重算 park 锚**——驱动不再为堆顶墓碑空醒一拍。**执行语义零变化**：已出堆检查-执行窗口内落地的取消仍不可撤、仍照跑。墓碑计数为近似量（清扫期间落地的取消会漂移，良性——额度上限由 CAS 闸门精确管理）。

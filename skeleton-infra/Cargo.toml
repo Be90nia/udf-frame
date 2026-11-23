@@ -225,6 +225,11 @@ required-features = ["memgov"]
 name = "quickstart"
 required-features = ["runtime"]
 
+# #53 验收第 1 条：整体 vs 分片布局写入代价示例（runtime 默认 feature 已含）。
+[[example]]
+name = "state_layout"
+required-features = ["runtime"]
+
 # 订阅断言 + Emit 回灌链（撤销计数器）。
 [[example]]
 name = "counter_local_runtime"

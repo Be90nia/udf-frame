@@ -32,8 +32,9 @@
 //! - **close = 关闸 + 清 pending + 在途跑完**（拍板点）：注册显式
 //!   `Err(Closed)` 禁静默；pending 全部标 Cancelled（句柄侧可见）；在途
 //!   回调跑完为止（同步代码无中断面），驱动线程随后退出
-//!   （[`WorkerHandle::join`] = close + join；丢弃句柄（Drop）= close 不
-//!   join，驱动线程随之退出——#72）；
+//!   （[`WorkerHandle::join`] = close + join；丢弃句柄（Drop）= 只停该
+//!   worker 的 per-worker 停信标——不关闸、不 join，其余 worker 与既有登记
+//!   不受影响——#72）；
 //! - **回调 panic 不杀驱动**：点火 catch_unwind 摘除 + [`Scheduler::panic_count`]
 //!   留痕（池审计回调同款纪律）；周期任务 panic 后摘除不再臂（JDK 语义）；
 //!   驱动循环体另有兜底 catch（正常零命中）——「驱动线程 panic 静默死亡 =
@@ -99,7 +100,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrd};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrd};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -740,17 +741,26 @@ impl Scheduler {
     }
 
     /// 起驱动线程（生产形态）：park 到最近 deadline（零自旋）→ 到期点火；
-    /// 注册（更早 deadline）即时唤醒重算，close 即退。可多起（互抢 pop，
-    /// 典型 1 个）；MockClock 时间不自动流动，驱动线程对其无意义——确定性
-    /// 测试走 [`Scheduler::tick`]。
+    /// 注册（更早 deadline）即时唤醒重算。可多起（互抢 pop，典型 1 个）：
+    /// 每个 worker 有自己的停信标——丢弃一个 [`WorkerHandle`] 只停它自己，
+    /// 不关闸、不影响其余 worker 与既有登记（#72）。
+    ///
+    /// **无 worker 态**：所有句柄都丢弃而调度器仍开放时，注册继续入堆但不再
+    /// 点火，直到再起 worker 或显式 [`Scheduler::close`]。
+    ///
+    /// MockClock 时间不自动流动，驱动线程对其无意义——确定性测试走
+    /// [`Scheduler::tick`]。
     pub fn spawn_worker(self: &Arc<Self>) -> WorkerHandle {
+        let stop = Arc::new(AtomicBool::new(false));
         let thread = thread::spawn({
             let sched = Arc::clone(self);
-            move || worker_loop(sched)
+            let stop = Arc::clone(&stop);
+            move || worker_loop(sched, stop)
         });
         WorkerHandle {
             thread: Some(thread),
             sched: Arc::clone(self),
+            stop,
         }
     }
 }
@@ -832,13 +842,22 @@ impl Drop for TaskHandle {
     }
 }
 
-/// 驱动线程句柄：[`WorkerHandle::join`] = close + 等线程退出（优雅停机）；
-/// 丢弃句柄（Drop）= close 不 join（#72：驱动线程必随之退出）。
+/// 驱动线程句柄：[`WorkerHandle::join`] = close（scheduler-wide 关闸）+ 等线程
+/// 退出（优雅停机）；丢弃句柄（Drop）= 只请求**本 worker** 停机、不 join、
+/// 不关闸（#72）。
+///
+/// 多 worker 下丢一个句柄只停它自己：其余 worker 与既有登记照常。所有句柄都
+/// 丢弃而调度器仍开着时，注册继续入堆但不再点火，直到再
+/// [`Scheduler::spawn_worker`] 或显式 [`Scheduler::close`]（显式状态，不是
+/// 泄漏）。
 pub struct WorkerHandle {
     /// Option 化：`join` 需把 JoinHandle 移出（类型有 Drop impl 时禁止
     /// 移出字段）；`None` = 已 join。
     thread: Option<JoinHandle<()>>,
     sched: Arc<Scheduler>,
+    /// per-worker 停信标（#72）：置位 + 唤醒共享 condvar ⇒ 本 worker 退出；
+    /// 与调度器的 `closed` 闸解耦（丢句柄不得停无关 worker/取消登记）。
+    stop: Arc<AtomicBool>,
 }
 
 impl WorkerHandle {
@@ -858,24 +877,39 @@ impl WorkerHandle {
 }
 
 impl Drop for WorkerHandle {
-    /// drop = 请求停机（关闸），**不 join**（#72）：`worker_loop` 持
-    /// `Arc<Scheduler>`，丢弃句柄而不关闸 ⇒ 驱动线程永远 park 在 condvar
-    /// 上，且再无公开句柄能关它（线程+调度器双泄漏）。关闸唤醒 worker 退出。
+    /// drop = 只请求**本 worker** 停机（per-worker 停信标），**不 join、不关闸**
+    /// （#72）：关闸是 scheduler-wide 操作（[`Scheduler::close`]），丢一个句柄不得
+    /// 停无关 worker、不得取消既有登记。
+    ///
+    /// 信标在状态锁内置位、解锁后再 `notify_all`：worker 的 park 判定（含
+    /// 信标）同在这把锁内 ⇒ 无丢失唤醒（worker 不会在「判定后、wait 前」
+    /// 错过置位）。唤醒走共享 condvar 的 `notify_all`——无关 worker 虚假醒来
+    /// 重算后重 park（worker 数典型 1，不到可测成本不做 per-worker condvar）。
     ///
     /// 禁 join：句柄可能在 worker 自身回调内被 drop ⇒ 自等死锁。
     ///
     /// 丢弃路径**不确认**线程终止、**不传播** worker panic（仅
     /// [`WorkerHandle::join`] 确认终止并原样重抛 panic）。
     fn drop(&mut self) {
-        self.sched.close();
+        let s = lock(&self.sched.shared.state);
+        self.stop.store(true, AtomicOrd::SeqCst);
+        drop(s);
+        self.sched.shared.signal.notify_all();
         // thread（Option<JoinHandle>）随之 drop ⇒ std 语义 = detach（非阻塞）。
     }
 }
 
-/// 驱动主循环：park 到最近 deadline（condvar，零自旋），到期点火，关闭即退。
-fn worker_loop(sched: Arc<Scheduler>) {
+/// 驱动主循环：park 到最近 deadline（condvar，零自旋），到期点火；本 worker
+/// 的停信标置位（[`WorkerHandle`] Drop）或调度器关闸（[`Scheduler::close`] /
+/// [`WorkerHandle::join`]）即退。
+fn worker_loop(sched: Arc<Scheduler>, stop: Arc<AtomicBool>) {
     loop {
         sched.shared.worker_passes.fetch_add(1, AtomicOrd::SeqCst);
+        if stop.load(AtomicOrd::SeqCst) {
+            // 终态（worker 退出）：只停本 worker（信标），不关闸。
+            embed_event!(info, target: "skeleton::scheduler::worker", reason = "stopped");
+            return;
+        }
         if sched.is_closed() {
             // 终态（worker 退出）：close 是唯一正常出口。
             embed_event!(info, target: "skeleton::scheduler::worker", reason = "closed");
@@ -901,10 +935,12 @@ fn worker_loop(sched: Arc<Scheduler>) {
                 }
             }
             Some(d) => {
-                // park 到最近 deadline；注册（更早锚）/close 即时唤醒重算。
-                // 虚假唤醒醒来重算剩余时间继续 park——非自旋（每次醒必 park）。
+                // park 到最近 deadline；注册（更早锚）/close/停信标即时唤醒
+                // 重算。虚假唤醒醒来重算剩余时间继续 park——非自旋（每次醒
+                // 必 park）。信标判定在状态锁内：置位（Drop）同持此锁 ⇒
+                // 「判定后、wait 前」的窗口不会错过唤醒。
                 let s = lock(&sched.shared.state);
-                if s.closed {
+                if stop.load(AtomicOrd::SeqCst) || s.closed {
                     return;
                 }
                 // 双检（与 None 分支对称）：拿锁前可能有更早 deadline 注册入堆
@@ -925,9 +961,9 @@ fn worker_loop(sched: Arc<Scheduler>) {
                 }
             }
             None => {
-                // 空堆：无限期 park，等 close/注册唤醒（零自旋的关键面）。
+                // 空堆：无限期 park，等 close/注册/停信标唤醒（零自旋的关键面）。
                 let s = lock(&sched.shared.state);
-                if s.closed {
+                if stop.load(AtomicOrd::SeqCst) || s.closed {
                     return;
                 }
                 // 双检：拿锁前可能有注册入堆——有活就回主循环重算锚。

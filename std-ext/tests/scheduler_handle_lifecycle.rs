@@ -1,5 +1,5 @@
 //! 句柄生命周期集成测试：#55（detach 泄漏 TaskCell）+ #72（丢 WorkerHandle
-//! 不关闸 ⇒ 驱动线程与调度器双泄漏）。
+//! 只停该 worker（per-worker 信标），不关闸、不取消无关 worker 的登记）。
 //!
 //! 时间线：确定性面走 [`MockClock`] + [`Scheduler::tick`]（零真实 sleep）；
 //! 驱动线程面走 [`SystemClock`] 真实时钟，判定用**握手**（channel）或
@@ -125,22 +125,71 @@ fn dropping_handle_still_cancels_the_task() {
     assert_eq!(hits.load(Ordering::SeqCst), 0);
 }
 
-// ── #72：丢弃 WorkerHandle 必须关闸，驱动线程随之退出 ──
+// ── #72：丢弃 WorkerHandle = 只停该 worker（per-worker 信标，不关闸） ──
 
 #[test]
-fn dropping_worker_handle_closes_scheduler_and_releases_it() {
+fn dropping_worker_handle_stops_worker_without_closing_scheduler() {
     let sched = Arc::new(Scheduler::new(Arc::new(SystemClock)));
     let weak = Arc::downgrade(&sched);
     let worker = sched.spawn_worker();
     drop(worker);
     assert!(
-        sched.is_closed(),
-        "丢弃 WorkerHandle 必关闸（否则再无公开句柄能关它）"
+        !sched.is_closed(),
+        "drop 是 worker-local：不得关闸（关闸会取消无关 worker 的登记）"
+    );
+    assert!(
+        sched.after(Duration::from_secs(3600), || {}).is_ok(),
+        "drop 后调度器仍开放：注册照常受理"
     );
     drop(sched);
     assert!(
-        wait_until(Duration::from_secs(5), || weak.upgrade().is_none()),
-        "驱动线程退出并释放其 Arc<Scheduler>（否则线程+调度器双泄漏）"
+        wait_until(Duration::from_secs(10), || weak.upgrade().is_none()),
+        "停信标唤醒后驱动线程有界退出并释放其 Arc<Scheduler>（否则线程泄漏）"
+    );
+}
+
+#[test]
+fn dropping_one_worker_handle_keeps_other_worker_and_registrations() {
+    let sched = Arc::new(Scheduler::new(Arc::new(SystemClock)));
+    let w1 = sched.spawn_worker();
+    let w2 = sched.spawn_worker();
+    // 既有登记：drop 前注册（关闸形态会把它标 Cancelled ⇒ 永不点火）。
+    let (tx_existing, rx_existing) = mpsc::channel::<()>();
+    sched
+        .after(Duration::from_millis(200), move || {
+            let _ = tx_existing.send(());
+        })
+        .expect("未关闸注册必成")
+        .detach();
+    drop(w1);
+    assert!(!sched.is_closed(), "丢一个句柄不得关闸");
+    // 新提交：存活 worker 仍受理并点火。
+    let (tx_new, rx_new) = mpsc::channel::<()>();
+    sched
+        .after(Duration::from_millis(20), move || {
+            let _ = tx_new.send(());
+        })
+        .expect("调度器仍开放：存活 worker 受理新提交")
+        .detach();
+    rx_existing
+        .recv_timeout(Duration::from_secs(10))
+        .expect("既有登记不得被丢句柄取消（关闸形态会取消它）");
+    rx_new
+        .recv_timeout(Duration::from_secs(10))
+        .expect("存活 worker 响应新提交");
+    // 被丢句柄的 worker 已退出：Arc<Scheduler> 强引用 = main + w2 句柄 + w2 线程。
+    assert!(
+        wait_until(Duration::from_secs(10), || Arc::strong_count(&sched) == 3),
+        "丢句柄后该 worker 线程有界退出（强引用应回到 3，实得 {}）",
+        Arc::strong_count(&sched)
+    );
+    // 显式 join：scheduler-wide 关闸 + 等第二个 worker 退出（旧公共面不回归）。
+    w2.join();
+    assert!(sched.is_closed(), "join = close + join（语义不回归）");
+    assert_eq!(
+        Arc::strong_count(&sched),
+        1,
+        "两个 worker 线程均可回收（仅剩调用方引用）"
     );
 }
 
@@ -152,7 +201,7 @@ fn dropping_worker_handle_inside_callback_does_not_deadlock() {
     let (tx, rx) = mpsc::channel::<()>();
     sched
         .after(Duration::ZERO, move || {
-            drop(worker); // 回调内丢句柄：禁自 join 死锁
+            drop(worker); // 回调内丢句柄：禁自 join 死锁（只置信标 + wake）
             let _ = tx.send(());
         })
         .expect("未关闸注册必成")
@@ -161,7 +210,7 @@ fn dropping_worker_handle_inside_callback_does_not_deadlock() {
         .expect("回调应执行（丢句柄不得自等死锁）");
     drop(sched);
     assert!(
-        wait_until(Duration::from_secs(5), || weak.upgrade().is_none()),
+        wait_until(Duration::from_secs(10), || weak.upgrade().is_none()),
         "回调内丢句柄后驱动线程退出并释放调度器"
     );
 }
@@ -186,16 +235,16 @@ fn dropping_worker_handle_during_inflight_callback_stops_worker() {
         .recv_timeout(Duration::from_secs(5))
         .expect("在途回调应进入");
     drop(worker);
-    assert!(sched.is_closed(), "丢句柄即关闸");
+    assert!(!sched.is_closed(), "drop 只停该 worker，不关闸");
     assert!(
-        sched.after(Duration::ZERO, || {}).is_err(),
-        "关闸后注册显式拒绝（fail-visible）"
+        sched.after(Duration::ZERO, || {}).is_ok(),
+        "关闸未发生：注册照常受理"
     );
     release_tx.send(()).expect("放行在途回调");
     drop(sched);
     assert!(
-        wait_until(Duration::from_secs(5), || weak.upgrade().is_none()),
-        "在途回调返回后驱动线程退出并释放调度器"
+        wait_until(Duration::from_secs(10), || weak.upgrade().is_none()),
+        "在途回调返回后驱动线程因停信标退出并释放调度器"
     );
 }
 
