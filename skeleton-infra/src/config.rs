@@ -82,8 +82,8 @@ use skeleton::config::ConfigError;
 /// 被静默字符串化、非有限浮点（NaN/±Inf）被静默写 null——类型层需挡这两
 /// 类值的采用方自理。
 ///
-/// TOML 面（`config-toml`）：[`load_toml`]/[`save_toml`] 类型化直读直写
-/// （Datetime 全保真）；[`ConfigFile::file_layer_toml`] 把 TOML 文件折进
+/// TOML 面（`config-toml`）：`load_toml`/`save_toml` 类型化直读直写
+/// （Datetime 全保真）；`ConfigFile::file_layer_toml` 把 TOML 文件折进
 /// 分层链——TOML Datetime 在统一值面无表示，**显式报错**（禁静默降级成
 /// 私有标记映射）。
 ///

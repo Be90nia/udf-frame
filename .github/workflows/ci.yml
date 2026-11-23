@@ -150,7 +150,7 @@ jobs:
   # （cargo tree 不编译、cargo check 不编 example/test，皆探不到）。
   # 矩阵成员 = Cargo.toml `full` 的全部 14 个子开关，一一对应不挑选；
   # unsafe-evidence 不在 full（证据专用开关，非消费能力）不入矩阵，其
-  # 行为由 --all-features 步覆盖。每面最小口径 check+test：
+  # 行为由 --all-features 步覆盖。每面最小口径 check+test+doc：
   # --no-default-features --features <X>。
   # 末位 `full` 条目额外验证聚合面：14 叶子并集一次编译+测试（采用方一键
   # 全开的实际口径）。与 --all-features 步的差 = unsafe-evidence 证据开关
@@ -183,6 +183,15 @@ jobs:
 
       - name: Test (no-default-features --features ${{ matrix.feature }})
         run: cargo test -p udf-skeleton-infra --no-default-features --features ${{ matrix.feature }}
+
+      # 单开面 doc 闸（bd udf-frame-ilh）：intra-doc 链接指向门控符号时，
+      # --all-features 面能解析、单开面解析不到 ⇒ 只有逐面 doc 才判红。
+      # 首跑实测 12/15 面红（fx 挂 tokio / toml 挂 config-toml / log 面符号），
+      # 已把跨门控链接改成 code span 清偿。
+      - name: Docs (no-default-features --features ${{ matrix.feature }})
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p udf-skeleton-infra --no-default-features --features ${{ matrix.feature }} --no-deps
 
       - name: Runtime face is Tokio-free (normal dep graph)
         if: matrix.feature == 'runtime'
@@ -225,6 +234,12 @@ jobs:
 
       - name: Test (no-default-features --features ${{ matrix.feature }})
         run: cargo test -p udf-std-ext --no-default-features --features ${{ matrix.feature }}
+
+      # 单开面 doc 闸（bd udf-frame-ilh，与 infra 矩阵同款口径）。
+      - name: Docs (no-default-features --features ${{ matrix.feature }})
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p udf-std-ext --no-default-features --features ${{ matrix.feature }} --no-deps
 
   # ── MSRV 闸（rust-version = 1.87，三 crate 同值）─────────────────
   # --locked 是本 job 的关键属性：Cargo.lock 参与校验 ⇒ 依赖版本被原地

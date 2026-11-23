@@ -5,14 +5,14 @@
 //!   （trait 住 `skeleton::logpath`）+ 默认实现 [`DefaultPathResolver`] +
 //!   按日滚动 [`FileSink`]。单开 `log-fs` 即可用文件日志，不拉 tracing 四件套。
 //! - **`log`（= `log-fs` + log + tracing + tracing-subscriber + tracing-log，
-//!   门面绑定层）**：init 系（[`init_tracing_from_env`]/[`init_with_file`]）、
-//!   [`FileSinkWriter`]（MakeWriter 适配壳）、默认行格式（LineFormat）。
+//!   门面绑定层）**：init 系（`init_tracing_from_env`/`init_with_file`）、
+//!   `FileSinkWriter`（MakeWriter 适配壳）、默认行格式（LineFormat）。
 //!   门面 trait=生态 `log::Log`（不自造）。
 //!
-//! 级别过滤=订阅者层全局上限；per-module 交给 [`init_tracing_from_env`] 的
+//! 级别过滤=订阅者层全局上限；per-module 交给 `init_tracing_from_env` 的
 //! EnvFilter。核心自身永不打日志（核心零依赖，结构性排除）。
 //!
-//! 域级过滤预设：[`init_tracing_from_env`] 在 RUST_LOG 未设/非法时兜底的
+//! 域级过滤预设：`init_tracing_from_env` 在 RUST_LOG 未设/非法时兜底的
 //! EnvFilter 恒为 `<default_level>,skeleton=off`——框架自身埋点默认静默，宿主
 //! 日志零打扰；RUST_LOG 已设且合法时逐字生效（显式值恒赢预设）。三种开启
 //! 姿势（RUST_LOG 语法示例，埋点 target 形如 `skeleton::<域>`）：
@@ -36,7 +36,7 @@
 //! `log::set_boxed_logger` 非幂等。故本件只调 `try_init()`（其内部已含桥
 //! 初始化），首调 Ok/重复 Err/log→tracing 桥生效的语义不变。
 //!
-//! 文件落盘面（拍板 2026-10-17）：[`init_with_file`] = console+file 双 sink
+//! 文件落盘面（拍板 2026-10-17）：`init_with_file` = console+file 双 sink
 //! （同一默认行格式）；落点经 `skeleton::logpath::LogPathResolver` 契约——
 //! 默认实现 [`DefaultPathResolver`]，debug 构建=编译期 `CARGO_MANIFEST_DIR`/log
 //!（框架自身开发态，零运行时猜测；采方开发态请注入自有 resolver，见
@@ -48,22 +48,22 @@
 //! chrono 依赖判否）。
 //!
 //! 多通道扇出面（P1-10-a 前置件，拍板 2026-10-23；`log` feature）：固定三
-//! 通道 [`Channel`]（general/access/dns，封闭枚举=非法通道名在类型层不可
+//! 通道 `Channel`（general/access/dns，封闭枚举=非法通道名在类型层不可
 //! 能）→ 每通道独立 sink（一通道一 sink 禁串扰）+ 独立 level（槽位
 //! AtomicU8 写路径比较：低于通道级在 registry 即滤，不计丢弃；
-//! [`ChannelRegistry::set_level`] 运行期原子改写）+ 重复注册 fail-visible
-//!（原 sink 不动）+ [`ChannelRegistry`] 零分配扇出（未注册通道静默：不输出/
+//! `ChannelRegistry::set_level` 运行期原子改写）+ 重复注册 fail-visible
+//!（原 sink 不动）+ `ChannelRegistry` 零分配扇出（未注册通道静默：不输出/
 //! 不 panic/不分配/不计数）+ 掩码唯一布点（`set_secrets`，写前统一过
-//! [`mask_secrets`]）+ 每通道独立落点（[`PerChannelPathResolver`] 通道子目录
-//! + [`ChannelFileSink`] 组合件）。
+//! [`mask_secrets`]）+ 每通道独立落点（`PerChannelPathResolver` 通道子目录
+//! + `ChannelFileSink` 组合件）。
 //!
 //! 通道动态级 armor 红线（域 ⑥ 调研：外部踩坑调研（本地留存，未入库）；tracing#2874/#2400 实锤）：禁 with_default 长驻、禁运行期
 //! 全局换装 subscriber——callsite interest 缓存的失效竞态是结构性风险。
 //! 本件通道级过滤在 registry 写路径（槽位 AtomicU8 比较），不在
 //! subscriber/callsite 层：动态改级天然免疫缓存失效，下一 emit 即按新级别
 //! 判定（无需重评 callsite）。两态显式：每条 emit 判定=投递或静默，静默
-//! 不计丢弃；投递写失败由 sink 自计数（[`ChannelRegistry::dropped`]/
-//! [`ChannelRegistry::dropped_total`] 可对账）。
+//! 不计丢弃；投递写失败由 sink 自计数（`ChannelRegistry::dropped`/
+//! `ChannelRegistry::dropped_total` 可对账）。
 
 use skeleton::logpath::LogPathResolver;
 

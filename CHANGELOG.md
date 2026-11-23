@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### Ci(docs): 单开 feature 面 doc 闸 + 面内 intra-doc 断链清偿,2026-11-23;bd udf-frame-ilh)
+- **门洞**：docs 门原来只跑 `--all-features`，指向**门控符号**的 intra-doc 链接在该面能解析、单开面解析不到 ⇒ 单面断链静默通过。逐面实测 15 面中 **12 面红**（`crate::fx::*` 挂 `tokio` 门、`load_toml` 等挂 `config-toml`、`init_*`/`ChannelRegistry` 等挂 `log`）。
+- **清偿**：把跨门控符号的链接改成 code span（与 config.rs 既有修法同款；模块头注在任一面都编译，链接不得依赖别的门）：`shutdown.rs` 1 处、`runtime.rs` 6 处、`config.rs` 3 处、`logx.rs` 模块头 14 处。
+- **闸**：`feature-isolation` 矩阵每面加 `RUSTDOCFLAGS=-D warnings cargo doc --no-deps`（infra 15 面 + std-ext 3 面）；实测 18 面全绿。
+- 纯文档 + CI，无公共面改动。
+
+### Docs(runtime): 澄清弃队留痕的口径混同与不可读边界,2026-11-23;bd udf-frame-8ad)
+- **纠偏**：`Drop for SyncStore` 旧文案称「drop 时队列非空只可能是预算止步残留」——**与实现相反**：store 句柄可在排空进行中被丢弃（另一线程持 sender / inner Arc 仍在跑），此快照到的队列可能是普通未处理 action。
+- **声明**：弃队数与 `feedback_budget_exceeded` 同账合并，两个 population 不可区分；**最后一份句柄析构后该留痕不可读**（累加点在析构、读口在实例上）⇒ 该路径只服务白盒/仍有 inner 持有者，**不是对外可观测面**；对外可观测面是 `ShutdownReport` / `rejected_after_close`。
+- 不改机制（按 bd 8ad 方案②：显式声明边界），无公共面改动。
+
 ### Docs(runtime): 纠正「unwind 清理期零用户代码」的不实表述并补 Action 析构义务,2026-11-23;GitHub issue#66)
 - **纠偏**：`DrainGuard` 的 `Drop` **不调任何回调**（reducer / 解释器 / 订阅 / 审计），但框架**拥有并按值丢弃**被摘下的 action 载荷 ⇒ 展开清理期**必有用户代码**（锁已在结算与析构前释放；**锁外 ≠ 无用户代码**）。旧表述「零用户代码」为误，已在 CHANGELOG 历史条目、`runtime.rs` 内部注释与 `docs/reference.md`「Panic 契约」三处改正。
 - **契约（窄口径，按维护者定稿）**：正常运行期载荷仍在内部锁外析构，**不新增**全局 panic-free Drop 要求；**DrainGuard/`SyncStore` 展开清理期**被丢弃 payload 的 `Drop` **必须 panic-free**（二次 panic = abort）且**不得重入同一 store**（排空旗已放，重入会夺新租约并跑排空环）；只读面安全。

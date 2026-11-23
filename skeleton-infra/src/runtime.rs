@@ -678,10 +678,10 @@ struct StoreInner<S, A, Op> {
 /// - **同步档**：`run` 内联把活干完（有界、非阻塞、不 await）。耗时直接计入
 ///   dispatch；`run` panic 原样从 [`Self::dispatch`] 上浮（fail-visible，毒锁
 ///   在下一次效果转发时恢复并计入 [`Self::runtime_panic_count`]），实例不报废。
-/// - **托管档**：`run` 只把工作 `spawn_tracked` 进 [`crate::fx::FxScope`] 的
+/// - **托管档**：`run` 只把工作 `spawn_tracked` 进 `crate::fx::FxScope` 的
 ///   生命周期集便返回——`dispatch` 返回 ≠ 效果完成。失败/取消经
-///   [`crate::fx::Spawned::join`] 的 [`crate::fx::TaskError`] 与
-///   [`crate::fx::ShutdownReport`] 分桶面可见；结果必须经 `back`
+///   `crate::fx::Spawned::join` 的 `crate::fx::TaskError` 与
+///   `crate::fx::ShutdownReport` 分桶面可见；结果必须经 `back`
 ///   （[`ActionSender`]）回灌成普通 action——状态仍只由
 ///   reducer 推进，跨线程回灌按外部流量计（不受回灌深度预算约束，环防护责任
 ///   在解释器自身，见 [`EffectRuntime`] 契约注）。
@@ -735,7 +735,7 @@ pub struct SyncStore<S, A, Op = Infallible> {
 }
 
 /// 停机闸已闭：订阅登记窗口已关（[`SyncStore::try_subscribe`] 的显式失败面）。
-/// 与 [`crate::fx::ScopeClosed`]、`RegisterError::Closed` 同族停机语义——
+/// 与 `crate::fx::ScopeClosed`、`RegisterError::Closed` 同族停机语义——
 /// 框架其余停机入口全都显式失败，本类型补齐 subscribe 面的缺口。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreClosed;
@@ -1718,7 +1718,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// [`Store::subscribe`] 完全一致，唯 `close()` 之后返回 `Err(StoreClosed)`
     /// 而非登记一张永不触发的死票据——停机序写反（先 close 后 subscribe）
     /// 在调用点即显形。与 `ActionSender::dispatch` 的显式 `false`、
-    /// [`crate::fx::FxScope::spawn_tracked`] 的 `Err(ScopeClosed)` 同族：其余
+    /// `crate::fx::FxScope::spawn_tracked` 的 `Err(ScopeClosed)` 同族：其余
     /// 停机入口全都显式失败，本方法补齐 subscribe 面的缺口。
     ///
     /// 旧 [`Store::subscribe`] 保持签名不变（迁移期兼容面）：照常登记 +
@@ -2253,9 +2253,11 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 正常流量不受预算影响（外部 action 深度恒 0）。停放记录等**显式**恢复
     /// （[`Self::resume_deferred`]，无自动重试）；续接无法留存（停放队列满）
     /// 同样计入本计数，并另计入 [`Self::deferred_capacity_rejected`]。store
-    /// drop 时若队列仍滞留（预算止步残留），弃队数一并计入本计数留痕
-    /// （禁静默弃队）。时间线现场 = [`AuditEventKind::FeedbackBudgetExceeded`]
-    /// （`subscribe_events` 订阅窗内可查——环结构重建走事件流，快速巡检走本
+    /// drop 时队列仍滞留的弃队数一并计入本计数留痕（禁静默弃队）——**但两个
+    /// population 混在同一读口**：弃队快照可能含普通未处理 action（句柄可在排空
+    /// 进行中被丢弃），且最后一次留痕在唯一句柄析构时写入、此后不可读 ⇒ 读到
+    /// 「预算触发」与「停机弃队」不可区分（bd udf-frame-8ad 显式承认）。时间线现场
+    /// = [`AuditEventKind::FeedbackBudgetExceeded`]（`subscribe_events` 订阅窗内可查——环结构重建走事件流，快速巡检走本
     /// 计数）。
     pub fn feedback_budget_exceeded(&self) -> u64 {
         self.inner.feedback_exceeded.load(Ordering::SeqCst)
@@ -2756,10 +2758,15 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     }
 }
 
-/// 残留弃队留痕：正常路径 drop 恒 idle（dispatch/close 同步排空至空），
-/// drop 时队列非空只可能是预算止步的残留回灌链——弃队数并入预算计数留痕，
-/// 禁静默弃队。读窗 = inner Arc 存续期（SyncStore 已弃而 inner 仍被持有，如测试
-/// 白盒），与 [`SyncStore::rejected_after_close`] 的停机窗同类语义。
+/// 残留弃队留痕：**快照式**，随 store 句柄退出做一次计数。单线程常规路径 drop
+/// 恒 idle（dispatch/close 同步排空至空）；但**句柄可在排空进行中被丢弃**（另一线程
+/// 持 sender / inner Arc 仍活着），此时快照到的队列可能是**普通未处理 action**，
+/// 不限于预算止步残留 ⇒ 弃队数并入 `feedback_exceeded` 同账，两个 population
+/// **不可区分**（bd udf-frame-8ad：显式承认的口径混同，不静默改义）。
+/// 读窗 = inner Arc 存续期（SyncStore 已弃而 inner 仍被持有，如测试白盒）；
+/// **最后一份句柄析构后本留痕不可读**（累加点是析构，读口在实例上）⇒ 本路径只服务
+/// 白盒/仍有 inner 持有者的场景，**不是**对外可观测面；对外可观测的是停机路径的
+/// `ShutdownReport` / `rejected_after_close`。
 impl<S, A, Op> Drop for SyncStore<S, A, Op> {
     fn drop(&mut self) {
         let discarded = match self.inner.queue.lock() {

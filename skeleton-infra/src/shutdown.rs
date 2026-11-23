@@ -2,7 +2,7 @@
 //!
 //! 三现状停机面各管各家——`crate::runtime::SyncStore::close`（关闸+清 pending+
 //! 在途排空，幂等）、[`std_ext::scheduler::Scheduler::close`]（关闸+标 Cancelled+
-//! 唤醒驱动）、tokio feature 的 [`crate::fx::FxScope::shutdown`]（drain+超时显式+
+//! 唤醒驱动）、tokio feature 的 `crate::fx::FxScope::shutdown`（drain+超时显式+
 //! abort 兜底）；本域把它们按**注册序串行**编排：单组件 panic/超时 fail-visible
 //! 上报、不拖垮整体，最终 [`ShutdownReport`] 全量如实（零组件=空报告合法）。
 //!
