@@ -1,6 +1,6 @@
 //! async-enabled 面（`tokio` feature）：fx 取消可见 + scope 停机净。
 
-use skeleton_infra::fx::{cancel_pair, FxScope};
+use skeleton_infra::fx::{FxScope, cancel_pair};
 use tokio::sync::oneshot;
 
 /// 取消探针：任务先进入等待点（oneshot 握手，无 sleep），宿主触发取消，

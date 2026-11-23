@@ -91,11 +91,7 @@ impl RecordingFx {
 }
 
 impl EffectRuntime<WorkflowAction, JobOp> for RecordingFx {
-    fn run(
-        &mut self,
-        effect: Effect<WorkflowAction, JobOp>,
-        _back: &ActionSender<WorkflowAction>,
-    ) {
+    fn run(&mut self, effect: Effect<WorkflowAction, JobOp>, _back: &ActionSender<WorkflowAction>) {
         // `Effect` 是 `#[non_exhaustive]`：未知变体显式留痕，不静默丢。
         let record = match &effect {
             Effect::Run { id, op } => Recorded {

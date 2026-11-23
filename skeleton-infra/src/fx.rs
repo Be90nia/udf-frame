@@ -525,8 +525,10 @@ enum DrainSlot {
     Owner,
     /// 已有 owner 在排空：等它的结算（共享 canonical 报告）。
     Waiter(watch::Receiver<DrainState>),
-    /// 排空早已结算：顺序调用语义（默认报告）。
-    Settled,
+    /// 排空早已结算：返回该次排空的 canonical 报告副本（顺序语义；并发晚到者与
+    /// owner/等待者所见一致——审计 F3：旧实现的两次读会让结算瞬间到达的调用拿到
+    /// 默认报告，panic 载荷就此静默丢失）。
+    Settled(ShutdownReport),
 }
 
 /// 排空 owner 守卫（issue#70，RAII）：JoinSet 留在**唯一** owner 手里
@@ -988,12 +990,14 @@ impl FxScope {
         if won {
             return DrainSlot::Owner;
         }
-        // 未赢：区分「排空在途」（等共享结果）与「已结算」（顺序语义）。
-        let draining = matches!(&*self.drain.borrow(), DrainState::Draining);
-        if draining {
-            DrainSlot::Waiter(self.drain.subscribe())
-        } else {
-            DrainSlot::Settled
+        // 未赢：**一次** borrow 同时取状态与载荷（线性化点 = 本次调用）。旧实现是
+        // 「先判 Draining、再 borrow」两次读 ⇒ 恰在结算瞬间到达的调用落进 Settled
+        // 分支却只拿到默认报告（审计 F3：并发停机时 panic 载荷静默丢失）。
+        match &*self.drain.borrow() {
+            DrainState::Settled(report) => DrainSlot::Settled(report.clone()),
+            // `Open` 不可达（`send_if_modified` 未命中即已离开 `Open`）；保守回退为
+            // 等待，与 Draining 同形——绝不返回伪造的默认报告。
+            DrainState::Open | DrainState::Draining => DrainSlot::Waiter(self.drain.subscribe()),
         }
     }
 
@@ -1015,13 +1019,14 @@ impl FxScope {
     /// |---|---|
     /// | 无人在排空 | 成为 owner：close + abort_all + take，排空至净 |
     /// | 有 owner 在排空 | **等待共享结果**：返回 owner 的 canonical 报告 |
-    /// | 排空已结算 | 顺序语义：返回 [`ShutdownReport::default()`] |
+    /// | 排空已结算 | 顺序语义：返回该次排空的 canonical 报告副本（晚到者亦可见） |
     ///
     /// owner 的 future 被 drop 或 panic 展开 ⇒ 守卫先发布**中断结果**
     /// （[`ShutdownReport::drain_interrupted`]）再让 JoinSet drop：全部等待者随之
     /// 醒来，绝不停在「排空中」。中断只**请求** abort，不确认任务终止 ⇒ 报告如实
-    /// 保留 `still_running` 读数。排空完成后再次调用仍走顺序语义（默认报告）——
-    /// 既有契约不变。
+    /// 保留 `still_running` 读数。排空完成后再次调用仍走顺序语义，但**返回的是该次
+    /// 排空的 canonical 报告副本**（非默认报告）——并发与顺序调用者的可见面一致
+    /// （审计 F3 修正；`ShutdownReport: Clone`，代价一次浅拷贝）。
     #[must_use = "shutdown 报告含终局归集与 panic 载荷清单，丢弃即静默丢失（纯收尾用 `let _ =` 显式让渡）"]
     pub async fn shutdown(&self) -> ShutdownReport {
         match self.begin_drain() {
@@ -1032,7 +1037,7 @@ impl FxScope {
                 owner.publish()
             }
             DrainSlot::Waiter(rx) => await_settled(rx).await,
-            DrainSlot::Settled => ShutdownReport::default(),
+            DrainSlot::Settled(report) => report,
         }
     }
 
@@ -1086,7 +1091,7 @@ impl FxScope {
                     }
                 }
             }
-            DrainSlot::Settled => ShutdownReport::default(),
+            DrainSlot::Settled(report) => report,
         }
     }
 
@@ -1114,8 +1119,18 @@ impl FxScope {
             }
         }
         // 收割记账：条目出集合 ⇒ 保留数与未收割数各减一（锁序 set → caps）。
+        // 安全性依赖**外部**不变量：tokio 保证任务析构先于 JoinError 观测 ⇒ 出集合
+        // 的条目必然已计入这两项。release 下 usize 减法无下溢保护（wrap 成巨值），
+        // 故 debug 构建显式锚住该前提（审计 F4；zero-cost in release）。
         if harvested > 0 {
             let mut caps = lock(&self.caps);
+            debug_assert!(
+                caps.tracked >= harvested && caps.completed_unreaped >= harvested,
+                "卡账不变量破损：tracked={} completed_unreaped={} harvested={}（tokio 任务析构先于 JoinError 观测之前提被破坏）",
+                caps.tracked,
+                caps.completed_unreaped,
+                harvested
+            );
             caps.tracked -= harvested;
             caps.completed_unreaped -= harvested;
         }

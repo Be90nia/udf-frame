@@ -292,11 +292,11 @@ async fn close_cancel_and_shutdown_are_idempotent() {
 
     let first = bounded("首次 shutdown 返回", scope.shutdown()).await;
     assert_eq!(first.completed, 1, "首次 shutdown 收割已终局任务");
+    // 审计 F3 后的语义：已结算的重复调用返回该次排空的 canonical 报告副本。
     let second = bounded("空集二次 shutdown 返回", scope.shutdown()).await;
     assert_eq!(
-        second,
-        ShutdownReport::default(),
-        "空集二次 shutdown 恒空报告"
+        second, first,
+        "二次 shutdown 返回 canonical 报告副本（不得静默降级为空报告）"
     );
     let third = bounded(
         "空集超时路径返回",
@@ -304,9 +304,8 @@ async fn close_cancel_and_shutdown_are_idempotent() {
     )
     .await;
     assert_eq!(
-        third,
-        ShutdownReport::default(),
-        "空集超时路径不得凭空申报超时"
+        third, first,
+        "已结算的超时路径返回 canonical 报告副本（completed 保留；不凭空申报超时）"
     );
 }
 

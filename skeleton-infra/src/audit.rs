@@ -176,8 +176,23 @@ impl Drop for AuditTicket {
             *guard = None;
             #[cfg(test)]
             drop_pause::pause(std::sync::Arc::as_ptr(&self.gate), self.gen);
-            self.gate.store(false, std::sync::atomic::Ordering::Release);
+            self.store_gate_under_slot_lock();
         }
+    }
+}
+
+impl AuditTicket {
+    /// 落闸（issue#60 线性化点的机械锚）：**必须在订阅槽锁内调用**——槽摘除与
+    /// `gate=false` 是一次状态变更。debug 构建用 `try_lock` 断言调用点确实持锁：
+    /// 若有人把落闸挪出临界区（#60 的缺陷形状），测试立刻红，鉴别力不再依赖测试
+    /// 暂停钩子恰好落在窗口内（审计 F1）。release 下 `debug_assert` 编译为空。
+    #[inline]
+    fn store_gate_under_slot_lock(&self) {
+        debug_assert!(
+            self.audit.try_lock().is_err(),
+            "审计闸落必须在订阅槽锁内（#60）：陈旧票据的落闸与新订阅装槽未串行"
+        );
+        self.gate.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 

@@ -20,21 +20,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use skeleton::lint::{
-    clear_stages, post_process, register_stage, registered_stages, LintError, LintStage,
-};
 use skeleton::clock::SystemClock;
 use skeleton::fields::{FieldBag, FieldValue};
+use skeleton::lint::{
+    LintError, LintStage, clear_stages, post_process, register_stage, registered_stages,
+};
 use skeleton::notify::{Notify, NotifySink};
+use skeleton::pool::{PoolManaged, PoolMetrics};
 use skeleton::{
-    ActionSender, Effect, EffectBuf, EffectId, Fragment, Infallible, NoFx, Reducer, Restore,
-    Store,
+    ActionSender, Effect, EffectBuf, EffectId, Fragment, Infallible, NoFx, Reducer, Restore, Store,
 };
 use skeleton_infra::compose::combine;
 use skeleton_infra::fx::{AdmissionError, FxScope};
 use skeleton_infra::runtime::{AdmissionOutcome, SyncStore};
 use skeleton_infra::{ObjectPool, ObjectPoolTuning, ResetPhase};
-use skeleton::pool::{PoolManaged, PoolMetrics};
 
 // ── 1. EffectId：跨 crate 受控构造 ────────────────────────────────────────
 // 裸元组语法 `EffectId(1)` 在外部 crate 不可用（字段私有）——唯一构造入口
@@ -135,7 +134,10 @@ impl Reducer for ParentFeature {
     type Op = Infallible;
 
     fn initial(&self) -> ParentState {
-        ParentState { total: 100, child: 0 }
+        ParentState {
+            total: 100,
+            child: 0,
+        }
     }
 
     fn reduce(
@@ -277,7 +279,10 @@ fn alloc_sites_roundtrip() {
     CONN_ACCEPT.bump();
     CONN_RECYCLE.bump();
     assert_eq!(CONN_ACCEPT.count(), 2);
-    assert_eq!(find(ADOPTER_SITES, "CONN_RECYCLE").map(|s| s.count()), Some(1));
+    assert_eq!(
+        find(ADOPTER_SITES, "CONN_RECYCLE").map(|s| s.count()),
+        Some(1)
+    );
 
     // 枚举序 = 宏声明序
     let names: Vec<&'static str> = ADOPTER_SITES.iter().map(|s| s.name).collect();
@@ -342,8 +347,11 @@ fn object_pool_roundtrip() {
     assert!(owned.endpoint.is_empty());
 
     // `PoolManaged` 三挂点（外部 crate 调用面）。
-    pool.resize(ObjectPoolTuning { max: 8, idle_cap: 4 })
-        .expect("valid resize");
+    pool.resize(ObjectPoolTuning {
+        max: 8,
+        idle_cap: 4,
+    })
+    .expect("valid resize");
     let mut kinds = Vec::new();
     let ticket = pool.subscribe_audit(move |e| kinds.push(e.kind));
     drop(ticket);

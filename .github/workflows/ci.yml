@@ -28,9 +28,15 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      # fmt 闸：防风格再漂移+行号钉位断言类测试因格式化重排批量假红
+      # fmt 闸：防风格再漂移+行号钉位断言类测试因格式化重排批量假红。
+      # 三个夹具是**独立 workspace**（自带空 [workspace] 表）⇒ 根 `--all` 看不到
+      # 它们的文件（审计 F7：hollow gate），逐仓 --check 补上。
       - name: Rustfmt
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path validation/consumer-sim/Cargo.toml -- --check
+          cargo fmt --manifest-path validation/consumer-sim/cli-host/Cargo.toml -- --check
+          cargo fmt --manifest-path validation/consumer-sim/workflow/Cargo.toml -- --check
 
       # 架构回归闸（蓝图 §13 行 1「Sync-only consumer has no Tokio in its
       # dependency tree」/ §11 项 5）：sync-only 依赖图出现 tokio 即红。
@@ -117,8 +123,10 @@ jobs:
       - name: paths_alloc serial
         run: cargo test -p udf-std-ext --test paths_alloc -- --test-threads=1
 
-      # bench 编译门（infra §3.3/P10 一级）：bench 三组 required-features 为
-      # fx/journal/memgov/testing 并集，--no-run 裸跑会整目标跳过（hollow gate），故 all-features
+      # bench 编译门（infra §3.3/P10 一级）：bench 三组 required-features 为五件并集
+      # （fx/journal/memgov/testing/pool，见 skeleton-infra/Cargo.toml），--no-run 裸跑
+      # 会整目标跳过（hollow gate），故 all-features；`-p udf-skeleton` 无 bench 目标
+      # （恒空跑），保留只为覆盖将来新增。
       - name: Bench compile gate
         run: cargo bench -p udf-skeleton-infra --all-features --no-run && cargo bench -p udf-skeleton --no-run
 
@@ -301,6 +309,13 @@ jobs:
         run: |
           cargo build --manifest-path validation/consumer-sim/workflow/Cargo.toml --locked
           cargo test --manifest-path validation/consumer-sim/workflow/Cargo.toml --locked
+
+      # 夹具断言住在 `fn main()`：`cargo test` 对纯 bin 包是 **0 tests**（审计 F2），
+      # 不真跑 bin 就只剩「可编译」证据。两夹具各真跑一遍（exit 0 才算端到端）。
+      - name: Run fixture bins (async root + sync workflow)
+        run: |
+          cargo run --manifest-path validation/consumer-sim/Cargo.toml --locked
+          cargo run --manifest-path validation/consumer-sim/workflow/Cargo.toml --locked
 
       - name: Assert fixture dependency tree has no Tokio
         shell: bash

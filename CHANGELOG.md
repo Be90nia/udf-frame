@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### Fix(audit 整改): 12 维审计 4 条 P2 + 2 条 P3 清偿,2026-11-23;reports/2026-11-23-12dim-audit.md)
+- **F1（#60 测试鉴别力）**：落闸改走 `AuditTicket::store_gate_under_slot_lock`，debug 下用 `audit.try_lock().is_err()` 断言「闸落必持槽锁」——把落闸挪出临界区（#60 缺陷形状）时测试**直接红**，不再依赖暂停钩子位置。release 零成本。
+- **F2（Stage A 在 CI 空跑）**：夹具断言住在 `fn main()` ⇒ `cargo test` 对纯 bin 包 0 tests；CI 新增真跑两夹具 bin（async 根 + sync workflow，`--locked`），exit 0 才算端到端。
+- **F3（并发停机报告窄窗丢载荷）**：`DrainSlot::Settled` 携带该次排空的 canonical 报告，`begin_drain` 改**单次 borrow** 同时取状态与载荷 ⇒ 结算瞬间到达的调用也拿到 canonical 报告（此前会拿默认报告、panic 载荷静默丢）；`shutdown`/`shutdown_timeout` 两分支同步；`reference.md` 口径更正。
+- **F4（`try_reap` release 下溢）**：加 `debug_assert` 锚住「tokio 任务析构先于 JoinError 观测」外部不变量并注释；release zero-cost。
+- **F6**：CI bench 注释改「五件并集（fx/journal/memgov/testing/pool）」+ 注明 `-p udf-skeleton` 无 bench 目标。
+- **F7（fmt 闸对夹具空心）**：三个夹具是独立 workspace，根 `cargo fmt --all` 看不到 ⇒ CI Rustfmt 步逐仓 `--check`（3 行）；并已 `cargo fmt` 排好 5 个文件（纯格式）。
+- **未改（P3 保留）**：F5 `Display` 中英混排（与 `shutdown.rs` 既有惯例同形，排文案批次）。
+
 ### Ci(docs): 单开 feature 面 doc 闸 + 面内 intra-doc 断链清偿,2026-11-23;bd udf-frame-ilh)
 - **门洞**：docs 门原来只跑 `--all-features`，指向**门控符号**的 intra-doc 链接在该面能解析、单开面解析不到 ⇒ 单面断链静默通过。逐面实测 15 面中 **12 面红**（`crate::fx::*` 挂 `tokio` 门、`load_toml` 等挂 `config-toml`、`init_*`/`ChannelRegistry` 等挂 `log`）。
 - **清偿**：把跨门控符号的链接改成 code span（与 config.rs 既有修法同款；模块头注在任一面都编译，链接不得依赖别的门）：`shutdown.rs` 1 处、`runtime.rs` 6 处、`config.rs` 3 处、`logx.rs` 模块头 14 处。

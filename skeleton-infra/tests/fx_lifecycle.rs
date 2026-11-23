@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use skeleton_infra::fx::{FxScope, ShutdownReport, TaskError, cancel_pair};
+use skeleton_infra::fx::{FxScope, TaskError, cancel_pair};
 
 /// 自旋段放行闸的 RAII 兜底：断言 panic 时也必须放开自旋段——否则 worker 线程
 /// 滞留在无 await 的 poll 里，运行时拆除期等它 ⇒ 测试挂死（CI 上表现成 job 超时，
@@ -288,14 +288,17 @@ async fn close_cancel_and_shutdown_are_idempotent() {
     let first = bounded("首次 shutdown 返回", scope.shutdown()).await;
     assert_eq!(first.completed, 1, "在途任务已终局 ⇒ 报告可见");
     assert_eq!(first.timed_out, 0);
+    // 审计 F3 后的语义：已结算的重复调用返回**该次排空的 canonical 报告副本**
+    // （旧实现返回空默认报告 ⇒ 并发停机时 panic 载荷静默丢）。
     let second = bounded("二次 shutdown 返回", scope.shutdown()).await;
-    assert_eq!(second, ShutdownReport::default(), "二次 shutdown 空报告");
+    assert_eq!(second, first, "二次 shutdown 返回 canonical 报告副本");
     let third = bounded(
         "空集超时路径返回",
         scope.shutdown_timeout(Duration::from_millis(50)),
     )
     .await;
-    assert_eq!(third, ShutdownReport::default(), "空集超时路径不声称超时");
+    assert_eq!(third.completed, 1, "已结算路径不得声称超时或丢失终局桶");
+    assert_eq!(third.timed_out, 0, "已结算路径不声称超时");
 }
 
 /// close ≠ cancel：闸关后在途任务照常跑到完成（既有语义，用测试钉死）。

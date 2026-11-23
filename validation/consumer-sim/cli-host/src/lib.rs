@@ -27,9 +27,7 @@ use std::time::{Duration, Instant};
 use skeleton::{
     ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Fragment, Reducer, Store as _,
 };
-use skeleton_infra::runtime::{
-    AdmissionOutcome, CloseReportOutcome, CloseWaitOutcome, SyncStore,
-};
+use skeleton_infra::runtime::{AdmissionOutcome, CloseReportOutcome, CloseWaitOutcome, SyncStore};
 
 /// 有界准入并发用例的握手 job：解释器在它的 `Run` 上停住，钉住排空租约。
 pub const GATE_JOB: JobId = 0;
@@ -198,10 +196,7 @@ impl RecordingFx {
     }
 
     pub fn executed(&self) -> Vec<Executed> {
-        self.executed
-            .lock()
-            .expect("解释器记录锁未被毒化")
-            .clone()
+        self.executed.lock().expect("解释器记录锁未被毒化").clone()
     }
 }
 
@@ -306,7 +301,10 @@ fn parse_job(raw: &str) -> Result<JobId, String> {
         .map_err(|err| format!("job id 非法 {raw:?}: {err}"))
 }
 
-fn admit(store: &SyncStore<HostState, HostAction, JobOp>, action: HostAction) -> Result<(), String> {
+fn admit(
+    store: &SyncStore<HostState, HostAction, JobOp>,
+    action: HostAction,
+) -> Result<(), String> {
     match store.try_dispatch(action) {
         AdmissionOutcome::Accepted => Ok(()),
         outcome => Err(format!("准入被拒: {outcome:?}")),
@@ -320,10 +318,7 @@ fn submit(raw: &str) -> Result<String, String> {
     let store = SyncStore::new(HostFeature, fx);
     store.set_capacity(16);
 
-    admit(
-        &store,
-        HostAction::Job(JobAction::Submit { job }),
-    )?;
+    admit(&store, HostAction::Job(JobAction::Submit { job }))?;
     let snapshot = store.snapshot();
     match store.close_wait() {
         CloseWaitOutcome::Drained => {}

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use skeleton_infra::fx::{CancelToken, FxScope, ShutdownReport, cancel_pair};
+use skeleton_infra::fx::{CancelToken, FxScope, cancel_pair};
 
 const LIMIT: Duration = Duration::from_secs(10);
 
@@ -342,11 +342,13 @@ async fn dropping_drain_owner_wakes_all_waiters_with_interrupted_outcome() {
     })
     .await;
 
-    // 中断不停在 Draining：后续顺序调用按既有契约返回空报告（可重试，不挂死）。
+    // 中断不停在 Draining：后续调用走「已结算」顺序语义，但**返回该次排空的
+    // canonical 报告副本**（审计 F3：旧实现返回空默认报告 ⇒ 并发停机时 panic
+    // 载荷被静默丢；此处仍须可重试、不挂死）。
     assert_eq!(
         scope.shutdown().await,
-        ShutdownReport::default(),
-        "已结算的排空：后续顺序调用返回空报告"
+        first_report,
+        "已结算的排空：后续调用返回该次排空的 canonical 报告副本（不得静默降级为空报告）"
     );
 }
 

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cli_host::{
-    run_cli, DrainGate, Executed, HostAction, HostFeature, JobAction, RecordingFx, GATE_JOB,
+    DrainGate, Executed, GATE_JOB, HostAction, HostFeature, JobAction, RecordingFx, run_cli,
 };
 use skeleton::Store as _;
 use skeleton_infra::runtime::{AdmissionOutcome, CloseReportOutcome, CloseWaitOutcome, SyncStore};
@@ -79,10 +79,7 @@ fn interpreter_records_run_then_cancel_in_order() {
 
     assert_eq!(
         observed.executed(),
-        vec![
-            Executed::Run { id: 5, job: 5 },
-            Executed::Cancel { id: 5 },
-        ]
+        vec![Executed::Run { id: 5, job: 5 }, Executed::Cancel { id: 5 },]
     );
     assert_eq!(
         store.cancel_unknown_id(),
@@ -148,7 +145,10 @@ fn composed_root_snapshot_freezes_held_arc_and_walks_make_mut_clone() {
     assert_eq!(live.heartbeats, 0);
     drop(live);
 
-    assert_eq!(store.try_dispatch(HostAction::Heartbeat), AdmissionOutcome::Accepted);
+    assert_eq!(
+        store.try_dispatch(HostAction::Heartbeat),
+        AdmissionOutcome::Accepted
+    );
     let live = store.snapshot();
     assert_eq!(live.heartbeats, 1);
     assert_eq!(live.queue.submitted, vec![1, 2], "父层分支不动子切片");
@@ -160,7 +160,10 @@ fn composed_root_snapshot_freezes_held_arc_and_walks_make_mut_clone() {
 fn heartbeat_parent_branch_leaves_child_slice_untouched() {
     let store = SyncStore::new(HostFeature, RecordingFx::new());
     assert_eq!(store.try_dispatch(submit(7)), AdmissionOutcome::Accepted);
-    assert_eq!(store.try_dispatch(HostAction::Heartbeat), AdmissionOutcome::Accepted);
+    assert_eq!(
+        store.try_dispatch(HostAction::Heartbeat),
+        AdmissionOutcome::Accepted
+    );
 
     let snapshot = store.snapshot();
     assert_eq!(snapshot.queue.submitted, vec![7]);
@@ -190,7 +193,7 @@ fn cli_entry_runs_submit_cancel_and_shutdown() {
 
 #[cfg(feature = "tokio")]
 mod async_face {
-    use skeleton_infra::fx::{cancel_pair, FxScope};
+    use skeleton_infra::fx::{FxScope, cancel_pair};
     use tokio::sync::oneshot;
 
     /// G1 修复后的消费方实证：`CancelSource: Clone`（同一取消态第二句柄）⇒
@@ -224,7 +227,10 @@ mod async_face {
         spawned.join().await.expect("任务应在取消后下一让渡点结束");
         let report = scope.shutdown().await;
         assert_eq!(scope.in_flight(), 0, "停机后无在途");
-        assert_eq!(report.completed, 1, "任务正常终局（取消是协作式返回，非 abort）");
+        assert_eq!(
+            report.completed, 1,
+            "任务正常终局（取消是协作式返回，非 abort）"
+        );
     }
 
     #[tokio::test]
