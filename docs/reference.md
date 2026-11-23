@@ -127,7 +127,7 @@ where S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
     pub fn feedback_budget_exceeded(&self) -> u64;
 
     // ── issue#62：历史 Run-ID 诊断（默认关闭，窄口径 opt-in）─────────────
-    pub const DEFAULT_RUN_ID_TRACKING_CAPACITY: usize;   // 保守默认（数值待 #56 拍板）
+    pub const DEFAULT_RUN_ID_TRACKING_CAPACITY: usize;   // 数值已拍板 keep current（2026-11-23），正典见本文件资源表决定记录
     /// 启用有界最近 ID 集 + 三态分类（`&mut self`：构造期/装配期一次性设置）。
     /// 关闭路径零 per-Run 锁与分配（门闸前仅一次 `OnceLock` load）。
     pub fn enable_run_id_diagnostics(&mut self, capacity: usize);
