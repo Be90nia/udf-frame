@@ -1,10 +1,10 @@
 //! 配置文件装配面：分层装配（default→file→层叠合并→load）+ 原子保存 + TOML
 //! 翻译捷径（行为件）。
 //!
-//! 契约已下沉 `skeleton::config`（批 1 契约真下沉，2026-10-18；ADR 0001）：[`ConfigPort`](skeleton::config::ConfigPort)/
-//! [`EnvSource`](skeleton::config::EnvSource)/[`ConfigError`]
+//! 契约已下沉 `skeleton::config`（批 1 契约真下沉，2026-10-18；ADR 0001）：`ConfigPort`/
+//! `EnvSource`/`ConfigError`
 //! 住契约层（纯 std 零门），本域只剩 feature 门控行为件——
-//! `config-json` = [`ConfigFile`] 分层装配+原子保存（serde_json::Value 统一
+//! `config-json` = `ConfigFile` 分层装配+原子保存（serde_json::Value 统一
 //! 值面），`config-toml` = TOML 翻译捷径（`load_toml`/`save_toml`/
 //! `file_layer_toml`）。拍板修订（2026-10-17，配置文件读写升一等公民）：
 //! 文件面框架供给，常驻核心格式盲的零依赖纪律由契约层承接。
@@ -14,7 +14,7 @@
 //! ```text
 //! 1. 底座（采用方）：默认值 / 文件加载结果，构造 Self 时自带——
 //!    格式解析、字段默认全在契约之外（格式不感知）；文件层框架面见
-//!    [`ConfigFile`]（config-json feature，default→file 分层装配）
+//!    `ConfigFile`（config-json feature，default→file 分层装配）
 //! 2. env 覆盖（契约层）：ConfigPort::load 经 EnvSource 读环境，
 //!    显式出现的键覆盖底座值
 //! 3. 校验（契约层）：产出 Config 前完成——缺必填键报 Missing（禁静默

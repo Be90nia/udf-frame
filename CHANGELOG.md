@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Fixed(fx): `CancelSource` 实现 `Clone`——接线后宿主仍可触发取消,2026-11-23;GitHub issue#56（Stage B G1）
+- **缺口（第二消费方实测）**：`CancelSource` 非 `Clone` 且 `FxScope::with_source(src)` **按值取走** ⇒ 宿主外接取消源后**再没有任何句柄能触发取消**（`source.clone()` → E0599），只剩「接线前已取消」的粘性用例可测。
+- **修复**：`#[derive(Clone)]`（底层 `watch::Sender` 本身可 Clone）。**Clone = 同一取消态的第二句柄，不是独立源**——所有句柄共享同一 watch 值，任一句柄 `cancel()` 全体可见；取消幂等、单向（`false → true`，不回落；与 #68 的无接收者粘性叠加）。
+- **测试**：新 `skeleton-infra/tests/fx_cancel_source_clone.rs`（2 例，确定性握手禁 sleep）——① 源被 `with_source` 取走后，用预先 clone 的句柄取消 ⇒ scope 的 token 见取消、任务在下一让渡点结束、`in_flight` 有界归 0；② 原句柄与初始 token 全丢弃后，唯一 clone 句柄仍可取消（连打两次验幂等），之后接入的两个 scope 都观察到 `true`。**红**：修复前两例均 `E0599 no method named clone`（编译级红）。
+- 公共 API 仅新增 `impl Clone`（无签名变更、无新依赖）；`docs/reference.md` API 目录与 Stage B 夹具注释同步。
+
 ### Added(validation): 第二消费方 Stage B（结构相异的任务调度 CLI 宿主）+ 资源默认值正典表,2026-11-23;GitHub issue#56)
 - **Stage B 夹具入库**：`validation/consumer-sim/cli-host/`（受版本控制，自带空 `[workspace]` + `Cargo.lock` + path 依赖）——真实宿主形态：submit / cancel / shutdown 三段 CLI、自定义 `EffectRuntime`（Run + Cancel 两种效果的执行序）、**并发下有界准入的真实 `Full`**（condvar 握手、无 sleep、断言被拒 action 未入队）、`close_wait_with_report → Drained` + 闭门后 typed `Closed`、**combine/Fragment 组合根** + `Arc::strong_count` 观测 `Arc::make_mut` 克隆分支与快照冻结。
 - **两面依赖树证据**：`cargo tree` 确定性脚本追加进 `validation/consumer-sim/dep-trees.txt`——sync 面 tokio 计数 **0**，`--features tokio` 面 **3**（反向控制：证明 feature 真接线、断言非恒真）。

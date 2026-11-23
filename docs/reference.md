@@ -2129,7 +2129,10 @@ pub struct ShutdownReport {          // 停机排空报告（fx 域自有；与 
     pub drain_interrupted: bool,     // 报告来源：排空 owner 被 drop/panic ⇒ 中断结果（只请求 abort，不确认终止）
 }
 
+#[derive(Clone)]
 pub struct CancelSource { /* … */ }
+// Clone = 同一取消态的第二句柄（不是独立源）：任一句柄 cancel 全体可见；
+// 宿主把源按值交给 `with_source` 后，仍可用预先 clone 的句柄触发取消。
 impl CancelSource {
     pub fn cancel(&self);            // 幂等；单向 false→true（粘性：无接收者期间也存下，之后订阅者立即见到 true）
     pub fn is_cancelled(&self) -> bool;

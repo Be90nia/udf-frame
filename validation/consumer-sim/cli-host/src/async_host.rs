@@ -6,12 +6,13 @@ use tokio::sync::oneshot;
 /// 取消探针：任务先进入等待点（oneshot 握手，无 sleep），宿主触发取消，
 /// 断言 token 立即可见、任务在下一让渡点结束、scope 停机后无在途。
 ///
-/// ⚠️ 消费方视角缺口（不改框架，Stage C 报告原料）：`CancelSource` 非
-/// `Clone` 且 [`FxScope::with_source`] 按值取走 ⇒ **接线后宿主手里再无
-/// 可触发取消的句柄**（scope 不暴露 source）。因此本探针保留 `cancel_pair`
-/// 的 source 在宿主侧触发，把 `with_source` 的外接形态留给「接线前已取消」
-/// 的粘性用例（见集成测试）；「宿主在 scope 存续期取消外接源」目前无公开
-/// 路径。
+/// ⚠️ 消费方视角缺口（Stage C 报告原料；**框架侧已修**）：`CancelSource`
+/// 曾非 `Clone` 且 [`FxScope::with_source`] 按值取走 ⇒ 接线后宿主手里再无
+/// 可触发取消的句柄。现 `CancelSource: Clone`（Clone = **同一取消态**的第二
+/// 句柄，不是独立源）⇒ 宿主可预先 `let handle = source.clone()`，把源按值
+/// 交给 `with_source` 后用 `handle.cancel()` 触发。框架侧回归见
+/// `skeleton-infra/tests/fx_cancel_source_clone.rs`（2 例）。本探针仍保留
+/// `cancel_pair` 的 source 在宿主侧触发的既有形态（不改变已入库证据）。
 pub async fn run_cancellation_probe() -> Result<String, String> {
     let (source, token) = cancel_pair();
     let scope = FxScope::new();
