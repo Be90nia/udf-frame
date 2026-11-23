@@ -4,6 +4,7 @@
 # Rust 版本 pin 1.96.0 对齐开发/验证基线，防工具链漂移；三 OS 矩阵。
 # 自持 workspace：members = udf-skeleton + udf-std-ext + udf-skeleton-infra。
 # 另含 feature 隔离矩阵 job（issue#37）：`full` 全部子开关各跑最小面 check+test。
+# 另含 std-ext 三门控域隔离矩阵 job 与 MSRV（1.87, --locked）job。
 name: udf-frame CI
 
 on:
@@ -151,6 +152,9 @@ jobs:
   # unsafe-evidence 不在 full（证据专用开关，非消费能力）不入矩阵，其
   # 行为由 --all-features 步覆盖。每面最小口径 check+test：
   # --no-default-features --features <X>。
+  # 末位 `full` 条目额外验证聚合面：14 叶子并集一次编译+测试（采用方一键
+  # 全开的实际口径）。与 --all-features 步的差 = unsafe-evidence 证据开关
+  # 不在 full 内（故 full 不是 --all-features 的别名，二者不可互换）。
   # runtime 面显式断言 Tokio-free（蓝图 §13 行 1「Sync-only consumer has
   # no Tokio in its dependency tree」）：与上方 sync-only 步同款
   # cargo tree -e normal + fail-closed 口径（tree 失败与检出 tokio 都
@@ -167,7 +171,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        feature: [runtime, pool, memgov, tokio, journal, testing, log-fs, log, tracing, log-embed, compose, view, config-json, config-toml]
+        feature: [runtime, pool, memgov, tokio, journal, testing, log-fs, log, tracing, log-embed, compose, view, config-json, config-toml, full]
     steps:
       - uses: actions/checkout@v4
 
@@ -195,3 +199,52 @@ jobs:
             exit 1
           fi
           echo "ok: runtime face normal dep graph is tokio-free"
+
+  # ── std-ext feature 隔离矩阵闸 ──────────────────────────────────
+  # std-ext 自身三个门控域（json = serde_json / random = getrandom /
+  # log-embed = tracing）都是依赖隔离门：单开面才证「该门不借别的门编过」
+  # （--all-features 步正好把三者一起点亮，掩盖单开面）。默认集为空（十三
+  # 域常驻零门），故 --no-default-features 与默认等价，仍显式带上：默认集
+  # 将来被改成非空时，本步不会静默变成「默认+该门」的另一口径。
+  # 单 OS：feature 门是 cfg(feature) 维度，与平台正交。
+  std-ext-feature-isolation:
+    name: std-ext feature isolation (${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [json, random, log-embed]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.96.0 (pinned)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Check (no-default-features --features ${{ matrix.feature }})
+        run: cargo check -p udf-std-ext --no-default-features --features ${{ matrix.feature }}
+
+      - name: Test (no-default-features --features ${{ matrix.feature }})
+        run: cargo test -p udf-std-ext --no-default-features --features ${{ matrix.feature }}
+
+  # ── MSRV 闸（rust-version = 1.87，三 crate 同值）─────────────────
+  # --locked 是本 job 的关键属性：Cargo.lock 参与校验 ⇒ 依赖版本被原地
+  # 锁定，任何「依赖抬高 MSRV」都落成**确定性红**（锁文件那版在 1.87 上
+  # 编不过，可复现、可定责），而不是解析期惊喜（某天自己挑了个更新的传递
+  # 依赖，红在与本仓无关的地方）。锁文件漂移同样红，须显式升级决策。
+  # docs -D warnings 与 clippy 刻意不进本 job：两者诊断集随工具链版本
+  # 变化，旧工具链会把新 warning 判红 = 与 MSRV 无关的假红。
+  # 不装 components：本 job 只需 rustc+cargo 默认面。
+  msrv:
+    name: msrv (1.87, locked)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.87 (MSRV, no components)
+        uses: dtolnay/rust-toolchain@1.87
+
+      - name: Check workspace (locked)
+        run: cargo check --workspace --locked
+
+      - name: Test skeleton (locked)
+        run: cargo test -p udf-skeleton --locked

@@ -53,6 +53,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+    # 基线 key 按 OS 分（perf-baseline-<os>-），不同 OS 的基线互不相干 ⇒
+    # concurrency 同按 OS 分组：保留 OS 并行，只串行同 OS 的跨 run。
+    # cancel-in-progress: false = 排队不取消——取消在途 run 会造出 #51 的
+    # 「部分运行污染基线」形态（cache 已存下半套 summary.json、artifact 缺
+    # 一半），下一轮拿它当基线 = 假回归告警。
+    concurrency:
+      group: perf-baseline-${{ matrix.os }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 

@@ -1644,11 +1644,14 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ///
     /// - `capacity`：有界环容量（0 视作 1）。溢出丢最旧——最新生命周期优先；
     ///   丢失无新计数，`seq` 空洞即显式证据（见 [`AuditEvent`]）。
-    /// - `on_event`：实时回调（每事件锁外调用一次；纯环录模式传 `|_| {}`）。
-    ///   回调 panic = fail-closed 摘除（环照录、dispatch 行为不变——观测面禁
-    ///   改变被观测者），成因计入 [`Self::subscriber_panics`] /
-    ///   [`Self::subscriber_panic_last_cause`]。回调内重入 dispatch 的
-    ///   事件只录环不再回调（TLS 在途标记封自指递归）。
+    /// - `on_event`：实时回调（**best-effort 观测面**，非每事件保证——权威历史
+    ///   是环 + `seq`，取证走 [`Self::take_events`]；订阅面通用词汇见
+    ///   `docs/reference.md`「投递语义词汇」）。回调在 emit 调用方线程内同步
+    ///   调用（慢回调拖慢 emit 调用方的时序）；并发发射窗内未取得回调权的事件、
+    ///   以及回调内重入 dispatch 的事件，只录环不再回调（后者 TLS 在途标记封
+    ///   自指递归）。纯环录模式传 `|_| {}`。回调 panic = fail-closed 摘除（环照
+    ///   录、dispatch 行为不变——观测面禁改变被观测者），成因计入
+    ///   [`Self::subscriber_panics`] / [`Self::subscriber_panic_last_cause`]。
     /// - 票据 Drop = 关闭；被覆盖的旧票据 Drop 凭代次对账，禁误杀后继流。
     ///
     /// # Examples

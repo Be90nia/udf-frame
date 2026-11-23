@@ -153,7 +153,7 @@ cargo build --workspace --all-features
 cargo test --workspace --all-features
 ```
 
-采用方一键全开（tokio 先例）：`features = ["full"]` = 本 crate 全部子开关并集，等价本 crate `--all-features`；默认集仍最小（零三方），子开关=进阶裁剪。`std-ext` 的七域 35 埋点（`log-embed`）由其自有同款 feature 承载，不随本 crate `full` 点亮（ADR 0005：跨 crate 强制耦合否决）——workspace 全量埋点=两 crate 各自 `--all-features`（CI 同款）。
+采用方一键全开（tokio 先例）：`features = ["full"]` = 14 个消费面叶子并集（不含 `unsafe-evidence` 证据开关；`--all-features` = full + unsafe-evidence）；默认集仍最小（零三方），子开关=进阶裁剪。`std-ext` 的七域 35 埋点（`log-embed`）由其自有同款 feature 承载，不随本 crate `full` 点亮（ADR 0005：跨 crate 强制耦合否决）——workspace 全量埋点=两 crate 各自 `--all-features`（CI 同款）。
 
 ## License
 

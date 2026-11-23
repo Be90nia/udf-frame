@@ -50,25 +50,34 @@ pub(super) fn audit_enqueued<S, A, Op>(inner: &StoreInner<S, A, Op>, origin: Act
 }
 
 /// 审计发射唯一收口：未订阅 = 一次 gate load 即返；订阅态 = 有界环入账
-/// （溢出丢最旧）+ 实时回调（锁外调用——回调可重入本 store 的一切入口，
-/// 持锁即死锁；take/归还窗口内订阅被替换则宁弃旧回调禁覆盖新槽）。
+/// （`seq` 在入环临界区内分配 ⇒ 环序 = `seq` 序；溢出丢最旧）+ 实时回调。
+///
+/// 实时回调是 **best-effort 观测面**（权威历史 = 环 + `seq`，取证走
+/// `take_events`；订阅面通用词汇见 `docs/reference.md`「投递语义词汇」）：
+/// 回调在 emit 调用方线程内同步调用（慢回调拖慢 emit 调用方的时序——已知
+/// 观测面张力）；并发发射窗内未取得回调权的事件只入环、不进回调；同线程
+/// 重入 dispatch 的事件同款抑制。回调**锁外**调用（回调可重入本 store 的
+/// 一切入口，持锁即死锁）；take/归还窗口内订阅被替换则宁弃旧回调禁覆盖新槽。
 pub(super) fn audit_emit<S, A, Op>(inner: &StoreInner<S, A, Op>, kind: AuditEventKind) {
     if !inner.audit_gate.load(Ordering::Acquire) {
         return;
     }
-    let event = AuditEvent {
-        seq: inner.audit_seq.fetch_add(1, Ordering::Relaxed) + 1,
-        kind,
-    };
-    let mut notify = {
+    // `seq` 分配与入环同一临界区（issue#65）：并发 emitter 不会出现「先取得
+    // seq、后入环」的反序；sink 已摘除（None）不分配 seq。原子仍取 Relaxed
+    // ——序由锁临界区给。
+    let (event, mut notify) = {
         let mut guard = lock(&inner.audit);
         match guard.as_mut() {
             Some(sink) => {
+                let event = AuditEvent {
+                    seq: inner.audit_seq.fetch_add(1, Ordering::Relaxed) + 1,
+                    kind,
+                };
                 if sink.ring.len() >= sink.cap {
                     sink.ring.pop_front();
                 }
                 sink.ring.push_back(event);
-                sink.notify.take()
+                (event, sink.notify.take())
             }
             None => return,
         }

@@ -386,6 +386,10 @@ fn closed_gate_dispatch_leaves_rejected_audit_scene() {
     let mut sorted = seqs.clone();
     sorted.sort_unstable();
     assert_eq!(seqs, sorted, "取走序即发射序（seq 单调）");
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "入环事件的 seq 严格递增且与环序一致（seq 与入环同临界区分配）：{seqs:?}"
+    );
     assert_eq!(
         store.rejected_after_close(),
         3,

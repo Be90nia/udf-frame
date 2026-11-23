@@ -16,7 +16,7 @@
 
 | feature | 依赖面 | 默认 | 内容 |
 |---|---|---|---|
-| `full` | 全部子开关 | — | **一键全开**（tokio 先例）：`features = ["full"]` = 下表全部子开关并集；新手心智入口，子开关=进阶裁剪面 |
+| `full` | 全部子开关 | — | **一键全开**（tokio 先例）：`features = ["full"]` = 下表 14 个消费面叶子并集（不含 `unsafe-evidence` 证据开关；`--all-features` = full + unsafe-evidence）；新手心智入口，子开关=进阶裁剪面 |
 | `runtime` | — | ✅ | `SyncStore`（契约参考实现，std-only）+ `LocalSubscription` + `audit` 审计值面 |
 | `pool` | `memgov` | ✅ | `PoolBase` 管理组合件 + `ThreadPool` + `PooledThreadPool` + `ObjectPool` 通用对象池（reset 钩子/有界降级/分片槽位）；连带启用 `memgov` |
 | （常驻，std-ext） | 十三域零依赖；`json` 域经 `json` feature 门引 `serde_json` | — | `text` `backoff` `retry` `paths` `clock` `scheduler` `ratelimit` `cache` `fsx` `encode` `id` `iter` `hash` `json` **十四域**（`std-ext` crate；行为件面；时间源/配置/日志路径契约在 `skeleton::clock`/`skeleton::config`/`skeleton::logpath`，批 1 契约真下沉；十三域零门常驻，`json` 域门控 `json` feature） |
@@ -280,7 +280,21 @@ impl EffectKind {
 
 **`EffectId` ≠ 投递身份**：`EffectId` 是 reducer/消费者定义的**逻辑效果句柄**（**一个 store 内全局唯一**——见 `skeleton::EffectId` 的唯一性纪律），**不是**框架生成的投递尝试身份。本批**不引入重试**、**不承诺** exactly-once；#45 拍板的 Option D 语义（至多一次调用尝试 · 外部结果不确定 · 不自动重放）**保持不变**，幂等/去重属消费方责任。
 
-生命周期重建协议：记账单位是 **action 而非 dispatch**——一笔 dispatch 主 action 走 `Enqueued(depth) → Reduced → [EffectForwarded* | EffectInterrupted] → Notified?`；Emit 回灌派生的每个动作各走一条同形链交错嵌进主链时间线。`Notified` 仅当拍确有状态快照订阅者收到快照时记录。`seq` 单调，订阅窗内**连续**——空洞 = 有界环溢出丢最旧的显式证据。默认关闭零开销：未订阅路径 = 每 emit 点一次 gate load 即返。多订阅者间逐字交错顺序不可预推；时间线断言用语义不变量（深度链/节点计数），勿钉逐字全局顺序。
+生命周期重建协议：记账单位是 **action 而非 dispatch**——一笔 dispatch 主 action 走 `Enqueued(depth) → Reduced → [EffectForwarded* | EffectInterrupted] → Notified?`；Emit 回灌派生的每个动作各走一条同形链交错嵌进主链时间线。`Notified` 仅当拍确有状态快照订阅者收到快照时记录。`seq` 在入环临界区内分配（⇒ 环序 = `seq` 序，并发发射下亦然；issue#65），订阅窗内单调**连续**——空洞 = 有界环溢出丢最旧的显式证据。**实时回调是 best-effort 观测面**（不承诺每事件必达，权威历史是环 + `seq`）——词汇与丢弃证据分类见下方「投递语义词汇（订阅面通用）」。默认关闭零开销：未订阅路径 = 每 emit 点一次 gate load 即返。多订阅者间逐字交错顺序不可预推；时间线断言用语义不变量（深度链/节点计数），勿钉逐字全局顺序。
+
+### 投递语义词汇（订阅面通用）
+
+四个订阅面（`SyncStore` 审计实时回调、状态订阅者、异步 `NotifySink`、池域审计流）共用同一套投递语义；词表在此定义一次，各面 rustdoc 引用本节，禁各自改写（口径漂移 = 采用方拿到两套保证）。
+
+| 词 | 定义 |
+|---|---|
+| **权威历史** | 有界环 + 单调 `seq`（`SyncStore::take_events` / `PoolBase::take_audit_events` 取证面）。**完整性承诺只在历史侧**：环内事件按 `seq` 序可重放，`seq` 空洞 = 环溢出丢最旧的显式证据。 |
+| **best-effort 观测面** | 实时回调（live callback）：在 emit 调用方线程内**同步**调用——慢回调拖慢 emit 调用方的时序（已知观测面张力）；并发发射窗内未取得回调权的事件、以及同线程重入的事件只入环不进回调。**不承诺**每事件必达、**不引入** backpressure；要完整性 ⇒ 消费方 drain 权威历史。 |
+| **deactivation 线性化点** | 去活裁决点 = 摘除路径的 `alive` swap（`false`；票据 Drop 与 panic 摘除共用这一裁决与闸回落）。**该点之后不再准入新投递**（#73/#74 引用本定义）。 |
+| **in-flight** | 已通过**最终 alive 检查**的已准入投递。线性化点之前准入的投递**可以完成**（可能在去活后、甚至票据 Drop 返回后仍在执行）⇒ 契约是「去活后无新投递开始，在途可完成」，**不是**静默保证；严格 quiescence（Drop 返回即无回调在跑）需另立阻塞式协议，本框架不提供。 |
+| **丢弃证据（互不替代）** | ① **投递丢弃计数**：只数回调投递未发生的次数（观测面自己的账，不留 `seq` 痕迹）；② **ring 溢出**：历史侧丢最旧（容量因）；③ **seq 断裂**：ring 溢出的可观测形态。⇒ 回调漏投**不产生** `seq` 空洞；`seq` 空洞**只证**历史丢失，不证回调丢失；`take_events` 取走（drain）也不留空洞（空环 ≠ 历史丢失）。 |
+
+**当前状态（2026-11-23，#65 拍板）**：`SyncStore` 审计实时回调为 best-effort，**不**新增投递丢弃计数（无 backpressure 就不虚构精确账）；权威历史 = 环 + `seq`，`seq` 在入环临界区内分配。池域 / 状态订阅 / 异步投递面的同类契约与计数以各自 rustdoc 为准，词表统一按本节。
 
 ### 最小示例
 
@@ -2343,7 +2357,7 @@ pub fn bridge_events_to_tracing<
 ) -> AuditTicket;
 ```
 
-每事件一条 `tracing::event!`（target `skeleton::audit`，INFO 级），字段 `seq`/`kind`（生命周期节点名=过滤聚合稳定键）/`depth`（仅 Enqueued 携带回灌深度）。`capacity` 语义同 `SyncStore::subscribe_events`；返回票据 Drop=停桥（零开销恢复）。
+每个投递到的事件一条 `tracing::event!`（target `skeleton::audit`，INFO 级），字段 `seq`/`kind`（生命周期节点名=过滤聚合稳定键）/`depth`（仅 Enqueued 携带回灌深度）。**best-effort 观测面**：并发发射窗内可能有事件未进回调（桥也就不输出），完整性取证走 `take_events`——见「投递语义词汇（订阅面通用）」。`capacity` 语义同 `SyncStore::subscribe_events`；返回票据 Drop=停桥（零开销恢复）。
 
 ```rust
 use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
@@ -2497,7 +2511,7 @@ target 规范：域=`skeleton::<domain>`，子流程=`skeleton::<domain>::<phase
 
 | 组合 | 形态 | 说明 |
 |---|---|---|
-| `full` | 一键全开 | 本 crate 13 子开关并集（等价本 crate `--all-features`）；采用方默认心智入口——「不懂就 full」，子开关=进阶裁剪。std-ext 七域 35 埋点由其自有 `log-embed` 承载（ADR 0005 否决跨 crate 强制耦合）；workspace 全量=两 crate 各自 `--all-features` |
+| `full` | 一键全开 | 本 crate 14 消费面叶子并集（不含 `unsafe-evidence` 证据开关；`--all-features` = full + unsafe-evidence）；采用方默认心智入口——「不懂就 full」，子开关=进阶裁剪。std-ext 七域 35 埋点由其自有 `log-embed` 承载（ADR 0005 否决跨 crate 强制耦合）；workspace 全量=两 crate 各自 `--all-features` |
 | `--no-default-features` | 纯生态件面 | 常驻 14 域（行为件面；十三域零门常驻、本体纯 std；`json` 域与凭据级 `RandomId`（`random` 门）按需显式开）+ memgov 可独立（`--features memgov`） |
 | 默认 | runtime + pool | pool 连带 memgov；SyncStore/PoolBase/ThreadPool 可用 |
 | `log-fs` 单开 | log-fs 面零三方 | 文件日志可用（mask_secrets/DefaultPathResolver/FileSink），不拉 tracing 四件套；std-ext 常驻依赖（及其 `json` 域 `serde_json`）仍在树内 |

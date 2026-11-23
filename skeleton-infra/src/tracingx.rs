@@ -1,10 +1,11 @@
 //! 骨架审计事件流 → tracing 桥。
 //!
 //! 核心零原生输出、宿主无库内 hook/span 可挂——收口形态：核心出审计事件流
-//! （[`crate::runtime::SyncStore::subscribe_events`]），本桥一行接线把每事件转
-//! `tracing::event!`（target `skeleton::audit`，INFO 级）。核心 crate 保持零
-//! 依赖：桥在本层持 tracing 依赖（feature 门控，tokio/log 先例形态）；审计值面
-//! 在本 crate `audit` 域，实现走 `runtime::SyncStore`。
+//! （[`crate::runtime::SyncStore::subscribe_events`]），本桥一行接线把投递到的
+//! 审计事件转 `tracing::event!`（target `skeleton::audit`，INFO 级；**best-effort
+//! 观测面**——不保证每事件必达，权威历史见 `SyncStore::take_events`）。核心
+//! crate 保持零依赖：桥在本层持 tracing 依赖（feature 门控，tokio/log 先例形态）；
+//! 审计值面在本 crate `audit` 域，实现走 `runtime::SyncStore`。
 //!
 //! # Examples
 //!
@@ -31,9 +32,11 @@
 use crate::audit::{AuditEvent, AuditEventKind, AuditTicket};
 use crate::runtime::SyncStore;
 
-/// 把 `store` 的审计事件流桥接到 tracing：每事件一条 `tracing::event!`
-/// （target `skeleton::audit`，INFO 级），字段 `seq`（单调序号）/ `kind`
-/// （生命周期节点名）/ `depth`（仅 Enqueued 事件携带回灌深度）。
+/// 把 `store` 的审计事件流桥接到 tracing：每个投递到的事件一条
+/// `tracing::event!`（target `skeleton::audit`，INFO 级），字段 `seq`（单调
+/// 序号）/ `kind`（生命周期节点名）/ `depth`（仅 Enqueued 事件携带回灌深度）。
+/// **best-effort**：并发发射窗内可能有事件未进回调（桥也就未输出），完整性
+/// 取证走 `take_events`（见 [`SyncStore::subscribe_events`] 的回调契约）。
 /// `capacity` 语义同 [`SyncStore::subscribe_events`]；返回票据 Drop =
 /// 停桥（零开销恢复）。
 ///
