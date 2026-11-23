@@ -2080,11 +2080,12 @@ pub struct ScopeClosed;   // accepting 闸已关：spawn 拒新（fail-closed �
 pub struct ShutdownReport {          // 停机排空报告（fx 域自有；与 shutdown 域 coordinator 报告同名不同型）
     pub panicked: Vec<String>,       // 排空收割的 panic 消息（句柄被丢也不丢）
     pub timed_out: usize,            // 截止时未完成数（仅 shutdown_timeout 超时路径 >0）
+    pub drain_interrupted: bool,     // 报告来源：排空 owner 被 drop/panic ⇒ 中断结果（只请求 abort，不确认终止）
 }
 
 pub struct CancelSource { /* … */ }
 impl CancelSource {
-    pub fn cancel(&self);            // 幂等；观察面恒见 false→true 恰一次
+    pub fn cancel(&self);            // 幂等；单向 false→true（粘性：无接收者期间也存下，之后订阅者立即见到 true）
     pub fn is_cancelled(&self) -> bool;
 }
 
@@ -2115,6 +2116,7 @@ impl FxScope {
 - `spawn_tracked` 线性化=锁内原子 RMW 过闸 + 插入与 shutdown 的 abort_all 串行——过闸任务必被 shutdown 覆及。
 - 条目滞留与收割（issue#13）：生命周期集条目不再静默丢弃——panic 载荷进集合（句柄被丢也不丢），**join 与 `try_reap`/停机排空双重可见**（同一 panic 两条路都可能报出，诊断面语义非 exactly-once）；完成条目滞留集合至 `try_reap`（增量收割口：锁内同步 `try_join_next` 扫已完成条目，空集零分配、幂等，不动在途任务、不改 in_flight）或停机排空显式消费。
 - 停机报告：`shutdown` 排空收割 panic 载荷入 `ShutdownReport.panicked`（abort 条目=预期消亡不计入）；`shutdown_timeout` 超时不再返回 `Err`——超时即返前先增量收割已完结条目（panic 载荷不因超时丢失），剩余未完成数计 `timed_out`（剩余集 Drop=abort 兜底，零残留）。
+- **并发停机契约（issue#70）**：三个角色。**owner** = 首个进入排空的调用（`Open→Draining` 在取 JoinSet **之前**原子发布）——由它决定排空策略并发布 **canonical 报告**（正常完成 / 自身截止），实现上是一条 RAII 守卫，**每条退出路径（成功 / 超时 / panic / 取消）都先结算共享谓词再通知等待者**，共享状态锁内只碰报告自有数据（不跑用户代码、不跑用户析构）；守卫被 drop（owner future 被弃置）⇒ 发布**中断结果**（`drain_interrupted=true` + 中断时已知计数）再让 JoinSet drop 请求 abort，**绝不**停在 `Draining`。**等待者** = 之后的并发调用——醒来拿到同一份 canonical 报告；等待者**自己的**截止到期时只按自身读数返回（终局桶空，只有自身的 `timed_out`/`still_running`），**不得改写 owner 的策略**，其报告**不是** canonical。**已结算** = 排空完成后的再次调用——返回默认报告（顺序二次调用的既有语义不变）。判「整 scope 停机完成」请用「已结算」或 `in_flight()==0`，勿只看报告字段：中断/超时都**只请求 abort，不确认终止**。
 
 **实测**（单批，Windows 10 x64 / 16 核 / rustc 1.96.0；`cargo run --release -p udf-skeleton-infra --features tokio,memgov --example fxscope_multidim` ⑤停机段；粗测供判级，跨批波动 10–30% 属常态）：shutdown 排空已完结条目 **252ns/条目**（10k 条目 join_next 收割面）；shutdown 中止在途 111µs（100 park 任务 close+abort_all+收割）；`shutdown_timeout` 守卫设定 5ms 中位 7ms、超时命中 3/3（报告形 `timed_out>0` 判定；超出部分=Windows 计时器粒度+传播开销）。
 

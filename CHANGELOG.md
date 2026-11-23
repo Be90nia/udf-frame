@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+### Added(fx): 并发停机契约（RAII drain-owner 守卫 + 中断结果）,2026-11-23;GitHub issue#70)
+- **问题面**:`shutdown`/`shutdown_timeout` 并发调用时,排空状态此前不是共享状态机——并发叫者会**先于排空完成**拿到一份全零 `ShutdownReport`;owner future 被弃置(select 竞败)时会**永久停在排空中**,等待者等于等一个永不产生的报告。
+- **契约(三角色)**:① **owner** = 首个进入排空者,`Open→Draining` 在**取 JoinSet 之前**原子发布(两段无 await),由它决定策略并发布 **canonical 报告**;实现为 RAII 守卫,**每条退出路径(成功/超时/panic/取消)先结算共享谓词再通知等待者**,锁内只碰报告自有数据(不跑用户代码/用户析构)。② **等待者** 醒来拿同一份 canonical 报告;自身截止到期只按自身读数返回,**不得改写 owner 策略**,其报告**非 canonical**。③ **已结算** 再调用返回默认报告(顺序二次调用语义不变)。守卫被 drop ⇒ 发布**中断结果**(新公共字段 `ShutdownReport::drain_interrupted` + 中断时已知计数)再让 JoinSet drop 请求 abort,**绝不**停在 `Draining`。
+- **不声称取消确认终止**:中断/超时都只请求 abort;任务守卫与 `in_flight` 在任务真正退出前具权威(与 #67 同一口径)。
+- **测试**:新 `skeleton-infra/tests/fx_cancel_and_shutdown_owner.rs`(7 例,确定性握手禁 sleep,含用户析构重入探针):并发等待者共享 canonical 报告(修复前实得全零报告)/ 更短截止的等待者不改写 owner 策略 / owner future 被 drop 时所有等待者以文档化中断结果醒来 / 超时 owner 向等待者发布截止报告 / 既有唤醒与顺序二次调用回归。**红→绿**:修复前 6 FAILED / 1 passed。
+- **公共面**:仅新增 `ShutdownReport::drain_interrupted` 字段(`#[non_exhaustive]` 内,非破坏)与既有方法的行为修复;无依赖/feature 变更。
+
+### Fixed(fx): `CancelSource` 取消态在无接收者期间不再丢失（单向存储转换）,2026-11-23;GitHub issue#68)
+- **缺陷**:`watch::Sender::send(true)` 在**没有接收者**时不写入值 ⇒ 无接收者窗口里的取消**静默丢失**,之后 `with_source` 接上的订阅者观察到 `false`,取消永不生效。
+- **修复**:改用 `send_if_modified`(单向 `false→true`,即 CAS)——无接收者也把值存下、只在真实转换时唤醒当前接收者(重复 cancel 无冗余版本通知)、**watch 值是唯一真源**(不另设原子标志)。同时修发送侧 `is_cancelled()`(读存下的值,不再受接收者影响)与「send 失败无害」的误导性注释。
+- **测试**:`fx_cancel_and_shutdown_owner.rs` 内 2 例(无接收者窗口后接订阅者：source 与 token 都必须见到 true;全部 clone 丢弃后取消仍留存且幂等)+ 1 例唤醒回归。修复前红。
+- **兼容**:`cancel`/`cancelled`/`is_cancelled` 签名与语义零破坏(旧行为是无接收者时丢失——属 bug 不是承诺)。
+
 ### Added(runtime): `close_wait_with_report` 终态报告 + `discard_pending_effects` 显式丢弃,2026-11-23;GitHub issue#61)
 - **契约口径（维护者拍板 B+C）**:legacy `close()` 保持「准入关闭 + best-effort 排空/交接」,**不是效果 flush**,**不承诺**终态 pending 效果快照。新增**一个**受 quiescence 闸控的操作 `SyncStore::close_wait_with_report(d)`:闭门 → 复用 #64 谓词等待（排空租约释放 + 活跃队列空）→ **仅在 `Drained` 之后**快照。
 - **返回和类型 `CloseReportOutcome`**:`Drained(CloseReport)` / `TimedOutStillRunning` / `Reentrant`;**只有 `Drained` 携带快照**（超时/重入带快照会被调用方误当终态）。`Reentrant` 时准入**已关**（闭门先于重入判定）。静止窗复核失败宁报 `TimedOutStillRunning`,不给假快照。
