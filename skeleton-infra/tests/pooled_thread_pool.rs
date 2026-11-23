@@ -409,6 +409,19 @@ fn resize_shrink_overflow_semantics() {
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
+    // 归还发生在闭包返回后，recv 信号早于归还完成——先等两件归还入池
+    // （idle 达 1）再提交第三任务，否则第三任务 borrow 会与归还在途竞争
+    // （ubuntu 实测 dropped_overflow=2：第三任务 borrow 拿到池空态等待，
+    // 期间第二件归还占满唯一闲槽，第三件归还即溢出）。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while buffers.metrics().core.idle < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待两件归还入池超时（idle 应达 1）"
+        );
+        std::thread::yield_now();
+    }
+
     // 池可继续用（先跑完使用面，指标终态断言统一放 join 后）。
     let (tx, rx) = mpsc::channel();
     ptp.submit(move |buf: &mut Vec<u8>| {
