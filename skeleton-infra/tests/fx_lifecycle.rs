@@ -19,6 +19,11 @@ use std::time::{Duration, Instant};
 
 use skeleton_infra::fx::{FxScope, TaskError, cancel_pair};
 
+#[path = "common/guards.rs"]
+mod guards;
+
+use guards::{bounded, wait_until};
+
 /// 自旋段放行闸的 RAII 兜底：断言 panic 时也必须放开自旋段——否则 worker 线程
 /// 滞留在无 await 的 poll 里，运行时拆除期等它 ⇒ 测试挂死（CI 上表现成 job 超时，
 /// 比一条红更难诊断）。
@@ -30,34 +35,7 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
-/// 有界等待握手条件（5s 抖动余量，远小于 job 超时）：不变量被破坏时以诊断 panic
-/// 收场，禁无限轮转成挂死。
-async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    const LIMIT: Duration = Duration::from_secs(5);
-    let reached = tokio::time::timeout(LIMIT, async {
-        while !ready() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    assert!(
-        reached.is_ok(),
-        "等待 {}s 仍未见「{what}」：不变量可能已被破坏（有界等待，禁挂死）",
-        LIMIT.as_secs()
-    );
-}
-
-/// 有界等待 future 完成（任务终止 / 停机返回）：超时即诊断 panic，禁挂死。
-async fn bounded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
-    const LIMIT: Duration = Duration::from_secs(10);
-    match tokio::time::timeout(LIMIT, fut).await {
-        Ok(output) => output,
-        Err(_) => panic!(
-            "等待 {}s 仍未见「{what}」：不变量可能已被破坏（有界等待，禁挂死）",
-            LIMIT.as_secs()
-        ),
-    }
-}
+// 有界等待条件 / future 完成见 `common/guards.rs`（OS 时钟，不依赖 tokio 计时器）。
 
 /// 正常路径（e2e 对照跑法②）：任务在期限内全部退出 → `completed` 计满、
 /// `timed_out` / `still_running` 归零。current_thread 运行时保证 join 返回时条目

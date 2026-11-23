@@ -26,6 +26,11 @@ use std::time::Duration;
 use skeleton_infra::fx::{FxScope, ShutdownReport, TaskError, cancel_pair};
 use skeleton_infra::objpool::ObjectPool;
 
+#[path = "common/guards.rs"]
+mod guards;
+
+use guards::{bounded, wait_until};
+
 // ── 共享判别式（真实实现与「错误语义桩」走同一条，见文末变异守卫）─────────
 
 /// 桶互斥且穷尽：本次排空观测到的每条任务终局恰落一桶（报告对外可观察的唯一
@@ -80,34 +85,7 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
-/// 有界等待握手条件（5s 抖动余量，远小于 job 超时）：不变量被破坏时以诊断 panic
-/// 收场，禁无限轮转成挂死。
-async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    const LIMIT: Duration = Duration::from_secs(5);
-    let reached = tokio::time::timeout(LIMIT, async {
-        while !ready() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    assert!(
-        reached.is_ok(),
-        "等待 {}s 仍未见「{what}」：不变量可能已被破坏（有界等待，禁挂死）",
-        LIMIT.as_secs()
-    );
-}
-
-/// 有界等待 future 完成（任务终止 / 停机返回）：超时即诊断 panic，禁挂死。
-async fn bounded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
-    const LIMIT: Duration = Duration::from_secs(10);
-    match tokio::time::timeout(LIMIT, fut).await {
-        Ok(output) => output,
-        Err(_) => panic!(
-            "等待 {}s 仍未见「{what}」：不变量可能已被破坏（有界等待，禁挂死）",
-            LIMIT.as_secs()
-        ),
-    }
-}
+// 有界等待握手条件 / future 完成见 `common/guards.rs`（OS 时钟，不依赖 tokio 计时器）。
 
 // ── 生命周期：close ≠ cancel，且最终等净 ────────────────────────────────
 

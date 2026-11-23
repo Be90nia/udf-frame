@@ -10,25 +10,12 @@
 //!
 //! 一致性：有界等待（让渡 + 超时），禁 sleep。
 
-use std::time::Duration;
-
 use skeleton_infra::fx::{FxScope, cancel_pair};
 
-const LIMIT: Duration = Duration::from_secs(10);
+#[path = "common/guards.rs"]
+mod guards;
 
-/// 有界等待条件成立（禁 sleep：让渡 + 超时上限；不变量被破坏时以诊断 panic 收场）。
-async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let reached = tokio::time::timeout(LIMIT, async {
-        while !ready() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    assert!(
-        reached.is_ok(),
-        "等待 {LIMIT:?} 仍未见「{what}」：不变量可能已被破坏（有界等待，禁挂死）"
-    );
-}
+use guards::{bounded, wait_until};
 
 /// G1①：`with_source` 取走原句柄后，clone 句柄仍能触发取消——观察面与在途面同时收敛。
 #[tokio::test]
@@ -50,9 +37,8 @@ async fn cloned_source_cancels_after_source_moves_into_scope() {
         scope.token().is_cancelled(),
         "clone 出的句柄必须与移入 scope 的源共享同一取消态"
     );
-    tokio::time::timeout(LIMIT, task.join())
+    bounded("cancel 唤醒等待取消的托管任务", task.join())
         .await
-        .expect("cancel 必须唤醒等待取消的托管任务（有界等待，禁挂死）")
         .expect("等待取消的任务正常返回，不得是 Cancelled/Panicked");
     // join 只消费结果，in_flight 由任务 future 的 Drop 归零 ⇒ 有界等待其收敛。
     wait_until("in_flight 归零", || scope.in_flight() == 0).await;

@@ -20,21 +20,10 @@ use std::time::Duration;
 
 use skeleton_infra::fx::{CancelToken, FxScope, cancel_pair};
 
-const LIMIT: Duration = Duration::from_secs(10);
+#[path = "common/guards.rs"]
+mod guards;
 
-/// 有界等待条件成立（禁 sleep：让渡 + 超时上限；不变量被破坏时以诊断 panic 收场）。
-async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    let reached = tokio::time::timeout(LIMIT, async {
-        while !ready() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    assert!(
-        reached.is_ok(),
-        "等待 {LIMIT:?} 仍未见「{what}」：不变量可能已被破坏（有界等待，禁挂死）"
-    );
-}
+use guards::{bounded, wait_until};
 
 /// 把 future 轮询**一次**：`biased` 保证先 poll 目标、再落到让渡分支。
 ///
@@ -194,9 +183,7 @@ async fn cancel_wakes_parked_waiter() {
     assert!(!source.is_cancelled());
 
     source.cancel();
-    let woken = tokio::time::timeout(LIMIT, task)
-        .await
-        .expect("等待者必须被 cancel 唤醒（有界等待，禁挂死）");
+    let woken = bounded("等待者被 cancel 唤醒", task).await;
     woken.expect("等待任务不得 panic");
     assert!(token.is_cancelled());
 }
@@ -304,12 +291,8 @@ async fn dropping_drain_owner_wakes_all_waiters_with_interrupted_outcome() {
 
     drop(owner); // 排空 owner 被弃置：其 JoinSet drop 只「请求」abort
 
-    let first_report = tokio::time::timeout(LIMIT, first)
-        .await
-        .expect("#70：owner 被 drop 后等待者必须有界醒来（不得永等一个不会产生的报告）");
-    let second_report = tokio::time::timeout(LIMIT, second)
-        .await
-        .expect("#70：owner 被 drop 后等待者必须有界醒来（不得永等一个不会产生的报告）");
+    let first_report = bounded("#70：owner 被 drop 后等待者必须有界醒来", first).await;
+    let second_report = bounded("#70：owner 被 drop 后等待者必须有界醒来", second).await;
     assert_eq!(first_report, second_report, "所有等待者看到同一份中断结果");
     assert!(
         first_report.drain_interrupted,

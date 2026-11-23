@@ -23,6 +23,11 @@ use std::time::Duration;
 use skeleton_infra::fx::{FxScope, Spawned, TaskError};
 use tokio::sync::oneshot;
 
+#[path = "common/guards.rs"]
+mod guards;
+
+use guards::wait_until;
+
 /// 自旋段放行闸的 RAII 兜底：断言 panic 时也必须放开自旋段——否则 worker 线程
 /// 滞留在无 await 的 poll 里，运行时拆除期等它 ⇒ 测试挂死（CI 上表现成 job 超时，
 /// 比一条红更难诊断）。
@@ -34,20 +39,7 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
-/// 有界等待条件成立（禁 sleep：让渡 + 超时上限；不变量被破坏时以诊断 panic 收场）。
-async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
-    const LIMIT: Duration = Duration::from_secs(10);
-    let reached = tokio::time::timeout(LIMIT, async {
-        while !ready() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    assert!(
-        reached.is_ok(),
-        "等待 {LIMIT:?} 仍未见「{what}」：不变量可能已被破坏（有界等待，禁挂死）"
-    );
-}
+// 有界等待条件成立见 `common/guards.rs`（OS 时钟，不依赖 tokio 计时器）。
 
 /// 等任务体终局可见（在途计数归零 **且** 终局记账已落）⇒ body-idle 断言可安全执行。
 ///
