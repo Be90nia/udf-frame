@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### Added(runtime): `close_wait_with_report` 终态报告 + `discard_pending_effects` 显式丢弃,2026-11-23;GitHub issue#61)
+- **契约口径（维护者拍板 B+C）**:legacy `close()` 保持「准入关闭 + best-effort 排空/交接」,**不是效果 flush**,**不承诺**终态 pending 效果快照。新增**一个**受 quiescence 闸控的操作 `SyncStore::close_wait_with_report(d)`:闭门 → 复用 #64 谓词等待（排空租约释放 + 活跃队列空）→ **仅在 `Drained` 之后**快照。
+- **返回和类型 `CloseReportOutcome`**:`Drained(CloseReport)` / `TimedOutStillRunning` / `Reentrant`;**只有 `Drained` 携带快照**（超时/重入带快照会被调用方误当终态）。`Reentrant` 时准入**已关**（闭门先于重入判定）。静止窗复核失败宁报 `TimedOutStillRunning`,不给假快照。
+- **四个 population 分列**（禁合并成一个 pending 计数）:`queued_actions`（`Drained` 恒 0）/ `deferred_actions`（#49 停放记录,**不影响 `Drained` 判定**）/ `pending_effects`（已提交未转发的效果后缀:`effects` 总条数 + `segments` 段级身份 `origin_action_seq`/`next_effect_index`/条数）/ `interrupted_effect`（最近一次中断:`dispatch_action_seq`/`origin_action_seq`/`effect_index`/种类/`EffectId`,与 #48 词汇同源）。
+- **报告只读**：后缀在报告后仍归 store 所有、可重复报告检视（读数逐字相等）；**唯一解决面** = `discard_pending_effects()`（显式、返回精确条数与段身份;`None` = 未关闭或未静止,**什么都没丢**）。**close 与 discard 都不跑宿主 `EffectRuntime` 代码**（含 `Effect::Emit`:丢弃不回灌;载荷析构在锁外）。
+- **明确不做**:post-close 转发（需独立 drain-to-idle continuation epoch 与回执归属,保留为独立规格）、one-effect pop、为 close 拥有的解决动作伪造普通 dispatch action seq。与 #64 共用同一谓词与 Condvar。
+- **测试**:新 `skeleton-infra/tests/close_report_contract.rs`(6 例,确定性握手,禁 sleep):报告等待活跃排空并含其提交的后缀 / 超时不暴露假终态快照 / `Reentrant` 不声称终态且准入已关 / deferred 与后缀分列 / legacy close 不动后缀 / discard 报精确身份且**不跑效果代码**（`calls` 恒 1 + `MustNotRun` 哨兵）。新面为变异红验证（跳过等待→假快照、报告不放回→条数 0）。
+- **公共面**:仅新增（5 类型 + 2 方法）,无签名/依赖/feature 变更;`skeleton` 契约 crate 仅 `Store::close` rustdoc 补「不是效果 flush」一句（行为零变化）。
+
+### Fixed(runtime): 审计票据落闸与 sink 摘除同一临界区（陈旧票据不再关掉新订阅）,2026-11-23;GitHub issue#60)
+- **缺陷**:`AuditTicket::drop` 原在**放锁之后**才 `gate.store(false)` ⇒ 并发 `subscribe_events` 可在窗口内装入新 sink 并开闸,随后旧票据的延迟 `false` 把**新订阅静默关掉**——闸 false 时发射在环入账**之前**就返回 ⇒ 实时回调与取证环**一起失声**。
+- **修复（线性化点）**:摘槽 + `gate=false` 在**仍持审计 mutex** 时一次完成;`subscribe_events` 的装槽与开闸也移入**同一把 mutex** ⇒ 两侧串行,无第三种交错:落闸先则新订阅随后重新开闸;装槽先则本票据代次失配、根本不碰闸。**热发射路径不变**（未订阅 = 一次 Acquire gate load 即返）;代价只有关闭路径多持一拍锁。
+- **边界分账**:本条是**订阅代次/闸的正确性竞态**;#65/#75 是**有效代次内的实时投递竞态**（其 FIFO 溢出有独立投递丢弃计数）——两者互不替代。
+- **测试**:`audit.rs` 内 3 例白盒红→绿（修复前 3 FAILED / 2 passed）+ 公共面 `tests/audit_gate_generation.rs` 4 例（两种顺序、多代次只当前代可关流、重订阅重开闸;每条都验证**随后一个事件**同时证明环历史与当前代次回调活跃）。测试钩子只在 `cfg(test)`,**不扩公共面**。
+
 ### Fixed(fx): `TaskError::TimedOut` 语义更正为「截止已过 + 已请求 abort」（≠ 已确认终止）,2026-11-23;GitHub issue#67)
 - **契约冻结（issue#67）**:`TaskError::TimedOut` 表示**调用方截止已过且 `AbortHandle::abort()` 已被请求**——**不表示**任务体已终止、其守卫已运行或 `JoinSet` 条目已被收割（tokio abort 是**取消请求**：正在执行非 yield 的 poll 的任务要等它交还运行时才被销毁）。维护者拍板**不加** per-task 完成回执（YAGNI：无真实消费方需要）；超时后的证据是 **scope 级观察面**（`in_flight` / `expect_body_idle` / `expect_fully_reaped_idle` / `counts()`）。
 - **行为零变化**:`join_timeout` 函数体未动（仍 `abort()` + 立即 `Err(TimedOut)`），**只更正承诺**;enum 形状与签名未变。**唯一可观测变化** = `TaskError::TimedOut` 的 `Display` 文本:`"join timed out; task aborted"` → `"join timed out; abort requested (task termination not confirmed)"`（按旧字符串匹配的下游需同步;兄弟仓 agentwiki 是独立 vendored 快照且不匹配该字符串,需跑同步窗才带上新措辞）。

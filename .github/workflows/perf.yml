@@ -259,6 +259,27 @@ jobs:
               "scheduler/pending_control/1000",
               "scheduler/pending_control/10000",
               "scheduler/pending_control/100000",
+              # ── udf-skeleton-infra/benches/infra.rs 的每组代表 ID ──
+              # 只为「该组整组消失/中途死掉」判缺；组内参数化叶子不逐条钉
+              # （参数表是 bench 自己的调参面，改了不该红）。动态 ID
+              # （effect_batch_forward/k{k}）取固定代表 k1。
+              "fxscope_spawn_join",
+              "journal_append_line",
+              "effect_steady_state",
+              "effect_batch_forward/k1",
+              "dispatch_per_beat/hit",
+              "dispatch_per_beat/cancel_unknown_id",
+              "notify_dispatch/no_subscriber",
+              "notify_dispatch/one_subscriber",
+              "object_pool_acquire_drop/reuse_round_trip",
+              "memory_pool_acquire_drop/idle_hit_round_trip",
+              "memory_pool_acquire_drop/empty_pool_create_round_trip",
+              "thread_pool_reject/abort",
+              "thread_pool_reject/caller_runs",
+              "byte_budget_contention/unbudgeted_single_thread",
+              "byte_budget_contention/budgeted_single_thread",
+              "byte_budget_contention/unbudgeted_four_threads",
+              "byte_budget_contention/budgeted_four_threads",
           }
           base_keys = {k for k in baseline if not k.startswith("_")}
           expected_keys = EXPECTED_BENCH_IDS | base_keys

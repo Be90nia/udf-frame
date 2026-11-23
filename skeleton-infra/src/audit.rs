@@ -163,12 +163,259 @@ pub struct AuditTicket {
 impl Drop for AuditTicket {
     fn drop(&mut self) {
         // 代次对账在锁内完成：现役票据才落闸清槽；旧票据（已被后订覆盖）禁动。
+        //
+        // **落闸也在锁内**（issue#60 线性化点）：槽摘除与 `gate=false` 是**一次**
+        // 状态变更。旧的「先放锁再落闸」会让并发 `subscribe_events` 在窗口内装入
+        // 新 sink 并开闸，随后旧票据的延迟 `false` 把新订阅静默关掉（闸 false 时
+        // 发射在环入账**之前**就返回 ⇒ 实时回调与取证环一起失声）。
+        // 总序论证：两侧都在这把 mutex 上 ⇒ 落闸先则新订阅随后重新开闸；装槽先
+        // 则本票据代次失配、根本不碰闸。无第三种交错。热路径不变（未订阅 =
+        // 一次 Acquire load 即返）；代价只有关闭路径多持一拍锁。
         let mut guard = lock_audit(&self.audit);
         if guard.as_ref().is_some_and(|s| s.gen == self.gen) {
             *guard = None;
-            drop(guard);
-            use std::sync::atomic::Ordering;
-            self.gate.store(false, Ordering::Release);
+            #[cfg(test)]
+            drop_pause::pause(std::sync::Arc::as_ptr(&self.gate), self.gen);
+            self.gate.store(false, std::sync::atomic::Ordering::Release);
         }
+    }
+}
+
+/// 测试专用暂停点（`cfg(test)`，**不进公共面**）：让「槽已摘除、闸未落」这一
+/// 窗口可被确定性地插进来（GitHub issue#60 的回归夹具——不暂停就只能靠概率
+/// 竞速）。键 = (闸 Arc 身份, 订阅代次)：闸 Arc 每 store 一个，故跨测试并行
+/// 运行时不会误命中别人的票据。
+#[cfg(test)]
+pub(crate) mod drop_pause {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+
+    pub(crate) struct Hook {
+        pub(crate) gate: *const AtomicBool,
+        pub(crate) gen: u64,
+        pub(crate) reached: mpsc::Sender<()>,
+        pub(crate) resume: mpsc::Receiver<()>,
+    }
+
+    // SAFETY（Mutex 包裹）：`Hook` 只被一次取走并在测试线程间移动（Sender/
+    // Receiver 均 Send）；`*const AtomicBool` 只作身份比较，不解引用。
+    unsafe impl Send for Hook {}
+
+    static SLOT: Mutex<VecDeque<Hook>> = Mutex::new(VecDeque::new());
+
+    pub(crate) fn install(hook: Hook) {
+        SLOT.lock()
+            .expect("drop_pause 槽中毒：测试线程已 panic")
+            .push_back(hook);
+    }
+
+    /// 命中（闸身份 + 代次）则取走该钩子并阻塞到测试放行——一次性。
+    pub(crate) fn pause(gate: *const AtomicBool, gen: u64) {
+        let hook = {
+            let mut slot = SLOT.lock().expect("drop_pause 槽中毒：测试线程已 panic");
+            match slot.iter().position(|h| h.gate == gate && h.gen == gen) {
+                Some(idx) => slot.remove(idx),
+                None => return,
+            }
+        };
+        if let Some(hook) = hook {
+            // 通道失败 = 测试线程已退出（测试本来就失败了）：此处**不可** panic
+            // ——本函数在票据 Drop（可能在 unwind 路径上）里被调用，二次 panic 会
+            // 直接把进程 abort，掩盖真正的失败原因。
+            let _ = hook.reached.send(());
+            let _ = hook.resume.recv();
+        }
+    }
+}
+
+/// issue#60 回归：陈旧票据落闸 vs 替换订阅的竞态（确定性交错，非概率竞速）。
+///
+/// 白盒测试住本模块：夹具要 `cfg(test)` 暂停点与票据的 `gen`/闸身份（crate 内
+/// 可见、**不扩公共面**）。公共面的两种顺序与被取代票据 drop 见
+/// `tests/audit_gate_generation.rs`。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::SyncStore;
+    use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    /// 计数 reducer（零效果）：只为驱动 dispatch 产审计事件。
+    struct Tick;
+
+    impl Reducer for Tick {
+        type State = u64;
+        type Action = u64;
+        type Op = Infallible;
+
+        fn initial(&self) -> u64 {
+            0
+        }
+
+        fn reduce(&self, s: &u64, a: u64, _out: &mut EffectBuf<u64, Infallible>) -> u64 {
+            s + a
+        }
+    }
+
+    /// 强制交错的观测面（三块断言各取一处，互不掩盖）。
+    struct ForcedRace {
+        /// 新订阅是否在「旧票据已摘槽、闸未落」的暂停窗内装入完成。
+        installed_during_pause: bool,
+        /// 随后一个事件的环历史。
+        events: Vec<AuditEvent>,
+        /// 随后一个事件命中**当前代次**回调的次数。
+        current_hits: usize,
+        /// 旧票据回调的命中次数（它已被摘除，必须 0）。
+        stale_hits: usize,
+    }
+
+    /// 序列：旧票据 Drop 暂停在「槽已摘、闸未落」→ 新订阅抢在暂停窗内装入 →
+    /// 放行旧 Drop → 打一个事件。
+    fn force_stale_drop_before_new_subscription() -> ForcedRace {
+        let store = Arc::new(SyncStore::new(Tick, NoFx));
+        let stale_hits = Arc::new(AtomicUsize::new(0));
+        let ticketing = {
+            let hits = Arc::clone(&stale_hits);
+            store.subscribe_events(16, move |_| {
+                hits.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let gen_a = ticketing.gen;
+        let gate_ptr = Arc::as_ptr(&ticketing.gate);
+
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        drop_pause::install(drop_pause::Hook {
+            gate: gate_ptr,
+            gen: gen_a,
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+
+        let dropper = thread::spawn(move || drop(ticketing));
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("旧票据 Drop 未进入暂停点");
+
+        // 替换订阅：修复后（落闸在审计 mutex 内）会被挡到 Drop 结束；竞态版
+        // 会直接装入并开闸——故此处**有界**观察即可，无需 sleep。
+        let current_hits = Arc::new(AtomicUsize::new(0));
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let subscriber = {
+            let store = Arc::clone(&store);
+            let hits = Arc::clone(&current_hits);
+            thread::spawn(move || {
+                let ticket = store.subscribe_events(16, move |_| {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                });
+                installed_tx.send(()).expect("install 信号通道");
+                ticket
+            })
+        };
+        let installed_during_pause = installed_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_ok();
+
+        resume_tx.send(()).expect("放行旧票据 Drop");
+        dropper.join().expect("dropper 线程");
+        let ticket_b = subscriber.join().expect("subscriber 线程");
+
+        store.dispatch(1u64);
+        let race = ForcedRace {
+            installed_during_pause,
+            events: store.take_events(),
+            current_hits: current_hits.load(Ordering::SeqCst),
+            stale_hits: stale_hits.load(Ordering::SeqCst),
+        };
+        drop(ticket_b);
+        race
+    }
+
+    /// ① 陈旧旧票据**绝不能**禁用更新的 sink（实时回调面）。
+    #[test]
+    fn stale_ticket_drop_never_disables_newer_callback() {
+        let race = force_stale_drop_before_new_subscription();
+        assert!(
+            race.current_hits > 0,
+            "陈旧票据的落闸禁用了当前代次的实时回调（#60 竞态）"
+        );
+        assert_eq!(race.stale_hits, 0, "已被摘除的旧回调不得再收到事件");
+    }
+
+    /// ② 被禁用的闸**不得**意外压制环历史（取证面，与实时流分账）。
+    #[test]
+    fn stale_ticket_drop_never_suppresses_ring_history() {
+        let race = force_stale_drop_before_new_subscription();
+        assert!(
+            !race.events.is_empty(),
+            "陈旧票据的落闸压制了环历史（随后一个事件零记录，取证面静默）"
+        );
+    }
+
+    /// ③ 落闸与装槽必须**串行在同一把审计 mutex 上**（竞态被结构性消除，而
+    /// 不只是「碰巧没撞上」）：暂停窗内新订阅装不进来。
+    #[test]
+    fn stale_ticket_drop_serializes_with_new_subscription() {
+        let race = force_stale_drop_before_new_subscription();
+        assert!(
+            !race.installed_during_pause,
+            "旧票据落闸与新订阅装槽未串行（暂停窗内装入成功 ⇒ #60 窗口仍在）"
+        );
+    }
+
+    /// ④ 反序守卫：新订阅先装入、旧票据后 Drop（代次失配）——旧票据不得动新流。
+    #[test]
+    fn superseded_ticket_drop_leaves_current_stream_live() {
+        let store = SyncStore::new(Tick, NoFx);
+        let stale_hits = Arc::new(AtomicUsize::new(0));
+        let stale = {
+            let hits = Arc::clone(&stale_hits);
+            store.subscribe_events(16, move |_| {
+                hits.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let current_hits = Arc::new(AtomicUsize::new(0));
+        let _current = {
+            let hits = Arc::clone(&current_hits);
+            store.subscribe_events(16, move |_| {
+                hits.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        drop(stale); // 代次失配：既不清槽也不落闸
+
+        store.dispatch(1u64);
+        assert!(
+            !store.take_events().is_empty(),
+            "环历史被被取代票据的 drop 压制"
+        );
+        assert!(
+            current_hits.load(Ordering::SeqCst) > 0,
+            "被取代票据的 drop 禁用了当前代次的回调"
+        );
+        assert_eq!(
+            stale_hits.load(Ordering::SeqCst),
+            0,
+            "被取代票据的回调不得再收到事件"
+        );
+    }
+
+    /// ⑤ 顺序守卫：现役票据 Drop（无人接手）后事件流确实关闭——闸与槽同生死。
+    #[test]
+    fn dropping_current_ticket_without_replacement_closes_the_stream() {
+        let store = SyncStore::new(Tick, NoFx);
+        let ticket = store.subscribe_events(16, |_| {});
+        store.dispatch(1u64);
+        assert!(!store.take_events().is_empty(), "订阅期事件应入环");
+        drop(ticket);
+        store.dispatch(1u64);
+        assert!(
+            store.take_events().is_empty(),
+            "无订阅者时环历史必须为空（闸 = 槽，禁残留记录）"
+        );
     }
 }

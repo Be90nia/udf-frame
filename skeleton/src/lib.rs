@@ -762,6 +762,11 @@ pub trait Store {
     /// **不承诺 quiescence**：本线程夺得排空租约时同步排至 idle；他线程已持
     /// 租约时只完成交接即返（排空仍在进行）。要显式等静止见
     /// `skeleton_infra::runtime::SyncStore::close_wait` / `close_wait_timeout`。
+    ///
+    /// **不是效果 flush**：不承诺终态 pending 效果快照（解释器 panic 后
+    /// 已提交未转发的效果后缀仍归 store 所有）。需要终态报告用
+    /// `SyncStore::close_wait_with_report`，显式丢弃保留后缀用
+    /// `SyncStore::discard_pending_effects`（参考实现面）。
     fn close(&self);
     /// 停机闸状态。
     fn is_closed(&self) -> bool;

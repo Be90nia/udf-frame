@@ -167,11 +167,15 @@ pub enum AdmissionOutcome {
 
 **停机等待（#64）**：`close()` 是 **best-effort**——静默态（本调用夺得排空租约）同步排至 idle；**竞争态**（他线程已持租约）只完成交接即返，返回时排空可能仍在进行。要「等静止」用 `close_wait()` / `close_wait_timeout(d)`，结果 `Drained` / `TimedOutStillRunning` / `Reentrant`（同栈重入不自等）。谓词 = 租约释放 + 活跃队列空，**不计 deferred 停放记录**（#49 口径）；timeout 只界等待、不取消同步 reducer。宿主要真屏障（flush/drop 依赖前）用此等待面，勿依赖 `close()` 的返回时机。
 
+**终态报告与保留后缀（#61）**：`close()` **不是效果 flush**，**不承诺**终态 pending 效果快照。要「闭门 + 等静止 + 一次拿到终态报告」用 `SyncStore::close_wait_with_report(d)`——返回和类型，**只有 `Drained` 携带快照**：`Drained(CloseReport)` / `TimedOutStillRunning` / `Reentrant`（超时与重入**不带快照**，防调用方误当终态；`Reentrant` 时准入**已关**，闭门先于重入判定）。报告四个 population **分列、禁合并成一个 pending 计数**：`queued_actions`（`Drained` 恒 0）、`deferred_actions`（#49 停放记录，**不影响 `Drained` 判定**）、`pending_effects`（已提交未转发的效果后缀：总条数 + 段级身份 `origin_action_seq` / `next_effect_index` / 条数）、`interrupted_effect`（最近一次中断的归属：`dispatch_action_seq` / `origin_action_seq` / `effect_index` / 种类 / `EffectId`，与 #48 词汇同源）。报告**只读**——后缀在报告后**仍被 store 持有**、可重复报告检视；唯一解决面是 `discard_pending_effects()`（显式、返回精确条数与段身份；`None` = 未关闭或未静止，**什么都没丢**）。**close 与 discard 都不跑宿主 `EffectRuntime` 代码**（含 `Effect::Emit`：丢弃不回灌；载荷析构在锁外）。**不做 post-close 转发**：转发需要独立的 drain-to-idle continuation epoch 与回执归属，保留为独立规格；也**不提供** one-effect pop。与 #64 共用同一谓词与同一 Condvar（不复制等待机器），差别只有「闭门先于重入判定」与「`Drained` 后才快照」。
+
 ### 订阅双档
 
 - `subscribe`（跨线程档）：回调需 `Send`，槽位 Mutex 串行化；返回 `Subscription<S>`（`#[must_use]`，Drop=注销即时摘表，无「一拍滞后」）。
 - `subscribe_local`（单线程档）：回调免 `Send`（可用 Rc/RefCell），只在注册线程触发，免锁免原子量；返回 `LocalSubscription`（`#[must_use]`，`!Send + !Sync`——线程亲和的类型化表达）。同一 dispatch 内通知序：本地订阅先行，跨线程随后（确定性）。
 - **登记与闭门同一把门**（#63）：`try_subscribe` 与 `close`（及 `close_wait`）共用一个**订阅门**（每 store 一把小锁，只在登记/闭门**冷路径**取，热 dispatch 路径零开销）⇒ `try_subscribe` 要么**线性化在 close 之前**并登记成功，要么**线性化在 close 之后**并返回 `Err(StoreClosed)`——**不会出现「已登记但 store 已关」**。legacy `subscribe` 语义不变：闭门后**照常登记**并计入 `subscriptions_after_close`（它不是可失败入口）。close 翻转 `closed` 后**放门再排空/回调**（不在持门期间跑用户回调、丢用户闭包或排空队列）。
+
+- **审计面同理（#60）**：`AuditTicket` 的 Drop 在**持有审计 mutex 时**完成「摘槽 + `gate=false`」**一次**状态变更；`subscribe_events` 的装槽与开闸也在**同一把 mutex** 内 ⇒ 装槽与闸翻转串行，**陈旧票据绝不会禁用更新的 sink**，被禁的闸也**不会**压制环历史（发射在闸 false 时于环入账前返回）。热发射路径仍是一次 Acquire gate load 即返。#65/#75 的「有效代次内的实时投递竞态」是**另一条**边界，其 FIFO 溢出走独立投递丢弃计数（与 ring 溢出分账）。
 - **去活后不再开始新投递/新回调**（#73/#74）：订阅槽持 **atomic alive 标志**（发布前初始化）；票据 Drop 与 panic 摘除**先原子失活**（幂等）再解链 + `subs_version` 递增。异步投递在**收集窗过滤已死槽**并在**每次 publish 前复查 alive**；同步订阅在**每次调用缓存回调前复查 active** ⇒ 缓存快照虽持强 `Arc`，也不能在失活后启动新回调。**窄契约**：通过了最后一次检查的投递/回调视为 **in-flight**，允许在票据 Drop 返回后完成（严格 quiescence 需另立阻塞式协议，本框架不提供）。
 
 ### 可观测计数面（fail-visible，对齐 `subscriber_panics` 先例）

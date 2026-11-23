@@ -13,11 +13,12 @@ use std::collections::{HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 
 use skeleton::notify::{Notify, NotifySink};
 use skeleton::{
-    ActionSender, Effect, EffectBuf, EffectKind, EffectRuntime, Infallible, Reducer, Restore,
-    Store, Subscription,
+    ActionSender, Effect, EffectBuf, EffectId, EffectKind, EffectRuntime, Infallible, Reducer,
+    Restore, Store, Subscription,
 };
 
 use crate::audit::{AuditEvent, AuditEventKind, AuditSink, AuditTicket};
@@ -126,9 +127,16 @@ struct DrainExclusive<T> {
 // 的每次读写都必须经 [`ExclusiveCell::with_mut`]，且调用点必须在
 // [`drain_owned`] 的 `DrainGuard` armed 区间内；重入路径（reducer/订阅回调/
 // 解释器内 dispatch 或 sender dispatch）只经 `enqueue` 入队即返，不入 with_mut。
+// **唯一例外 = 关闭路径的静止窗**（issue#61 `with_quiescent_effect_bufs`：显式
+// 丢弃与终态报告）：调用方已持 `queue` 锁且复核「无排空租约 + 活跃队列空」——
+// 闭门后无生产者、排空者无记录可处理（不会触达本 cell）、`Effect::Emit` 回灌只
+// 在排空者的转发环内发生；读者经 `queue` 锁串行 ⇒ 至多一个 `&mut`。热路径
+// （dispatch 排空环）的访问点与开销零变化。
 // `effect_buf` 一个字段内含暂存区与已提交待转发队列两段（见 [`EffectBufs`]）：
-// 一次 with_mut 取两段的 &mut——不新增独占字段、不新增访问点。
-// 「调用点全集」即本约束的检查清单——新增第四处访问点必须同时扩清单。
+// 一次 with_mut 取两段的 &mut——不新增独占字段。
+// 「调用点全集」即本约束的检查清单：排空环三处（`effect_buf`/`notify_cache`/
+// `notify_sink_buf`）+ 关闭路径静止窗一处（`effect_buf`，见上）；新增访问点必须
+// 同时扩清单。
 // SAFETY（违反后果）：两线程同时拿到 `&mut T`（排空旗旁路，或 `&mut` 活到排空权
 // 释放之后）= `UnsafeCell` 别名写，Vec 扩容/清空撕裂、迭代器失效，属未定义行为
 // 而非可兜底的 panic；`tests/unsafe_evidence.rs` 的不变量测试与其变异验证是该
@@ -146,10 +154,12 @@ impl<T> DrainExclusive<T> {
     /// `f`（不跨排空权释放点存活）。默认构建在 `ExclusiveCell` 单变体上直通，
     /// 无 tag、无分支开销。
     ///
-    /// SAFETY: 调用方必须在排空权区间内（`DrainGuard` armed）；建立者/维持者/
-    /// 违反后果见上方类型级安全纪要。
+    /// SAFETY: 调用方必须在排空权区间内（`DrainGuard` armed）**或**关闭路径的
+    /// 静止窗内（持 `queue` 锁且已复核无租约/队列空，见类型级安全纪要的例外）；
+    /// 建立者/维持者/违反后果见上方类型级安全纪要。
     fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        // SAFETY: 调用方持排空权（DrainGuard armed），见类型级安全纪要
+        // SAFETY: 调用方持排空权（DrainGuard armed）或处于关闭路径静止窗，
+        // 见类型级安全纪要
         f(unsafe { self.get_mut() })
     }
 
@@ -454,6 +464,12 @@ struct StoreInner<S, A, Op> {
     /// （实时投递专用，**与审计环分开**）。锁序：审计环锁 → 本状态锁（全程
     /// 一致 ⇒ 无死锁）；回调调用一律在两把锁之外。
     audit_dispatch: Mutex<AuditDispatch>,
+    /// 最近一次效果转发中断的完整归属（issue#61 close 报告的第四个 population；
+    /// 与 [`AuditEventKind::EffectInterrupted`] 同一组五字段）。只在解释器 panic
+    /// 路径写入 ⇒ dispatch 热路径零开销；`None` = 本 store 从未中断过转发。
+    /// **与已提交后缀分账**：被中断的那条效果不在后缀里（已随转发丢弃、不重放
+    /// ——#45 at-most-once），它只是后缀被留下的原因。
+    interrupted_effect: Mutex<Option<InterruptedEffect>>,
     /// 停机等待广播（配对 `queue` 锁）：排空租约释放的两个点各 notify 一次
     /// （正常出口 [`DrainGuard::disarm`] + unwind 臂 [`DrainGuard::drop`]）。
     /// 谓词读的「租约已释放 + 队列空」两点同受 `queue` 锁保护，故与本锁配对；
@@ -957,6 +973,13 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
     /// 租约时仅完成交接（闭门后 push 恒拒，其循环必达空）即返——**该路返回时
     /// 排空仍在进行**，要等静止请用 [`Self::close_wait`] /
     /// [`Self::close_wait_timeout`]（#64 拍板：close 保持现状，等待面独立）。
+    ///
+    /// **`close` 不是效果 flush**（issue#61 定稿）：主队列空时排空环不进转发环，
+    /// 故解释器 panic 遗留的**已提交未转发效果后缀**会原样留存，且本方法**不
+    /// 承诺**任何终态 pending 快照、**绝不**因收到停机请求就执行宿主
+    /// `EffectRuntime`（效果可能做 I/O / 改外部系统，框架无法判定重放安全）。
+    /// 要「等静止 + 读终态报告」用 [`Self::close_wait_with_report`]，要显式
+    /// 清掉留存后缀用 [`Self::discard_pending_effects`]。
     /// 幂等。闭门后 push 恒拒：dispatch no-op、send 显式 `false`、subscribe
     /// 照常登记但永不触发——三入口对照见类型文档「闭门后的入口对照」表。
     fn close(&self) {
@@ -1326,6 +1349,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             audit_preempted: AtomicU64::new(0),
             audit_delivery_drops: AtomicU64::new(0),
             audit_dispatch: Mutex::new(AuditDispatch::new()),
+            interrupted_effect: Mutex::new(None),
             stop_wait: Condvar::new(),
             #[cfg(test)]
             in_flight: AtomicUsize::new(0),
@@ -1696,7 +1720,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ///
     /// 非零读数 = id 纪律漂移的直接证据：Cancel 打错数字、多效果域撞 id 后
     /// 引用了他域 id、或 Cancel 早于 Run 的时序 bug。持续上升的读数需在
-    /// reducer 侧修 id 指派（唯一性纪律见 [`EffectId`](skeleton::EffectId)
+    /// reducer 侧修 id 指派（唯一性纪律见 [`EffectId`]
     /// 文档）。
     pub fn cancel_unknown_id(&self) -> u64 {
         self.inner.cancel_unknown_id.load(Ordering::SeqCst)
@@ -1806,8 +1830,12 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             // 进替换订阅，作废件数计入投递丢弃计数）；在途标记复位（新代次可
             // 自行派发；旧代次在途者凭代次对账自行作废，不覆盖新代次状态）。
             audit_dispatch_reset(&self.inner, gen);
+            // 开闸与装槽同一临界区（issue#60 线性化点的对侧）：票据 Drop 的落闸
+            // 也在本锁内 ⇒ 装槽/摘槽与闸翻转串行；且「已装槽、闸未开」的窗口
+            // 不存在（该窗口内的发射会因闸 false 在环入账**之前**返回 = 静默丢
+            // 取证）。热发射路径仍是一次 Acquire load。
+            self.inner.audit_gate.store(true, Ordering::Release);
         }
-        self.inner.audit_gate.store(true, Ordering::Release);
         AuditTicket {
             gate: Arc::clone(&self.inner.audit_gate),
             audit: Arc::clone(&self.inner.audit),
@@ -1822,6 +1850,305 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             Some(sink) => sink.ring.drain(..).collect(),
             None => Vec::new(),
         }
+    }
+}
+
+// ── 关闭终态报告（issue#61 定稿 B + C）──────────────────────────────────────
+//
+// `close` 是「准入关闭 + best-effort 排空/交接」，**不是效果 flush**：主队列空
+// 时排空环 `pop_front` 到 `None` 即返回，不进转发环 ⇒ 解释器 panic 遗留的
+// 已提交后缀会原地留存，直到宿主显式处理或 store 析构。本域补的是**观察与显式
+// 解决面**（不是转发面）：一个受 quiescence 闸控的报告操作 + 一个显式有计数的
+// 丢弃操作。post-close 转发（含 Emit 回灌的 drain-to-idle continuation epoch 与
+// 回执归属）是**另立规格**的扩展，本版不给（也不给「弹一条」式的 API —— 那会
+// 搁浅出新的后缀）。
+
+/// 单个已提交段的后缀摘要（身份词汇与 #48/#49/#57 共享）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingSegmentSummary {
+    /// 产出该段全部效果的 action 的**入队序号**（producer/origin；可能早于任何
+    /// 触发续转的 action）。
+    pub origin_action_seq: u64,
+    /// 该段下一条待转发效果的 0-based 位置（= #48 的 `effect_index` 起点；计数
+    /// 含 [`Effect::Emit`] 占位，与效果种类无关）。
+    pub next_effect_index: u64,
+    /// 该段剩余待转发条数。
+    pub effects: usize,
+}
+
+/// 已提交、未转发的效果后缀摘要（issue#61 的第三个 population）。
+///
+/// **不是**「pending 总数」：活跃队列、停放 deferred action（#49）、本后缀、被
+/// 中断效果归属四类**分列**（见 [`CloseReport`]），禁合并成一个计数。段级
+/// producer 身份保留 ⇒ 消费方可按 `(origin_action_seq, next_effect_index)` 定位
+/// 剩余效果的来源（#48 词汇），且**绝不为**它们伪造普通 dispatch action seq。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingEffectsSummary {
+    /// 待转发效果总条数（所有段合计）。
+    pub effects: usize,
+    /// 段级归属（FIFO 序，每段一项；空壳段不计）。
+    pub segments: Vec<PendingSegmentSummary>,
+}
+
+/// 被中断效果的归属（issue#61 的第四个 population；与
+/// [`AuditEventKind::EffectInterrupted`] 同词汇、同值）。
+///
+/// 该效果**不在** [`PendingEffectsSummary`] 里：它已随转发丢弃、不回填、不自动
+/// 重放（#45 拍板 at-most-once）。它只是后缀被留下的原因，且两个序号分开保存
+/// ⇒ 「谁产出、谁触发」可追（pending 效果跨 action 存活）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptedEffect {
+    /// 触发转发、并承接失败回执的 action 的入队序号。
+    pub dispatch_action_seq: u64,
+    /// 实际产出该效果的 action 的入队序号（可能早于 `dispatch_action_seq`）。
+    pub origin_action_seq: u64,
+    /// 该效果在产出 action 输出序列中的 0-based 位置（含 [`Effect::Emit`] 占位）。
+    pub effect_index: u64,
+    /// 解释器侧效果种类（[`EffectKind`]）。
+    pub effect_kind: EffectKind,
+    /// 效果逻辑句柄（`Run` 自身 / `Cancel` 的目标；语义随种类而变，见
+    /// [`AuditEventKind::EffectInterrupted`] 的字段文档）。
+    pub effect_id: Option<EffectId>,
+}
+
+/// 关闭后的终态报告（issue#61 定稿 B）：**只报告**，不改任何归属。
+///
+/// 四类未完成工作**分列**（禁合并成一个 pending 计数）：
+///
+/// 1. **活跃队列**（[`CloseReport::queued_actions`]）——`Drained` 时恒 0（它就是
+///    quiescence 谓词的一半）；
+/// 2. **停放 deferred action**（#49，[`CloseReport::deferred_actions`]）——不是
+///    活跃排空工作，#64 谓词不计数 ⇒ 可非零；
+/// 3. **已提交未转发的效果后缀**（本票，[`CloseReport::pending_effects`]）——可
+///    非零；报告之后仍被 store 持有、可再报告检视，直到显式丢弃；
+/// 4. **被中断效果的归属**（[`CloseReport::interrupted_effect`]）——已不在后缀里。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CloseReport {
+    /// 活跃队列残留（`Drained` 恒 0）。
+    pub queued_actions: usize,
+    /// 停放的 deferred action 数（#49；不影响 `Drained` 判定）。
+    pub deferred_actions: usize,
+    /// 已提交、未转发的效果后缀（本票）。
+    pub pending_effects: PendingEffectsSummary,
+    /// 最近一次被中断效果的归属；`None` = 本 store 从未中断过转发。
+    pub interrupted_effect: Option<InterruptedEffect>,
+}
+
+/// [`SyncStore::close_wait_with_report`] 的结果。**只有 `Drained` 携带快照**：
+/// 超时/重入若携带报告，调用方会把它当终态（这正是要禁的假终态快照）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseReportOutcome {
+    /// 已闭门且排空至静止：报告是本关闭 store 的**终态**（闭门后无生产者、无
+    /// 排空者 ⇒ 后缀不再变化）。
+    Drained(CloseReport),
+    /// 超时仍有排空在跑：**不声称**任何终态——活跃 reducer/效果路径可能继续
+    /// 提交工作（含新的效果后缀）。
+    TimedOutStillRunning,
+    /// 本线程正在本 store 的排空帧内（reducer/订阅回调/效果转发）：等待即自等。
+    /// 准入**已关**（闭门先于本判定），但不声称终态。
+    Reentrant,
+}
+
+/// 一段被摘出的后缀（段元数据 + 效果本体）：报告路径用后原序放回，丢弃路径
+/// 让它随返回值在锁外析构。
+struct PendingSuffixSegment<A, Op> {
+    origin_action_seq: u64,
+    next_index: u64,
+    effects: VecDeque<Effect<A, Op>>,
+}
+
+/// 摘出各段待转发效果（段壳与段元数据**原位不动**；`next_index` 不推进——本
+/// 操作不是转发）。
+///
+/// 代价：O(段内条数) 次值搬移 + 每段一个临时 FIFO。**只在关闭路径**（报告/显式
+/// 丢弃）发生 ⇒ dispatch 热路径零改动。`EffectBuf` 无 `len` 面（契约 crate 不
+/// 扩面），故计数必须摘出来数。
+fn take_pending_suffix<A, Op>(bufs: &mut EffectBufs<A, Op>) -> Vec<PendingSuffixSegment<A, Op>> {
+    let mut out = Vec::with_capacity(bufs.pending.len());
+    for seg in bufs.pending.iter_mut() {
+        let mut effects = VecDeque::new();
+        while let Some(effect) = seg.buf.pop_front() {
+            effects.push_back(effect);
+        }
+        out.push(PendingSuffixSegment {
+            origin_action_seq: seg.origin_action_seq,
+            next_index: seg.next_index,
+            effects,
+        });
+    }
+    out
+}
+
+fn summarize_pending<A, Op>(segments: &[PendingSuffixSegment<A, Op>]) -> PendingEffectsSummary {
+    let mut summary = PendingEffectsSummary::default();
+    for seg in segments {
+        // 空壳段（中断恰在段末）没有身份可报——不计段、不计条。
+        if seg.effects.is_empty() {
+            continue;
+        }
+        summary.effects += seg.effects.len();
+        summary.segments.push(PendingSegmentSummary {
+            origin_action_seq: seg.origin_action_seq,
+            next_effect_index: seg.next_index,
+            effects: seg.effects.len(),
+        });
+    }
+    summary
+}
+
+/// 按 FIFO 原序放回（报告路径：读而不动）。
+fn restore_pending_suffix<A, Op>(
+    bufs: &mut EffectBufs<A, Op>,
+    segments: Vec<PendingSuffixSegment<A, Op>>,
+) {
+    debug_assert_eq!(bufs.pending.len(), segments.len());
+    for (seg, suffix) in bufs.pending.iter_mut().zip(segments) {
+        debug_assert!(seg.buf.is_empty(), "静止窗内段壳必须是空壳");
+        for effect in suffix.effects {
+            seg.buf.push(effect);
+        }
+    }
+}
+
+impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> SyncStore<S, A, Op> {
+    /// 关闭准入 → 等 #64 的静止谓词 → **仅在 `Drained` 之后**快照终态报告
+    /// （issue#61 定稿 B）。
+    ///
+    /// 与 legacy [`Store::close`] 的差别：`close` 只
+    /// best-effort 排空、**不是**效果 flush（主队列空时根本不进转发环）；本方法
+    /// **等**到「排空租约释放 + 活跃队列空」，然后才读终态。等待与快照在**一次
+    /// 调用内**完成——故调用方不必（也不该）用 `close_wait()` + 另一次报告拼，
+    /// 那会留下「两次调用之间有别的生命周期操作插进来」的 TOCTOU 组合。
+    ///
+    /// 保证：
+    ///
+    /// - **超时/重入不携带快照**（[`CloseReportOutcome`] 的类型层保证）——活跃
+    ///   reducer/效果路径可能继续提交工作，「看起来终态」的计数会误导读方；
+    /// - **绝不执行宿主 `EffectRuntime`**：收到停机请求不是重放已提交效果的理由
+    ///   （效果可能做 I/O 或改外部系统，框架无法判定重放安全）；
+    /// - 报告不改任何归属：保留的后缀仍被 store 持有，直到
+    ///   [`Self::discard_pending_effects`] 显式丢弃；本版**不提供** post-close
+    ///   转发面（Emit 回灌在闭门后仍可入队 ⇒ 需要独立规格的 continuation epoch）；
+    /// - 幂等：已闭门再调用只重新等 + 重新报告。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
+    /// use skeleton_infra::runtime::{CloseReportOutcome, SyncStore};
+    ///
+    /// struct Counter;
+    /// impl Reducer for Counter {
+    ///     type State = u32;
+    ///     type Action = u32;
+    ///     type Op = Infallible;
+    ///     fn initial(&self) -> u32 { 0 }
+    ///     fn reduce(&self, s: &u32, a: u32, _out: &mut EffectBuf<u32>) -> u32 { s + a }
+    /// }
+    ///
+    /// let store = SyncStore::new(Counter, NoFx);
+    /// store.dispatch(1);
+    /// match store.close_wait_with_report(Duration::from_secs(5)) {
+    ///     CloseReportOutcome::Drained(report) => {
+    ///         assert_eq!(report.queued_actions, 0);
+    ///         assert_eq!(report.deferred_actions, 0);
+    ///         assert_eq!(report.pending_effects.effects, 0); // 零效果 reducer
+    ///         assert!(report.interrupted_effect.is_none());
+    ///     }
+    ///     other => panic!("静止 store 必须报 Drained：{other:?}"),
+    /// }
+    /// ```
+    pub fn close_wait_with_report(&self, timeout: Duration) -> CloseReportOutcome {
+        // 闭门先于重入判定（定稿条目 2/3）：`Reentrant` 的语义是「准入**已关**、
+        // 但当前排空帧不能等自己」。与 `Store::close` 取同一把订阅闸 ⇒ 与
+        // `try_subscribe` 同一线性化点（闸在排空前释放）。
+        {
+            let _gate = lock(&self.inner.sub_gate);
+            self.inner.closed.store(true, Ordering::Release);
+        }
+        match self.close_wait_timeout(timeout) {
+            CloseWaitOutcome::Drained => match self.close_report() {
+                Some(report) => CloseReportOutcome::Drained(report),
+                // 静止窗复核失败 = 又有排空工作出现（闭门后无生产者 ⇒ 理论不可达）：
+                // 宁报「仍在跑」也不给一个看起来终态的快照。
+                None => CloseReportOutcome::TimedOutStillRunning,
+            },
+            CloseWaitOutcome::TimedOutStillRunning => CloseReportOutcome::TimedOutStillRunning,
+            CloseWaitOutcome::Reentrant => CloseReportOutcome::Reentrant,
+        }
+    }
+
+    /// 显式丢弃已提交、未转发的效果后缀（issue#61 定稿 C）：返回**精确**摘要
+    /// （条数 + 段级身份）。
+    ///
+    /// `None` = 未关闭或未静止（有排空在跑）——本次**什么都没丢**，也不声称终态。
+    /// 推荐时机：[`Self::close_wait_with_report`] 返回 `Drained` 之后（那里的
+    /// 计数即本次将要丢弃的内容）。
+    ///
+    /// **不跑宿主代码**：只摘缓冲并让效果载荷在内部锁外析构——绝不调用
+    /// `EffectRuntime::run`（含 `Effect::Emit`：丢弃 = 不回灌）。丢弃后后缀为空
+    /// （再报告可见 0），store 其余状态不受影响。
+    pub fn discard_pending_effects(&self) -> Option<PendingEffectsSummary> {
+        if !self.is_closed() {
+            return None;
+        }
+        let (summary, discarded) = self.with_quiescent_effect_bufs(|bufs| {
+            let segments = take_pending_suffix(bufs);
+            let summary = summarize_pending(&segments);
+            // 段壳一并出队：丢弃 = 后缀整体消失（不留下可续转的半段）。
+            bufs.pending.clear();
+            (summary, segments)
+        })?;
+        // 载荷析构在内部锁之外（宿主 `Drop` 可能加锁或 panic，禁在临界区内跑）。
+        drop(discarded);
+        Some(summary)
+    }
+
+    /// 终态报告快照（`None` = 复核发现仍有排空工作）。
+    fn close_report(&self) -> Option<CloseReport> {
+        // 被中断效果与 deferred 队列各自独立取锁（不同 population，禁合并计数）。
+        let interrupted_effect = *lock(&self.inner.interrupted_effect);
+        let deferred_actions = lock(&self.inner.deferred_queue).len();
+        let pending_effects = self.with_quiescent_effect_bufs(|bufs| {
+            let segments = take_pending_suffix(bufs);
+            let summary = summarize_pending(&segments);
+            // 报告只读：原序放回（后缀仍归 store 所有，等显式丢弃）。
+            restore_pending_suffix(bufs, segments);
+            summary
+        })?;
+        // 活跃队列：静止窗内已复核为空；这里**如实采样**（不是 0 常量）——
+        // 闭门后无生产者，读数必为 0。
+        let queued_actions = lock(&self.inner.queue).len();
+        Some(CloseReport {
+            queued_actions,
+            deferred_actions,
+            pending_effects,
+            interrupted_effect,
+        })
+    }
+
+    /// 静止窗专属访问（issue#61）：持 `queue` 锁复核 #64 谓词（无排空租约 +
+    /// 活跃队列空），成立后才触达效果缓冲。
+    ///
+    /// SAFETY（[`ExclusiveCell::with_mut`] 的第四处访问点，安全纪要见
+    /// [`DrainExclusive`]）：静止窗内本 cell **无写者**——闭门后无生产者（push 在
+    /// `queue` 锁内复检 `closed`），排空者要有记录才会进 `with_mut`（队列空 ⇒ 它
+    /// `pop_front` 到 `None` 即放旗返回，不触达本 cell），`Effect::Emit` 回灌也只
+    /// 发生在排空者的转发环内；读者经本函数的 `queue` 锁串行 ⇒ 同一时刻至多一个
+    /// `&mut`。锁序 `queue → effect_buf`（与排空环的 `queue` 先于 `effect_buf`
+    /// 同向；对照实现的 `Mutex` 变体亦无反转）。
+    fn with_quiescent_effect_bufs<R>(
+        &self,
+        f: impl FnOnce(&mut EffectBufs<A, Op>) -> R,
+    ) -> Option<R> {
+        let queue = lock(&self.inner.queue);
+        if self.inner.draining.load(Ordering::Acquire) || !queue.is_empty() {
+            return None;
+        }
+        let out = self.inner.effect_buf.with_mut(f);
+        drop(queue);
+        Some(out)
     }
 }
 
@@ -2370,6 +2697,15 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                 // （issue#48）。
                 let run = catch_unwind(AssertUnwindSafe(|| runtime.run(effect, &inner.back)));
                 if let Err(payload) = run {
+                    // 中断归属留痕（issue#61 close 报告读侧）：与下方审计事件
+                    // 同一组值——「谁产出、谁触发、第几条、哪个句柄」。
+                    *lock(&inner.interrupted_effect) = Some(InterruptedEffect {
+                        dispatch_action_seq,
+                        origin_action_seq,
+                        effect_index,
+                        effect_kind,
+                        effect_id,
+                    });
                     audit_emit(
                         inner,
                         AuditEventKind::EffectInterrupted {

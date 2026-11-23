@@ -15,8 +15,10 @@
 //!
 //! 增量收割面（issue#13）：完成条目滞留集合到 [`FxScope::try_reap`] 显式收割；
 //! `shutdown`/`shutdown_timeout` 排空产出 [`ShutdownReport`]（终局五桶 completed/
-//! cancelled/panicked/failed/still_running + 截止计数 timed_out；超时不等于已终止），
-//! panic 载荷 join 与收割双重可见（诊断面语义非 exactly-once）。
+//! cancelled/panicked/failed/still_running + 截止计数 timed_out + 中断标记
+//! drain_interrupted；超时不等于已终止，中断也不等于已终止），并发停机共享一次
+//! 排空（owner/等待者/已结算三角色，issue#70），panic 载荷 join 与收割双重可见
+//! （诊断面语义非 exactly-once）。
 //!
 //! 三资源轴（issue#39）：`max_concurrency`（并发许可）/ `max_pending`（已准入
 //! 但等待许可）/ `max_tracked`（集合保留条目，含已完成未收割）互相独立——
@@ -135,18 +137,34 @@ pub struct FxCounts {
 
 /// 取消源（fx 域停机三段的② abort 协作取消通知面，三段定义见
 /// [`FxScope::shutdown`] 文档）；幂等 cancel。
+///
+/// **取消是粘性的**：状态存进 watch 值本身，不依赖此刻是否有接收者——取消之后
+/// 才订阅的观察者（如 [`FxScope::with_source`] 新建的 scope token）同样看到
+/// `true`。无接收者期间取消不得静默丢失（issue#68）。
 pub struct CancelSource {
     tx: watch::Sender<bool>,
 }
 
 impl CancelSource {
-    /// 触发取消（幂等；观察面 `CancelToken` 恒见 `false→true` 恰一次）。
+    /// 触发取消（幂等；单向 `false → true`）。
+    ///
+    /// 用 `send_if_modified` 而非 `send`：`send` 在**没有接收者**时不写入值
+    /// （tokio watch 语义）⇒ 取消会静默丢失，之后 `with_source` 的订阅者观察到
+    /// `false`（issue#68）。`send_if_modified` 无接收者也把值存下，且只在真实
+    /// 转换时唤醒当前接收者（重复 cancel 不产生冗余版本通知）；watch 值是唯一
+    /// 真源，不另设原子标志。
     pub fn cancel(&self) {
-        // 幂等：重复 cancel 语义恒真；接收端全部丢弃时 send 失败可忽略（无观察者）。
-        let _ = self.tx.send(true);
+        let _ = self.tx.send_if_modified(|cancelled| {
+            if *cancelled {
+                false
+            } else {
+                *cancelled = true;
+                true
+            }
+        });
     }
 
-    /// 取消态读侧（非阻塞快照）。
+    /// 取消态读侧（非阻塞快照；读的是存下的 watch 值，与接收者是否在场无关）。
     pub fn is_cancelled(&self) -> bool {
         *self.tx.borrow()
     }
@@ -164,7 +182,10 @@ impl CancelToken {
         *self.rx.borrow()
     }
 
-    /// cancel-safe（false→true 才返回）。
+    /// cancel-safe（`false→true` 才返回）。
+    ///
+    /// 取消态是粘性的：**取消发生在订阅之前**（含无接收者窗口里的取消）⇒ 立即
+    /// 返回；源已丢且从未取消 ⇒ 永不到来。
     pub async fn cancelled(&self) {
         let mut rx = self.rx.clone();
         if rx.wait_for(|v| *v).await.is_err() {
@@ -314,6 +335,10 @@ where
 /// 与终局桶正交（可覆盖截止瞬间已终局但尚未收割的条目）。失败桶另带 `errors`
 /// 逐条明细（计数与文案同一处写入）。
 ///
+/// `drain_interrupted` 不是桶而是**报告来源**标记：排空 owner 的 future 被 drop
+/// 或 panic 展开时置 true——本报告是中断结果，不是整 scope 的 canonical 终局
+/// （issue#70）。
+///
 /// `#[non_exhaustive]`：字段按真实采用面渐进扩，加字段属非破坏演进——**跨 crate
 /// 禁用 struct literal**（含 `..Default::default()` 形态，rustc 一律 E0639），采用
 /// 方走 `ShutdownReport::default()` 起手再按需赋值/读侧访问（同 crate 豁免，纪律
@@ -350,6 +375,14 @@ pub struct ShutdownReport {
     /// 已排队但尚未生效）。**语义边界**：不宣称这些任务仍在执行，只申报「终止未
     /// 确认」；超时路径上 ≤ [`Self::timed_out`]（截止后的首轮收割只会减少）。
     pub still_running: usize,
+    /// 本报告来自**被中断的排空**（排空 owner 的 future 被 drop 或 panic 展开，
+    /// issue#70）：置 true ⇒ 这是中断结果，不是整 scope 的 canonical 终局。
+    ///
+    /// 此时各终局桶只统计中断前已收割的条目，[`Self::still_running`] 为中断时集内
+    /// 条数。中断只**请求** abort（JoinSet drop 语义），**不**确认任务终止——任务
+    /// 守卫与 [`FxScope::in_flight`] 在任务真正退出前具权威。中断后排空已结算：
+    /// 后续 [`FxScope::shutdown`] 调用的顺序语义不变（默认报告）。
+    pub drain_interrupted: bool,
 }
 
 impl ShutdownReport {
@@ -466,10 +499,140 @@ impl Drop for SlotGuard {
     }
 }
 
+/// 排空共享状态（issue#70）：`Open` → `Draining` → `Settled`。
+///
+/// watch 值是**唯一真源**：`Settled` 的写入本身就携带 canonical 报告，故不存在
+/// 「通知了但谓词未落」的窗——等待者被唤醒时谓词必已成立。
+#[derive(Clone)]
+enum DrainState {
+    /// 无人在排空（含从未调用过停机的 scope）。
+    Open,
+    /// 已有 owner 取得排空权；该发布**先于**取走 JoinSet。
+    Draining,
+    /// 排空已结算：载荷 = 该次排空的 canonical 报告（正常完成 / 截止期 / 中断）。
+    Settled(ShutdownReport),
+}
+
+/// [`FxScope::begin_drain`] 的角色判定（一次调用恰得一种）。
+enum DrainSlot {
+    /// 本次调用赢得排空权（唯一 owner）。
+    Owner,
+    /// 已有 owner 在排空：等它的结算（共享 canonical 报告）。
+    Waiter(watch::Receiver<DrainState>),
+    /// 排空早已结算：顺序调用语义（默认报告）。
+    Settled,
+}
+
+/// 排空 owner 守卫（issue#70，RAII）：JoinSet 留在**唯一** owner 手里
+/// （take-ownership 保持 [`FxScope::try_reap`] 同步、临界区不跨 await），共享状态
+/// 的结算由本守卫的每条退出路径负责。
+///
+/// 结算顺序铁律：先发布共享谓词（`DrainState::Settled`），再让 `set` 字段 drop
+/// ——JoinSet drop 会**请求** abort，其任务 future 的析构（用户代码）因此发生在
+/// 结算之后，且全程不持有本 scope 的任何锁。取消 / panic 路径由 [`Drop`] 兜底，
+/// 永不把 `Draining` 留在原地。
+struct DrainOwner<'a> {
+    scope: &'a FxScope,
+    report: ShutdownReport,
+    set: JoinSet<Result<(), TaskError>>,
+    settled: bool,
+}
+
+impl<'a> DrainOwner<'a> {
+    /// 建守卫（调用前 `begin_drain` 已发布 `Draining`）：`set` 先为占位空集，
+    /// 真实集合由 [`Self::attach`] 接管——接管阶段即使 panic（毒锁等）也已有守卫
+    /// 在栈上，[`Drop`] 会发布中断结果，绝不把 `Draining` 留在原地。
+    fn new(scope: &'a FxScope) -> Self {
+        Self {
+            scope,
+            report: ShutdownReport::default(),
+            set: JoinSet::new(),
+            settled: false,
+        }
+    }
+
+    /// 接管真实生命周期集（close + abort_all + take；与 `new` 之间无 await）。
+    fn attach(&mut self) {
+        self.set = self.scope.close_and_take();
+    }
+
+    /// 排空至空集（正常完成路径的 await 段）。
+    async fn drain_all(&mut self) {
+        while let Some(outcome) = self.set.join_next().await {
+            self.report.record(outcome);
+        }
+    }
+
+    /// 截止结算（owner 的排空策略）：先记截止时未完成数，再收割此刻已终局者
+    /// （panic 载荷不丢），剩余 = 终止未观测数。
+    fn settle_deadline(&mut self) -> ShutdownReport {
+        self.report.timed_out = self.set.len();
+        while let Some(outcome) = self.set.try_join_next() {
+            self.report.record(outcome);
+        }
+        self.report.still_running = self.set.len();
+        self.publish()
+    }
+
+    /// 结算并发布本次排空结果（正常完成 / 截止期 / 中断共用同一发布口）。
+    ///
+    /// watch 写入即通知 ⇒ **谓词先落、等待者后醒**；锁内只有 [`ShutdownReport`]
+    /// （自有 `Vec<String>`，无用户载荷）——用户代码与用户析构一律不在锁内运行。
+    fn publish(&mut self) -> ShutdownReport {
+        self.settled = true;
+        let report = std::mem::take(&mut self.report);
+        self.scope
+            .drain
+            .send_replace(DrainState::Settled(report.clone()));
+        report
+    }
+}
+
+impl Drop for DrainOwner<'_> {
+    /// owner future 被 drop（select! 竞败 / 超时分支弃置）或 panic 展开 ⇒ 发布
+    /// **中断结果**（含中断时已知计数），再让 JoinSet drop 请求 abort。绝不留在
+    /// `Draining`，也绝不让等待者等一个永远不会产生的报告。
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.report.drain_interrupted = true;
+        // 中断前已终局的条目同步收割（不 await）：panic 载荷不静默丢。
+        while let Some(outcome) = self.set.try_join_next() {
+            self.report.record(outcome);
+        }
+        self.report.still_running = self.set.len();
+        let _ = self.publish(); // 报告只投给等待者（owner 已被弃置，无返回方）
+    }
+}
+
+/// 等排空 owner 结算（issue#70）：订阅者以共享 canonical 报告醒来。
+///
+/// `wait_for` 先查当前值 ⇒ owner 已结算时立即返回（无丢失唤醒）。发送端消亡
+/// （scope 先于等待者消失）按中断结果申报，禁挂死。
+async fn await_settled(mut rx: watch::Receiver<DrainState>) -> ShutdownReport {
+    match rx
+        .wait_for(|state| matches!(state, DrainState::Settled(_)))
+        .await
+    {
+        Ok(state) => match &*state {
+            DrainState::Settled(report) => report.clone(),
+            // `wait_for` 的谓词只放行 `Settled`，其余臂不可达。
+            _ => unreachable!("wait_for predicate only admits DrainState::Settled"),
+        },
+        Err(_closed) => ShutdownReport {
+            drain_interrupted: true,
+            ..ShutdownReport::default()
+        },
+    }
+}
+
 /// 托管 scope：内部 = `Mutex<JoinSet<Result<(), TaskError>>>`（生命周期集，短临界区
 /// 零 await；条目载荷 = panic 归一面——完成条目滞留至 [`Self::try_reap`] 或停机排空
 /// 显式收割，见 issue#13）+ AtomicBool accepting 闸 + `Option<Arc<Semaphore>>` 并发闸
-/// + 取消源/令牌。通过 `Arc<FxScope>` 跨任务共享（spawn/join 均 &self）。
+/// + 取消源/令牌 + 排空共享状态（issue#70：`Open`/`Draining`/`Settled`）。
+///
+/// 通过 `Arc<FxScope>` 跨任务共享（spawn/join 均 &self）。
 pub struct FxScope {
     set: Mutex<JoinSet<Result<(), TaskError>>>,
     accepting: AtomicBool,
@@ -482,12 +645,18 @@ pub struct FxScope {
     in_flight: Arc<AtomicUsize>,
     source: CancelSource,
     token: CancelToken,
+    /// 排空共享状态（issue#70）：`Open`/`Draining`/`Settled`——watch 值为唯一真源，
+    /// 并发停机共享同一次排空。
+    drain: watch::Sender<DrainState>,
 }
 
 impl FxScope {
     /// 新建即 accepting（可 spawn）；并发闸与外接取消源经 builder 链显式加挂。
     pub fn new() -> Self {
         let (source, token) = cancel_pair();
+        // 初始接收者即刻丢弃：`send_replace` / `send_if_modified` 无接收者也写入值
+        // （#68 的教训），等待者按需 `subscribe`（watch 的共享状态由发送侧持有）。
+        let (drain, _initial_receiver) = watch::channel(DrainState::Open);
         Self {
             set: Mutex::new(JoinSet::new()),
             accepting: AtomicBool::new(true),
@@ -498,6 +667,7 @@ impl FxScope {
             in_flight: Arc::new(AtomicUsize::new(0)),
             source,
             token,
+            drain,
         }
     }
 
@@ -549,6 +719,9 @@ impl FxScope {
     }
 
     /// 外接取消源（scope 内部 token 与外部源同 channel）。
+    ///
+    /// 外部源已取消（含取消发生时**没有任何接收者**）⇒ 本 scope 的 token 立即
+    /// 观察到 `true`（粘性取消，issue#68）。
     pub fn with_source(mut self, src: CancelSource) -> Self {
         self.token = CancelToken {
             rx: src.tx.subscribe(),
@@ -793,6 +966,31 @@ impl FxScope {
         Ok(tokio::spawn(fut))
     }
 
+    /// 尝试成为排空 owner（issue#70）：`Open → Draining` 的原子转换**先于**取走
+    /// JoinSet——否则并发调用者会把「集合已被取走」误读成「排空已完成」。
+    ///
+    /// owner 身份 = 赢得这次转换的调用者（本地知识，无需可观测载荷）；发布
+    /// `Draining` 的作用是让并发调用者看到「排空在途」而非「空集 = 完成」。
+    fn begin_drain(&self) -> DrainSlot {
+        let won = self.drain.send_if_modified(|state| match state {
+            DrainState::Open => {
+                *state = DrainState::Draining;
+                true
+            }
+            _ => false,
+        });
+        if won {
+            return DrainSlot::Owner;
+        }
+        // 未赢：区分「排空在途」（等共享结果）与「已结算」（顺序语义）。
+        let draining = matches!(&*self.drain.borrow(), DrainState::Draining);
+        if draining {
+            DrainSlot::Waiter(self.drain.subscribe())
+        } else {
+            DrainSlot::Settled
+        }
+    }
+
     /// fx 域停机三段一次收拢：① close（accepting 闸关，拒新 spawn）→
     /// ② abort_all（在途任务收 abort——[`CancelSource`] 协作取消面；未到 await 点
     /// 的任务在下一次让渡时才终止）→ ③ 等净（join_next 循环至任务集清空）。锁内
@@ -800,15 +998,36 @@ impl FxScope {
     /// （禁持 std 锁跨 await）。
     ///
     /// 排空即收割（issue#13）：终局按 [`ShutdownReport`] 五桶归集（panic 载荷入
-    /// 清单，不静默丢弃）；本路径等净至空集 ⇒ `timed_out` / `still_running` 恒 0。
+    /// 清单，不静默丢弃）；正常等净至空集 ⇒ `timed_out` / `still_running` 恒 0。
+    ///
+    /// # 并发调用契约（issue#70）
+    ///
+    /// 一次 scope 的排空是**共享操作**：owner 身份由 `Open → Draining` 的原子转换
+    /// 唯一产生，该发布**先于**取走 JoinSet。到达时的状态决定本次调用的角色：
+    ///
+    /// | 到达时 | 行为 |
+    /// |---|---|
+    /// | 无人在排空 | 成为 owner：close + abort_all + take，排空至净 |
+    /// | 有 owner 在排空 | **等待共享结果**：返回 owner 的 canonical 报告 |
+    /// | 排空已结算 | 顺序语义：返回 [`ShutdownReport::default()`] |
+    ///
+    /// owner 的 future 被 drop 或 panic 展开 ⇒ 守卫先发布**中断结果**
+    /// （[`ShutdownReport::drain_interrupted`]）再让 JoinSet drop：全部等待者随之
+    /// 醒来，绝不停在「排空中」。中断只**请求** abort，不确认任务终止 ⇒ 报告如实
+    /// 保留 `still_running` 读数。排空完成后再次调用仍走顺序语义（默认报告）——
+    /// 既有契约不变。
     #[must_use = "shutdown 报告含终局归集与 panic 载荷清单，丢弃即静默丢失（纯收尾用 `let _ =` 显式让渡）"]
     pub async fn shutdown(&self) -> ShutdownReport {
-        let mut set = self.close_and_take();
-        let mut report = ShutdownReport::default();
-        while let Some(outcome) = set.join_next().await {
-            report.record(outcome);
+        match self.begin_drain() {
+            DrainSlot::Owner => {
+                let mut owner = DrainOwner::new(self);
+                owner.attach();
+                owner.drain_all().await;
+                owner.publish()
+            }
+            DrainSlot::Waiter(rx) => await_settled(rx).await,
+            DrainSlot::Settled => ShutdownReport::default(),
         }
-        report
     }
 
     /// 同上+超时：先 close+abort_all；超时不再返回 `Err`，改 [`ShutdownReport`]
@@ -821,27 +1040,48 @@ impl FxScope {
     /// 未完成数计 [`ShutdownReport::timed_out`]，报告返回时终止仍未观测到者计
     /// [`ShutdownReport::still_running`]：超时路径**不得**把仍在运行记成已完成或
     /// 已终止。
+    ///
+    /// # 并发语义与截止仲裁（issue#70）
+    ///
+    /// 排空权与共享结果同 [`Self::shutdown`]：成为 owner 时本截止决定**owner 的
+    /// 排空策略**，其截止期报告即该次排空的 canonical 结果（等待者共享它）。
+    ///
+    /// **截止仲裁**：以等待者身份到达时，本截止只约束**自己的等待**——到期即按
+    /// 自己的读数返回（`timed_out` / `still_running` = 此刻 [`Self::in_flight`]），
+    /// **不**取消、**不**改写 owner 的排空操作；owner 之后照样发布它的 canonical
+    /// 报告供其余等待者。
+    ///
+    /// **该报告不是整 scope 的 canonical 结果**（终局桶恒空，只含自己的截止读数）：
+    /// 判断「整 scope 已停机完成」请以共享排空已结算（再调用 `shutdown` 返回默认
+    /// 报告）或 [`Self::in_flight`] 归零为准，勿把等待者的到期报告当终局账。
     pub async fn shutdown_timeout(&self, d: Duration) -> ShutdownReport {
-        let mut set = self.close_and_take();
-        let mut report = ShutdownReport::default();
-        {
-            let drain = async {
-                while let Some(outcome) = set.join_next().await {
-                    report.record(outcome);
+        match self.begin_drain() {
+            DrainSlot::Owner => {
+                let mut owner = DrainOwner::new(self);
+                owner.attach();
+                let outcome = tokio::time::timeout(d, owner.drain_all()).await;
+                match outcome {
+                    Ok(()) => owner.publish(),
+                    Err(_elapsed) => owner.settle_deadline(),
                 }
-            };
-            if tokio::time::timeout(d, drain).await.is_ok() {
-                return report;
             }
+            DrainSlot::Waiter(rx) => {
+                let waited = tokio::time::timeout(d, await_settled(rx)).await;
+                match waited {
+                    Ok(report) => report,
+                    // 自己的截止到期：只停止自己的等待，不触碰 owner 的排空。
+                    Err(_elapsed) => {
+                        let unconfirmed = self.in_flight();
+                        ShutdownReport {
+                            timed_out: unconfirmed,
+                            still_running: unconfirmed,
+                            ..ShutdownReport::default()
+                        }
+                    }
+                }
+            }
+            DrainSlot::Settled => ShutdownReport::default(),
         }
-        // 超时即返：先记截止时未完成数（调用方停等的量），再收割此刻已终局者
-        // （panic 载荷不丢），剩余 = 终止未观测数；下面 set drop = abort 兜底。
-        report.timed_out = set.len();
-        while let Some(outcome) = set.try_join_next() {
-            report.record(outcome);
-        }
-        report.still_running = set.len();
-        report
     }
 
     /// 增量收割口（issue#13 缺口一）：锁内同步扫集合中**已完成**条目——正常完成

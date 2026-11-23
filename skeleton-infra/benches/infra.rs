@@ -2,8 +2,16 @@
 //! effect_steady_state）+ 池维度四组（蓝图 §11 第 9 项：借还热路径、饱和拒绝、
 //! 字节预算争用）。
 //!
-//! 注意：CountingAllocator 常驻本二进制（effect_steady_state 的测量前提）——全部
-//! 组计时同受每分配 2 次原子加的噪声；预算门为 10µs 量级，余量充足。
+//! 注意：CountingAllocator 由下方 `#[global_allocator]` 声明为**本二进制的**全局
+//! 分配器（effect_steady_state 预算闸与全部 churn 读数的前提）——组计时同受每
+//! 分配 2 次原子加的噪声；预算门为 10µs 量级，余量充足。**声明此前缺失**：计数
+//! 恒 0 ⇒ 两组预算闸退化成 `0 - 0 == 0` 恒真（2026-11-23 补上，并由
+//! `assert_allocator_instrumented` 在首个布局组 setup 把前提钉住）。
+//!
+//! State 布局指导证据（issue#53 / bd udf-frame-68t）三组：
+//! `state_layout_update`（整体 vs 分片 × 总量 × 留存）、
+//! `state_layout_update_scope`（选择性 vs 整体更新 + 分片粒度）、
+//! `state_layout_retention`（陈旧长持 vs 滚动窗口 + 内存增长）。
 //!
 //! **只产数据**：池组不设阈值、不写机器相关基线注释（§9 性能实践——基线走
 //! `perf.yml` 滚动 + artifacts）；本机实测数字落在 verify 报告里，不进源码。
@@ -11,6 +19,7 @@
 //! 跑法（required-features 并集，见 Cargo.toml）：
 //! `cargo bench -p udf-skeleton-infra --all-features --bench infra`
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,6 +38,22 @@ use skeleton_infra::pool::{
 };
 use skeleton_infra::runtime::SyncStore;
 use skeleton_infra::{Journal, JournalError, JsonlJournal};
+
+// 分配面计量前提：CountingAllocator 必须是本二进制的全局分配器，否则
+// live_*/total_* 恒 0（预算闸与 churn 表全部失真）。
+#[global_allocator]
+static ALLOC: CountingAllocator = CountingAllocator;
+
+/// 计量前提闸：一次真实分配必须被记到。**不是**阈值——是「表在不在」的开关。
+fn assert_allocator_instrumented() {
+    let before = CountingAllocator::total_allocs();
+    let probe = Arc::new(vec![0u8; 4096]);
+    black_box(&probe);
+    assert!(
+        CountingAllocator::total_allocs() > before,
+        "CountingAllocator 未装配为全局分配器：分配计量恒 0，预算闸 / churn 读数全部失真"
+    );
+}
 
 // ---- effect_steady_state 的最小效果域（单效果 dispatch 稳态，零订阅者）----
 
@@ -554,6 +579,546 @@ fn byte_budget_contention(c: &mut Criterion) {
     group.finish();
 }
 
+// ---- State 布局指导证据（issue#53 / bd udf-frame-68t）----
+//
+// 维护者定稿（issue#53 评论 2026-11-23）：本组只产**决策证据**——布局指导是给
+// 消费方的通用建议（更新局部性 / 快照留存 / Fragment 组合），不是框架强制的
+// 唯一表示形态。矩阵覆盖会改变决策的维度：整体 vs 分片、总量与分片粒度、
+// 选择性 vs 整体更新、留存形态与内存增长。**含碎片化开销占优的反例**（小状态、
+// 过度分片、整片更新三处整体态更快），禁读成「分片总是更快」。
+//
+// 装置口径（跨臂一致）：
+// ① reducer 恒做一次状态构造（整体态 = 全量 `Vec` 拷贝；分片态 = 根
+//    `Vec<Arc>` 浅拷贝 + 仅被改动分片的 `Arc::make_mut`）——值语义 reducer 的
+//    固有税，与框架侧 `Arc::make_mut` 发布克隆分开读；
+// ② 「发布前持有一份当前快照」= 一位读者在发布窗内持态 ⇒ 发布走 `make_mut`
+//    克隆分支（README 大状态锚的最坏情形）；陈旧长持只在首拍触发；
+// ③ 分配面读 `CountingAllocator` 累计面（churn）：**局限** = 分配器只见分配
+//    事件、不见 memcpy 字节数（拷贝成本只体现在墙钟），realloc 计作换块
+//    （alloc/dealloc 各 1）；`live_bytes` 是请求字节净额、非 RSS，同机同 run
+//    内可比、跨平台不可比。**读数里还有一层分配器类别效应**：单次分配跨过
+//    malloc 的 mmap 阈值后每次都要重新缺页+零页——本机实测每 MiB 拷贝 ≈ 210 µs
+//    （~5 GB/s），而 64 KiB 拷贝 ≈ 2.3 µs（~28 GB/s）；故「整体态 vs 分片态」
+//    的倍数里含这一段，不是纯 memcpy 带宽差;
+// ④ 分片态与 `compose` 的 Fragment 对齐是**布局层面**的等价（分片边界 =
+//    Fragment 切片边界）；本文件不 import `compose` 域，避免把 `compose` 塞进
+//    bench 的 required-features（Cargo.toml 归 PM）。
+
+const KIB: usize = 1024;
+const MIB: usize = 1024 * 1024;
+/// 分片态默认分片数（1 MiB / 16 = 64 KiB）。
+const PARTITIONS: usize = 16;
+
+/// 单拍触碰范围：改 1 字节（选择性）vs 改全部字节（整体更新，两布局同工作量）。
+#[derive(Clone, Copy)]
+enum UpdateScope {
+    One,
+    All,
+}
+
+/// 整体式状态：单块连续缓冲，`Clone` = 全量深拷贝。
+#[derive(Clone, Debug)]
+struct MonoState {
+    bytes: Vec<u8>,
+}
+
+/// 分片状态：根 `Clone` 只拷 `Arc` 句柄；被改动且被快照钉住的分片才深拷贝。
+#[derive(Clone, Debug)]
+struct PartitionedState {
+    partitions: Vec<Arc<Vec<u8>>>,
+}
+
+struct MonoReducer {
+    total: usize,
+    scope: UpdateScope,
+}
+
+impl skeleton::Reducer for MonoReducer {
+    type State = MonoState;
+    type Action = u8;
+    type Op = skeleton::Infallible;
+
+    fn initial(&self) -> MonoState {
+        MonoState {
+            bytes: vec![0u8; self.total],
+        }
+    }
+
+    fn reduce(
+        &self,
+        s: &MonoState,
+        a: u8,
+        _out: &mut skeleton::EffectBuf<u8, skeleton::Infallible>,
+    ) -> MonoState {
+        let mut next = s.clone(); // 整体态固有税：全量拷贝
+        match self.scope {
+            UpdateScope::One => next.bytes[0] = a,
+            UpdateScope::All => next.bytes.fill(a),
+        }
+        next
+    }
+}
+
+struct PartitionedReducer {
+    partitions: usize,
+    partition_bytes: usize,
+    scope: UpdateScope,
+}
+
+impl skeleton::Reducer for PartitionedReducer {
+    type State = PartitionedState;
+    type Action = u8;
+    type Op = skeleton::Infallible;
+
+    fn initial(&self) -> PartitionedState {
+        PartitionedState {
+            partitions: (0..self.partitions)
+                .map(|_| Arc::new(vec![0u8; self.partition_bytes]))
+                .collect(),
+        }
+    }
+
+    /// 两段税：根浅拷贝（逐片 `Arc` 计数 +1）恒发生；深拷贝只落在被
+    /// `Arc::make_mut` 触碰**且**被快照钉住的分片上（无快照钉住则原地写）。
+    fn reduce(
+        &self,
+        s: &PartitionedState,
+        a: u8,
+        _out: &mut skeleton::EffectBuf<u8, skeleton::Infallible>,
+    ) -> PartitionedState {
+        let mut next = s.clone();
+        match self.scope {
+            UpdateScope::One => Arc::make_mut(&mut next.partitions[0])[0] = a,
+            UpdateScope::All => {
+                for p in &mut next.partitions {
+                    Arc::make_mut(p).fill(a);
+                }
+            }
+        }
+        next
+    }
+}
+
+fn mono_store(total: usize, scope: UpdateScope) -> SyncStore<MonoState, u8> {
+    let store = SyncStore::new(MonoReducer { total, scope }, skeleton::NoFx);
+    // 预热：队列/缓冲到稳态容量（此后每拍只剩状态拷贝）。
+    for _ in 0..64 {
+        store.dispatch(1);
+    }
+    store
+}
+
+fn partitioned_store(
+    total: usize,
+    partitions: usize,
+    scope: UpdateScope,
+) -> SyncStore<PartitionedState, u8> {
+    let store = SyncStore::new(
+        PartitionedReducer {
+            partitions,
+            partition_bytes: total / partitions,
+            scope,
+        },
+        skeleton::NoFx,
+    );
+    for _ in 0..64 {
+        store.dispatch(1);
+    }
+    store
+}
+
+/// 留存窗口：滚动持有最近 `len` 份快照（`len = 0` = 不持，发布原地写）。
+/// 每拍先拉一份**当前**快照再发布 ⇒ 发布时当前世代恒被钉住（活跃读者形态）。
+struct Window<S> {
+    snaps: VecDeque<Arc<S>>,
+    len: usize,
+}
+
+impl<S> Window<S> {
+    fn new(len: usize) -> Self {
+        Self {
+            snaps: VecDeque::with_capacity(len),
+            len,
+        }
+    }
+
+    fn rotate(&mut self, current: Arc<S>) {
+        if self.len == 0 {
+            return;
+        }
+        self.snaps.push_back(current);
+        if self.snaps.len() > self.len {
+            self.snaps.pop_front();
+        }
+    }
+}
+
+/// 单拍：`window.len == 0` 时不拉快照（保护无留存臂的读数），否则在发布窗内
+/// 持一份当前快照 ⇒ 发布走 `Arc::make_mut` 克隆分支。
+fn beat<S, A, Op>(store: &SyncStore<S, A, Op>, window: &mut Window<S>, action: A)
+where
+    S: Clone + Send + Sync + 'static,
+    A: Send + 'static,
+    Op: Send + 'static,
+{
+    if window.len == 0 {
+        store.dispatch(action);
+        return;
+    }
+    window.rotate(store.snapshot());
+    store.dispatch(action);
+}
+
+/// 每拍分配 / 释放事件数（churn 口径：live 净额对「即用即还」恒 0）。
+fn churn(beats: u32, mut once: impl FnMut()) -> (f64, f64) {
+    let allocs = CountingAllocator::total_allocs();
+    let deallocs = CountingAllocator::total_deallocs();
+    for _ in 0..beats {
+        once();
+    }
+    let n = f64::from(beats);
+    (
+        (CountingAllocator::total_allocs() - allocs) as f64 / n,
+        (CountingAllocator::total_deallocs() - deallocs) as f64 / n,
+    )
+}
+
+struct ChurnRow {
+    arm: String,
+    allocs: f64,
+    frees: f64,
+}
+
+/// 登记一条臂：先测 churn，再注册 Criterion 用例（同装置同窗口 ⇒ 可比）。
+fn push_arm<S, A, Op>(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    rows: &mut Vec<ChurnRow>,
+    arm: String,
+    store: &SyncStore<S, A, Op>,
+    window: &mut Window<S>,
+    action: A,
+) where
+    S: Clone + Send + Sync + 'static,
+    A: Copy + Send + 'static,
+    Op: Send + 'static,
+{
+    let (allocs, frees) = churn(16, || beat(store, window, action));
+    rows.push(ChurnRow {
+        arm: arm.clone(),
+        allocs,
+        frees,
+    });
+    group.bench_function(arm, |b| b.iter(|| beat(store, window, black_box(action))));
+}
+
+fn print_churn(title: &str, rows: &[ChurnRow]) {
+    println!("\n== {title} ==");
+    println!("{:<32} {:>12} {:>12}", "arm", "allocs/beat", "frees/beat");
+    for r in rows {
+        println!("{:<32} {:>12.2} {:>12.2}", r.arm, r.allocs, r.frees);
+    }
+}
+
+/// 留存形态（④ 的自变量）。
+#[derive(Clone, Copy)]
+enum RetainShape {
+    /// 不持快照（发布原地写）
+    None,
+    /// 一份快照长持不刷新（陈旧世代；只有首拍触发发布克隆）
+    Stale,
+    /// 滚动窗口 `k`：每拍发布前拉一份当前快照，保留最近 `k` 份
+    Window(usize),
+}
+
+impl RetainShape {
+    fn label(self) -> &'static str {
+        match self {
+            RetainShape::None => "none",
+            RetainShape::Stale => "stale1",
+            RetainShape::Window(1) => "window1",
+            RetainShape::Window(4) => "window4",
+            RetainShape::Window(16) => "window16",
+            RetainShape::Window(_) => "windowN",
+        }
+    }
+}
+
+/// 留存净字节：(live_bytes 增量, 每份留存快照钉住的净字节)。
+/// 窗口按 2k 拍测（前 k 拍填窗、后 k 拍滚动稳态）；陈旧长持按 8 拍测。
+/// **留存物必须活到读数之后**——放在 match 臂内的局部会在臂尾析构，量到的
+/// 「增长」恒 0（本函数 2026-11-23 初版即栽在此，被 `state_layout_retention`
+/// 的主张闸抓住）。
+fn retention_bytes<S, A, Op>(
+    store: &SyncStore<S, A, Op>,
+    shape: RetainShape,
+    action: A,
+) -> (i64, i64)
+where
+    S: Clone + Send + Sync + 'static,
+    A: Copy + Send + 'static,
+    Op: Send + 'static,
+{
+    let (delta, retained) = match shape {
+        RetainShape::None => {
+            let before = CountingAllocator::live_bytes() as i64;
+            for _ in 0..8 {
+                store.dispatch(action);
+            }
+            (CountingAllocator::live_bytes() as i64 - before, 0)
+        }
+        RetainShape::Stale => {
+            let stale = store.snapshot();
+            let before = CountingAllocator::live_bytes() as i64;
+            for _ in 0..8 {
+                store.dispatch(action);
+            }
+            let delta = CountingAllocator::live_bytes() as i64 - before;
+            black_box(&stale);
+            (delta, 1)
+        }
+        RetainShape::Window(k) => {
+            let mut window = Window::new(k);
+            let before = CountingAllocator::live_bytes() as i64;
+            for _ in 0..(2 * k as u32) {
+                beat(store, &mut window, action);
+            }
+            let delta = CountingAllocator::live_bytes() as i64 - before;
+            black_box(&window.snaps);
+            (delta, k)
+        }
+    };
+    (
+        delta,
+        if retained == 0 {
+            0
+        } else {
+            delta / retained as i64
+        },
+    )
+}
+
+struct RetRow {
+    layout: &'static str,
+    shape: &'static str,
+    delta: i64,
+    per_snap: i64,
+}
+
+fn print_retention(rows: &[RetRow]) {
+    println!("\n== retention growth (1 MiB total, 16 x 64 KiB shards) ==");
+    println!(
+        "{:<24} {:>16} {:>18}",
+        "arm", "live delta B", "per snapshot B"
+    );
+    for r in rows {
+        println!(
+            "{:<24} {:>16} {:>18}",
+            format!("{}/{}", r.layout, r.shape),
+            r.delta,
+            r.per_snap
+        );
+    }
+}
+
+fn per_snap_of(rows: &[RetRow], layout: &str, shape: &str) -> i64 {
+    rows.iter()
+        .find(|r| r.layout == layout && r.shape == shape)
+        .expect("retention row present")
+        .per_snap
+}
+
+/// ① 整体 vs 分片 × 总量 × 留存：交叉区（分片何时开始赢）与「无留存时整体态
+/// 只剩 reducer 一次拷贝」的反例都在本组。16 臂含 16 MiB 臂，故测量窗收窄到
+/// 2s/50 样本（臂间差距 ≫ 采样噪声）。
+fn state_layout_update(c: &mut Criterion) {
+    assert_allocator_instrumented();
+    let mut group = c.benchmark_group("state_layout_update");
+    group.throughput(Throughput::Elements(1));
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.sample_size(50);
+    let mut rows = Vec::new();
+
+    for (label, total) in [
+        ("1k", KIB),
+        ("64k", 64 * KIB),
+        ("1m", MIB),
+        ("16m", 16 * MIB),
+    ] {
+        for retain in [false, true] {
+            let tag = if retain { "retain" } else { "noretain" };
+            let window_len = if retain { 1 } else { 0 };
+
+            let store = mono_store(total, UpdateScope::One);
+            let mut window = Window::new(window_len);
+            push_arm(
+                &mut group,
+                &mut rows,
+                format!("mono_{label}_{tag}"),
+                &store,
+                &mut window,
+                2,
+            );
+
+            let store = partitioned_store(total, PARTITIONS, UpdateScope::One);
+            let mut window = Window::new(window_len);
+            push_arm(
+                &mut group,
+                &mut rows,
+                format!("sharded_{label}_{tag}"),
+                &store,
+                &mut window,
+                2,
+            );
+        }
+    }
+    group.finish();
+    print_churn("state_layout_update: per-beat allocation events", &rows);
+}
+
+/// ③⑤ 选择性 vs 整体更新 + 分片粒度（固定 1 MiB 总量；末两臂 1 KiB 总量）。
+/// 反例臂：单片分装（同样字节、只多一层 `Arc` + 根 `Vec`）、触全部分片（同
+/// 字节工作量、分片态多出 16 倍分配事件）、过度分片（1 KiB / 256 片：逐片
+/// `Arc` 计数压过 4 字节拷贝）。
+fn state_layout_update_scope(c: &mut Criterion) {
+    assert_allocator_instrumented();
+    let mut group = c.benchmark_group("state_layout_update_scope");
+    group.throughput(Throughput::Elements(1));
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.sample_size(50);
+    let mut rows = Vec::new();
+
+    for retain in [false, true] {
+        let tag = if retain { "retain" } else { "noretain" };
+        let window_len = if retain { 1 } else { 0 };
+
+        // 整体态：任何更新都要全量拷贝（无选择性可言）。
+        let store = mono_store(MIB, UpdateScope::All);
+        let mut window = Window::new(window_len);
+        push_arm(
+            &mut group,
+            &mut rows,
+            format!("mono_whole_{tag}"),
+            &store,
+            &mut window,
+            2,
+        );
+
+        for (name, total, parts, scope) in [
+            ("sharded_single", MIB, 1, UpdateScope::One),
+            ("sharded_16parts_one", MIB, PARTITIONS, UpdateScope::One),
+            ("sharded_16parts_all", MIB, PARTITIONS, UpdateScope::All),
+            ("sharded_256parts_1k_one", KIB, 256, UpdateScope::One),
+            ("sharded_256parts_1k_all", KIB, 256, UpdateScope::All),
+        ] {
+            let store = partitioned_store(total, parts, scope);
+            let mut window = Window::new(window_len);
+            push_arm(
+                &mut group,
+                &mut rows,
+                format!("{name}_{tag}"),
+                &store,
+                &mut window,
+                2,
+            );
+        }
+    }
+    group.finish();
+    print_churn(
+        "state_layout_update_scope: per-beat allocation events",
+        &rows,
+    );
+}
+
+/// ④ 留存形态 × 内存增长：陈旧长持（快照只在首拍触发发布克隆）vs 滚动窗口
+/// （每拍发布都撞上当前世代）——「持有一份快照」这句话的两种读法在这里分叉。
+fn state_layout_retention(c: &mut Criterion) {
+    assert_allocator_instrumented();
+    let mut group = c.benchmark_group("state_layout_retention");
+    group.throughput(Throughput::Elements(1));
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.sample_size(50);
+
+    // 墙钟臂：陈旧长持 vs 16 份滚动窗口（同状态同总量，只差留存形态）。
+    {
+        let store = mono_store(MIB, UpdateScope::One);
+        let stale = store.snapshot();
+        group.bench_function("mono_stale1", |b| {
+            b.iter(|| {
+                black_box(&stale);
+                store.dispatch(black_box(2))
+            })
+        });
+        let mut window = Window::new(16);
+        group.bench_function("mono_window16", |b| {
+            b.iter(|| beat(&store, &mut window, black_box(2)))
+        });
+    }
+    {
+        let store = partitioned_store(MIB, PARTITIONS, UpdateScope::One);
+        let stale = store.snapshot();
+        group.bench_function("sharded_stale1", |b| {
+            b.iter(|| {
+                black_box(&stale);
+                store.dispatch(black_box(2))
+            })
+        });
+        let mut window = Window::new(16);
+        group.bench_function("sharded_window16", |b| {
+            b.iter(|| beat(&store, &mut window, black_box(2)))
+        });
+    }
+
+    // 内存面：每形态独立 store（上一形态的窗口快照不污染下一形态的基线）。
+    let shapes = [
+        RetainShape::None,
+        RetainShape::Stale,
+        RetainShape::Window(1),
+        RetainShape::Window(4),
+        RetainShape::Window(16),
+    ];
+    let mut rows = Vec::new();
+    for shape in shapes {
+        let store = mono_store(MIB, UpdateScope::One);
+        let (delta, per_snap) = retention_bytes(&store, shape, 2);
+        rows.push(RetRow {
+            layout: "mono",
+            shape: shape.label(),
+            delta,
+            per_snap,
+        });
+    }
+    for shape in shapes {
+        let store = partitioned_store(MIB, PARTITIONS, UpdateScope::One);
+        let (delta, per_snap) = retention_bytes(&store, shape, 2);
+        rows.push(RetRow {
+            layout: "sharded",
+            shape: shape.label(),
+            delta,
+            per_snap,
+        });
+    }
+    group.finish();
+    print_retention(&rows);
+
+    // 布局主张闸：字节数由请求大小决定（非机器相关），同 run 内可比——分片态
+    // + 选择性更新时留存一份快照应≈单分片字节，整体态≈全量。若哪天根克隆变深
+    // 或更新绕过 `Arc::make_mut`，本闸即红。
+    let mono_per_snap = per_snap_of(&rows, "mono", "window16");
+    let sharded_per_snap = per_snap_of(&rows, "sharded", "window16");
+    assert!(
+        mono_per_snap >= (MIB / 2) as i64,
+        "整体态留存一份快照应钉住约全量状态（实测 {mono_per_snap} 字节）"
+    );
+    assert!(
+        sharded_per_snap <= (MIB / 8) as i64,
+        "分片态 + 选择性更新留存一份快照应只钉住被改分片（实测 {sharded_per_snap} 字节）；\
+         达到全量说明根克隆变深或更新绕过 Arc::make_mut"
+    );
+}
+
 criterion_group!(
     benches,
     fxscope_spawn_join,
@@ -565,6 +1130,9 @@ criterion_group!(
     object_pool_acquire_drop,
     memory_pool_acquire_drop,
     thread_pool_reject,
-    byte_budget_contention
+    byte_budget_contention,
+    state_layout_update,
+    state_layout_update_scope,
+    state_layout_retention
 );
 criterion_main!(benches);
