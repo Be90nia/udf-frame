@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Docs(runtime): 纠正「unwind 清理期零用户代码」的不实表述并补 Action 析构义务,2026-11-23;GitHub issue#66)
+- **纠偏**：`DrainGuard` 的 `Drop` **不调任何回调**（reducer / 解释器 / 订阅 / 审计），但框架**拥有并按值丢弃**被摘下的 action 载荷 ⇒ 展开清理期**必有用户代码**（锁已在结算与析构前释放；**锁外 ≠ 无用户代码**）。旧表述「零用户代码」为误，已在 CHANGELOG 历史条目、`runtime.rs` 内部注释与 `docs/reference.md`「Panic 契约」三处改正。
+- **契约（窄口径，按维护者定稿）**：正常运行期载荷仍在内部锁外析构，**不新增**全局 panic-free Drop 要求；**DrainGuard/`SyncStore` 展开清理期**被丢弃 payload 的 `Drop` **必须 panic-free**（二次 panic = abort）且**不得重入同一 store**（排空旗已放，重入会夺新租约并跑排空环）；只读面安全。
+- **不加** `catch_unwind` 隔离（捕得住 abort、挡不住重入，且会在 `Drop` 里引入新的诊断策略）；保留 #41 fail-visible 终局结算与「绝不重放」。
+- **契约落点**：`skeleton::Store` 语义契约 7 + `SyncStore`「Action 析构义务」+ `docs/reference.md` Panic 契约第五条。
+- **测试**：新 `tests/drop_contract_unwind.rs`（1 例 + 观测夹具）——detached 载荷在析构期调用只读面与准入（有界 10s）成功 ⇒ 证明**锁未持有**；**变异证据**：在 `DrainGuard::drop` 结算循环前插 `lock(queue)` ⇒ 该测 10s 超时判红，回滚后字节一致。
+- 纯文档 + 测试增量，无机制/公共面改动。
+
 ### Tests: 补 #60 未订阅零分配锚 + #61 首/中/末 panic 三档 + 不重试断言,2026-11-23;bd udf-frame-u11)
 - **#60 零分配机械锚**（新 `tests/audit_no_subscriber_alloc.rs`）：未订阅时 32 连发（含 `Effect::Run`）**分配事件 == 0**——伴随断言「32 条效果全到解释器 + `take_events()` 为空」防「没干活」假零；**不恒真**由三条控制臂证明（冷启动框架分配 / 订阅激活 / 订阅态回调确定性 `with_capacity`），另断言弃票后回落 0（gate 真关断）。「一次 gate load、无锁」仍为结构保证（分配器观测不到锁）。
 - **#61 三档 panic 轴**（`tests/close_report_contract.rs`）：`PanicOnFirst` → 参数化 `PanicOnNth`，新增 **middle**（`effects==2` + 段身份精确 + `calls==3` 不变）与 **final**（中断在段末 ⇒ `effects==0`、无段、空壳段被跳过；再次报告同值）两档。
@@ -260,7 +268,7 @@
 
 ### Added（SyncStore dispatch 回执 + drain 恢复交接 + 有界准入，2026-11-18；GitHub issue#40 / #41 / #38）
 - **#40 并发 dispatch 回执**：新增公共面 `try_dispatch` / `set_capacity` / `admission_full_count` / `AdmissionOutcome`。**完成边界 = per-action**（状态提交 → 效果转发 → 通知返回）+ 全部因果后代终局——外部并发 dispatch 在**自己的** action 到达该边界前不返回；同线程/同 store 重入保持「仅入队不返回」以免自死锁。
-- **#41 drain owner 异常恢复交接**：`DrainGuard` 的 `Drop` **只记账**（当前记录按阶段失败 + 残留整批失败 + 摘队放旗同临界区），**零用户代码**——guard 的 drop 绝不跑用户代码，杜绝「unwind 中二次 panic ⇒ abort」。批次中断为 fail-visible：不重放、原 panic 照常上浮、等待者**恰好结算一次**。排空权判定由单槽改为 **TLS 帧栈**（修 A→B→A 同栈误判）。
+- **#41 drain owner 异常恢复交接**：`DrainGuard` 的 `Drop` **只记账**（当前记录按阶段失败 + 残留整批失败 + 摘队放旗同临界区），**不调任何回调**（reducer / 解释器 / 订阅 / 审计）——但展开清理期**必有用户代码**：被摘下的队列载荷按值析构，其 `Drop` **必须 panic-free 且不得重入同一 store**（#66 补契约；原「零用户代码」表述为误）。批次中断为 fail-visible：不重放、原 panic 照常上浮、等待者**恰好结算一次**。排空权判定由单槽改为 **TLS 帧栈**（修 A→B→A 同栈误判）。
 - **#38 有界准入**：容量 = **等待被 reduce 的 action 数**（执行中不计入），只约束外部准入，同栈回灌豁免；满时 **typed reject 不阻塞**（阻塞会与回调重入死锁），legacy `dispatch` 显式 panic。超反馈预算的动作**停放 deferred 队列**（零丢失留痕，外部流量不被饿死）。
 - **口径变更（相对 issue#44）**：反馈预算止步由「后续 dispatch 重放」改为「停放」——残留不再自动再执行，但**可查、可计数**。
 - **行为变更**：legacy `dispatch` 对**并发外部调用者会阻塞**（issue#40 拍板）。**已知残余风险（2026-11-20 已复现并文档化）**：若宿主在 drain 回调（`EffectRuntime::run` / 订阅回调）里 spawn 工作线程并 join、且该线程用**阻塞式** `dispatch` 回调同一 store ⇒ **确定性互等死锁**（排空环被 join 卡住，而回执只由排空环兑现）。**规避**：派生工作走**框架提供的** sender（`Store::sender()` 或回调收到的 `back`；**回调内 = 竞争态** ⇒ 纯准入、不等回执）或不得 join；同线程重入仅入队不等待（不互等）。该义务已写进契约（`skeleton::Store::dispatch` 与 `EffectRuntime::run` 的 rustdoc）；**框架侧未加防护**（属宿主误用），复现证据见 `verify/2026-11-20-residual-join-risk/`。

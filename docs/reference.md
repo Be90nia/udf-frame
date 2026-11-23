@@ -211,6 +211,7 @@ pub enum AdmissionOutcome {
 - reducer panic 不报废实例：计数（`reducer_panic_count`）+审计现场（`AuditEventKind::ReducerInterrupted`）后原样重抛；action 已出队随栈展开丢失，状态不前进。
 - 解释器 panic 不报废实例：panic 原样从 `dispatch` 上浮（fail-visible），毒锁在下一次效果转发时恢复 + 计数（`runtime_panic_count`）——读数口径与首轮 panic 的细节见下文「effect 执行两档」节。
 - 订阅回调 panic：fail-closed 摘除 + `subscriber_panics` 计数 + `subscriber_panic_last_cause` 成因摘要。
+- **`A::Drop`（action 载荷）在展开清理期必被调用（#66）**：排空环 panic 时 `DrainGuard` 与 `SyncStore` 自身的析构都按值丢弃残留载荷 ⇒ 该 `Drop` **必须 panic-free**（二次 panic = abort）且**不得重入同一 store**（排空旗已放，重入会夺得新租约并在展开栈上跑排空环）；只读面（`snapshot` / `pending_actions` / `subscriber_count`）安全。正常运行期 `A` 析构同样在所有内部锁之外，**无**额外 panic-free 要求。正文见 `skeleton::Store` 语义契约 7 与 `SyncStore`「Action 析构义务」，回归见 `tests/drop_contract_unwind.rs`。
 
 ### 回灌深度预算
 

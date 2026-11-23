@@ -702,6 +702,34 @@ struct StoreInner<S, A, Op> {
 /// 见 [`Self::runtime_panic_count`]）；reducer panic 同不报废（计数+审计现场，
 /// 见 [`Self::reducer_panic_count`]——action 本体已出队随栈展开丢失，状态不前进；
 /// 本次调用已产的暂存效果随未提交迁移一并丢弃，不执行）。
+///
+/// ## Action 析构义务（unwind 清理期，issue#66）
+///
+/// 两件事分开说，别混成一条全局要求：
+///
+/// - **正常运行期**：`A` 的析构同样发生在所有内部锁之外（与 `S::Drop` 的
+///   「旧快照锁外析构」同款纪律：锁内只剩搬移与计数）。本库**不**对一般运行
+///   路径提出 panic-free 的 `Drop` 要求——`Drop` panic 与任何用户代码 panic
+///   同形上浮，不做特殊处理。
+/// - **排空环 panic 的展开清理期**（`DrainGuard` 的 `Drop`）：队列残留被整批
+///   摘下、按值结算为失败，随后各条 `A` 载荷**在构造该 panic 的展开栈上**析构。
+///   框架拥有并按值丢弃这些载荷 ⇒ 无法阻止其 `Drop` 执行，而 `catch_unwind`
+///   隔离不是答案（捕得住 abort、挡不住重入，且把诊断策略塞进 `Drop` 是更差的
+///   取舍——同 #46 的先例：宿主代码形状义务写进契约，不做框架侧探测）。⇒
+///   **义务在宿主**：这类 `Drop` **必须 panic-free**（展开中二次 panic =
+///   进程 abort），且**不得重入同一 Store**（放旗已在 `Drop` 前半完成 ⇒ 重入
+///   会夺得新排空租约、在展开栈上跑完整个排空环）；只读面（[`Self::snapshot`] /
+///   [`Self::pending_actions`] / [`Self::subscriber_count`] 等）安全。
+///
+/// 覆盖范围与暴露面：本段直接覆盖排空环 panic 的展开清理期（上面的 `DrainGuard`
+/// 清理：先结算收据，再析构载荷）。同一义务在另一条路径上同样成立、框架同样
+/// 无法兜底：**store 自身在既有展开中被析构**（栈展开带走 `SyncStore`）时，
+/// 队列与停放队列的残留载荷也在展开栈上析构——差别只在它只剩弃队留痕，没有
+/// 逐条收据结算。在途记录的完成元信息（内部 `CurrentMeta`）不含载荷：载荷已
+/// 交给 reducer 按值消费，其析构不在框架手里。结算顺序不因本契约而变：
+/// queue / ledger 锁的释放在前，收据结算与载荷析构在后。被中断的 action
+/// **绝不重放**（#45 at-most-once），终局回执照常 fail-visible 结算
+/// （#41 语义不变）。
 pub struct SyncStore<S, A, Op = Infallible> {
     inner: Arc<StoreInner<S, A, Op>>,
 }
@@ -2756,9 +2784,15 @@ impl<S, A, Op> Drop for SyncStore<S, A, Op> {
 /// queue 锁，旗与队列状态的交接在同一临界区）；异常出口（panic 展开）只做
 /// **记账**：结算当前记录与队列残留的完成回执、摘队、放旗。
 ///
-/// 展开路径纪律（issue#41）：Drop 内**绝不跑用户代码**（reducer / 解释器 /
-/// 订阅回调 / 审计回调）——展开中二次 panic = 进程 abort。载荷析构在 queue
-/// 锁之外发生（锁内只搬指针）。
+/// 展开路径纪律（issue#41）：Drop 内**绝不调用** reducer / 解释器 / 订阅回调 /
+/// 审计回调——展开中二次 panic = 进程 abort。
+///
+/// **但展开清理期必有用户代码**（issue#66）：被摘下的队列记录按值持有 `A`，
+/// 结算之后其析构在**所有内部锁之外**发生（锁内只搬指针）。框架拥有并按值丢弃
+/// 这些载荷 ⇒ 既无法阻止其 `Drop` 运行，也不做 `catch_unwind` 隔离（捕得住
+/// abort、挡不住重入）。义务因此落在宿主：该 Drop **必须 panic-free**，且
+/// **不得重入同一 Store**（放旗已在本 Drop 前半完成 ⇒ 重入会夺得新租约、在
+/// 展开栈上跑完整个排空环）。契约正文见 [`SyncStore`]「Action 析构义务」。
 ///
 /// 摘队与放旗同一临界区：生产者要么进本批（被结算为失败），要么在放旗之后
 /// 夺下新租约（不搁浅）。
@@ -2801,7 +2835,8 @@ impl<S, A, Op> Drop for DrainGuard<'_, S, A, Op> {
         if !self.armed {
             return;
         }
-        // 展开路径：只做记账（禁跑用户代码、禁在锁内析构载荷）。
+        // 展开路径：只做记账（禁调任何回调；载荷析构在锁外进行——其 Drop 的
+        // 义务见类型文档）。
         // 1. 当前在途记录：按最后已知阶段结算失败（状态已提交则如实标注——
         //    提交后失败 ≠ reducer 失败）。
         if let Some(meta) = self.current.take() {
@@ -2835,7 +2870,8 @@ impl<S, A, Op> Drop for DrainGuard<'_, S, A, Op> {
             self.inner.stop_wait.notify_all();
             detached
         };
-        // 3. 逐条结算（action 载荷随记录离开临界区即析构——锁外）。
+        // 3. 逐条结算；载荷在本步末尾的锁外析构——该 Drop 必须 panic-free 且
+        //    不得重入同一 Store（宿主义务，见类型文档）。
         for record in detached {
             let failure = DispatchFailure {
                 seq: record.seq,
