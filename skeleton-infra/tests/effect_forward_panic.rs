@@ -10,6 +10,8 @@
 //! 判据用「最终收到的 op 序列逐条等于 0..k」——它同时钉住三件事：前缀没被重放
 //! （否则前缀元素出现两次）、后缀没丢（否则缺尾）、后缀没被复制（否则元素重复）。
 
+#![cfg(feature = "runtime")]
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
