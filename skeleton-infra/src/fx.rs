@@ -141,6 +141,12 @@ pub struct FxCounts {
 /// **取消是粘性的**：状态存进 watch 值本身，不依赖此刻是否有接收者——取消之后
 /// 才订阅的观察者（如 [`FxScope::with_source`] 新建的 scope token）同样看到
 /// `true`。无接收者期间取消不得静默丢失（issue#68）。
+///
+/// **Clone = 同一取消态的第二句柄**（不是独立源）：所有句柄共享同一个 watch
+/// 值，任一句柄 `cancel()` 全体可见——宿主把源按值交给
+/// [`FxScope::with_source`] 后，用预先 clone 的句柄照样能触发取消。取消幂等、
+/// 单向（`false → true`，不回落）。
+#[derive(Clone)]
 pub struct CancelSource {
     tx: watch::Sender<bool>,
 }
