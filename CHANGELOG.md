@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+### Added(validation): 第二消费方 Stage B（结构相异的任务调度 CLI 宿主）+ 资源默认值正典表,2026-11-23;GitHub issue#56)
+- **Stage B 夹具入库**：`validation/consumer-sim/cli-host/`（受版本控制，自带空 `[workspace]` + `Cargo.lock` + path 依赖）——真实宿主形态：submit / cancel / shutdown 三段 CLI、自定义 `EffectRuntime`（Run + Cancel 两种效果的执行序）、**并发下有界准入的真实 `Full`**（condvar 握手、无 sleep、断言被拒 action 未入队）、`close_wait_with_report → Drained` + 闭门后 typed `Closed`、**combine/Fragment 组合根** + `Arc::strong_count` 观测 `Arc::make_mut` 克隆分支与快照冻结。
+- **两面依赖树证据**：`cargo tree` 确定性脚本追加进 `validation/consumer-sim/dep-trees.txt`——sync 面 tokio 计数 **0**，`--features tokio` 面 **3**（反向控制：证明 feature 真接线、断言非恒真）。
+- **CI 闸**：`consumer-sim` job 扩为 Stage A（workflow 夹具）+ Stage B 两面（sync/tokio 各自 build+test，`--locked`）+ 两面依赖树双向断言（sync 无 tokio / async 必须有 tokio）。
+- **发现并单独立票的契约缺口**：`CancelSource` 非 `Clone` 且 `with_source` 按值取走 ⇒ 外接取消源后宿主再无可触发句柄（#56 Stage B G1，另单修）。
+- **资源上限与默认值正典表**（`docs/reference.md` 新章「资源上限与默认值（决策载体）」）：按维护者裁定——**表是决策载体、#56 是证据载体**；统一约定五条（0=不限 / 默认保守可用 / 超界三分类且禁静默丢 / 界≠指标 / 改大兼容改小破坏走 ADR）+ 9 行现状基线（scheduler 注册上限、watchdog live-cap、Run-ID 诊断、审计环、待投递 FIFO、回灌深度预算、deferred 停放、FxScope 准入、池 idle）。**提案数值不写入**——待 Stage B 证据后一次性拍板。
+
+### 文档(reference): 新增「资源上限与默认值」跨面正典表
+- 各面 rustdoc 从此只写「界语义 + 超界行为」，数值引用该表；修订只走表（改大 = 兼容放宽，改小 = 破坏性 + ADR）。
+
 ### Fixed(runtime): 审计回调在夺租约 dispatch 首条 Enqueued 上的单线程确定性死锁,2026-11-23;GitHub issue#59)
 - **缺陷**:夺租约路径在 `drain_owned` **之前**投递首条 pop 记录的 `Enqueued` 回调，而排空帧只在 `drain_owned` 内 push ⇒ 回调期间 `admission_context` 看不到重入帧，把嵌套 `Store::dispatch` 判为**外部根**（`wait=true`）；此刻 `draining` 已置 ⇒ `enqueue` 返回 `Queued` ⇒ 调用方在无界账本等待上**等自己 = 单线程确定性死锁**（不需要并发）。三条夺租约路径同形：`Store::dispatch` / `SyncStore::try_dispatch` / 框架 `ActionSender::dispatch`。
 - **修复（维护者定稿：临时帧，不延迟投递事件）**：在首条记录的 `Enqueued` 回调**之前**安装临时 RAII 排空帧（携带 store 身份 + 回灌深度 + 账本）⇒ 回调内的同 store dispatch 归为**因果后代**（共享账本、深度 +1、`wait=false` 只入队即返）。帧随投递函数返回（含 panic 展开）弹出，**先于** `drain_owned` 装真帧 ⇒ 首条记录自身深度不被重复计。**装帧与闸判下沉到同一次无锁 load**（`audit_emit_prepared`）——否则两次 load 之间会重开「判未订阅 → 并发订阅 → 回调无帧」的新竞态；零订阅稳态仍零 TLS/零 `Arc`。

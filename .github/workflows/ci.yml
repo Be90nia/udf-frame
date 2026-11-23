@@ -294,3 +294,28 @@ jobs:
             echo "::error::sync-only fixture dependency tree contains tokio"
             exit 1
           fi
+
+      # Stage B 第二消费方（#56）：两面都钉。
+      # sync-only 面树无 tokio（同 Stage A 口径）；async 面树**必须**含 tokio
+      # （反向控制：证明 feature 真的接线、断言不是恒真）。
+      - name: Build + test Stage B consumer (sync face, locked)
+        run: |
+          cargo test --manifest-path validation/consumer-sim/cli-host/Cargo.toml --locked
+
+      - name: Build + test Stage B consumer (tokio face, locked)
+        run: |
+          cargo test --manifest-path validation/consumer-sim/cli-host/Cargo.toml --features tokio --locked
+
+      - name: Assert Stage B dependency trees (sync no tokio / async has tokio)
+        shell: bash
+        run: |
+          fail=0
+          if cargo tree --manifest-path validation/consumer-sim/cli-host/Cargo.toml -e normal | grep -q tokio; then
+            echo "::error::sync face of cli-host contains tokio"
+            fail=1
+          fi
+          if ! cargo tree --manifest-path validation/consumer-sim/cli-host/Cargo.toml -e normal --features tokio | grep -q tokio; then
+            echo "::error::tokio face of cli-host has no tokio — the assertion would be vacuous"
+            fail=1
+          fi
+          exit "$fail"

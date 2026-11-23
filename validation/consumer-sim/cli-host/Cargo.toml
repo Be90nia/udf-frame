@@ -1,0 +1,29 @@
+[package]
+name = "cli-host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "第二消费方（#56 Stage B）：任务调度 CLI 宿主——真实运行、自定义解释器、有界准入、取消/停机、combine 组合态"
+
+# 独立 workspace 根（与 ../Cargo.toml、../workflow/Cargo.toml 同机制）：
+# 不被上级夹具 workspace 吸收，本 crate 的 Cargo.lock/target 不污染仓库。
+[workspace]
+
+[lib]
+name = "cli_host"
+
+[[bin]]
+name = "cli-host"
+path = "src/main.rs"
+
+[features]
+# 默认关 tokio ⇒ `cargo tree -e normal`（sync-only 面）无 tokio 子树。
+# 开 `tokio` 才进 async-enabled 面（FxScope 取消面）。
+default = []
+tokio = ["dep:tokio", "udf-skeleton-infra/tokio"]
+
+[dependencies]
+udf-skeleton = { path = "../../../skeleton" }
+# compose 只为 Fragment 组合（combine!/combine），纯 std 零 tokio 增量。
+udf-skeleton-infra = { path = "../../../skeleton-infra", features = ["compose"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"], optional = true }

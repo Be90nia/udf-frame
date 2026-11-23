@@ -365,6 +365,36 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 
 ---
 
+## 资源上限与默认值（决策载体）
+
+跨面资源策略的**唯一正典表**（维护者裁定：表是本仓的决策载体，`#56` 是证据载体、不拥有决策；数值调整只走本表修订）。各面 rustdoc 只写「本面的界语义 + 超界行为」，数值引用本节，**禁各写各的**。
+
+### 统一约定
+
+1. **`0` = 不限（unbounded）**，沿用 `ByteBudget` / `set_capacity` 既有先例；显式 opt-in 才设界。
+2. **默认 = 保守可用**：默认值必须让结构相异的第二消费方（#56 Stage B：`validation/consumer-sim/cli-host`）开箱可用，不为了炫技设小界。
+3. **超界行为必须属三类之一并写进该面 rustdoc**：拒绝（typed error）· 降级（inline/degrade）· 摘除（fail-closed）——**禁止静默丢**；静默丢必须另有独立丢弃计数（见「丢弃证据（互不替代）」词条）。
+4. **界是准入闸（hard cap），不是指标**：指标（borrowed/idle/dropped…）与准入闸分离，禁一个计数兼任两职（#28 教训）。
+5. **pre-publication 时钟**：默认值一旦发布即表现层契约——**改大 = 兼容放宽，改小 = 破坏性变更（走 ADR）**。
+
+### 当前策略（基线 = 实现现状；提案值待 #56 Stage B 证据后统一拍板）
+
+| # | 资源项 | 所在面 | `0` 含义 | **当前基线** | 超界行为 | 逃生口 |
+|---|---|---|---|---|---|---|
+| 1 | 活跃注册数上限 | `std_ext::scheduler`（#58） | 无界（默认） | `Scheduler::set_capacity(cap)`；默认**无界** | 拒绝：`register` 返回 typed `SchedulerFull`（任务未入堆，不静默丢） | 显式 `set_capacity(n)`；调低到当前活跃数以下不驱逐既有任务 |
+| 2 | watchdog 执行数上限 | `shutdown::ShutdownCoordinator`（#54） | 无界（`None`，默认） | `with_max_watchdogs(n)`；默认**不限** | 拒绝启动：该组件记 `Failed{reason: watchdog capacity exhausted}`（**不**内联跑闭包、不静默） | 显式 `with_max_watchdogs(n)`；`live_watchdogs()` / `peak_watchdogs()` 读数 |
+| 3 | 历史 Run-ID 诊断注册表 | `runtime`（#62） | —（见右） | 现状 = 追踪全开、历史无界；**目标 = opt-in 默认关**（#62 落地后更新本行数值与字段名） | 饱和/驱逐 ⇒ 三态判 `not-tracked`（**绝不**判 `definitely-unknown`） | 窄口径 runtime 诊断设置 opt-in；容量参数化（数值待 #56） |
+| 4 | 审计环容量（权威历史） | `SyncStore::subscribe_events` / `PoolBase` | 视作 `1`（调用方给 `0` 时取 `max(1)`） | `SyncStore`：**调用方显式给**；池域：`AUDIT_RING_DEFAULT_CAP = 1024` | 溢出丢最旧（`seq` 空洞 = 显式证据；`take_events` 取走不留空洞） | 调大 `subscribe_events(cap, ..)` / 池域容量；完整性靠「权威历史」不靠实时回调 |
+| 5 | 审计待投递 FIFO | `SyncStore` / 池域（#65/#75） | —（固定） | `AUDIT_PENDING_CAP = 1024`（**无配置面**，两处同值） | 溢出丢最旧 + **独立投递丢弃计数**（`audit_delivery_drops()`，与环溢出分账） | 消费慢 ⇒ 改用 `take_events` 取权威历史 |
+| 6 | 回灌深度预算 | `runtime` 排空环 | —（固定） | `FEEDBACK_DEPTH_BUDGET = 64`（单次 dispatch 连续回灌链深度） | 停排 + `feedback_budget_exceeded` 计数；触发点 action **原值退回队尾**（零丢失，非 panic 非静默） | `Effect::Emit` 回灌受限 ⇒ 改用托管任务（`FxScope`）或显式分帧 |
+| 7 | deferred 停放队列 | `runtime`（#49） | —（现状无界） | 现状**无界**（停放记录不被排队预算挡，见 #61 四 population 分列） | 现状：不拒绝（无上限）；#49 提案显式上限 + `resume_deferred(limit)` | 显式 recovery API（#49）；`CloseReport::deferred_actions` 可查残留 |
+| 8 | FxScope 等待/跟踪条目 | `fx`（#13/#39） | 无界（`usize::MAX`，默认） | `with_max_pending(n)` / `with_max_tracked(n)`；默认**均无界** | 拒绝：`try_spawn_tracked` 返回 typed `AdmissionError::{PendingFull,TrackedFull}`（不阻塞不 panic） | 显式设界；`try_reap()` 收割后回落；`counts()` 读数 |
+| 9 | 对象池/线程池 idle 容量 | `pool` | 由 tuning 显式给 | `ObjectPoolTuning` / `ThreadPoolTuning` **显式必填，无默认** | 超 `idle_cap` ⇒ `dropped_overflow` 计数（有界降级） | 调 tuning；`shrink_to`/`prune_idle` 主动回收 |
+
+**修订规则**：某默认值经 #56 Stage B 实测不合格 ⇒ 修订本表一次（改大 = 兼容放宽；改小 = 破坏性，需 ADR 记录理由与迁移路径），各面 rustdoc 随表同步，禁单点改数。
+
+---
+
 ## notify — 异步信号式通知（案 C 水位）
 
 **feature**：`runtime`（默认，随 SyncStore）。**依赖面**：契约 `skeleton::notify` 零依赖；实现面零新三方。决策与论证唯一权威 = ADR 0008（异步通知信号）。
