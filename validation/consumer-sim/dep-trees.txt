@@ -47,3 +47,49 @@ consumer-sim v0.0.0 (E:\Projcet\udf-frame\validation\consumer-sim)
 ```
 3
 ```
+
+## 面 3: Stage B sync-only（`cli-host/` 默认 feature —— 任务调度 CLI 宿主）
+
+$ cargo +1.96.0 tree --manifest-path validation/consumer-sim/cli-host/Cargo.toml -e normal
+
+cli-host v0.0.0 (E:\Projcet\udf-frame\validation\consumer-sim\cli-host)
+├── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+└── udf-skeleton-infra v0.1.0 (E:\Projcet\udf-frame\skeleton-infra)
+    ├── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+    └── udf-std-ext v0.1.0 (E:\Projcet\udf-frame\std-ext)
+        └── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+
+### 面 3b: sync-only 里 tokio 出现次数（期望：**0**）
+
+```
+0
+```
+
+## 面 4: Stage B async-enabled（`cli-host/` + `--features tokio` —— FxScope 取消面）
+
+$ cargo +1.96.0 tree --manifest-path validation/consumer-sim/cli-host/Cargo.toml --features tokio -e normal
+
+cli-host v0.0.0 (E:\Projcet\udf-frame\validation\consumer-sim\cli-host)
+├── tokio v1.54.1
+│   ├── pin-project-lite v0.2.18
+│   └── tokio-macros v2.7.2 (proc-macro)
+│       ├── proc-macro2 v1.0.107
+│       │   └── unicode-ident v1.0.27
+│       ├── quote v1.0.47
+│       │   └── proc-macro2 v1.0.107 (*)
+│       └── syn v3.0.10
+│           ├── proc-macro2 v1.0.107 (*)
+│           ├── quote v1.0.47 (*)
+│           └── unicode-ident v1.0.27
+├── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+└── udf-skeleton-infra v0.1.0 (E:\Projcet\udf-frame\skeleton-infra)
+    ├── tokio v1.54.1 (*)
+    ├── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+    └── udf-std-ext v0.1.0 (E:\Projcet\udf-frame\std-ext)
+        └── udf-skeleton v0.1.0 (E:\Projcet\udf-frame\skeleton)
+
+### 面 4b: async-enabled 里 tokio 出现次数（期望：**> 0**）
+
+```
+3
+```
