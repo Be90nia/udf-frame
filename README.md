@@ -30,9 +30,11 @@ cargo run -p udf-skeleton-infra --example quickstart
 let store = Store::new(Counter, NoFx); // skeleton_infra::runtime::SyncStore
 store.dispatch(Msg::Inc);
 store.dispatch(Msg::Inc);
-assert_eq!(store.snapshot().0, 2); // 同步排空：dispatch 返回即 idle
+assert_eq!(store.snapshot().0, 2); // dispatch 返回 = 本 action 的完成边界（状态提交 → 效果转发 → 通知返回）且其因果后代终局；不承诺全局队列为空
 store.close();
 ```
+
+**完成边界的完整契约**（并发生产者下队列可能仍非空、属正常态）：见 [`docs/reference.md`](docs/reference.md) 的 runtime 章节与 `skeleton::Store` 的 rustdoc。
 
 **自建项目抄这段时**（`Cargo.toml` 补三行——仓库外建项目，见 [cheatsheet 坑 7](docs/tutorials/cheatsheet.md)；`[workspace]` 装甲行防被上层 workspace 吸收）：
 

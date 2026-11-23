@@ -27,11 +27,13 @@
 //!   已出堆条目的检查-执行窗口内落地的取消不可撤（本次照跑，文档化
 //!   语义；单线程 tick 确定性面无此窗口）；执行中取消 ⇒ 周期任务不再
 //!   重臂。`cancel` 幂等；句柄 RAII（Drop 即 cancel），[`TaskHandle::detach`]
-//!   是 fire-and-forget 逃生门；
+//!   是 fire-and-forget 逃生门（只解除取消、不接管所有权，TaskCell 随之
+//!   回收——#55）；
 //! - **close = 关闸 + 清 pending + 在途跑完**（拍板点）：注册显式
 //!   `Err(Closed)` 禁静默；pending 全部标 Cancelled（句柄侧可见）；在途
 //!   回调跑完为止（同步代码无中断面），驱动线程随后退出
-//!   （[`WorkerHandle::join`] = close + join）；
+//!   （[`WorkerHandle::join`] = close + join；丢弃句柄（Drop）= close 不
+//!   join，驱动线程随之退出——#72）；
 //! - **回调 panic 不杀驱动**：点火 catch_unwind 摘除 + [`Scheduler::panic_count`]
 //!   留痕（池审计回调同款纪律）；周期任务 panic 后摘除不再臂（JDK 语义）；
 //!   驱动循环体另有兜底 catch（正常零命中）——「驱动线程 panic 静默死亡 =
@@ -44,14 +46,24 @@
 //!   （无自死锁），测试钉死；
 //! - **溢出 fail-closed**：注册/重臂恒 `checked_add`（clock.rs armor：
 //!   Instant + 巨大 Duration 平台 panic 坑），溢出带因 panic；
-//! - **惰性墓碑**：cancel 不摘堆（O(1)），死亡条目到点弹出时摘除——远期
-//!   取消的墓碑会让驱动多醒一拍（语义正确，代价一次空醒）。
+//! - **有界准入**（#58）：[`Scheduler::set_capacity`] 设活跃注册数上限
+//!   （0=无界；默认不盲设有界默认值——#56 是默认资源策略的评审触发点）；
+//!   触顶 ⇒ typed 拒绝（[`AdmissionError::Full`]，任务**不入堆**、不部分
+//!   插入、禁静默丢回调）；额度随注册退役（点火/取消/关闸/panic）**恰好
+//!   一次**释放；既有 `after`/`every` 触顶时 panic（fail-visible），typed
+//!   拒绝面走 `try_after`/`try_every`；
+//! - **惰性墓碑 + 阈值清扫**（#52）：cancel 不摘堆（O(1)），死亡条目到点
+//!   弹出时摘除；驱动 park 锚跳过堆顶墓碑（墓碑不是有效 deadline ⇒ 驱动
+//!   不为它多醒一拍）；墓碑数越过「绝对下限 + 比例阈值」时清扫堆（只留
+//!   PENDING 条目，被摘条目移出锁外析构）⇒ 已取消的远期条目在原 deadline
+//!   之前回收；执行语义不变（已出堆检查-执行窗口内落地的取消仍不可撤、
+//!   仍照跑）。
 //!
 //! log-embed 埋点（`log-embed` feature，默认关=宏消除零开销）：target
 //! `skeleton::scheduler::{register,cancel,close,fire,worker}`。级别规范
 //! （骨架默认：正常流转=debug / 异常路径=warn / 终态=info）：注册/取消/
-//! 点火/墓碑跳过=debug；关闸拒绝注册、回调 panic、超载退化重臂、驱动
-//! 内部 panic=warn；close（清 pending）与 worker 退出=info。seq（堆条目
+//! 点火/墓碑跳过=debug；关闸拒绝注册、容量触顶拒绝注册、回调 panic、
+//! 超载退化重臂、驱动内部 panic=warn；close（清 pending）与 worker 退出=info。seq（堆条目
 //! 序号）进字段承载 register↔fire 跨事件关联；埋点全部在状态锁外发射
 //!（订阅方 IO 不持锁，坑面同「睡眠持锁」）。
 //!

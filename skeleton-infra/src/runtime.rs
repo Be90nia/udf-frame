@@ -35,7 +35,7 @@ mod receipt;
 #[cfg(feature = "unsafe-evidence")]
 mod evidence;
 
-use audit_emit::{audit_emit, audit_enqueued};
+use audit_emit::{AuditDispatch, audit_dispatch_reset, audit_emit, audit_enqueued};
 pub use close_wait::CloseWaitOutcome;
 pub use local_subs::LocalSubscription;
 use local_subs::{local_notify, next_local_sub_id};
@@ -105,6 +105,9 @@ type SubscriberCallback<S> = Box<dyn FnMut(&S) + Send>;
 
 struct SubscriptionSlot<S> {
     notify: Mutex<SubscriberCallback<S>>,
+    /// 存活闸（issue#74）：票据 Drop / panic 摘除先原子失活（幂等），缓存快照
+    /// 回调前复查——失活槽不再被调用。单一真源，不另立第二套登记表。
+    alive: AtomicBool,
 }
 
 /// 排空权独占字段：仅持排空权（[`StoreInner::draining`] 旗互斥下的 drain 循环）
@@ -338,6 +341,10 @@ struct StoreInner<S, A, Op> {
     deferred_queue: Mutex<VecDeque<ActionRecord<A>>>,
     /// 订阅集（Arc 包裹：票据 Drop 经共享句柄即时摘表）
     subs: Arc<Mutex<Vec<Weak<SubscriptionSlot<S>>>>>,
+    /// 订阅闸（issue#63）：闭门翻转（closed=false→true）与可失败订阅登记
+    /// （`try_subscribe`）共用的一把小锁——二者互斥 ⇒ 登记与闭门线性化。
+    /// 只在登记/闭门路径取用，热 dispatch 路径不取（零热路径开销）。
+    sub_gate: Mutex<()>,
     /// 回灌句柄缓存：每 store 构造一次；`sender()` 克隆、排空循环借用。
     back: ActionSender<A>,
     /// 效果缓冲（锁消融修订）：**两段式**——暂存区（每次 reducer 调用的未提交
@@ -438,6 +445,15 @@ struct StoreInner<S, A, Op> {
     /// `subscribe_events` 落槽时槽内已有订阅即 +1——单槽二次订阅静默杀掉
     /// 前订的显形。
     audit_preempted: AtomicU64,
+    /// 审计实时投递丢弃计数（读侧 [`SyncStore::audit_delivery_drops`]）：
+    /// 实时回调**未发生投递**的次数（待投递 FIFO 溢出 / 回调 panic 后该代次
+    /// 队列作废 / 订阅替换时旧代次队列作废）。**与环溢出分账**：环溢出丢历史侧
+    /// （容量因），本计数丢实时流（背压因）；两套证据互不替代。
+    audit_delivery_drops: AtomicU64,
+    /// 审计实时回调派发状态（issue#65 主路线①）：在途标志 + 有界待投递 FIFO
+    /// （实时投递专用，**与审计环分开**）。锁序：审计环锁 → 本状态锁（全程
+    /// 一致 ⇒ 无死锁）；回调调用一律在两把锁之外。
+    audit_dispatch: Mutex<AuditDispatch>,
     /// 停机等待广播（配对 `queue` 锁）：排空租约释放的两个点各 notify 一次
     /// （正常出口 [`DrainGuard::disarm`] + unwind 臂 [`DrainGuard::drop`]）。
     /// 谓词读的「租约已释放 + 队列空」两点同受 `queue` 锁保护，故与本锁配对；
@@ -917,28 +933,16 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
     /// 本方法保留签名作迁移期兼容面——闭门登记照常 + 计数
     /// （[`SyncStore::subscriptions_after_close`]），不静默。
     fn subscribe(&self, f: impl FnMut(&S) + Send + 'static) -> Subscription<S> {
+        // 闸内「闭门观测 + 登记」（issue#63）：与 close 的闭门翻转互斥 ⇒
+        // 闭门观测与登记同一线性化点（legacy 语义不变：闭门后仍登记并计数）。
+        let _gate = lock(&self.inner.sub_gate);
         // 闭门登记显形（登记照常生效，但永无通知——见类型文档对照表）
         if self.is_closed() {
             self.inner
                 .subscriptions_after_close
                 .fetch_add(1, Ordering::SeqCst);
         }
-        let slot = Arc::new(SubscriptionSlot {
-            notify: Mutex::new(Box::new(f)),
-        });
-        lock(&self.inner.subs).push(Arc::downgrade(&slot));
-        self.inner.subs_version.fetch_add(1, Ordering::Release);
-        let dead = Arc::downgrade(&slot);
-        let subs = Arc::clone(&self.inner.subs);
-        let version = Arc::clone(&self.inner.subs_version);
-        // 存活令牌随闭包持有：表项存 Weak，强引用在票据 Drop（闭包释放）前
-        // 保 slot 存活——旧形态 `_slot: Arc<SubscriptionSlot>` 字段的等价物。
-        let keep_alive = Arc::clone(&slot);
-        Subscription::new(move || {
-            lock(&subs).retain(|w| !Weak::ptr_eq(w, &dead));
-            version.fetch_add(1, Ordering::Release);
-            drop(keep_alive);
-        })
+        self.insert_subscription(f)
     }
 
     /// 可克隆回灌句柄（解释器异步回灌的唯一通道）。克隆 StoreInner 缓存句柄
@@ -961,7 +965,13 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
         // 闭门）只会让 push 照常入队，随后 close 的 drain 必经锁覆盖该 push；
         // 反向（未见 store 即读到 true）单变量一致性上不可能。Release 只保证
         // 「读到 true 时闸前所有写可见」，单调闸下这是唯一的错误方向防护。
-        self.inner.closed.store(true, Ordering::Release);
+        // 闭门翻转与订阅登记互斥（issue#63）：closed=false→true 的翻转取
+        // 同一把订阅闸 ⇒ try_subscribe 与本翻转线性化互斥（不会「已登记
+        // 但 store 已关」）。闸在排空前释放：排空/回调期间不持闸。
+        {
+            let _gate = lock(&self.inner.sub_gate);
+            self.inner.closed.store(true, Ordering::Release);
+        }
         drain(&self.inner);
     }
 
@@ -1284,6 +1294,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             ledger_pool: Mutex::new(Vec::new()),
             deferred_queue: Mutex::new(VecDeque::new()),
             subs: Arc::new(Mutex::new(Vec::new())),
+            sub_gate: Mutex::new(()),
             back: back_sender(weak),
             effect_buf: cells.effect_buf,
             notify_cache: cells.notify_cache,
@@ -1313,6 +1324,8 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             audit_seq: AtomicU64::new(0),
             audit_gen: AtomicU64::new(0),
             audit_preempted: AtomicU64::new(0),
+            audit_delivery_drops: AtomicU64::new(0),
+            audit_dispatch: Mutex::new(AuditDispatch::new()),
             stop_wait: Condvar::new(),
             #[cfg(test)]
             in_flight: AtomicUsize::new(0),
@@ -1339,6 +1352,36 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ) -> Self {
         let state = root.initial();
         Self::assemble(root, fx, state, Vec::new(), ExclusiveCells::locked())
+    }
+
+    /// 订阅登记（issue#63 私有 helper）：**假定调用方已持订阅闸** `sub_gate`
+    /// ——闸把「闭门观测 + 登记」与 close 的闭门翻转变为同一线性化点：登记要么
+    /// 整体在闭门前，要么整体在闭门后（不会出现「已登记但 store 已关」）。
+    ///
+    /// 闸内纪律（issue#63 锁序）：不跑用户回调、不丢用户闭包、不排空队列——
+    /// 本 helper 只做「建槽 → 入表 → 版本自增 → 造票据」。
+    fn insert_subscription(&self, f: impl FnMut(&S) + Send + 'static) -> Subscription<S> {
+        let slot = Arc::new(SubscriptionSlot {
+            notify: Mutex::new(Box::new(f)),
+            alive: AtomicBool::new(true),
+        });
+        lock(&self.inner.subs).push(Arc::downgrade(&slot));
+        self.inner.subs_version.fetch_add(1, Ordering::Release);
+        let dead = Arc::downgrade(&slot);
+        let subs = Arc::clone(&self.inner.subs);
+        let version = Arc::clone(&self.inner.subs_version);
+        // 存活令牌随闭包持有：表项存 Weak，强引用在票据 Drop（闭包释放）前
+        // 保 slot 存活——旧形态 `_slot: Arc<SubscriptionSlot>` 字段的等价物。
+        let keep_alive = Arc::clone(&slot);
+        Subscription::new(move || {
+            // 失活优先（issue#74）：alive=false 先于摘表 + 递增版本——缓存
+            // 快照回调前复查 alive，失活槽不再被调用（幂等：panic 摘除与
+            // 票据 Drop 竞争时只有一方做实）。
+            keep_alive.alive.store(false, Ordering::Release);
+            lock(&subs).retain(|w| !Weak::ptr_eq(w, &dead));
+            version.fetch_add(1, Ordering::Release);
+            drop(keep_alive);
+        })
     }
 
     /// 登记跨线程订阅，闭门显式拒绝（推荐停机序主路径）：登记路径与
@@ -1374,10 +1417,17 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         &self,
         f: impl FnMut(&S) + Send + 'static,
     ) -> Result<Subscription<S>, StoreClosed> {
+        // 闸内「检查 closed + 登记」原子化（issue#63）：close 的
+        // closed=false→true 翻转取同一把闸 ⇒ 本调用与 close 互斥——结果
+        // 只能是「Ok 且登记线性化在 close 之前」或「Err(StoreClosed) 且
+        // close 已线性化」；绝不会「已登记但 store 已关」。
+        let _gate = lock(&self.inner.sub_gate);
         if self.is_closed() {
+            // 闸在抛错前释放：用户闭包随参数析构，不在闸内（禁持闸丢闭包）。
+            drop(_gate);
             return Err(StoreClosed);
         }
-        Ok(self.subscribe(f))
+        Ok(self.insert_subscription(f))
     }
 
     /// 单线程订阅：回调免 `Send` 约束——闭包体内可用 `Rc`/`RefCell` 等线程
@@ -1585,6 +1635,17 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         self.inner.audit_preempted.load(Ordering::Relaxed)
     }
 
+    /// 审计实时投递丢弃计数（fail-visible 读侧，issue#65 主路线①）：实时回调
+    /// **未发生投递**的次数——待投递 FIFO 溢出（丢最旧）/ 回调 panic 后该代次
+    /// 队列作废 / 订阅替换时旧代次队列作废。
+    ///
+    /// **与环溢出分账**：环溢出丢历史侧（容量因，`seq` 空洞即显式证据），
+    /// 本计数丢实时流（背压因）；两套证据互不替代（词表见
+    /// `docs/reference.md`「投递语义词汇（订阅面通用）」）。
+    pub fn audit_delivery_drops(&self) -> u64 {
+        self.inner.audit_delivery_drops.load(Ordering::Relaxed)
+    }
+
     /// 异步投递累计次数（ADR 0008 唯一新增读侧，成本可见）：投递口成功收到
     /// 信号的累计次数——逐口逐拍累计（panic 被摘除的投递不计；闭门/票 Drop 后
     /// 不再产生）。乘以单次投递成本即异步档对 dispatch 的总税额，是投递口
@@ -1654,14 +1715,19 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ///
     /// - `capacity`：有界环容量（0 视作 1）。溢出丢最旧——最新生命周期优先；
     ///   丢失无新计数，`seq` 空洞即显式证据（见 [`AuditEvent`]）。
-    /// - `on_event`：实时回调（**best-effort 观测面**，非每事件保证——权威历史
-    ///   是环 + `seq`，取证走 [`Self::take_events`]；订阅面通用词汇见
-    ///   `docs/reference.md`「投递语义词汇」）。回调在 emit 调用方线程内同步
-    ///   调用（慢回调拖慢 emit 调用方的时序）；并发发射窗内未取得回调权的事件、
-    ///   以及回调内重入 dispatch 的事件，只录环不再回调（后者 TLS 在途标记封
-    ///   自指递归）。纯环录模式传 `|_| {}`。回调 panic = fail-closed 摘除（环照
-    ///   录、dispatch 行为不变——观测面禁改变被观测者），成因计入
-    ///   [`Self::subscriber_panics`] / [`Self::subscriber_panic_last_cause`]。
+    /// - `on_event`：实时回调（**串行派发**：任一时刻至多一个派发者在调用回
+    ///   调）。回调在 emit 调用方线程内同步调用（慢回调拖慢 emit 调用方的时序
+    ///   ——已知观测面张力）。**回调在途期间**并发发射的事件**入队待补投**（有
+    ///   界 FIFO，按 `seq` 序，由在途者在所有内部锁之外补投）——并发发射**不
+    ///   丢事件**；队列有界 ⇒ 溢出丢最旧并计入 [`Self::audit_delivery_drops`]
+    ///   （实时流背压因，与环溢出分账）。**同 store 重入**（回调内 dispatch 本
+    ///   store）的事件只录环、不再回调（TLS 在途标记封自指递归）——该抑制与
+    ///   「并发投递入队」是两种不同意图。权威历史仍是环 + `seq`（取证走
+    ///   [`Self::take_events`]；订阅面通用词汇见 `docs/reference.md`「投递语义词
+    ///   汇」）。纯环录模式传 `|_| {}`。回调 panic = fail-closed 摘除（环照录、
+    ///   dispatch 行为不变——观测面禁改变被观测者），该代次排队事件作废（不投
+    ///   递给替换订阅）并计数，成因计入 [`Self::subscriber_panics`] /
+    ///   [`Self::subscriber_panic_last_cause`]。
     /// - 票据 Drop = 关闭；被覆盖的旧票据 Drop 凭代次对账，禁误杀后继流。
     ///
     /// # Examples
@@ -1736,6 +1802,10 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
                 gen,
                 notify: Some(Box::new(on_event)),
             });
+            // 派发状态换代次（issue#65 主路线①）：旧代次排队事件作废（禁泄漏
+            // 进替换订阅，作废件数计入投递丢弃计数）；在途标记复位（新代次可
+            // 自行派发；旧代次在途者凭代次对账自行作废，不覆盖新代次状态）。
+            audit_dispatch_reset(&self.inner, gen);
         }
         self.inner.audit_gate.store(true, Ordering::Release);
         AuditTicket {
@@ -2355,11 +2425,19 @@ fn notify_snapshot_consumers<
             // 订阅回调 panic 归一：摘除该订阅者后继续——中毒 slot.notify
             // 永久再 panic，留表即「每次 dispatch 必 panic」的双重变砖。摘除自增
             // 版本，快照缓存下一次 dispatch 冷重建时收敛。
+            // 缓存快照存活复查（issue#74）：快照持强 Arc，票据 Drop 后本次
+            // dispatch 仍可能回调已注销槽——alive=false 即跳过（已开始的
+            // 回调可完成：in-flight 语义，不承诺 quiescent 退订）。
+            if !slot.alive.load(Ordering::Acquire) {
+                continue;
+            }
             let notified = catch_unwind(AssertUnwindSafe(|| {
                 let mut notify = lock(&slot.notify);
                 notify(next);
             }));
             if let Err(payload) = notified {
+                // panic 摘除：先失活（幂等）再摘表 + 递增版本。
+                slot.alive.store(false, Ordering::Release);
                 let dead = Arc::downgrade(slot);
                 lock(&inner.subs).retain(|w| !Weak::ptr_eq(w, &dead));
                 inner.subs_version.fetch_add(1, Ordering::Release);

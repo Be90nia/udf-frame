@@ -361,14 +361,26 @@ required-features = ["runtime", "pool"]
 name = "object_pool"
 required-features = ["runtime", "pool"]
 [[test]]
+name = "pool_audit_concurrent_delivery"
+required-features = ["pool"]
+[[test]]
 name = "pool_base"
 required-features = ["runtime", "pool"]
+[[test]]
+name = "threadpool_resize_reservation"
+required-features = ["pool"]
 [[test]]
 name = "pooled_thread_pool"
 required-features = ["runtime", "pool"]
 [[test]]
 name = "receive_panic_location"
 required-features = ["runtime", "pool"]
+[[test]]
+name = "subscribe_close_linearization"
+required-features = ["runtime"]
+[[test]]
+name = "ticket_removal_delivery"
+required-features = ["runtime"]
 [[test]]
 name = "robust_panic_recovery"
 required-features = ["runtime", "pool"]

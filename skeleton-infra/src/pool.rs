@@ -37,6 +37,11 @@ use skeleton::pool::{
 /// 委托用（`PoolBase::subscribe_audit` 的订阅面可显式给 cap）。
 pub const AUDIT_RING_DEFAULT_CAP: usize = 1024;
 
+/// **待投递 FIFO 上限**（issue#75）：回调在途窗口内的并发 emit 排队上限。
+/// 溢出丢**最旧**并计入**投递丢弃计数**（与 ring 溢出分账：ring 溢出丢历史侧，
+/// 投递丢弃丢实时流）。
+pub(crate) const AUDIT_PENDING_CAP: usize = 1024;
+
 /// 入口校验（事前校验纪律，纯函数零锁零分配）：max==0 / idle_cap==0 /
 /// idle_cap>max 三类恒不合法配置。构造期（[`PoolBase::new`]）同规则 panic
 /// fail-fast，运行时（[`PoolBase::resize`]）显式 Err——同一套规则两档出口；
@@ -77,12 +82,20 @@ struct PoolCore {
 type AuditCallback = Box<dyn FnMut(&PoolAuditEvent) + Send>;
 
 /// 审计槽（订阅态的单槽内容）：容量环 + 实时回调 + 订阅代次（形态同
-/// `audit::AuditSink`）。
+/// `audit::AuditSink`）+ **在途派发状态 + 待投递 FIFO**（issue#75）。
 struct AuditSlot {
     ring: VecDeque<PoolAuditEvent>,
     cap: usize,
     gen: u64,
     notify: Option<AuditCallback>,
+    /// 在途派发标记：`true` = 有线程持有回调并在**锁外**调用中——此窗口内的
+    /// 并发 emit 入 [`Self::pending`] FIFO（不丢事件）。`false` 且
+    /// `notify == None` = 回调已被摘除（panic fail-closed）⇒ 只录环不投递。
+    inflight: bool,
+    /// 待投递 FIFO：回调在途期间并发 emit 的事件（**有界**——溢出丢最旧并
+    /// 计入**投递丢弃计数**，与 ring 溢出分账）。按 `seq` 序在所有内部锁
+    /// 之外排空（issue#75）。
+    pending: VecDeque<PoolAuditEvent>,
 }
 
 /// 池域审计环（`PoolBase` 与 [`crate::objpool::ObjectPool`] 共用的抽取件）：
@@ -95,6 +108,10 @@ pub(crate) struct PoolAuditSink {
     seq: AtomicU64,
     gen: AtomicU64,
     audit_callback_panics: AtomicU64,
+    /// **投递丢弃计数**（issue#75）：只数「实时回调投递未发生」的次数（待投递
+    /// FIFO 溢出丢最旧）。**与 ring 溢出分账**——ring 溢出丢历史侧（容量因），
+    /// 投递丢弃丢实时流（背压因）；两套证据互不替代。
+    audit_delivery_drops: AtomicU64,
 }
 
 impl PoolAuditSink {
@@ -106,6 +123,7 @@ impl PoolAuditSink {
             seq: AtomicU64::new(0),
             gen: AtomicU64::new(0),
             audit_callback_panics: AtomicU64::new(0),
+            audit_delivery_drops: AtomicU64::new(0),
         }
     }
 
@@ -119,11 +137,22 @@ impl PoolAuditSink {
         let gen = self.gen.fetch_add(1, Ordering::Relaxed) + 1;
         {
             let mut guard = lock(&self.audit);
+            // 替换旧槽：旧槽未投递完的队列随旧代次作废（禁泄漏进新订阅）——
+            // 作废件数计入投递丢弃计数（fail-visible，禁静默丢）。
+            if let Some(old) = guard.as_ref() {
+                let abandoned = old.pending.len() as u64;
+                if abandoned > 0 {
+                    self.audit_delivery_drops
+                        .fetch_add(abandoned, Ordering::Relaxed);
+                }
+            }
             *guard = Some(AuditSlot {
                 ring: VecDeque::new(),
                 cap: cap.max(1),
                 gen,
                 notify: Some(Box::new(f)),
+                inflight: false,
+                pending: VecDeque::new(),
             });
         }
         self.gate.store(true, Ordering::Release);
@@ -155,51 +184,135 @@ impl PoolAuditSink {
         self.audit_callback_panics.load(Ordering::Relaxed)
     }
 
+    /// **投递丢弃计数**（issue#75）：实时回调投递未发生的次数（待投递 FIFO
+    /// 溢出 / 回调 panic 后该代次队列作废 / 订阅替换时旧代次队列作废）。
+    /// **与 ring 溢出分账**——ring 溢出丢历史侧（容量因），本计数丢实时流
+    /// （背压因）；两套证据互不替代（词表见 `docs/reference.md`
+    /// 「投递语义词汇（订阅面通用）」）。
+    pub(crate) fn audit_delivery_drops(&self) -> u64 {
+        self.audit_delivery_drops.load(Ordering::Relaxed)
+    }
+
     /// 审计发射唯一收口：未订阅 = 一次 gate load 即返（热路径零分配零锁）；
     /// 订阅态 = seq 单调入账（容量环溢出丢最旧）+ **锁外**实时回调（回调可
     /// 重入本池一切入口，持锁即死锁）。热路径禁格式化。
+    ///
+    /// **并发投递语义（issue#75）**：实时回调**串行且不丢事件**——回调在途
+    /// （本线程持回调于锁外调用）时，并发 emitter 的事件入**待投递 FIFO**
+    /// （有界 [`AUDIT_PENDING_CAP`]，溢出丢最旧并计入**投递丢弃计数**，与
+    /// ring 溢出分账），由在途者按 `seq` 序在**所有内部锁之外**补投。
+    /// 同线程重入（回调在途）只录环不投递——封死自指递归（递归会栈爆）。
     pub(crate) fn emit(&self, kind: PoolAuditKind) {
         if !self.gate.load(Ordering::Acquire) {
             return;
         }
+        if EMIT_CB_IN_FLIGHT.with(Cell::get) {
+            // 同线程重入（任一池的回调在本线程在途）：只录环——封死自指递归。
+            self.record(kind);
+            return;
+        }
+        let mut taken: Option<(u64, AuditCallback, PoolAuditEvent)> = None;
+        {
+            let mut guard = lock(&self.audit);
+            let Some(slot) = guard.as_mut() else {
+                return;
+            };
+            // seq 在入环临界区内分配（与骨架 audit 同款）：环序 = seq 序。
+            let event = PoolAuditEvent {
+                seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
+                kind,
+            };
+            if slot.ring.len() >= slot.cap {
+                slot.ring.pop_front();
+            }
+            slot.ring.push_back(event);
+            if slot.inflight {
+                // 回调在途（他线程持有）：事件入待投递 FIFO ⇒ 由在途者补投
+                // （并发 emit 不丢事件——issue#75）。FIFO 满 ⇒ 丢最旧 + 计数。
+                if slot.pending.len() >= AUDIT_PENDING_CAP {
+                    slot.pending.pop_front();
+                    self.audit_delivery_drops.fetch_add(1, Ordering::Relaxed);
+                }
+                slot.pending.push_back(event);
+                return;
+            }
+            if let Some(cb) = slot.notify.take() {
+                // 本线程成为在途派发者（独占回调 ⇒ 回调串行调用）。
+                slot.inflight = true;
+                taken = Some((slot.gen, cb, event));
+            }
+            // notify 为 None 且非在途 ⇒ 回调已摘除（panic fail-closed）：只录环。
+        }
+        if let Some((gen, cb, event)) = taken {
+            self.dispatch(gen, Some(cb), event);
+        }
+    }
+
+    /// 只录环（不投递）：同线程重入路径——历史完整、实时流不递归。
+    fn record(&self, kind: PoolAuditKind) {
+        let mut guard = lock(&self.audit);
+        let Some(slot) = guard.as_mut() else {
+            return;
+        };
         let event = PoolAuditEvent {
             seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
             kind,
         };
-        let mut notify = {
-            let mut guard = lock(&self.audit);
-            match guard.as_mut() {
-                Some(slot) => {
-                    if slot.ring.len() >= slot.cap {
-                        slot.ring.pop_front();
-                    }
-                    slot.ring.push_back(event);
-                    slot.notify.take()
-                }
-                None => return,
-            }
-        };
-        if let Some(f) = notify.as_mut() {
-            if !EMIT_CB_IN_FLIGHT.with(Cell::get) {
-                EMIT_CB_IN_FLIGHT.with(|cell| cell.set(true));
-                match catch_unwind(AssertUnwindSafe(|| f(&event))) {
-                    Ok(()) => {}
-                    // 回调 panic：fail-closed 摘除（环照录、池行为不变——观测面
-                    // 禁改变被观测者），计数留痕（禁静默摘除）。
-                    Err(_) => {
-                        self.audit_callback_panics.fetch_add(1, Ordering::Relaxed);
-                        notify = None;
-                    }
-                }
-                EMIT_CB_IN_FLIGHT.with(|cell| cell.set(false));
-            }
+        if slot.ring.len() >= slot.cap {
+            slot.ring.pop_front();
         }
-        if let Some(f) = notify {
+        slot.ring.push_back(event);
+    }
+
+    /// 在途派发者：持回调（独占）**锁外**逐件投递，并按 `seq` 序补投待投递
+    /// FIFO（issue#75：并发 emit 不丢事件）。回调 panic ⇒ **fail-close 本
+    /// 代次**（摘除回调 + 作废本代次队列——禁投递到替换订阅），计数留痕。
+    fn dispatch(&self, gen: u64, mut cb: Option<AuditCallback>, mut next: PoolAuditEvent) {
+        loop {
+            // 回调调用在锁外（回调可重入本池一切入口，持锁即死锁）。
+            EMIT_CB_IN_FLIGHT.with(|cell| cell.set(true));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                if let Some(f) = cb.as_mut() {
+                    f(&next);
+                }
+            }));
+            EMIT_CB_IN_FLIGHT.with(|cell| cell.set(false));
+            if result.is_err() {
+                // 回调 panic：fail-closed 摘除（环照录、池行为不变——观测面禁改变
+                // 被观测者），计数留痕（禁静默摘除）；本代次待投递队列作废
+                // （禁泄漏进替换订阅），作废件数计入投递丢弃计数。
+                self.audit_callback_panics.fetch_add(1, Ordering::Relaxed);
+                let mut guard = lock(&self.audit);
+                if let Some(slot) = guard.as_mut() {
+                    if slot.gen == gen {
+                        slot.notify = None;
+                        slot.inflight = false;
+                        let dropped = slot.pending.len() as u64;
+                        slot.pending.clear();
+                        self.audit_delivery_drops
+                            .fetch_add(dropped, Ordering::Relaxed);
+                    }
+                }
+                return;
+            }
+            // 取下一件待投递事件（锁内）；空 ⇒ 交还回调并结束在途。
             let mut guard = lock(&self.audit);
-            if let Some(slot) = guard.as_mut() {
-                // 归还窗口内订阅被替换则宁弃旧回调，禁覆盖新槽。
-                if slot.notify.is_none() {
-                    slot.notify = Some(f);
+            let Some(slot) = guard.as_mut() else {
+                return;
+            };
+            if slot.gen != gen {
+                // 订阅已被替换：本代次队列随旧槽作废（不投递到替换订阅）。
+                return;
+            }
+            match slot.pending.pop_front() {
+                Some(ev) => {
+                    drop(guard);
+                    next = ev;
+                }
+                None => {
+                    slot.inflight = false;
+                    slot.notify = cb.take();
+                    return;
                 }
             }
         }
@@ -352,6 +465,16 @@ impl PoolBase {
 
     /// 开审计流：落闸 + 建槽（容量环 `cap` 钳到 ≥1——恒保最新一件）。再次订阅
     /// = 替换现役槽，被替换票据凭代次对账 inert（Drop 不误杀新流）。
+    ///
+    /// **投递语义（issue#75）**：实时回调是**串行且不丢事件**的观测面——
+    /// 回调在途窗口内的并发 emit 进入**待投递 FIFO**，由在途者按 `seq` 序在
+    /// 所有内部锁之外补投（每事件恰好投递一次）；FIFO 有界（上限见模块内
+    /// `AUDIT_PENDING_CAP`），溢出丢最旧并计入
+    /// [`Self::audit_delivery_drops`]（**与 ring 溢出分账**：ring 溢出丢历史侧，
+    /// 投递丢弃丢实时流）。回调 panic ⇒ **fail-close 本代次**（摘除回调 +
+    /// 该代次队列作废，禁泄漏进替换订阅），计数见
+    /// [`Self::audit_callback_panics`]。权威历史 = 环 + `seq`（取证走
+    /// [`Self::take_audit_events`]）。
     pub fn subscribe_audit(
         &self,
         cap: usize,
@@ -370,6 +493,15 @@ impl PoolBase {
     /// 环照录、池行为不变——观测面禁改变被观测者，摘除必留痕禁静默）。
     pub fn audit_callback_panics(&self) -> u64 {
         self.sink.audit_callback_panics()
+    }
+
+    /// **投递丢弃计数**（issue#75）：实时回调投递未发生的次数（待投递 FIFO
+    /// 溢出 / 回调 panic 后该代次队列作废 / 订阅替换时旧代次队列作废）。
+    /// **与 ring 溢出分账**——ring 溢出丢历史侧（容量因），本计数丢实时流
+    /// （背压因）；两套证据互不替代（词表见 `docs/reference.md`
+    /// 「投递语义词汇（订阅面通用）」）。
+    pub fn audit_delivery_drops(&self) -> u64 {
+        self.sink.audit_delivery_drops()
     }
 
     /// 审计发射唯一收口：未订阅 = 一次 gate load 即返（热路径零分配零锁）；
@@ -642,11 +774,19 @@ struct Shared {
     work: Condvar,
     /// join 等待面：worker 退役（workers==0）通知。
     retired: Condvar,
+    /// **resize 目标代次发放器**（issue#69）：每次 `resize` 入口领一个单调序号。
+    /// 目标更新按代次串行化——**最后发起**的 resize 目标生效（并发 resize 到
+    /// 不同目标时收敛到最新目标，与 spawn 完成顺序无关）。
+    next_epoch: AtomicU64,
 }
 
 struct Inner {
     queue: VecDeque<Task>,
     core: usize,
+    /// **目标代次**（issue#69）：resize 目标更新的单调序号。目标更新按代次
+    /// 串行化——**最后一次发起的 resize** 生效（并发 resize 到不同目标时收敛
+    /// 到最新目标，禁旧目标反过来覆盖新目标）。
+    target_epoch: u64,
     max: usize,
     queue_cap: usize,
     /// 存活 worker + 在途创建席位（保守上界：worker 退出递减不先于计数，禁
@@ -683,6 +823,19 @@ fn reserve_worker(g: &mut Inner) -> u64 {
     let id = g.next_id;
     g.next_id += 1;
     id
+}
+
+/// 缩容令牌对账（**锁内调用**）：按**最新 core**（`g.core`）与**真实存活**
+/// 重算待退令牌——在途席位不是可退役 worker（issue#34：席位兑现前不存在，
+/// 误发令牌会把 core worker 退役），但席位**兑现后**须再对账（issue#69：
+/// 并发 resize 下按最新目标收敛，不留陈旧令牌）。
+fn reconcile_shrink(g: &mut Inner) {
+    let live = g.workers - g.reservations;
+    g.shrinking = live.saturating_sub(g.core);
+    debug_assert!(
+        g.shrinking <= g.workers,
+        "retire tokens ⊆ committed population"
+    );
 }
 
 /// 线程池指标（§4.4.2 可观测行：队列深/活跃 worker/完成数 + 治理计数）。
@@ -952,35 +1105,69 @@ impl<G: SpawnGate> ThreadPool<G> {
             return Err(PoolResizeError::IdleCapZero);
         }
         self.base.resize(t.max, t.core)?;
-        let mut spawn_ids = Vec::new();
-        let shrink_pending;
-        {
-            let mut g = lock(&self.shared.inner);
-            g.core = t.core;
-            g.max = t.max;
-            g.queue_cap = t.queue_cap;
-            // 缩容差额按真实存活计（workers 剔除在途席位——issue#34：席位
-            // 不是可退役 worker，误发令牌会把 core worker 退役）。
-            let live = g.workers - g.reservations;
-            g.shrinking = live.saturating_sub(t.core);
-            shrink_pending = g.shrinking > 0;
-            let deficit = t.core.saturating_sub(live);
-            for _ in 0..deficit {
-                spawn_ids.push(reserve_worker(&mut g));
-            }
-        }
-        if shrink_pending {
-            self.shared.work.notify_all();
-        }
         let mut spawn_failure = None;
-        for (index, worker_id) in spawn_ids.iter().enumerate() {
-            if let Err(failure) = self.create_worker(None, *worker_id) {
-                // 补建在失败处停止；未尝试的预留一并回滚（幻影 worker 消除，
-                // join 不会等一个不存在的 worker）。
-                self.rollback_reservations(spawn_ids.len() - index - 1);
-                spawn_failure = Some(failure.error);
+        // 目标代次（issue#69）：入口领号 ⇒ **最后发起**的 resize 目标生效
+        // （并发 resize 到不同目标时收敛到最新目标，与 spawn 完成顺序无关）。
+        let epoch = self.shared.next_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        loop {
+            // ① 锁内：目标更新（按代次串行化）+ 缺口席位预留 + 缩容令牌对账。
+            //    同一临界区 ⇒ 并发 resize 的目标更新互斥（issue#69 的「在途
+            //    resize 协调器」等价物：代次 + 状态锁），OS 线程创建在锁外（见下）。
+            let (ids, shrink_pending) = {
+                let mut g = lock(&self.shared.inner);
+                if epoch >= g.target_epoch {
+                    // 最新发起的目标覆盖旧目标（core/max/queue_cap 同批更新）。
+                    g.target_epoch = epoch;
+                    g.core = t.core;
+                    g.max = t.max;
+                    g.queue_cap = t.queue_cap;
+                }
+                // 缩容令牌：只从**可退休的真实 worker** 计（issue#34：在途席位
+                // 不是可退役 worker），按**最新 core** 对账（issue#69：陈旧令牌
+                // 禁留——并发 resize 后按最新目标收敛）。
+                reconcile_shrink(&mut g);
+                // 增长缺口：按**已承诺总量**（真实 + 在途席位）计（issue#69：
+                // 在途预留已占席位，禁重复预留同一缺口 ⇒ workers ≤ max 恒成立）。
+                let before = g.workers;
+                let deficit = g.core.saturating_sub(g.workers);
+                let ids: Vec<u64> = (0..deficit).map(|_| reserve_worker(&mut g)).collect();
+                debug_assert!(
+                    g.workers <= before.max(g.core),
+                    "growth must not push committed population above max"
+                );
+                debug_assert!(g.reservations <= g.workers, "reservations ⊆ committed");
+                (ids, g.shrinking > 0)
+            };
+            if shrink_pending {
+                // 唤醒空闲 worker 认领退出令牌（缩容生效点）。
+                self.shared.work.notify_all();
+            }
+            if ids.is_empty() {
                 break;
             }
+            // ② 锁外：OS 线程创建 + 创建闸裁决（禁持调度锁跨创建/跨用户闸门）。
+            for (index, worker_id) in ids.iter().enumerate() {
+                if let Err(failure) = self.create_worker(None, *worker_id) {
+                    // 补建在失败处停止；未尝试的预留一并回滚（幻影 worker 消除，
+                    // join 不会等一个不存在的 worker）。
+                    self.rollback_reservations(ids.len() - index - 1);
+                    spawn_failure = Some(failure.error);
+                    break;
+                }
+                // 席位兑现 ⇒ 真实存活数 +1 ⇒ 待退令牌按**最新 core** 重算
+                // （issue#69：旧目标预留的席位兑现后若超出最新目标 ⇒ 标记退役，
+                // 不得静默满足新目标两次；陈旧令牌禁留）。
+                {
+                    let mut g = lock(&self.shared.inner);
+                    reconcile_shrink(&mut g);
+                }
+                self.notify_retire_tokens();
+            }
+            if spawn_failure.is_some() {
+                break;
+            }
+            // ③ 下一轮：对账最新目标（并发 resize 期间目标可能已变）——补足到
+            // 最新 core（issue#69：收敛到最新目标，不留永久偏小的 core）。
         }
         match spawn_failure {
             None => Ok(()),
@@ -1112,11 +1299,26 @@ impl<G: SpawnGate> ThreadPool<G> {
             g.workers -= 1;
             g.reservations -= 1;
             g.spawn_failures += 1;
+            debug_assert!(
+                g.reservations <= g.workers,
+                "reservations ⊆ committed population after rollback"
+            );
         }
         // join 在 `retired` 上等 worker 退役：回滚后必须唤醒，否则 join 会
         // 永远等一个不存在的 worker。
         self.shared.retired.notify_all();
         SpawnFailure { error, task }
+    }
+
+    /// 唤醒空闲 worker 认领退出令牌（缩容生效点，锁外调用）。
+    fn notify_retire_tokens(&self) {
+        let shrink_pending = {
+            let g = lock(&self.shared.inner);
+            g.shrinking > 0
+        };
+        if shrink_pending {
+            self.shared.work.notify_all();
+        }
     }
 
     /// 回滚未尝试的预留席位（resize 补建中断时用——幻影 worker 消除）。
@@ -1128,6 +1330,8 @@ impl<G: SpawnGate> ThreadPool<G> {
             let mut g = lock(&self.shared.inner);
             g.workers -= count;
             g.reservations -= count;
+            // 回滚后按最新 core 重算待退令牌（issue#69：陈旧令牌禁留）。
+            reconcile_shrink(&mut g);
         }
         self.shared.retired.notify_all();
     }

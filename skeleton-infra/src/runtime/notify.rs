@@ -26,6 +26,10 @@ use super::panic_cause_summary;
 /// 没有它，摘除后再 Drop 票据会把闸打到下溢。
 pub(super) struct NotifySinkSlot {
     sink: Box<dyn NotifySink>,
+    /// 存活闸（issue#73）：**唯一真源**——闸回落的一次性裁决与「是否仍在册」
+    /// 共用同一标志（不另立第二套登记表）。`remove_sink` 的
+    /// `alive.swap(false, AcqRel)` 同时完成「闸回落恰好一次」与「失活」；
+    /// 收集窗与投递窗各复查一次（Acq），失活槽不得进入/留在投递窗口。
     alive: AtomicBool,
 }
 
@@ -85,7 +89,15 @@ pub(super) fn notify_async<S, A, Op>(inner: &StoreInner<S, A, Op>) {
         {
             // 表锁只覆盖收集窗；投递仍在锁外（publish 是宿主代码，持锁调用即死锁）。
             let sinks = lock(&inner.notify_sinks);
-            slots.extend(sinks.iter().filter_map(|w| w.upgrade()));
+            slots.extend(
+                sinks
+                    .iter()
+                    .filter_map(|w| w.upgrade())
+                    // 收集窗过滤已死槽（issue#73）：摘除路径先置 alive=false
+                    // 再摘表，收集窗可能撞上「已失活未摘表」的中间态——
+                    // 死槽不得进入投递窗口。
+                    .filter(|slot| slot.alive.load(Ordering::Acquire)),
+            );
         }
         if slots.is_empty() {
             // 闸 stale 的并发摘除窗：表已空——门控语义（无人订阅不推进版本）成立
@@ -99,6 +111,14 @@ pub(super) fn notify_async<S, A, Op>(inner: &StoreInner<S, A, Op>) {
             // 继续（中毒口每次 dispatch 必再 panic，留表即「每拍必 panic」双重变砖）。
             // 成因留痕与订阅回调 panic 同一纪律（subscriber_panics / last_cause）；
             // panic 的投递不计入 notify_published（成本只计成功投递）。
+            // 投递前复查 alive（issue#73）：收集窗之后、投递窗之前票据可能
+            // 已注销（remove_sink 先置 alive=false 再摘表）——死槽跳过投递。
+            // 竞态边界：通过本次检查的 publish 视为 in-flight，允许在票据
+            // Drop 返回后完成（不承诺 quiescent 退订）——契约面见
+            // skeleton::notify（去活后不开始新投递，在途可完成）。
+            if !slot.alive.load(Ordering::Acquire) {
+                continue;
+            }
             let published = catch_unwind(AssertUnwindSafe(|| slot.sink.publish(version)));
             match published {
                 Ok(()) => {

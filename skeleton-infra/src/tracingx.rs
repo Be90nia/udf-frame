@@ -2,8 +2,12 @@
 //!
 //! 核心零原生输出、宿主无库内 hook/span 可挂——收口形态：核心出审计事件流
 //! （[`crate::runtime::SyncStore::subscribe_events`]），本桥一行接线把投递到的
-//! 审计事件转 `tracing::event!`（target `skeleton::audit`，INFO 级；**best-effort
-//! 观测面**——不保证每事件必达，权威历史见 `SyncStore::take_events`）。核心
+//! 审计事件转 `tracing::event!`（target `skeleton::audit`，INFO 级）。上游实时
+//! 回调已升级为**串行派发**（issue#65 主路线①）：并发发射窗内的事件入队补投
+//! 而非跳过，故桥**不再有「并发窗内未进回调」的缺口**；仍存的丢弃面只有
+//! 有界待投递 FIFO 溢出（计入 [`SyncStore::audit_delivery_drops`]，与环溢出
+//! 分账）与环溢出（历史侧，证据=`seq` 空洞）——权威历史见
+//! `SyncStore::take_events`。核心
 //! crate 保持零依赖：桥在本层持 tracing 依赖（feature 门控，tokio/log 先例形态）；
 //! 审计值面在本 crate `audit` 域，实现走 `runtime::SyncStore`。
 //!
@@ -35,8 +39,11 @@ use crate::runtime::SyncStore;
 /// 把 `store` 的审计事件流桥接到 tracing：每个投递到的事件一条
 /// `tracing::event!`（target `skeleton::audit`，INFO 级），字段 `seq`（单调
 /// 序号）/ `kind`（生命周期节点名）/ `depth`（仅 Enqueued 事件携带回灌深度）。
-/// **best-effort**：并发发射窗内可能有事件未进回调（桥也就未输出），完整性
-/// 取证走 `take_events`（见 [`SyncStore::subscribe_events`] 的回调契约）。
+/// **上游已升级为串行派发**（issue#65 主路线①）：并发发射窗内的事件**入队补投**
+/// 而非跳过，故桥**不再有「并发窗内未进回调」的缺口**；仍存的丢弃面只有有界
+/// 待投递 FIFO 溢出（计入 [`SyncStore::audit_delivery_drops`]，与环溢出分账）
+/// 与环溢出（历史侧，证据=`seq` 空洞）——完整性取证走 `take_events`
+/// （见 [`SyncStore::subscribe_events`] 的回调契约）。
 /// `capacity` 语义同 [`SyncStore::subscribe_events`]；返回票据 Drop =
 /// 停桥（零开销恢复）。
 ///

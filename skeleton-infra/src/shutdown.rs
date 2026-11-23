@@ -23,6 +23,14 @@
 //! `FxScope::shutdown_timeout`）在闭包内自行组合超时；协调器超时是防单组件挂死
 //! 拖垮整体报告的兜底防线。`Duration::MAX` 超时=等到底。
 //!
+//! watchdog 容量闸：带超时组件的闭包跑在 watchdog 线程上，超时=放弃等待（线程
+//! 照跑、detach）——组件大量挂死时「仍在跑的 watchdog 闭包数」若无上界即随组件数
+//! 线性增长。`with_max_watchdogs(n)` 给硬上界：许可 spawn 前占用、线程退出时归还
+//! （超时后仍在跑的**仍占着**许可）；许可耗尽 → 该组件**未启动**（不 spawn 线程、
+//! 不内联跑闭包），如实记 `Failed`——非静默丢弃停机回调。`live_watchdogs()`/
+//! `peak_watchdogs()` 给运营读数（区分 `TimedOut` 与仍在跑的 detached 工作）。
+//! 默认不限（`None`）。
+//!
 //! 坑面装甲（每坑→堵法→测试，`tests/shutdown.rs` 红绿；对照表见
 //! shutdown 域性能锚（本地留存，未入库））：
 //!
@@ -36,6 +44,7 @@
 //! | 零组件误判失败 | 空报告合法，`is_clean()`=true |
 //! | 组件闭包内重入 shutdown 自锁（HANG 无留痕） | 双锚 `ThreadId` 检查：驱动线程（内联闭包）+役中 watchdog 线程集（带超时组件闭包），重入就地 panic → 被编排面捕获记 `Failed`；无关线程并发叫仍=阻塞等首叫同报告 |
 //! | watchdog 线程创建失败/上报通道断连被静默 | 显式 `Failed`（fail-visible，`await_watchdog` 四分支单测钉死） |
+//! | watchdog 执行数无上界（超时 abandon 后照跑，线程随组件数线性增长） | 容量闸 `with_max_watchdogs` 许可上限 + live/peak 读数；许可耗尽 → 组件**未启动**显式 `Failed` |
 //!
 //! log-embed 埋点（级别规范：正常流转=info / 异常终态=warn；target
 //! `skeleton::shutdown[::phase]`，字段化纪律见 lib.rs `embed_event!` 注）：
@@ -111,12 +120,73 @@ struct Component {
     f: Box<dyn FnOnce() + Send>,
 }
 
-/// 役中 watchdog 线程集（重入装甲第二锚）：带超时组件的闭包跑在协调器自
-/// spawn 的 watchdog 线程上，ThreadId 不等于驱动线程——只查驱动线程锚时其
-/// 重入落并发等待分支（等 Done），timeout=MAX 档双线程互等永久死锁零留痕。
-/// 惰性建（仅超时组件路径解引用时分配），零构造成本——不并入 `Inner` 以免
-/// 把 Arc 共享需求传染到构造/注册热路径（register 冷/热分配锚 2.00/1.00 事件）。
-type WatchdogSet = Arc<Mutex<Vec<ThreadId>>>;
+/// 容量闸耗尽的失败原因（固定文案：组件**未启动**，非超时、非静默丢弃）。
+const WATCHDOG_CAPACITY_EXHAUSTED: &str = "watchdog capacity exhausted; component not started";
+
+/// 役中 watchdog 账本状态（重入装甲第二锚 + 容量闸计数）。
+struct WatchdogState {
+    /// 役中 watchdog 线程 id（重入装甲第二锚）：带超时组件的闭包跑在协调器自
+    /// spawn 的 watchdog 线程上，ThreadId 不等于驱动线程——只查驱动线程锚时其
+    /// 重入落并发等待分支（等 Done），timeout=MAX 档双线程互等永久死锁零留痕。
+    marks: Vec<ThreadId>,
+    /// 已放行但尚未收口的 watchdog 执行数（含超时放弃等待后仍在跑的）。
+    live: usize,
+    /// `live` 历史峰值（诊断用：区分「曾堆积」与「此刻仍在跑」）。
+    peak: usize,
+}
+
+/// 役中 watchdog 账本（共享 Arc，watchdog 线程与协调器共写同一份）：惰性建
+/// （仅超时组件路径解引用时分配），零构造成本——不并入 `Inner` 以免把 Arc
+/// 共享需求传染到构造/注册热路径（register 冷/热分配锚 2.00/1.00 事件）。
+type WatchdogLedger = Arc<Mutex<WatchdogState>>;
+
+/// watchdog 执行许可（RAII）：放行时占用（spawn 前），归还于**持有者消亡**
+/// ——watchdog 线程退出（正常完成/panic）或**起线程失败**（std 丢弃闭包 ⇒ 闭包
+/// 内的许可随之消亡）时自动归还，不靠手写每条分支。
+struct WatchdogPermit {
+    state: Arc<Mutex<WatchdogState>>,
+}
+
+impl WatchdogPermit {
+    /// 占用许可：容量闸通过 → Some(许可)；已满 → None（**不 spawn、不内联跑**）。
+    fn acquire(ledger: &WatchdogLedger, max_watchdogs: Option<usize>) -> Option<Self> {
+        let mut g = lock(ledger);
+        if let Some(cap) = max_watchdogs {
+            if g.live >= cap {
+                return None;
+            }
+        }
+        g.live += 1;
+        g.peak = g.peak.max(g.live);
+        drop(g);
+        Some(Self {
+            state: Arc::clone(ledger),
+        })
+    }
+}
+
+impl Drop for WatchdogPermit {
+    fn drop(&mut self) {
+        let mut g = lock(&self.state);
+        g.live -= 1;
+    }
+}
+
+/// watchdog 役中守卫（RAII）：摘掉役中线程牌（重入装甲第二锚）——每次退出路径
+/// 都摘（含 panic），不靠手写每条分支。许可归还由 [`WatchdogPermit`] 承担。
+struct WatchdogGuard {
+    state: Arc<Mutex<WatchdogState>>,
+    id: ThreadId,
+    /// 许可随守卫同寿：线程退出（守卫析构）即归还。
+    _permit: WatchdogPermit,
+}
+
+impl Drop for WatchdogGuard {
+    fn drop(&mut self) {
+        let mut g = lock(&self.state);
+        g.marks.retain(|&id| id != self.id);
+    }
+}
 
 impl Component {
     /// 单组件执行：无超时=驱动线程内联跑（零 watchdog 线程开销，panic 同样
@@ -125,7 +195,15 @@ impl Component {
     /// watchdog 路径先登记线程 id 再跑闭包（执行窗），闭包结束即摘牌——此后
     /// 闭包内任何 `shutdown()` 调用必能在装甲检查中看到本线程，登记先于执行
     /// 无逃逸窗。
-    fn run(self, watchdogs: &LazyLock<WatchdogSet>) -> ComponentOutcome {
+    ///
+    /// 容量闸（`max_watchdogs`）：watchdog 执行许可在 spawn 前占用、线程退出时
+    /// 归还（超时放弃等待后仍在跑的**仍占着**许可）——许可耗尽则该组件
+    /// **未启动**，如实记 `Failed`（不 spawn 线程、不内联跑闭包）。
+    fn run(
+        self,
+        watchdogs: &LazyLock<WatchdogLedger>,
+        max_watchdogs: Option<usize>,
+    ) -> ComponentOutcome {
         let Component { name, timeout, f } = self;
         // 埋点「逐组件开始」：注册序串行执行每组件一条 info。
         embed_event!(
@@ -147,30 +225,7 @@ impl Component {
                     },
                 },
             },
-            Some(d) => {
-                let (tx, rx) = channel();
-                let marks = Arc::clone(watchdogs);
-                // 线程名带组件名：超时 detach 后宿主仍可归因谁在照跑。
-                let spawn = thread::Builder::new()
-                    .name(format!("shutdown-{name}"))
-                    .spawn(move || {
-                        let me = thread::current().id();
-                        lock(&marks).push(me);
-                        let result = catch_unwind(AssertUnwindSafe(f)).map_err(panic_reason);
-                        lock(&marks).retain(|&id| id != me);
-                        let _ = tx.send(result);
-                    });
-                match spawn {
-                    // 起线程失败（OS 资源面）：如实 Failed，不静默跳过该组件。
-                    Err(e) => ComponentOutcome {
-                        name,
-                        kind: OutcomeKind::Failed {
-                            reason: format!("watchdog 线程创建失败: {e}"),
-                        },
-                    },
-                    Ok(handle) => await_watchdog(name, d, rx, handle),
-                }
-            }
+            Some(d) => run_timed(name, d, f, watchdogs, max_watchdogs),
         };
         // 埋点「终态」：Stopped=info，TimedOut/Failed=warn（异常路径留痕）。
         #[cfg(feature = "log-embed")]
@@ -196,6 +251,59 @@ impl Component {
             ),
         }
         outcome
+    }
+}
+
+/// watchdog 路径（带超时组件）：容量闸 → spawn watchdog 线程 → 等结果
+/// （超时=放弃等待，线程照跑、detach）。
+fn run_timed(
+    name: String,
+    timeout: Duration,
+    f: Box<dyn FnOnce() + Send>,
+    watchdogs: &LazyLock<WatchdogLedger>,
+    max_watchdogs: Option<usize>,
+) -> ComponentOutcome {
+    let (tx, rx) = channel();
+    let ledger = Arc::clone(watchdogs);
+    match WatchdogPermit::acquire(&ledger, max_watchdogs) {
+        // 许可耗尽：不 spawn 线程、不内联跑闭包——组件**未启动**，显式 Failed
+        // 上报（fail-visible，禁静默丢弃停机回调）。
+        None => ComponentOutcome {
+            name,
+            kind: OutcomeKind::Failed {
+                reason: WATCHDOG_CAPACITY_EXHAUSTED.into(),
+            },
+        },
+        Some(permit) => {
+            let state = Arc::clone(&ledger);
+            // 线程名带组件名：超时 detach 后宿主仍可归因谁在照跑。
+            let spawn = thread::Builder::new()
+                .name(format!("shutdown-{name}"))
+                .spawn(move || {
+                    let me = thread::current().id();
+                    // 守卫先建后跑：任何退出路径（含 panic）都归还许可。
+                    let guard = WatchdogGuard {
+                        state: Arc::clone(&state),
+                        id: me,
+                        _permit: permit,
+                    };
+                    lock(&state).marks.push(me);
+                    let result = catch_unwind(AssertUnwindSafe(f)).map_err(panic_reason);
+                    drop(guard); // 先摘牌归还许可再上报：观察者确定性看到归还
+                    let _ = tx.send(result);
+                });
+            match spawn {
+                // 起线程失败（OS 资源面）：如实 Failed，不静默跳过该组件；线程从未
+                // 启动 ⇒ std 丢弃闭包 ⇒ 闭包内的许可随之归还。
+                Err(e) => ComponentOutcome {
+                    name,
+                    kind: OutcomeKind::Failed {
+                        reason: format!("watchdog 线程创建失败: {e}"),
+                    },
+                    Ok(handle) => await_watchdog(name, d, rx, handle),
+                }
+            }
+        }
     }
 }
 
@@ -258,8 +366,10 @@ pub struct ShutdownCoordinator {
     inner: Mutex<Inner>,
     done: Condvar,
     default_timeout: Option<Duration>,
-    /// 役中 watchdog 线程集（重入装甲第二锚，见 [`WatchdogSet`]）。
-    watchdogs: LazyLock<WatchdogSet>,
+    /// 役中 watchdog 账本（重入装甲第二锚 + 容量闸计数，见 [`WatchdogLedger`]）。
+    watchdogs: LazyLock<WatchdogLedger>,
+    /// watchdog 执行许可上限（`None`=不限；见 [`Self::with_max_watchdogs`]）。
+    max_watchdogs: Option<usize>,
 }
 
 /// 取锁：毒锁恢复继续（`PoisonError::into_inner`，scheduler/clock/ratelimit 同款）
@@ -279,7 +389,14 @@ impl ShutdownCoordinator {
             }),
             done: Condvar::new(),
             default_timeout: None,
-            watchdogs: LazyLock::new(|| Arc::new(Mutex::new(Vec::new()))),
+            watchdogs: LazyLock::new(|| {
+                Arc::new(Mutex::new(WatchdogState {
+                    marks: Vec::new(),
+                    live: 0,
+                    peak: 0,
+                }))
+            }),
+            max_watchdogs: None,
         }
     }
 
@@ -287,6 +404,20 @@ impl ShutdownCoordinator {
     /// `FxScope::with_concurrency` 形。
     pub fn with_default_timeout(mut self, d: Duration) -> Self {
         self.default_timeout = Some(d);
+        self
+    }
+
+    /// 设 watchdog 容量上限（同时在跑的 watchdog 闭包数硬上界；**按协调器计**——
+    /// 各协调器的许可池彼此独立）。
+    ///
+    /// 口径**不是并发池**：上限计的是「已放行但尚未收口」的 watchdog 执行数
+    /// ——含超时放弃等待后仍在跑（detach）的那些。协调器串行执行组件，故 N 的
+    /// 实际含义=「最多允许 N 个 watchdog 闭包同时存在（含已放弃等待仍在跑的）」。
+    ///
+    /// 许可耗尽时：不 spawn 线程、不内联跑闭包，该组件**未启动**，如实记
+    /// `Failed{reason}`（fail-visible，禁静默丢弃停机回调）。默认不限（`None`）。
+    pub fn with_max_watchdogs(mut self, max: usize) -> Self {
+        self.max_watchdogs = Some(max);
         self
     }
 
@@ -366,7 +497,7 @@ impl ShutdownCoordinator {
                 // timeout=MAX 档永久 HANG 零留痕（盲评 F-1 实弹）。就地 panic
                 // → 该线程 catch_unwind → Failed 上报。
                 let me = thread::current().id();
-                let in_window = lock(&*self.watchdogs).contains(&me);
+                let in_window = lock(&*self.watchdogs).marks.contains(&me);
                 if in_window {
                     panic!(
                         "ShutdownCoordinator::shutdown 重入：watchdog 线程上的组件闭包内禁止再次调用（自锁防线）——需要子编排请新起独立协调器"
@@ -391,7 +522,7 @@ impl ShutdownCoordinator {
 
         let per_component = components
             .into_iter()
-            .map(|c| c.run(&self.watchdogs))
+            .map(|c| c.run(&self.watchdogs, self.max_watchdogs))
             .collect();
         let report = ShutdownReport { per_component };
         // 埋点「整体报告」：编排收口一条 info（组件数/三态计数）。
@@ -425,6 +556,17 @@ impl ShutdownCoordinator {
     /// shutdown 已启动（含进行中）或已完成（闸语义同 `SyncStore::is_closed`）。
     pub fn is_shutdown(&self) -> bool {
         !matches!(lock(&self.inner).phase, Phase::Open)
+    }
+
+    /// 当前在跑的 watchdog 闭包数（已放行未收口；含超时放弃等待后仍在跑的）。
+    /// ——运营读数：区分「已放弃等待（`TimedOut`）」与「仍在跑的 detached 工作」。
+    pub fn live_watchdogs(&self) -> usize {
+        lock(&*self.watchdogs).live
+    }
+
+    /// [`Self::live_watchdogs`] 历史峰值（诊断用：区分「曾堆积」与「此刻仍在跑」）。
+    pub fn peak_watchdogs(&self) -> usize {
+        lock(&*self.watchdogs).peak
     }
 }
 
@@ -507,5 +649,30 @@ mod tests {
             "不可达路径须如实报 Failed，实为 {:?}",
             o.kind
         );
+    }
+
+    // 容量闸记账（白盒单测）：许可 acquire/release 语义——达上限则 acquire 返
+    // None（不占许可）；持有者消亡即归还（与「起线程失败时 std 丢弃闭包 ⇒ 闭包
+    // 内许可随之消亡」同一机制，故该路径的归还亦被此单测钉住）。
+    #[test]
+    fn watchdog_permit_accounting_releases_on_drop() {
+        let ledger: WatchdogLedger = Arc::new(Mutex::new(WatchdogState {
+            marks: Vec::new(),
+            live: 0,
+            peak: 0,
+        }));
+        let permit = WatchdogPermit::acquire(&ledger, Some(1)).expect("首个许可应放行");
+        assert_eq!(lock(&ledger).live, 1);
+        assert_eq!(lock(&ledger).peak, 1);
+        assert!(
+            WatchdogPermit::acquire(&ledger, Some(1)).is_none(),
+            "达上限须拒发许可"
+        );
+        drop(permit); // 持有者消亡 → 归还
+        assert_eq!(lock(&ledger).live, 0);
+        let permit = WatchdogPermit::acquire(&ledger, Some(1)).expect("归还后应可再放行");
+        assert_eq!(lock(&ledger).live, 1);
+        drop(permit);
+        assert_eq!(lock(&ledger).live, 0);
     }
 }

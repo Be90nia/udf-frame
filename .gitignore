@@ -5,6 +5,12 @@ target-*/
 .codebase-memory/
 verify/
 
+# 验证夹具的编译产物不入库（夹具本体入库：validation/ 是 #56 Stage A 的受版本
+# 控制路径——fresh clone 必须能构建 sync-only 消费方并记录其依赖树）。
+validation/**/target/
+validation/**/target-*/
+validation/**/out.log
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

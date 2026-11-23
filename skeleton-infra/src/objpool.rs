@@ -1130,6 +1130,14 @@ impl<T> ObjectPool<T> {
         self.sink.audit_callback_panics()
     }
 
+    /// **投递丢弃计数**（issue#75）：实时回调投递未发生的次数（待投递 FIFO 溢出
+    /// / 回调 panic 后该代次队列作废 / 订阅替换时旧代次队列作废）。与
+    /// [`PoolBase::audit_delivery_drops`](crate::pool::PoolBase) 同名同义——
+    /// 本件共用 `PoolAuditSink`，公开面同款呈现。**与 ring 溢出分账**。
+    pub fn audit_delivery_drops(&self) -> u64 {
+        self.sink.audit_delivery_drops()
+    }
+
     /// 取走环内审计事件（随取随清；实时回调是持续观测面，本方法是批量对账面）。
     pub fn take_audit_events(&self) -> Vec<PoolAuditEvent> {
         self.sink.take_events()

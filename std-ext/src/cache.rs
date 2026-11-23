@@ -26,8 +26,10 @@
 //!   `K: Clone` 且 O(log n)——被 arena 严格支配，不取。
 //!
 //! `K: Clone` 的来源：std `HashMap` 键单一所有权（map 与 arena 槽各需一份），
-//! clone 仅发生在 `insert` 写路径一次（moka 同约定）；**get 热路径零 clone
-//! 零分配**（`map.get(&k)` 借用查询 + u32 链操作）。
+//! clone 仅发生在 `insert` 写路径一次（moka 同约定）；**单线程面 get 热路径
+//! 零 clone 零分配**（`map.get(&k)` 借用查询 + u32 链操作，读面返 `&V`）。
+//! 共享面读面返 owned ⇒ 读路径有 `V::clone`，且该 clone 在 cache 锁内执行
+//! （见下方「锁边界契约」）。
 //!
 //! # 语义拍板
 //!
@@ -42,6 +44,67 @@
 //! | 并发 | 单线程面 [`LruCache`]/[`TtlCache`]（`&mut self`）；共享面
 //!   [`SyncLruCache`]/[`SyncTtlCache`]（内部 `Mutex` 短临界区 + 原子计数，
 //!   poison fail-fast，无后台线程） | 契约收窄 + 并发批（issue#1-3）兑现 |
+//! | 锁边界 | 共享面临界区内**仍跑用户代码**：键的 `Hash`/`Eq`（含借用键
+//!   `Q::Hash`/`Q::Eq`）与读路径的 `V::clone` ⇒ 须**快、不 panic、不得重入
+//!   同一个缓存**；#71 只把**退休值析构**移出锁、#80 只把**插入路径的
+//!   `K::clone`** 移出锁 ⇒ 二者**不**使上述两类变成无锁 | 显式限制文档化
+//!   （issue#82/#83；`HashMap<K,_>` 作权威索引 + 单 mutex 的固有属性，
+//!   真锁外化属架构重设计） |
+//!
+//! # 锁边界契约（共享面 = 用户代码**仍在锁内**）
+//!
+//! 共享面用**一把 `Mutex` 串行化全部状态变更** ⇒ 临界区内执行的**用户代码**
+//! 由两类 trait 构成。**不是「所有用户代码都在锁外」**——#71 只把**退休值
+//! 析构**移出锁，#80 只把**插入路径的 `K::clone`** 移出锁，二者都不使
+//! `Hash`/`Eq` 或读侧 `Clone` 变成无锁。逐条边界如下（issue#82/#83）。
+//!
+//! ## 键 trait 在锁内（issue#82）
+//!
+//! `HashMap<K, u32>` 作权威索引 ⇒ 键哈希/比较在锁内发生。调用点清单：
+//!
+//! - **查表**：`idx_of` → `HashMap::get` —— 覆盖 `get`/`peek`/`contains`/
+//!   `remove`/TTL 过期检查/插入存在性检查；
+//! - **插入**：`LruCore::insert` → `map.get(&k)`（存在性查表）+ `map.insert`
+//!   （建表项的哈希）；
+//! - **删除**：`pop_lru`/`remove`/`retain` → `map.remove(&key)`；
+//! - **扩容/rehash**：`HashMap` 增长时可能在锁内重新哈希既有键。
+//!
+//! ⇒ **键契约**：`K::Hash`、`K::Eq` 与借用键 `Q::Hash`/`Q::Eq`（`Borrow<Q>`
+//! 路径，由调用方控制）**可能在内部 mutex 下执行** ⇒ 必须**快、不 panic、
+//! 不得重入同一个缓存**（重入 = 非重入 mutex 自死锁；panic = 投毒锁，
+//! 后续访问全部 fail-fast）。
+//!
+//! ## 读路径 `V::clone` 在锁内（issue#83）
+//!
+//! 读族返回 owned 值 ⇒ 克隆在锁内发生。四个调用点：
+//!
+//! - [`SyncLruCache::get`]：`g.get_mut(k).map(|v| v.clone())`；
+//! - [`SyncLruCache::peek`]：`self.lock_core().peek(k).cloned()`；
+//! - [`SyncTtlCache::get`]：过期检查 + LRU touch 之后 `e.value.clone()`；
+//! - [`SyncTtlCache::peek`]：过期检查之后 `e.value.clone()`。
+//!
+//! ⇒ **值契约**：`V::clone` **在内部 mutex 下执行** ⇒ 必须**快、不 panic、
+//! 不得重入同一个缓存**。
+//!
+//! ## 与 #71 / #80 的精确对照（两句并列，勿互相误读）
+//!
+//! - #71 移出锁的是**退休值的析构**（`K::drop`/`V::drop`）；
+//! - 读侧 **`Clone` 仍在锁内**（本节）。
+//!
+//! #71 与 #80 **都没有**让 `Hash`/`Eq` 或读侧 `Clone` 变成无锁执行。
+//!
+//! ## 既有 API 属性（未被本契约改动）
+//!
+//! [`SyncLruCache::remove`]/[`SyncLruCache::pop_lru`] 与
+//! [`SyncTtlCache::remove`]/[`SyncTtlCache::pop_lru`] 仍**移动出 owned `V`**，
+//! **不需要 `V: Clone`**；只有返回 owned 值的读族 API（`get`/`peek`）要求
+//! `V: Clone`。
+//!
+//! ## 单线程面区分
+//!
+//! [`LruCache`]/[`TtlCache`] **无共享 mutex** ⇒ 不存在上述锁内用户代码问题；
+//! 但 `Hash`/`Eq` 仍在**调用方栈上同步执行**（调用方自担慢/重入/panic 后果，
+//! 与锁无关）。
 //!
 //! # Examples
 //!
@@ -364,6 +427,11 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
 /// 同款纪律）；满插入恒逐 LRU 尾（无 Reject 形——缓存的淘汰本来就是承诺）。
 ///
 /// 并发面：单线程 `&mut self`，无内部锁；`&self` 共享面见 [`SyncLruCache`]。
+///
+/// 键 trait 边界（issue#82）：本面**无共享 mutex** ⇒ 不存在「用户代码在 cache
+/// 锁内」问题；但 `K::Hash`/`K::Eq` 仍在**调用方栈上同步执行**（慢/panic/重入
+/// 的后果由调用方自担，与锁无关）。读面返 `&V` ⇒ 无 `V::clone`（issue#83 的
+/// 读侧限制只存在于共享面）。
 #[derive(Debug)]
 pub struct LruCache<K, V> {
     core: LruCore<K, V>,
@@ -464,6 +532,11 @@ struct TtlEntry<V> {
 /// - 时钟只消费 `now_instant` 单调面（挂钟回拨结构性排除）。
 ///
 /// 并发面：单线程 `&mut self`；`&self` 共享面见 [`SyncTtlCache`]。
+///
+/// 键 trait 边界（issue#82）：本面**无共享 mutex** ⇒ 不存在「用户代码在 cache
+/// 锁内」问题；但 `K::Hash`/`K::Eq` 仍在**调用方栈上同步执行**（慢/panic/重入
+/// 的后果由调用方自担，与锁无关）。读面返 `&V` ⇒ 无 `V::clone`（issue#83 的
+/// 读侧限制只存在于共享面）。
 pub struct TtlCache<K, V> {
     clock: Arc<dyn Clock>,
     core: LruCore<K, TtlEntry<V>>,
@@ -671,6 +744,28 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
 ///   已破，`into_inner` 静默续跑 = 破链读写放大，禁（与 logx 的 `into_inner`
 ///   先例区分——cache 不变量耦合度高）。
 ///
+/// # 锁内用户代码契约（issue#82/#83）
+///
+/// 上述「析构在锁外」「`K::clone` 在锁外」**只覆盖那两条边界**——共享面仍有
+/// 用户代码跑在内部 mutex 下：
+///
+/// - **键 trait 在锁内**（issue#82）：`HashMap<K, u32>` 作权威索引 ⇒
+///   `K::Hash`、`K::Eq` 与借用键 `Q::Hash`/`Q::Eq`（`Borrow<Q>` 路径）**可能
+///   在内部 mutex 下执行**（查表 `idx_of`→`HashMap::get`、插入 `map.get`/
+///   `map.insert`、删除 `map.remove`、`HashMap` 扩容/rehash）⇒ 键实现必须
+///   **快、不 panic、不得重入同一个缓存**（重入 = 非重入 mutex 自死锁；panic
+///   = 投毒锁 ⇒ 后续访问全部 fail-fast）。
+/// - **读路径 `V::clone` 在锁内**（issue#83）：[`Self::get`]（`g.get_mut(k)
+///   .map(|v| v.clone())`）与 [`Self::peek`]（`self.lock_core().peek(k)
+///   .cloned()`）返 owned 值 ⇒ `V::clone` **在内部 mutex 下执行** ⇒ 值实现
+///   必须**快、不 panic、不得重入同一个缓存**。
+/// - **与 #71 的精确对照**（两句并列，勿互相误读）：#71 移出锁的是**退休值的
+///   析构**；读侧 **`Clone` 仍在锁内**。#71/#80 **都没有**让 `Hash`/`Eq` 或
+///   读侧 `Clone` 变成无锁执行。
+/// - **既有 API 属性未被改动**：[`Self::remove`]/[`Self::pop_lru`] 仍**移动出
+///   owned `V`**、**不需要 `V: Clone`**；只有返回 owned 值的 `get`/`peek`
+///   要求 `V: Clone`。
+///
 /// 计数：命中（get 触碰命中）/淘汰（满插逐尾）各一个 `AtomicU64` 单点，锁内
 /// 无第二套计数；`Relaxed` 序（诊断面，等价性断言由线程 join 同步保证，见
 /// c4v 测试）。淘汰口径：容量满插自动逐出才计；`remove`/`pop_lru` 是显式
@@ -710,6 +805,17 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
 
     /// 插入/覆盖。已存在键=更新值+touch（不触发淘汰）；新键满=先逐 LRU 尾
     /// 再插（计入 [`Self::evictions`]）。
+    ///
+    /// **用户 `K::clone` 在锁外**（issue#80）：两阶段插入——① 持锁查存在，存在
+    /// 即更新值 + touch（**不 clone**，覆盖语义不变）；② 不存在 ⇒ **放锁** →
+    /// clone map 侧键副本（此刻无锁、无任何变更 ⇒ clone panic 不投毒 cache）→
+    /// **重取锁再查**（第二次锁定检查 = 本操作的线性化点）：仍不存在则用备好的
+    /// 键副本插入（锁内不调 `K::clone`）；已存在（竞态）则走普通覆盖路径，
+    /// **未被采用**的候选键在**解锁之后**才析构。
+    ///
+    /// ⚠️ 本条**只覆盖 `K::clone`**：锁内仍会执行键的 `Hash`/`Eq`（查表/建表
+    /// 项/删除/rehash）与读路径的 `V::clone` ⇒ 见类型文档「锁内用户代码契约」
+    /// （issue#82/#83）。
     pub fn insert(&self, k: K, v: V) {
         let evicted = self.lock_core().insert(k, v);
         if evicted {
@@ -719,6 +825,10 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
 
     /// 读（**touch**：命中刷新 recency 并计入 [`Self::hits`]）。返 owned
     ///（引用不可跨锁，moka 同款）；不扰动淘汰序的读面用 [`Self::peek`]。
+    ///
+    /// ⚠️ 锁内用户代码（issue#83）：`V::clone`（`g.get_mut(k).map(|v| v.clone())`）
+    /// 与键的 `Hash`/`Eq`（查表）**都在内部 mutex 下执行** ⇒ `V` 与 `K` 的
+    /// 实现必须快、不 panic、不得重入同一个缓存。
     pub fn get(&self, k: &K) -> Option<V>
     where
         V: Clone,
@@ -732,6 +842,10 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
     }
 
     /// 读（不 touch、不计数，纯读面）。
+    ///
+    /// ⚠️ 锁内用户代码（issue#83）：`V::clone`（`self.lock_core().peek(k)
+    /// .cloned()`）与键的 `Hash`/`Eq`（查表）**都在内部 mutex 下执行** ⇒ `V`
+    /// 与 `K` 的实现必须快、不 panic、不得重入同一个缓存。
     #[must_use]
     pub fn peek(&self, k: &K) -> Option<V>
     where
@@ -855,6 +969,19 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
     /// touch，不触发淘汰。`ttl == 0` panic、`now + ttl` 溢出 panic（fail-closed，
     /// 取锁前校验——不投毒）。新键满插：先清过期（计入 [`Self::expired`]），
     /// 仍满逐 LRU 尾（计入 [`Self::evictions`]）。
+    ///
+    /// **用户 `K::clone` 在锁外**（issue#80）：与 [`SyncLruCache::insert`] 同款
+    /// 两阶段插入——① 持锁查存在，存在即更新值 + 重置过期 + touch（**不
+    /// clone**）；② 不存在 ⇒ **放锁** → clone map 侧键副本（此刻无锁、无任何
+    /// 变更 ⇒ clone panic 不投毒 cache）→ **重取锁再查**（第二次锁定检查 =
+    /// 线性化点，且**早于过期清扫/淘汰**：panic 的 clone 不得造成部分清扫/变更）
+    /// → 仍不存在才走「先过期先淘汰」政策并用备好的键副本插入（锁内不调
+    /// `K::clone`）；已存在（竞态）则走普通覆盖路径，未被采用的候选键**解锁
+    /// 之后**才析构。
+    ///
+    /// ⚠️ 本条**只覆盖 `K::clone`**：锁内仍会执行键的 `Hash`/`Eq`（查表/建表
+    /// 项/删除/rehash）与读路径的 `V::clone` ⇒ 见类型文档「锁内用户代码契约」
+    /// （issue#82/#83）。
     pub fn insert(&self, k: K, v: V, ttl: Duration) {
         assert!(
             !ttl.is_zero(),
@@ -880,7 +1007,26 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
                     key_hash = key_fingerprint(&k),
                     zombies = purged as u64
                 );
+        // 阶段 1：持锁查存在 —— 存在即更新值 + 重置过期 + touch（**不 clone**）。
+        let phase1 = {
+            let mut g = self.lock_core();
+            match g.overwrite_if_present(k, TtlEntry { expires, value: v }) {
+                Ok(retired) => InsertPhase1::Replaced(retired),
+                Err((k, entry)) => InsertPhase1::Absent(k, entry),
             }
+        };
+        let (k, entry) = match phase1 {
+            InsertPhase1::Replaced(retired) => {
+                retired.retire();
+                return;
+            }
+            InsertPhase1::Absent(k, entry) => (k, entry),
+        };
+        // 锁外 clone map 侧键副本：此刻**无 cache 锁持有、未发生任何变更**
+        // ⇒ clone panic 在此展开（不投毒 cache，issue#80）。
+        let map_key = k.clone();
+        // 阶段 2：重取锁 + 重查（**第二次锁定检查 = 线性化点**；重查**早于**
+        // 过期清扫/淘汰 ⇒ panic 的 clone 不会造成部分清扫/变更）。
             if g.len() >= g.capacity() {
                 // 埋点「容量淘汰」（TtlCache 站点）：被逐者恒 LRU 尾。
                 let _evicted = g.pop_lru();
@@ -902,6 +1048,11 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
     ///
     /// 借用键面（`K: Borrow<Q>`）：`K = String` 时可直接用 `&str` 查，热路径
     /// 零分配（`HashMap::get` 的借用查询不透支键类型）。
+    ///
+    /// ⚠️ 锁内用户代码（issue#83）：过期检查 + LRU touch 之后的 `V::clone`
+    /// （`e.value.clone()`）与键的 `Hash`/`Eq`（查表；借用键面由调用方控制
+    /// `Q::Hash`/`Q::Eq`）**都在内部 mutex 下执行** ⇒ `V` 与 `K`/`Q` 的实现
+    /// 必须快、不 panic、不得重入同一个缓存。
     pub fn get<Q>(&self, k: &Q) -> Option<V>
     where
         V: Clone,
@@ -921,6 +1072,10 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
     }
 
     /// 读（不 touch + 惰性过期；无命中计数——纯读面）。
+    ///
+    /// ⚠️ 锁内用户代码（issue#83）：过期检查之后的 `V::clone`（`e.value.clone()`）
+    /// 与键的 `Hash`/`Eq`（查表）**都在内部 mutex 下执行** ⇒ `V` 与 `K` 的实现
+    /// 必须快、不 panic、不得重入同一个缓存。
     #[must_use]
     pub fn peek(&self, k: &K) -> Option<V>
     where
@@ -1034,5 +1189,356 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
             );
         }
         due
+    }
+}
+
+/// 锁边界探针（issue#82/#83）：证明「用户 `Hash`/`Eq`/`V::clone` **确实在共享
+/// cache 的内部 mutex 下执行**」——这是**实现边界的回归测试**，不是「mutex 必须
+/// 永远是实现方式」的公共承诺：若将来索引协议改为锁外执行 Hash/Eq/Clone，本组
+/// 测试会失败（届时应同步复核契约与文档）。
+///
+/// 手法（维护者拍板形态，确定性、无 sleep、无子进程）：探针态用
+/// `Weak<SyncLruCache<..>>`/`Weak<SyncTtlCache<..>>` 持目标 cache，用户 trait
+/// （`Hash`/`Eq`/`Clone`）内升级 Weak 并对**同一个内部 mutex** 调 `try_lock` ⇒
+/// 期望 `Err(TryLockError::WouldBlock)`（同线程重入，非重入锁立即失败，不阻塞
+/// ⇒ 不会挂死测试进程）。`Poisoned`/`Ok` 都不算「锁被持有」的证据。
+#[cfg(test)]
+mod lock_boundary_probe {
+    use super::{Hash, LruCache, SyncLruCache, SyncTtlCache, TtlCache};
+    use std::cell::RefCell;
+    use std::hash::Hasher;
+    use std::sync::{Arc, TryLockError, Weak};
+
+    /// 探针结论：`try_lock` 的三种结果里**只有 `WouldBlock` 是「临界区确被持有」
+    /// 的证据**（`Acquired` = 用户代码在锁外，`Poisoned` = 锁已投毒、均非证据）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProbeOutcome {
+        Acquired,
+        WouldBlock,
+        Poisoned,
+    }
+
+    thread_local! {
+        /// 共享探针态：装入的闭包对目标 cache 的内部 mutex 做 `try_lock`。
+        static PROBE: RefCell<Option<Box<dyn Fn() -> ProbeOutcome>>> =
+            const { RefCell::new(None) };
+        /// 本次操作期间所有探针命中记录（顺序无关 ⇒ 严判：必须**全部**是
+        /// `WouldBlock` 且**至少一次**）。
+        static PROBE_HITS: RefCell<Vec<ProbeOutcome>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// 装入探针（操作前调用）；`None` = 探针关闭 ⇒ 用户 trait 不记录任何东西。
+    fn install_probe(f: Box<dyn Fn() -> ProbeOutcome>) {
+        PROBE.with(|p| *p.borrow_mut() = Some(f));
+        PROBE_HITS.with(|h| h.borrow_mut().clear());
+    }
+
+    /// 卸下探针（操作后调用，防止后续调用污染本次结论）。
+    fn uninstall_probe() {
+        PROBE.with(|p| *p.borrow_mut() = None);
+    }
+
+    /// 用户 trait（`Hash`/`Eq`/`Clone`）内部调用：探针开启时记录 `try_lock` 结果。
+    fn probe_hit() {
+        let outcome = PROBE.with(|p| {
+            let borrowed = p.borrow();
+            borrowed.as_ref().map(|f| f())
+        });
+        if let Some(outcome) = outcome {
+            PROBE_HITS.with(|h| h.borrow_mut().push(outcome));
+        }
+    }
+
+    /// 断言：本次操作期间用户 trait **至少被调用一次**，且每次都观测到内部
+    /// mutex 被持有（`try_lock` = `WouldBlock`）。
+    fn assert_ran_under_core_mutex(what: &str) {
+        let hits = PROBE_HITS.with(|h| h.borrow_mut().drain(..).collect::<Vec<_>>());
+        assert!(
+            !hits.is_empty(),
+            "{what}: 探针未被触发（该用户 trait 未在本次操作中被调用）"
+        );
+        assert!(
+            hits.iter().all(|h| *h == ProbeOutcome::WouldBlock),
+            "{what}: 期望用户 trait 在内部 mutex 下执行（try_lock = WouldBlock），实际 = {hits:?}"
+        );
+    }
+
+    /// `SyncLruCache` 探针：对内部 `core` mutex 调 `try_lock`。
+    fn lru_probe<K: 'static, V: 'static>(
+        cache: &Arc<SyncLruCache<K, V>>,
+    ) -> Box<dyn Fn() -> ProbeOutcome> {
+        let weak: Weak<SyncLruCache<K, V>> = Arc::downgrade(cache);
+        Box::new(move || match weak.upgrade() {
+            Some(c) => match c.core.try_lock() {
+                Ok(_) => ProbeOutcome::Acquired,
+                Err(TryLockError::WouldBlock) => ProbeOutcome::WouldBlock,
+                Err(TryLockError::Poisoned(_)) => ProbeOutcome::Poisoned,
+            },
+            None => ProbeOutcome::Poisoned,
+        })
+    }
+
+    /// `SyncTtlCache` 探针：对内部 `core` mutex 调 `try_lock`。
+    fn ttl_probe<K: 'static, V: 'static>(
+        cache: &Arc<SyncTtlCache<K, V>>,
+    ) -> Box<dyn Fn() -> ProbeOutcome> {
+        let weak: Weak<SyncTtlCache<K, V>> = Arc::downgrade(cache);
+        Box::new(move || match weak.upgrade() {
+            Some(c) => match c.core.try_lock() {
+                Ok(_) => ProbeOutcome::Acquired,
+                Err(TryLockError::WouldBlock) => ProbeOutcome::WouldBlock,
+                Err(TryLockError::Poisoned(_)) => ProbeOutcome::Poisoned,
+            },
+            None => ProbeOutcome::Poisoned,
+        })
+    }
+
+    /// 查表面探针键：`Hash` 记录探针命中（`Eq` 保持普通语义）。
+    #[derive(Clone, Debug)]
+    struct HashProbeKey(u32);
+
+    impl Hash for HashProbeKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            probe_hit();
+            self.0.hash(state);
+        }
+    }
+
+    impl PartialEq for HashProbeKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 == other.0
+        }
+    }
+
+    impl Eq for HashProbeKey {}
+
+    /// 相等面探针键：`Eq` 记录探针命中（`Hash` 保持普通语义）。
+    #[derive(Clone, Debug)]
+    struct EqProbeKey(u32);
+
+    impl Hash for EqProbeKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
+
+    impl PartialEq for EqProbeKey {
+        fn eq(&self, other: &Self) -> bool {
+            probe_hit();
+            self.0 == other.0
+        }
+    }
+
+    impl Eq for EqProbeKey {}
+
+    /// 借用查询面探针键（`Q` 侧）：`Hash`/`Eq` 均记录命中。
+    #[derive(Clone, Debug)]
+    struct BorrowProbeKey(u32);
+
+    impl Hash for BorrowProbeKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            probe_hit();
+            self.0.hash(state);
+        }
+    }
+
+    impl PartialEq for BorrowProbeKey {
+        fn eq(&self, other: &Self) -> bool {
+            probe_hit();
+            self.0 == other.0
+        }
+    }
+
+    impl Eq for BorrowProbeKey {}
+
+    /// 借用查询面的拥有侧键（`K` 侧）：`Borrow<BorrowProbeKey>`；其 `Hash` 必须与
+    /// `Q` 侧一致（`Borrow` 契约：`hash(borrowed) == hash(owner)`），故**不**带探针
+    /// ——命中只可能来自调用方的 `Q` 实现。
+    #[derive(Clone, Debug)]
+    struct OwnedBorrowKey {
+        inner: BorrowProbeKey,
+    }
+
+    impl std::borrow::Borrow<BorrowProbeKey> for OwnedBorrowKey {
+        fn borrow(&self) -> &BorrowProbeKey {
+            &self.inner
+        }
+    }
+
+    impl Hash for OwnedBorrowKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            // 与 `BorrowProbeKey::hash` 逐字同源（`Borrow` 契约：两者 hash 相等）
+            // ——但**不带探针**：命中只可能来自调用方的 `Q` 实现。
+            self.inner.0.hash(state);
+        }
+    }
+
+    impl PartialEq for OwnedBorrowKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.inner.0 == other.inner.0
+        }
+    }
+
+    impl Eq for OwnedBorrowKey {}
+
+    /// 读路径探针值（`V` 侧）：`Clone` 记录命中。
+    #[derive(Debug)]
+    struct CloneProbeValue(u32);
+
+    impl Clone for CloneProbeValue {
+        fn clone(&self) -> Self {
+            probe_hit();
+            Self(self.0)
+        }
+    }
+
+    /// #82：共享面查表路径（`get`）——键的 `Hash` 在内部 mutex 下执行。
+    #[test]
+    fn lru_get_hashes_key_under_core_mutex() {
+        let cache = Arc::new(SyncLruCache::<HashProbeKey, u32>::new(8));
+        cache.insert(HashProbeKey(1), 1); // 播种阶段探针未装 ⇒ 无命中记录
+        install_probe(lru_probe(&cache));
+        let got = cache.get(&HashProbeKey(1));
+        uninstall_probe();
+
+        assert_eq!(got, Some(1));
+        assert_ran_under_core_mutex("SyncLruCache::get 的键 Hash");
+    }
+
+    /// #82：共享面查表路径（`peek`）——键的 `Hash` 在内部 mutex 下执行。
+    #[test]
+    fn lru_peek_hashes_key_under_core_mutex() {
+        let cache = Arc::new(SyncLruCache::<HashProbeKey, u32>::new(8));
+        cache.insert(HashProbeKey(1), 1);
+        install_probe(lru_probe(&cache));
+        let got = cache.peek(&HashProbeKey(1));
+        uninstall_probe();
+
+        assert_eq!(got, Some(1));
+        assert_ran_under_core_mutex("SyncLruCache::peek 的键 Hash");
+    }
+
+    /// #82：共享面存在性判定（`contains`）——键的 `Hash` 在内部 mutex 下执行。
+    #[test]
+    fn lru_contains_hashes_key_under_core_mutex() {
+        let cache = Arc::new(SyncLruCache::<HashProbeKey, u32>::new(8));
+        cache.insert(HashProbeKey(1), 1);
+        install_probe(lru_probe(&cache));
+        let has = cache.contains(&HashProbeKey(1));
+        uninstall_probe();
+
+        assert!(has);
+        assert_ran_under_core_mutex("SyncLruCache::contains 的键 Hash");
+    }
+
+    /// #82：共享面相等判定——键的 `Eq` 在内部 mutex 下执行（查表命中即比较）。
+    #[test]
+    fn lru_get_compares_key_under_core_mutex() {
+        let cache = Arc::new(SyncLruCache::<EqProbeKey, u32>::new(8));
+        cache.insert(EqProbeKey(1), 1);
+        install_probe(lru_probe(&cache));
+        let got = cache.get(&EqProbeKey(1));
+        uninstall_probe();
+
+        assert_eq!(got, Some(1));
+        assert_ran_under_core_mutex("SyncLruCache::get 的键 Eq");
+    }
+
+    /// #82：共享面变更路径（`insert` 新键 + `remove`）——键的 `Hash` 在内部
+    /// mutex 下执行（覆盖路径同样先查表 ⇒ 命中）。
+    #[test]
+    fn lru_mutation_hashes_key_under_core_mutex() {
+        let cache = Arc::new(SyncLruCache::<HashProbeKey, u32>::new(8));
+        install_probe(lru_probe(&cache));
+        cache.insert(HashProbeKey(1), 1);
+        cache.insert(HashProbeKey(2), 2);
+        let removed = cache.remove(&HashProbeKey(1));
+        uninstall_probe();
+
+        assert_eq!(removed, Some(1));
+        assert_ran_under_core_mutex("SyncLruCache::insert/remove 的键 Hash");
+    }
+
+    /// #82：TTL 共享面查表路径（`get`）——键的 `Hash` 在内部 mutex 下执行
+    /// （过期检查同样走查表）。
+    #[test]
+    fn ttl_get_hashes_key_under_core_mutex() {
+        let clock = Arc::new(skeleton::clock::MockClock::new());
+        let cache = Arc::new(SyncTtlCache::<HashProbeKey, u32>::new(clock, 8));
+        cache.insert(HashProbeKey(1), 1, std::time::Duration::from_secs(60));
+        install_probe(ttl_probe(&cache));
+        let got = cache.get(&HashProbeKey(1));
+        uninstall_probe();
+
+        assert_eq!(got, Some(1));
+        assert_ran_under_core_mutex("SyncTtlCache::get 的键 Hash");
+    }
+
+    /// #82：借用查询面（`K: Borrow<Q>`）——**调用方**的 `Q::Hash`/`Q::Eq` 在内部
+    /// mutex 下执行（`Q` 侧实现由调用方完全控制）。
+    #[test]
+    fn ttl_borrowed_lookup_runs_caller_key_traits_under_core_mutex() {
+        let clock = Arc::new(skeleton::clock::MockClock::new());
+        let cache = Arc::new(SyncTtlCache::<OwnedBorrowKey, u32>::new(clock, 8));
+        cache.insert(
+            OwnedBorrowKey {
+                inner: BorrowProbeKey(1),
+            },
+            1,
+            std::time::Duration::from_secs(60),
+        );
+        install_probe(ttl_probe(&cache));
+        let got = cache.get(&BorrowProbeKey(1));
+        uninstall_probe();
+
+        assert_eq!(got, Some(1));
+        assert_ran_under_core_mutex("SyncTtlCache::get 借用查询面的 Q::Hash/Q::Eq");
+    }
+
+    /// #83：`SyncLruCache` 读路径——`V::clone` 在内部 mutex 下执行（`get`/`peek`）。
+    #[test]
+    fn lru_read_clones_value_under_core_mutex() {
+        let cache = Arc::new(SyncLruCache::<u32, CloneProbeValue>::new(8));
+        cache.insert(1, CloneProbeValue(7));
+        install_probe(lru_probe(&cache));
+        let got = cache.get(&1);
+        let peeked = cache.peek(&1);
+        uninstall_probe();
+
+        assert_eq!(got.map(|v| v.0), Some(7));
+        assert_eq!(peeked.map(|v| v.0), Some(7));
+        assert_ran_under_core_mutex("SyncLruCache::get/peek 的 V::clone");
+    }
+
+    /// #83：`SyncTtlCache` 读路径——过期检查与 LRU touch 之后的 `V::clone` 在内部
+    /// mutex 下执行（`get`/`peek`）。
+    #[test]
+    fn ttl_read_clones_value_under_core_mutex() {
+        let clock = Arc::new(skeleton::clock::MockClock::new());
+        let cache = Arc::new(SyncTtlCache::<u32, CloneProbeValue>::new(clock, 8));
+        cache.insert(1, CloneProbeValue(7), std::time::Duration::from_secs(60));
+        install_probe(ttl_probe(&cache));
+        let got = cache.get(&1);
+        let peeked = cache.peek(&1);
+        uninstall_probe();
+
+        assert_eq!(got.map(|v| v.0), Some(7));
+        assert_eq!(peeked.map(|v| v.0), Some(7));
+        assert_ran_under_core_mutex("SyncTtlCache::get/peek 的 V::clone");
+    }
+
+    /// 单线程面**没有**共享 mutex ⇒ 用户 trait 在调用方栈上同步执行（不在任何
+    /// 临界区内）。本测试只锁定「单线程面无内部锁」这一事实：共享面的
+    /// `try_lock` 结论不适用于单线程面（那里不存在可争用的内部 mutex）。
+    #[test]
+    fn single_threaded_faces_have_no_shared_mutex() {
+        let mut lru: LruCache<HashProbeKey, u32> = LruCache::new(8);
+        lru.insert(HashProbeKey(1), 1);
+        assert_eq!(lru.get(&HashProbeKey(1)), Some(&1));
+
+        let clock = Arc::new(skeleton::clock::MockClock::new());
+        let mut ttl: TtlCache<HashProbeKey, u32> = TtlCache::new(clock, 8);
+        ttl.insert(HashProbeKey(1), 1, std::time::Duration::from_secs(60));
+        assert_eq!(ttl.get(&HashProbeKey(1)), Some(&1));
     }
 }

@@ -32,6 +32,6 @@ fn main() {
     let store = Store::new(Counter, NoFx);
     store.dispatch(Msg::Inc);
     store.dispatch(Msg::Inc);
-    assert_eq!(store.snapshot().0, 2); // 同步排空：dispatch 返回即 idle
+    assert_eq!(store.snapshot().0, 2); // dispatch 返回 = 本 action 的完成边界（状态提交 → 效果转发 → 通知返回）且其因果后代终局；不承诺全局队列为空
     store.close();
 }

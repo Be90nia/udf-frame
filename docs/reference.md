@@ -36,7 +36,7 @@
 
 > 注（批 1 契约真下沉，2026-10-18；ADR 0001）：`skeleton` 由 optional 转常驻非 optional 依赖（常驻域 cache/id/retry/scheduler 消费 `skeleton::clock` 契约）——workspace path 非三方，`skeleton` 依赖面零三方口径不变。原 `runtime`/`pool`/`journal`/`compose` 的 `dep:skeleton` 叠门随之移除。
 
-必选组合（`Cargo.toml` required-features 口径）：bench `infra` = `["tokio","journal","memgov","testing"]`；示例 `end_to_end` = `["tokio","journal","testing","compose"]`。 hollow gate 纪律：feature 不全的目标整目标跳过——CI 闸与首跑一律 `--all-features`。
+必选组合（`Cargo.toml` required-features 口径）：bench `infra` = `["tokio","journal","memgov","testing","pool"]`；示例 `end_to_end` = `["tokio","journal","testing","compose"]`。 hollow gate 纪律：feature 不全的目标整目标跳过——CI 闸与首跑一律 `--all-features`。
 
 构建与测试：`cargo build --workspace --all-features` / `cargo test --workspace --all-features`。
 
@@ -171,6 +171,8 @@ pub enum AdmissionOutcome {
 
 - `subscribe`（跨线程档）：回调需 `Send`，槽位 Mutex 串行化；返回 `Subscription<S>`（`#[must_use]`，Drop=注销即时摘表，无「一拍滞后」）。
 - `subscribe_local`（单线程档）：回调免 `Send`（可用 Rc/RefCell），只在注册线程触发，免锁免原子量；返回 `LocalSubscription`（`#[must_use]`，`!Send + !Sync`——线程亲和的类型化表达）。同一 dispatch 内通知序：本地订阅先行，跨线程随后（确定性）。
+- **登记与闭门同一把门**（#63）：`try_subscribe` 与 `close`（及 `close_wait`）共用一个**订阅门**（每 store 一把小锁，只在登记/闭门**冷路径**取，热 dispatch 路径零开销）⇒ `try_subscribe` 要么**线性化在 close 之前**并登记成功，要么**线性化在 close 之后**并返回 `Err(StoreClosed)`——**不会出现「已登记但 store 已关」**。legacy `subscribe` 语义不变：闭门后**照常登记**并计入 `subscriptions_after_close`（它不是可失败入口）。close 翻转 `closed` 后**放门再排空/回调**（不在持门期间跑用户回调、丢用户闭包或排空队列）。
+- **去活后不再开始新投递/新回调**（#73/#74）：订阅槽持 **atomic alive 标志**（发布前初始化）；票据 Drop 与 panic 摘除**先原子失活**（幂等）再解链 + `subs_version` 递增。异步投递在**收集窗过滤已死槽**并在**每次 publish 前复查 alive**；同步订阅在**每次调用缓存回调前复查 active** ⇒ 缓存快照虽持强 `Arc`，也不能在失活后启动新回调。**窄契约**：通过了最后一次检查的投递/回调视为 **in-flight**，允许在票据 Drop 返回后完成（严格 quiescence 需另立阻塞式协议，本框架不提供）。
 
 ### 可观测计数面（fail-visible，对齐 `subscriber_panics` 先例）
 
@@ -291,12 +293,13 @@ impl EffectKind {
 | 词 | 定义 |
 |---|---|
 | **权威历史** | 有界环 + 单调 `seq`（`SyncStore::take_events` / `PoolBase::take_audit_events` 取证面）。**完整性承诺只在历史侧**：环内事件按 `seq` 序可重放，`seq` 空洞 = 环溢出丢最旧的显式证据。 |
-| **best-effort 观测面** | 实时回调（live callback）：在 emit 调用方线程内**同步**调用——慢回调拖慢 emit 调用方的时序（已知观测面张力）；并发发射窗内未取得回调权的事件、以及同线程重入的事件只入环不进回调。**不承诺**每事件必达、**不引入** backpressure；要完整性 ⇒ 消费方 drain 权威历史。 |
+| **best-effort 观测面** | 实时回调（live callback）：在 emit 调用方线程内**同步**调用——慢回调拖慢 emit 调用方的时序（已知观测面张力）；并发发射窗内未取得回调权的事件、以及同线程重入的事件只入环不进回调。**不承诺**每事件必达、**不引入** backpressure；要完整性 ⇒ 消费方 drain 权威历史。**适用面**：状态订阅者与异步 `NotifySink` 等**未升级为串行派发**的面；`SyncStore` 审计实时回调与池域审计流**已升级为「串行派发」**（见上条）。 |
+| **串行派发（不丢并发事件）** | 实时回调的**增强形态**（池域审计流 #75 / `SyncStore` 审计实时回调 #65 主路线①）：回调有**显式在途状态 + 待投递 FIFO** ⇒ 回调在途期间的并发发射事件**入队而非跳过**，在途者按 `seq` 序在所有内部锁之外补投；FIFO **有界**，溢出丢最旧并计入**独立的投递丢弃计数**（与 ring 溢出分账）；回调 panic 时 **fail-close 本代次**（排队事件不投递给替换订阅）。三条不变：`FnMut` 回调串行 / 禁锁内调用 / 禁同线程递归。**两类抑制分别文档化**：并发投递=入队不丢；**同 store 重入**=只记环、**不进待投递队列**（不递归调用同一回调）。 |
 | **deactivation 线性化点** | 去活裁决点 = 摘除路径的 `alive` swap（`false`；票据 Drop 与 panic 摘除共用这一裁决与闸回落）。**该点之后不再准入新投递**（#73/#74 引用本定义）。 |
 | **in-flight** | 已通过**最终 alive 检查**的已准入投递。线性化点之前准入的投递**可以完成**（可能在去活后、甚至票据 Drop 返回后仍在执行）⇒ 契约是「去活后无新投递开始，在途可完成」，**不是**静默保证；严格 quiescence（Drop 返回即无回调在跑）需另立阻塞式协议，本框架不提供。 |
 | **丢弃证据（互不替代）** | ① **投递丢弃计数**：只数回调投递未发生的次数（观测面自己的账，不留 `seq` 痕迹）；② **ring 溢出**：历史侧丢最旧（容量因）；③ **seq 断裂**：ring 溢出的可观测形态。⇒ 回调漏投**不产生** `seq` 空洞；`seq` 空洞**只证**历史丢失，不证回调丢失；`take_events` 取走（drain）也不留空洞（空环 ≠ 历史丢失）。 |
 
-**当前状态（2026-11-23，#65 拍板）**：`SyncStore` 审计实时回调为 best-effort，**不**新增投递丢弃计数（无 backpressure 就不虚构精确账）；权威历史 = 环 + `seq`，`seq` 在入环临界区内分配。池域 / 状态订阅 / 异步投递面的同类契约与计数以各自 rustdoc 为准，词表统一按本节。
+**当前状态（2026-11-23）**：**`SyncStore` 审计实时回调与池域审计流均已升级为「串行派发」**——并发发射事件入队补投（`SyncStore` 侧 #65 主路线① / 池域 #75）、FIFO 有界、**独立的投递丢弃计数**（`SyncStore::audit_delivery_drops()` / `PoolBase::audit_delivery_drops()` / `ObjectPool::audit_delivery_drops()`，与 ring 溢出**分账**）、回调 panic **fail-close 本代次**（排队事件不投递给替换订阅）。权威历史 = 环 + `seq`（`seq` 在入环临界区内分配 ⇒ 环序 = `seq` 序）。状态订阅 / 异步 `NotifySink` 两面**仍为 best-effort 观测面**，其契约与计数以各自 rustdoc 为准，词表统一按本节。
 
 ### 最小示例
 
@@ -425,12 +428,15 @@ impl PoolBase {
         f: impl FnMut(&PoolAuditEvent) + Send + 'static) -> PoolAuditTicket;
     pub fn take_audit_events(&self) -> Vec<PoolAuditEvent>;      // 环随取随清
     pub fn audit_callback_panics(&self) -> u64;
+    pub fn audit_delivery_drops(&self) -> u64;                   // #75：投递丢弃（实时流背压因），与 ring 溢出分账
 }
 ```
 
 - 校验规则一套两档出口：`max == 0` / `idle_cap == 0` / `idle_cap > max` → 构造期 panic、运行时 `Err(PoolResizeError)`（拒绝路径零状态变更）。
 - 归还裁决 RAII 唯一自洽：归还永不阻塞永不报错；槽满 = 丢弃 + `PoolMetrics::dropped_overflow` 计数（fail-visible）。
 - 审计发射唯一收口：未订阅 = 一次 gate load 即返；订阅态 = seq 单调入账（容量环溢出丢最旧）+ **锁外**回调（回调内重入 emit 只录环——TLS 在途标记封自指递归）；回调 panic 摘除留痕。
+- **审计实时回调 = 串行派发，不丢并发事件**（#75）：回调有**显式在途状态 + 待投递 FIFO** ⇒ 回调在途期间的并发 emit **入队而非跳过**（此前是 `notify.take()` 窗口内静默丢件），在途者按 `seq` 序在**所有内部锁之外**补投；FIFO **有界**，溢出丢最旧并计入**独立的投递丢弃计数** `audit_delivery_drops()`（与 ring 溢出 `dropped_overflow` **分账**：历史侧丢 vs 实时流丢）；回调 panic 时 **fail-close 本代次**（摘回调 + 清本代次 pending 并计数），**排队事件不投递给替换订阅**。三条不变：`FnMut` 串行 / 禁锁内调用 / 禁同线程递归。
+- **resize 预留协议：目标 epoch 串行化**（#69）：`workers` 视作**已承诺 + 已预留**总量（增长缺口**不再减去在途预留**）⇒ 并发 resize 不再双预留同一缺口（此前实测 `workers=7 max=4`）；`target_epoch`/`next_epoch` 串行化目标更新 ⇒ **最后发起**的目标生效，旧目标预留的席位在兑现后按最新 core 重算退役令牌（`reconcile_shrink`），**不会被新目标静默满足两次**；缩容令牌只从**可退休的真实 worker** 计且不得退到最新 core 以下；**OS 线程创建仍在状态锁外**，任务创建失败仍退还提交者。
 - `watermark = borrowed / max`，可 >1.0（缩容后借出数高于新池深的合法中间态，读数如实不钳位）。
 
 ### ThreadPool — 动态线程池
@@ -1116,6 +1122,14 @@ impl Scheduler {
         -> Result<TaskHandle, Closed>;                     // delay=0 合法（下个 tick 即火）
     pub fn every(&self, period: Duration, task: impl Fn() + Send + Sync + 'static)
         -> Result<TaskHandle, Closed>;                     // period=0 panic
+    pub fn try_after(&self, delay: Duration, task: impl FnOnce() + Send + Sync + 'static)
+        -> Result<TaskHandle, AdmissionError>;             // #58：触顶返回 Full（无部分插入）
+    pub fn try_every(&self, period: Duration, task: impl Fn() + Send + Sync + 'static)
+        -> Result<TaskHandle, AdmissionError>;             // #58：触顶返回 Full
+    pub fn set_capacity(&self, cap: usize);                 // #58：0=无界（默认）；置上限后 legacy after/every 触顶 panic
+    pub fn capacity(&self) -> usize;                        // #58
+    pub fn live_registrations(&self) -> usize;              // #58：堆内待执行 + 执行中周期任务（≠ heap.len()）
+    pub fn rejected_registrations(&self) -> u64;            // #58：闸关拒绝不计入（同 FxCounts::rejected）
     pub fn tick(&self) -> usize;                           // 点火全部到期任务，返回实际点火数
     pub fn next_deadline(&self) -> Option<Instant>;        // 含惰性墓碑（park 依据）
     pub fn close(&self);                                   // 幂等；回调内调用合法
@@ -1128,15 +1142,17 @@ impl Scheduler {
 pub struct TaskHandle { /* … */ }   // RAII（Drop 即 cancel）；非 Clone；Send + Sync
 impl TaskHandle {
     pub fn cancel(&self) -> bool;   // 线性化点=状态 CAS；幂等（已完成取消返 false）
-    pub fn detach(self);            // fire-and-forget 逃生门（消费句柄不触发 Drop-cancel）
+    pub fn detach(self);            // fire-and-forget 逃生门（消费句柄不触发 Drop-cancel；#55：只解除取消，TaskCell 随之释放，不泄漏）
 }
 
 pub struct WorkerHandle { /* … */ }
 impl WorkerHandle {
     pub fn join(self);   // = close + 等线程退出；worker 侧 panic 原样重抛
 }                        // 禁在驱动回调内 join 同一 worker（自等死锁）
+                        // #72：丢弃句柄（Drop）= close 不 join——驱动线程随之退出，不留「无句柄可关闸」的孤儿线程
 
 pub struct Closed;                  // 关闸后注册的显式拒绝
+pub enum AdmissionError { Closed, Full }   // #58：拒绝原因（Full = 容量触顶）
 ```
 
 语义拍板：
@@ -1145,7 +1161,11 @@ pub struct Closed;                  // 关闸后注册的显式拒绝
 - **cancel 线性化点 = 状态原子位**：CAS 置位成功即承诺此后不再点火；已出堆条目检查-执行窗口内落地的取消不可撤（本次照跑，文档化语义；单线程 tick 确定性面无此窗口）；执行中取消 ⇒ 周期任务不再重臂。
 - **close = 关闸 + 清 pending + 在途跑完**：注册显式 `Err(Closed)`；pending 全部标 Cancelled（句柄侧可见）；驱动线程随后退出。
 - **回调 panic 不杀驱动**：点火 catch_unwind 摘除 + `panic_count` 留痕；周期任务 panic 后摘除不再臂。
+- **detach = 解除取消，不接管所有权**（#55）：此前用 `mem::forget` 抑制 Drop-cancel，连带永久泄漏 `Arc<TaskCell>`（周期任务的回调与捕获图随之留存）。现取消语义与所有权释放解耦——detach 后句柄照常释放，任务仍按调度照跑。
+- **丢弃 WorkerHandle = 关闸不 join**（#72）：`worker_loop` 持 `Arc<Scheduler>`，丢弃句柄而不关闸 ⇒ 驱动线程永远 park 在 condvar 上，且再无公开句柄能关它（线程+调度器双泄漏）。Drop 路径只 `close`（唤醒退出），**不 join**（句柄可能在 worker 自身回调内被 drop ⇒ 自等死锁）；因此该路径**不确认线程终止、不传播 worker panic**（仅 `join` 确认终止并原样重抛）。
 - **惰性墓碑**：cancel 不摘堆（O(1)），死亡条目到点弹出时摘除——远期取消的墓碑多醒一拍（语义正确，代价一次空醒）。
+- **有界准入**（#58）：`capacity` 默认 **0 = 无界**⇒ 既有行为零变化；**不预设**有界默认值（#56 第二消费方验证前不盲设）。触顶时 legacy `after`/`every` **panic**（fail-visible；返回 `Err(Closed)` 会撒谎），typed 面用 `try_after`/`try_every` 返回 `AdmissionError::Full` 且**无部分插入**。活跃注册数口径 = 堆内待执行条目 **+ 执行中周期任务**（后者仍可能重臂）——**不等同 `heap.len()`**（墓碑不计入）。额度**恰好一次**释放：一次性点火终态、周期任务取消·关闸·panic 四条退役路径共用单一 CAS 闸门（赢家释放）。取消仍 **O(1)**（零锁零扫堆）；容量检查与计数同在状态锁内 ⇒ 并发注册不越上界；被拒回调**不入堆**，其捕获在堆锁外析构。
+- **远期取消条目提前回收**（#52）：取消路径仍 O(1)（弱引用记账 + 墓碑计数）；**清扫独立触发**（不在 cancel 路径），按绝对下限 16 / 比例阈值 4 在状态锁内重建堆只留 PENDING 条目，被摘条目**移出锁外**析构。取消 earliest-deadline 时通知驱动并**重算 park 锚**——驱动不再为堆顶墓碑空醒一拍。**执行语义零变化**：已出堆检查-执行窗口内落地的取消仍不可撤、仍照跑。墓碑计数为近似量（清扫期间落地的取消会漂移，良性——额度上限由 CAS 闸门精确管理）。
 - 溢出 fail-closed：注册/重臂恒 `checked_add`；重入安全：点火在堆锁外——回调内 after/every/cancel/close 合法。
 
 ```rust
@@ -1187,6 +1207,9 @@ pub struct ShutdownCoordinator { /* … */ }   // Arc 共享线程安全；注�
 impl ShutdownCoordinator {
     pub fn new() -> Self;                          // 注册窗开，无默认超时
     pub fn with_default_timeout(mut self, d: Duration) -> Self;  // builder 沿 FxScope 形
+    pub fn with_max_watchdogs(mut self, n: usize) -> Self;       // #54：watchdog 执行数上限（默认不限）
+    pub fn live_watchdogs(&self) -> usize;                       // #54：此刻仍在跑的 watchdog 执行数
+    pub fn peak_watchdogs(&self) -> usize;                       // #54：live 历史峰值
     pub fn register<F>(&self, name: impl Into<String>, shutdown: F) -> Result<(), RegisterError>
     where F: FnOnce() + Send + 'static;
     pub fn register_with_timeout<F>(&self, name: impl Into<String>, shutdown: F,
@@ -1219,6 +1242,7 @@ impl ShutdownReport { pub fn is_clean(&self) -> bool; }
 - panic 装甲：组件闭包 panic（内联/watchdog 双路 catch_unwind）→ `Failed{reason}`，后续组件照跑。
 - 重入装甲（双锚 ThreadId）：组件闭包内重入 `shutdown()` 就地 panic → 被编排面捕获记 `Failed`（非 HANG 无留痕）；无关线程并发叫=合法等待者等首叫同报告。
 - watchdog 线程创建失败/上报通道断连：显式 `Failed`（fail-visible）。
+- **watchdog 执行数有上界**（#54）：带超时组件的闭包跑在 watchdog 线程上，超时=**放弃等待、线程照跑** ⇒ 组件大量挂死时仍在跑的 watchdog 数随组件数线性增长。`with_max_watchdogs(n)` 给硬上界：**许可在 spawn 之前占用、于持有者消亡时归还**（线程退出/panic，或起线程失败时 std 丢弃闭包连带归还）⇒ 不靠手写每条分支。许可耗尽时该组件**未启动**（不 spawn 线程、不内联跑闭包），如实记 `Failed{reason: "watchdog capacity exhausted; component not started"}`——**非静默丢弃停机回调**。`live_watchdogs()` / `peak_watchdogs()` 给运营读数（区分「此刻仍在跑」与「曾堆积」）。默认**不限**（既有用户行为零变化）。
 - 停机中/后注册静默丢失被 `Err(Closed)` 封死；重名静默覆盖被 `Err(Duplicate)` 封死。
 
 ```rust,no_run
@@ -1333,7 +1357,14 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
 - TTL=逐条 expire-after-write（覆盖重置计时）；`now + ttl` 溢出 panic（fail-closed）。
 - 双界交互：满时**先清过期再逐 LRU 尾**（过期条目永不把活条目挤出去，当清得动时）。
 - 惰性过期：触碰即回收 + `expired` 计数（fail-visible，过期不是静默 None）；`len()`=物理条数（回收前僵尸占容，如实声明）。
-- 时钟只消费单调面；**并发面：单线程 `&mut self` 面 + `SyncLruCache`/`SyncTtlCache` 并发薄包装（`&self`+内部 Mutex，语义与单线程版一致；poison=fail-fast panic 带因；分片留待命中率证据）**。
+- 时钟只消费单调面；**并发面：单线程 `&mut self` 面 + `SyncLruCache`/`SyncTtlCache` 并发薄包装（`&self`+内部 Mutex，可观察语义与单线程版一致；共享面另有**锁内用户代码边界**，见下三条；分片留待命中率证据）**。
+- **用户析构在锁外**（#71）：淘汰/过期/覆盖的 `V::drop`，以及 `remove`/`pop_lru`/`retain` 移除 map 条目或取走 arena 键时的 `K::drop`，**不在共享 mutex 内执行**——就**退休面**而言临界区内只做簿记与所有权转移（`HashMap::remove_entry` 取回 map 键，连同 arena 键/值装进退休批），解锁后按显式顺序（map 键 → arena 键 → 值）析构。退休批**零堆分配**（不破「覆盖插入不得分配」锚）。**本条只覆盖析构**——临界区内仍执行键的 `Hash`/`Eq` 与读侧 `V::clone`（见下两条）。
+- **poison 契约拆分**（#71）：**锁外**析构 panic **不投毒**缓存（析构发生在临界区之外，缓存状态未受损）；**临界区内** panic 仍投毒并 fail-fast 带因——**包括临界区内用户 trait 的 panic**（键 `Hash`/`Eq`、读侧 `V::clone`）⇒ 键/值实现须 panic-free。
+- **插入路径的 `K::clone` 在锁外**（#80）：`SyncLruCache::insert` / `SyncTtlCache::insert` 采**两阶段重验证插入**——先持锁查存在（存在则更新值与 recency，**不 clone**），不存在则**放锁**后 clone map 侧键副本（此刻无锁持有、未发生任何变更），再**重取锁重查**（第二次检查 = 线性化点），仍不存在才以已 clone 的键插入 ⇒ **锁内路径永不调 `K::clone`**。TTL 的第二次存在检查**早于**过期清扫/淘汰（panic 的 clone 不会造成部分变更）；「已有键重置过期且不 clone」保持；单线程 `LruCache` 路径不变。⚠️ 本条**只覆盖 `K::clone`**——锁内仍执行键的 `Hash`/`Eq` 与读路径的 `V::clone`。
+- **键 trait 在锁内**（#82，共享面的显式限制）：`K::Hash`、`K::Eq` 与借用键 `Q::Hash`/`Q::Eq` **可能在内部 mutex 下执行**——查表（`idx_of`→`HashMap::get`：`get`/`peek`/`contains`/`remove`/TTL 过期检查/插入存在性检查）、建表项（`map.get` + `map.insert`）、删除（`map.remove`）、以及 `HashMap` 扩容/rehash ⇒ 键实现须**快、不 panic、不得重入同一缓存**。这是「`HashMap` 作权威索引 + 单 mutex」的固有属性：真正的 lock-free 边界需要另一种索引协议（快照候选键 + 锁外哈希 + 槽位代次重验证），属架构重设计；**用指纹替代键身份被否决**（指纹不是等价关系，当身份会静默改 `Eq` 语义）。
+- **读路径 `V::clone` 在锁内**（#83，共享面的显式限制）：`get`/`peek` 返 owned ⇒ `V::clone` 在内部 mutex 下执行 ⇒ 值实现须**快、不 panic、不得重入同一缓存**。与 #71 的精确对照：**#71 移出锁的是退休值的析构；读侧 `Clone` 仍在锁内**。「锁外 clone + 重验证」不可安全实现（放锁后槽位可被替换/移除/淘汰/复用 ⇒ 锁外引用不安全），而 `Arc<V>` 存储会改所有权模型（`remove`/`pop_lru` 需新增 `V: Clone` 或改返回类型）⇒ 属公共兼容性决策，留待未来大版本。
+- **既有 API 属性未变**：`remove`/`pop_lru` 仍移动出 owned `V`、**不需要 `V: Clone`**。
+- **单线程面区分**：`LruCache`/`TtlCache` 无共享 mutex，但 `Hash`/`Eq` 仍在调用方栈上同步执行。
 - 构造签名类型强制「上限必填」（无默认无界构造，BoundedRegistry 同款）；满插入恒逐 LRU 尾（无 Reject 形）。
 
 ```rust
@@ -2033,7 +2064,7 @@ impl Default for FxScope { /* new() */ }
 pub struct Spawned<T> { /* … */ }   // Drop 不 abort——任务归生命周期集托管
 impl<T: Send + 'static> Spawned<T> {
     pub async fn join(self) -> Result<T, TaskError>;
-    pub async fn join_timeout(self, d: Duration) -> Result<T, TaskError>; // 超时先 abort 再回 TimedOut
+    pub async fn join_timeout(self, d: Duration) -> Result<T, TaskError>; // 超时=截止已过+已请求 abort（≠ 已确认终止）
     pub fn abort(&self);               // 幂等
     pub fn is_finished(&self) -> bool;
 }
@@ -2076,7 +2107,7 @@ impl FxScope {
 ```
 
 - **三资源维度（issue#39）**：`with_concurrency` 只限**任务体并发**，**不是**内存/保留量上界；保留上界 = `with_max_tracked`（含已完成未收割条目），等待许可数 = `with_max_pending`，两者默认**无界**（opt-in 显式设）。有界准入走 `try_spawn_tracked` → `Result<_, AdmissionError>`（过载 typed 拒绝，不阻塞不 panic）；`spawn_tracked` 是**无界旧口**（保持兼容，不受上界约束）。`Spawned::join()` 只消费结果、**不**移除集合条目（收割口 = `try_reap`）。`counts()` 暴露 active/waiting/completed_unreaped/rejected。
-- 任务结局归一：panic 经 catch_unwind 归一 `TaskError::Panicked(消息)`（payload downcast &str/String，否则哨兵文案）；发送端消亡=Cancelled；join 超时=TimedOut 且任务已 abort（禁留活口）。
+- 任务结局归一：panic 经 catch_unwind 归一 `TaskError::Panicked(消息)`（payload downcast &str/String，否则哨兵文案）；发送端消亡=Cancelled；**join 超时=`TimedOut` = 截止已过 + 已请求 abort（`AbortHandle::abort()` 只是取消请求）——不表示任务体已终止、其守卫已运行或集合条目已被收割**（issue#67 契约冻结；超时后的证据是 scope 级 `in_flight` / `expect_body_idle` / `expect_fully_reaped_idle` / `counts()`；abort 仍是请求，任务守卫与 `in_flight` 跟踪在任务真正退出前具权威）。
 - `spawn_tracked` 线性化=锁内原子 RMW 过闸 + 插入与 shutdown 的 abort_all 串行——过闸任务必被 shutdown 覆及。
 - 条目滞留与收割（issue#13）：生命周期集条目不再静默丢弃——panic 载荷进集合（句柄被丢也不丢），**join 与 `try_reap`/停机排空双重可见**（同一 panic 两条路都可能报出，诊断面语义非 exactly-once）；完成条目滞留集合至 `try_reap`（增量收割口：锁内同步 `try_join_next` 扫已完成条目，空集零分配、幂等，不动在途任务、不改 in_flight）或停机排空显式消费。
 - 停机报告：`shutdown` 排空收割 panic 载荷入 `ShutdownReport.panicked`（abort 条目=预期消亡不计入）；`shutdown_timeout` 超时不再返回 `Err`——超时即返前先增量收割已完结条目（panic 载荷不因超时丢失），剩余未完成数计 `timed_out`（剩余集 Drop=abort 兜底，零残留）。
@@ -2359,7 +2390,7 @@ pub fn bridge_events_to_tracing<
 ) -> AuditTicket;
 ```
 
-每个投递到的事件一条 `tracing::event!`（target `skeleton::audit`，INFO 级），字段 `seq`/`kind`（生命周期节点名=过滤聚合稳定键）/`depth`（仅 Enqueued 携带回灌深度）。**best-effort 观测面**：并发发射窗内可能有事件未进回调（桥也就不输出），完整性取证走 `take_events`——见「投递语义词汇（订阅面通用）」。`capacity` 语义同 `SyncStore::subscribe_events`；返回票据 Drop=停桥（零开销恢复）。
+每个投递到的事件一条 `tracing::event!`（target `skeleton::audit`，INFO 级），字段 `seq`/`kind`（生命周期节点名=过滤聚合稳定键）/`depth`（仅 Enqueued 携带回灌深度）。**上游已升级为「串行派发」**（`SyncStore` 审计实时回调，#65 主路线①）：并发发射窗内的事件**入队补投**而非跳过，故桥**不再有「并发窗内未进回调」的缺口**；仍存在的丢弃面只有**有界待投递 FIFO 的溢出**（计入 `SyncStore::audit_delivery_drops()`，与环溢出分账）与**环溢出**（历史侧，证据=`seq` 空洞）——完整性取证走 `take_events`，见「投递语义词汇（订阅面通用）」。`capacity` 语义同 `SyncStore::subscribe_events`；返回票据 Drop=停桥（零开销恢复）。
 
 ```rust
 use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
@@ -2495,7 +2526,7 @@ impl ViewBridge<S, A, M, I, J, R> {
 
 | 域 | target | 事件点 | 级别 |
 |---|---|---|---|
-| scheduler | `skeleton::scheduler::{register,cancel,close,fire,worker}` | 注册/取消/点火/墓碑跳过=debug；关闸拒绝、回调 panic、超载退化重臂、驱动内部 panic=warn；close 与 worker 退出=info | 混合 |
+| scheduler | `skeleton::scheduler::{register,cancel,close,fire,worker}` | 注册/取消/点火/墓碑跳过=debug；关闸拒绝、**容量触顶拒绝注册（#58）**、回调 panic、超载退化重臂、驱动内部 panic=warn；close 与 worker 退出=info | 混合 |
 | ratelimit | `skeleton::ratelimit::{try_acquire,acquire}` | 快路径拒绝与超容量拒绝=warn（available/wait_ns/capacity）；阻塞等待分段与醒后重查=debug（round/deficit）；成功扣减零事件 | 混合 |
 | retry | `skeleton::retry::{attempt,verdict,backoff}` | 尝试开始=debug；重试放行=warn（backoff_ms）；停机终态=info；退避截平=warn（linear_ms→capped_ms） | 混合 |
 | backoff | `skeleton::backoff` | 计算入参/结果（attempt/base_ms/max_ms/delay_ms）=debug（纯函数域唯一埋点） | debug |
@@ -2520,7 +2551,7 @@ target 规范：域=`skeleton::<domain>`，子流程=`skeleton::<domain>::<phase
 | testing | tokio + runtime | TestStore/ScriptedRuntime/parse_mock |
 | tracing | runtime + deps | 桥在审计值面上消费 |
 | config-toml | config-json + toml | 值面叠层；toml 仅此 feature 可达 |
-| bench `infra` | tokio+journal+memgov+testing | required-features 并集（hollow gate 纪律） |
+| bench `infra` | tokio+journal+memgov+testing+pool | required-features 并集（hollow gate 纪律） |
 | example `end_to_end` | tokio+journal+testing+compose | 五件套+combine+TestStore+fx/journal 解释器标准形 |
 
 零依赖证明口径：`cargo tree -p udf-skeleton-infra -e normal`（默认 feature 下 `skeleton` + `std-ext`，均 workspace path 非三方；std-ext 的 `json` 域带 `serde_json` 普通依赖进树）；`--no-default-features --features memgov` 仍独立；`--no-default-features --features log-fs` 树内同样含 std-ext 及其 `serde_json` 子树。

@@ -248,3 +248,16 @@ jobs:
 
       - name: Test skeleton (locked)
         run: cargo test -p udf-skeleton --locked
+
+      # issue#78 验收「三 crate 的 MSRV 面均被显式覆盖」：上面只覆盖了
+      # skeleton 的测试面。std-ext 的**测试面 + 三个可选 feature 组合**
+      # 与 infra 的 **all-features 聚合面**在 1.87 上从未验证过（--all-features
+      # 步在 1.96 上跑，不能替代 MSRV 面）⇒ 补齐。
+      - name: Test std-ext (locked)
+        run: cargo test -p udf-std-ext --locked
+
+      - name: Check std-ext optional features (locked)
+        run: cargo check -p udf-std-ext --locked --features json,random,log-embed
+
+      - name: Check infra all-features (locked)
+        run: cargo check -p udf-skeleton-infra --locked --all-features

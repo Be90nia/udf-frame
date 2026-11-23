@@ -52,7 +52,11 @@ pub enum TaskError {
     Cancelled,
     /// panic 消息（payload downcast &str/String，否则哨兵文案）。
     Panicked(String),
-    /// join 超时；任务已 abort（禁留活口）。
+    /// join 等待超时：截止已过且**已请求 abort**——**未**确认任务体终止。
+    ///
+    /// tokio 的 abort 是协作式取消请求：任务体在下一个让渡点才被销毁 ⇒ 收到本变体
+    /// 时任务体**可能仍在执行**。终止确认走 scope 级观察面（[`FxScope::in_flight`] /
+    /// [`FxScope::expect_body_idle`]），口径同 [`Spawned::join_timeout`]。
     TimedOut,
 }
 
@@ -61,7 +65,9 @@ impl fmt::Display for TaskError {
         match self {
             Self::Cancelled => f.write_str("task cancelled before completion"),
             Self::Panicked(msg) => write!(f, "task panicked: {msg}"),
-            Self::TimedOut => f.write_str("join timed out; task aborted"),
+            Self::TimedOut => {
+                f.write_str("join timed out; abort requested (task termination not confirmed)")
+            }
         }
     }
 }
@@ -329,6 +335,9 @@ pub struct ShutdownReport {
     /// 非 panic 的失败终局条数（任务体错误 `TaskError::TimedOut` 等，以及未知
     /// join 变体的兜底落账）；逐条文案与 [`Self::errors`] 对齐。任务包装体当前只
     /// 把 panic 归一成终局错误，故常态 0。
+    ///
+    /// [`TaskError::TimedOut`] 的语义是「截止已过 + 已请求 abort」，**不**表示
+    /// 任务体已终止——与 [`Self::timed_out`] / [`Self::still_running`] 的区分同口径。
     pub failed: usize,
     /// [`Self::failed`] 的逐条诊断文案（与计数同点写入，`errors.len() == failed`）；
     /// 未知 join 变体在此留 `Display` 原文，禁静默吞。
@@ -803,7 +812,8 @@ impl FxScope {
     }
 
     /// 同上+超时：先 close+abort_all；超时不再返回 `Err`，改 [`ShutdownReport`]
-    /// 的 `timed_out > 0` 表达（join_timeout 的 `TimedOut` 单任务面保留）。
+    /// 的 `timed_out > 0` 表达（单任务面对应 [`TaskError::TimedOut`]——同一口径：
+    /// 「截止已过 + 已请求 abort」，**不**表示任务体已终止）。
     /// abortable 任务零残留（剩余集 Drop=abort 兜底）；不可 abort 段依赖自终止
     /// 契约。
     ///
@@ -954,7 +964,20 @@ impl<T: Send + 'static> Spawned<T> {
         }
     }
 
-    /// 超时先 abort 再回 TimedOut（禁留活口——C 类收口）。
+    /// 超时 join：期限内完成⇒直传结果；逾期限⇒**请求 abort** 并回
+    /// [`TaskError::TimedOut`]。
+    ///
+    /// **超时路径不确认任务体已终止**：tokio 的 abort 是取消请求——任务体在下一个
+    /// 让渡点才被销毁 ⇒ 返回时任务体**可能仍在执行**（如正停在非让渡 poll 段内）。
+    /// [`TaskError::TimedOut`] 只表达「截止已过 + 已请求 abort」，与
+    /// [`ShutdownReport::timed_out`]（截止计数）/ [`ShutdownReport::still_running`]
+    /// （终止未观测）同一口径：**截止 ≠ 终止**。
+    ///
+    /// **终止确认走 scope 级观察面**（本方法消费句柄，调用方不再持有它）：
+    /// [`FxScope::expect_body_idle`] 通过 ⇒ 任务体已终局（在途计数与终局记账都在
+    /// 任务体真正终止后才更新）；[`FxScope::expect_fully_reaped_idle`] 通过 ⇒ 集合
+    /// 条目已收割（**终局 ≠ 已收割**，两层分开）。消费句柄**不**取消 scope 的生命
+    /// 周期跟踪——任务仍归 scope 生命周期集托管。
     pub async fn join_timeout(self, d: Duration) -> Result<T, TaskError> {
         match tokio::time::timeout(d, self.rx).await {
             Ok(Ok(result)) => result,
@@ -967,6 +990,9 @@ impl<T: Send + 'static> Spawned<T> {
     }
 
     /// 中止任务（幂等；join 侧见 `TaskError::Cancelled`）。
+    ///
+    /// **取消请求，非同步终止**：任务体在下一个让渡点才被销毁⇒调用返回时任务体
+    /// 可能仍在执行（与 [`TaskError::TimedOut`] 同一口径：abort 已请求 ≠ 已终止）。
     pub fn abort(&self) {
         self.handle.abort();
     }
@@ -1045,7 +1071,11 @@ mod tests {
         scope.expect_body_idle();
     }
 
-    /// ④join_timeout 超时→TimedOut 且 in_flight 归零（abort 生效断言）。
+    /// ④join_timeout 超时→TimedOut（**abort 请求已发**；本任务停在 await 点 ⇒
+    /// abort 立即生效）且 in_flight 归零。
+    ///
+    /// 终止未确认的路径（任务体停在非让渡段）见集成回归
+    /// `tests/fx_join_timeout_semantics.rs`——本例只覆盖「可 abort 段」。
     #[tokio::test(start_paused = true)]
     async fn join_timeout_aborts_and_reports_timed_out() {
         let scope = FxScope::new();

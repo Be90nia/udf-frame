@@ -48,7 +48,7 @@ Do not create a second Clock abstraction or a parallel contracts crate. In parti
 
 ### Existing ADRs and relationship to this blueprint
 
-The repository intentionally excludes `docs/adr/` from Git under the 2026-10-28 documentation policy (the repository keeps consumer-facing documentation in-tree, while decision/research archives remain local). This is a governance constraint, not evidence that the decisions do not exist. The following ADRs have direct architectural overlap with this blueprint and are inherited here:
+The repository tracks `docs/adr/` in Git: ADR-0001 through ADR-0010 plus the publishing checklist are committed decision records and are the canonical, versioned decisions for this project. Decision records are therefore visible to Git-based collaborators, not local-only archives. The following ADRs have direct architectural overlap with this blueprint and are inherited here:
 
 | ADR | Decision relevant to this blueprint | Relationship |
 |---|---|---|
@@ -57,9 +57,9 @@ The repository intentionally excludes `docs/adr/` from Git under the 2026-10-28 
 | ADR-0009 | Fragment / Reducer are distinct composition contracts: Reducer is the root contract; Fragment is the slice contract. Combining fragments as a root should fail at compile time (E0277), not at runtime by panic. | **Accepted and inherited.** The pure-state contract inventory includes both Fragment and Reducer; examples and trait bounds must preserve their root/slice distinction. |
 | ADR-0010 | ObjectPool uses bounded degradation when the accounted pool universe is full: it may directly build an object outside that universe, does not count it in `alive`, and releases it rather than returning it to the pool. | **Accepted and inherited.** §5 explicitly distinguishes the accounted pool cap from the fallback production policy; `max` is not necessarily an absolute cap on objects returned to callers. |
 
-ADR-0002–0007 are not cited as decision premises for the target-architecture choices in this blueprint. However, **ADR-0004 and ADR-0007 remain the authoritative basis for the current package layout described above** (the std-ext split and zero-third-party dependency posture); they are retained as current-state rationale, not re-decided here. ADR-0002, -0003, -0005, and -0006 are not cited as decision premises and have no material overlap with the decisions made in this blueprint. Their authoritative local copies remain governed by the existing `docs/adr/` exclusion policy. If a future blueprint change materially depends on one of them, summarize and cite that decision explicitly before proposing the change.
+ADR-0002–0007 are not cited as decision premises for the target-architecture choices in this blueprint. However, **ADR-0004 and ADR-0007 remain the authoritative basis for the current package layout described above** (the std-ext split and zero-third-party dependency posture); they are retained as current-state rationale, not re-decided here. ADR-0002, -0003, -0005, and -0006 are not cited as decision premises and have no material overlap with the decisions made in this blueprint; their committed records live in `docs/adr/` alongside the others. If a future blueprint change materially depends on one of them, summarize and cite that decision explicitly before proposing the change.
 
-This arrangement preserves the established policy that ADR source files are not committed while making the four decisions that materially constrain this architecture visible to Git-based collaborators. It does not claim that a short index replaces the authoritative ADR records.
+This arrangement keeps the decision record in-tree and versioned: the ADR files in `docs/adr/` are the authoritative records, and the table above is an index that states how each decision relates to this blueprint (not a replacement for the records themselves).
 
 ### Crate-splitting rule
 

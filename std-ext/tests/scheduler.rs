@@ -301,8 +301,9 @@ fn cancel_far_future_leaves_lazy_tombstone_semantics_pinned() {
         .after(Duration::from_secs(3600), || {})
         .expect("未关闸注册必成");
     assert!(handle.cancel());
-    // 惰性墓碑（文档化语义）：死亡条目到点弹出时摘除，堆顶仍可见——
-    // 驱动线程会为此多醒一拍（一次空醒，语义正确）。
+    // 惰性墓碑（文档化语义）：死亡条目到点弹出时摘除，堆顶仍可见。
+    // #52：墓碑可被独立清扫提前回收，且驱动会跳过堆顶墓碑、不再为空醒多醒一拍；
+    // 本例无 worker，next_deadline() 仍可见该墓碑（断言不变）。
     assert!(sched.next_deadline().is_some());
     assert_eq!(sched.tick(), 0);
 }

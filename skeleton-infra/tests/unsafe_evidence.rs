@@ -207,7 +207,7 @@ fn concurrent_dispatch_snapshot_and_subscription_interleaving_is_exact() {
     assert_eq!(
         store.pending_actions(),
         0,
-        "同步排空：dispatch 全返回即 idle"
+        "本例各 dispatch 返回 = 各自 action 的完成边界（并发下队列可能仍非空）"
     );
     assert_eq!(store.reducer_panic_count(), 0);
     assert_eq!(store.subscriber_panics(), 0);

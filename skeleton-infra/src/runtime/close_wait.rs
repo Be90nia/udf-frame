@@ -48,7 +48,13 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         if reentrant_context(self.inner.store_id).is_some() {
             return CloseWaitOutcome::Reentrant;
         }
-        self.inner.closed.store(true, Ordering::Release);
+        // 闭门翻转与订阅登记互斥（issue#63）：与 `Store::close` 取同一把订阅
+        // 闸 ⇒ try_subscribe 与本翻转线性化互斥（不会「已登记但 store 已关」）。
+        // 闸在排空前释放：排空/回调期间不持闸。
+        {
+            let _gate = lock(&self.inner.sub_gate);
+            self.inner.closed.store(true, Ordering::Release);
+        }
         // 静默态：本调用夺租约并排至 idle，随后谓词立即可满足；竞争态：只交接
         // 即返（他线程的循环必达空），本方法接着进等待。
         drain(&self.inner);

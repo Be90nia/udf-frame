@@ -4,7 +4,105 @@
 
 ## [Unreleased]
 
-### Added（显式停机等待面 `close_wait` / `close_wait_timeout`，2026-11-23；GitHub issue#64）
+### Fixed(fx): `TaskError::TimedOut` 语义更正为「截止已过 + 已请求 abort」（≠ 已确认终止）,2026-11-23;GitHub issue#67)
+- **契约冻结（issue#67）**:`TaskError::TimedOut` 表示**调用方截止已过且 `AbortHandle::abort()` 已被请求**——**不表示**任务体已终止、其守卫已运行或 `JoinSet` 条目已被收割（tokio abort 是**取消请求**：正在执行非 yield 的 poll 的任务要等它交还运行时才被销毁）。维护者拍板**不加** per-task 完成回执（YAGNI：无真实消费方需要）；超时后的证据是 **scope 级观察面**（`in_flight` / `expect_body_idle` / `expect_fully_reaped_idle` / `counts()`）。
+- **行为零变化**:`join_timeout` 函数体未动（仍 `abort()` + 立即 `Err(TimedOut)`），**只更正承诺**;enum 形状与签名未变。**唯一可观测变化** = `TaskError::TimedOut` 的 `Display` 文本:`"join timed out; task aborted"` → `"join timed out; abort requested (task termination not confirmed)"`（按旧字符串匹配的下游需同步;兄弟仓 agentwiki 是独立 vendored 快照且不匹配该字符串,需跑同步窗才带上新措辞）。
+- **同符号文档扫**:`TaskError` 变体文档与 `Display`、`join_timeout` rustdoc、`Spawned::abort`、`ShutdownReport::failed`、`FxScope::shutdown_timeout`、fx.rs 单测注释、reference 文档 —— 统一采用既有的 `timed_out` / `still_running` 词汇;`ShutdownReport` 侧的 `TimedOut` 引用同步对齐。
+- **测试**:新 `skeleton-infra/tests/fx_join_timeout_semantics.rs`(5 例,确定性握手 + 有界等待,禁 sleep)——① `TimedOut` 必须申报「已请求 abort」(修复前红:`join timed out; task aborted`)② 任务体停在非 yield 段时 `join_timeout` 返回 `TimedOut` 而 `scope.in_flight() > 0`（任务体仍在跑）③ 消费句柄后 scope **仍跟踪**该条目（`completed_unreaped == 1`,只有收割才归零)④ 截止前完成=返回值(既有语义)⑤ 首次 poll 前 abort=Cancelled(既有语义)。**红→绿**:修复前同一文件 `4 passed; 1 failed` ⇒ 真红;修复后 5 通过,连跑 10 次无抖动。
+
+### Fixed(runtime): 审计实时回调不再丢并发发射的事件（回到 #65 主路线①）,2026-11-23;GitHub issue#65)
+- **背景**:`SyncStore` 审计实时回调此前是 **best-effort 观测面**——并发发射窗内未取得回调权的事件只入环不进回调(不承诺每事件必达)。issue 给了两条路线:① 显式串行派发器(**主路线**) 与 ⑥ 把契约降级为 best-effort(**备选**)。**本仓实现的是主路线①**(备选路线未经拍板即被采用属违约,已纠正:issue 重开、路线重定)。
+- **实现**:`AuditDispatch { gen, inflight, pending }` 挂在 `StoreInner` 上——**显式在途派发状态 + 有界 pending FIFO**(`AUDIT_PENDING_CAP = 1024`,沿用池域同款常量,未新增配置面)。emitter 发现回调在飞 ⇒ **入队而非跳过**;回调 owner 按 **`seq` 序**在**两把锁之外**排空 pending;**禁在审计 mutex 内调回调**、全程未用阻塞锁替代回调(同 store 重入会死锁)。锁序固定「环锁 → 派发锁」。
+- **与环溢出分账**:环溢出丢**历史侧**(容量因,证据=`seq` 空洞);**投递丢弃计数**丢**实时侧**(待投递 FIFO 背压因)⇒ 新增只读面 `SyncStore::audit_delivery_drops()`(**落在实现层 `SyncStore`,契约 crate `skeleton/src/**` 零改动**)。两套证据互不为对方兜底。
+- **两类抑制分别文档化**:并发投递=入队不丢;**同 store 重入**(`AUDIT_CB_IN_FLIGHT`)=只记环、**不进待投递队列**(不递归调用同一回调)。
+- **panic fail-close 当前代次**:回调 panic ⇒ 计数 + 该代次 pending 作废并计入丢弃;订阅换代次时**旧代次队列作废**(排队事件**不投递给替换订阅**);被替换的旧槽**不覆盖新槽回调**。
+- **测试**:新 `skeleton-infra/tests/audit_dispatch_delivery.rs`(5 例,确定性握手,禁 sleep):① 并发 emit 期间的事件**恰好补投一次**(旧行为下 `[1]` vs 期望 `[1,2]`)② pending **严格按 seq 升序**补投(变异 `pop_back` ⇒ `[1,4,3,2]` 乱序红)③ 回调 panic ⇒ 本代次排队事件作废并计入丢弃计数(旧行为 0 vs 期望 76)④ 同 store 重入**只录环不进回调**(回归护栏,前后皆绿)⑤ **FIFO 溢出计数与环溢出分账**(旧行为 0 vs 期望 76)。**变异验证**:emitter 改回「跳过」⇒ 4 条红;改 `pop_front`→`pop_back` ⇒ 顺序用例红 ⇒ 断言有鉴别力。
+- **公共面**:仅新增 `SyncStore::audit_delivery_drops()` 一个只读方法;`skeleton` 契约 crate **零改动**;无字段/签名/依赖/feature 变更。
+
+### Added(bench): std-ext bench 增 scheduler 基准组（注册/取消/取消+回收/pending 对照 @1k/10k/100k）+ 回收字节计量,2026-11-23;GitHub issue#81)
+- **扩展现有 `std_ext` bench 目标**（不新增目标、不新增依赖、保留 criterion 0.5 与既有 cache/retry/random 组）；scheduler 是纯 std 恒可用域 ⇒ 该组**无 `required-features`**，`--no-default-features` 下亦可编译可跑。
+- **12 个新用例**（4 类 × 1k/10k/100k）：`register/{size}`（注册吞吐）· `cancel/{size}`（取消吞吐，**远期 deadline** = 1h 且 MockClock 冻结 ⇒ 测量期内**零点火**）· `cancel_reclaim/{size}`（取消 + **走 #52 的阈值触发压缩路径**）· `pending_control/{size}`（远期但**未取消**的对照组 ⇒ 区分「堆构造成本」与「回收成本」）。每次迭代用**全新 scheduler**（`iter_batched` + `BatchSize::PerIteration`，注册在 setup **不计时**、取消/回收在计时段；重对象析构落在计时区段外）。
+- **报告不止耗时**：ns/op + ops/s（中位）、被回收墓碑数、剩余 live 条目、峰值与回收后保留堆字节、**Drop 探针计数**（证明被取消的闭包确已释放）。
+- **字节计量 = 进程级计数分配器**（每块 16B 头 + 区段开关 + 计量标记位 ⇒ 区段差值 = **净保留字节，非 RSS**）。**与 issue 字面的一处偏离**：issue 写「isolated allocator-accounting run（或专用 bench 可执行文件/进程）」，而「不得新增第二个 bench 目标 / 不得改 Cargo.toml」使专用可执行文件不可行 ⇒ 改为进程级 + 区段隔离，**局限已逐条声明**（跨区段累计漂移；非独立进程）。若维护者要求字面的独立进程计量，需放行一个专用 bench 目标。
+- **实测**（本机，`--all-features`，19 个 ID 全出）：register 158~182 ns/op；**cancel 45~52 ns/op（与规模无关 ⇒ 取消 O(1) 快路径成立）**；cancel+reclaim 73~95 ns/op；pending 对照 tick 100/100/500 ns（无墓碑 ⇒ 阈值早退）。字节：基线 192 B，峰值（pending 保留）94.50 KiB / 1.11 MiB / 10.10 MiB ⇒ **取消后保留 == 峰值**（cancel 不摘堆，与既有语义一致）⇒ 清扫后 31.25 KiB / 312.50 KiB / 3.05 MiB（= 堆条目数组容量仍在，Entry 32 B/条），清扫释放 63.25 KiB / 824.50 KiB / 7.05 MiB；**drop 探针 = 1000 / 10000 / 100000**（取消后的捕获在 deadline 前确已释放），pending 对照 drop=0、live=N。既有 7 个组的计量区段净字节差 **全 0 B** ⇒ 其运行时热路径零堆分配（头部开销不在其路径上）。
+- **⚠️ 读数影响**：计数分配器给每块加 16B 头 ⇒ **既有组的读数会有一次性漂移**，新基线须重取；绝对 ns 读数请在安静 runner 重取（本机并行编译时 100k 注册 15.3 ms → 36.6 ms，2.4× 摆动）。
+- **未做**：独立进程级字节计量（见上）；字节读数未拆分「堆条目数组容量」与「捕获/任务胞」两类归属（只给总量 + 推算口径）；「堆条目数组容量不还给分配器」这一发现未改行为（是否 shrink 属维护者决策）。
+
+### Fixed(ci): 部分 bench 运行不得替换滚动基线（基线提升完整性闸）,2026-11-23;GitHub issue#51)
+- **缺陷**:perf workflow 的 bench 步用 `continue-on-error`（性能失败不拦合并,阈值只告警——此策略**不动**),但摘要脚本此前**只要采到任何一份新鲜 estimates 就把本轮写回基线** ⇒ 某个 bench 二进制中途失败(已产出部分 estimates)会用**部分基线替换完整基线**,后续运行随即丢失对比点而表面成功。
+- **提升条件收紧为三条全过**:① **每个期望 bench target 都有新鲜估计**——期望集合从 `cargo metadata` 推导(manifest 声明的 bench target),**不是**「本轮采到了什么」(那正是让部分运行自称完整的原因);② **上一份 good 基线里的每个 benchmark key 都在本轮出现**——key 级判据:缺一个 key 而其余全新鲜 ⇒ 不提升,且 summary **点名缺哪个 key**;③ **任一 target 的条目数不得少于上次**(中途死掉的二进制会留下更少条目)。基线文件另存每 target 的条目数供下轮比对。
+- **不提升时的行为**:`perf-baseline/summary.json` **逐字节保持不变**(上一份 good 基线经缓存原样存回),摘要标注「本轮不完整 → 未提升基线」,本轮测量仍作为**诊断产物**上传(`if: always()`)⇒ 部分数据绝不变成下一个对比点。
+- **取舍(明示)**:维护者**删掉**某个 bench 组同样会降低条目数 ⇒ 被保守判为「疑似部分运行」而不提升(需人工清理基线里的该 key)。刻意取的一边:误判成本 = 基线暂不更新(可人工修),漏判成本 = 部分运行永久替换完整基线且丢失对比点(不可见)。
+- **未按字面实现的一处**:issue 建议给 bench 步加稳定 step ID 并捕获其 outcome;本实现改用**期望集合推导**(issue 设计第 2 条的「显式期望 bench manifest」+ 上一份基线的 key 集合)作为等价信号——失败的 target 产不出估计 ⇒ 条件 ① 必然失败,提升闸的实质相同。
+- **验证**:闸逻辑用合成运行测过 7 例(完整→提升 / 缺 target→不提升 / 条目缩水→不提升 / 缺单个 key→不提升且点名 / 首轮无基线→提升 / metadata 缺失→不提升 / 不完整时基线逐字节未变),全绿;workflow 文件解析通过。性能失败仍不拦合并、回归仍只告警、CPU 型号不匹配仍只记录——三项既有行为未变。
+
+### Fixed(runtime): 票据注销后不再投递/回调 + try_subscribe 与 close 线性化,2026-11-23;GitHub issue#73/#74/#63)
+- **#73 修复(NotifySink 注销后仍投递)**:异步投递的收集窗只做 `w.upgrade()` **不看存活标志** ⇒ 票据已注销的 sink 仍收到 publish。现**收集窗过滤已死槽** + **每次 publish 前复查 alive**;唯一真源沿用既有 `alive.swap(false, AcqRel)`(不新增第二套登记表,闸回落恰好一次语义未动)。**竞态边界按 issue 的窄契约**:通过了最后一次 alive 检查的 publish 视为 **in-flight**,允许在票据 Drop 返回后完成——此后**不再开始新投递**(严格 quiescence 需另立阻塞式协议,本框架不提供)。
+- **#74 修复(同步订阅缓存注销后仍回调)**:跨线程同步订阅缓存持**强 `Arc<SubscriptionSlot>`**,票据 drop 后本次 dispatch 的缓存快照仍会回调该订阅。现给 `SubscriptionSlot` 增 **atomic alive 标志**(发布前初始化);票据 Drop 与 panic 摘除**先原子失活**(幂等)再解链 + `subs_version` 递增;**每次调用缓存回调前复查 active** ⇒ 缓存快照持强引用也不能在失活后开始新回调。panic fail-closed / subscriber 计数 / 缓存失效 / 稳态零锁快路径均未动。
+- **#63 修复(try_subscribe 与 close 的 TOCTOU)**:原实现先 `is_closed()` 再 `subscribe()`(后者在闭门后**照常登记**并计数)⇒ 并发 close 可线性化在两者之间,产生「已登记但 store 已关」。现把订阅插入抽成**假定已持订阅门**的私有 helper;`try_subscribe` **持门**检查 closed → 返回 `Err(StoreClosed)` 或插入;`close`(与 `close_wait`)**持同一门**做 `closed` 翻转后**放门再排空/回调**(不在持门期间跑用户回调、丢用户闭包或排空队列);**legacy `subscribe` 语义不变**(闭门后仍登记 + 计入 `subscriptions_after_close`)。闸为每 store 一把小锁,**热 dispatch 路径零开销**。
+- **测试**:新 `skeleton-infra/tests/ticket_removal_delivery.rs`(5 例:采集后未投递被跳过 / 在途投递可在 Drop 后完成 / panic 摘除与票 Drop 竞争闸恰好一次 / 缓存回调失活后不启动)与 `tests/subscribe_close_linearization.rs`(4 例:竞态下**绝不**出现「close 之后仍登记」/ close 后必 `Err` 且不增计数 / legacy 路径仍登记并计数 / close 排空期间不持订阅门)。**红→绿证据**:同一测试文件在 HEAD 上 FAILED(`left: 1, right: 0` 与 `left: 4, right: 0`)⇒ 真红。公共面零破坏(`skeleton` 契约 crate 未动)。
+
+### Fixed(pool): 池审计实时回调不再丢并发发射的事件 + resize 不再双预留,2026-11-23;GitHub issue#75/#69)
+- **#75 修复(实时流丢事件)**:`PoolAuditSink::emit` 原用 `slot.notify.take()` 把回调临时取走(锁外调用),此窗口内并发 emit 的事件**只入环、不投递**,首个 emitter 归还回调后**被跳过的事件不重放** ⇒ 实时回调流静默丢件。现引入**显式在途派发状态 + 待投递 FIFO**(`AuditSlot{ inflight, pending }`):回调在途期间的并发 emit **入队而非跳过**;在途者按 `seq` 序在**所有内部锁之外**补投;回调 panic 时 **fail-close 本代次**(摘除回调 + 清本代次 pending 并计数),**排队事件不投递给替换订阅**。三条约束保持:`FnMut` 回调串行 / 禁锁内调用 / 禁同线程递归(重入走 `record()` 只录环)。
+- **#75 有界与分账**:待投递 FIFO **有界**(cap 1024),溢出丢最旧并计入**独立的投递丢弃计数** `PoolBase::audit_delivery_drops()` / `ObjectPool::audit_delivery_drops()`——与 ring 溢出(`dropped_overflow`)**分账**(历史侧丢 vs 实时流丢,两套证据互不替代)。
+- **#69 修复(双预留致 `workers > max`)**:resize 的增长缺口原按 `core - (workers - reservations)` 计算 ⇒ **在途预留被忽略**,并发 resize 会重复预留同一缺口(实测 `workers=7 max=4`,与 issue 复现一致)。现缺口按**已承诺+已预留**总量计算;并引入 `target_epoch`/`next_epoch` **串行化目标更新**(**最后发起**的目标生效),旧目标预留的席位在兑现后按最新 core 重算退役令牌(`reconcile_shrink`)⇒ 不会被新目标静默满足两次。缩容令牌只从**可退休的真实 worker** 计、不得退到最新 core 以下;**OS 线程创建仍在状态锁外**,任务创建失败仍退还提交者。
+- **测试**:新 `skeleton-infra/tests/pool_audit_concurrent_delivery.rs`(3 例,PoolBase/ObjectPool 并发不丢事件 + panic 代次隔离)与 `tests/threadpool_resize_reservation.rs`(4 例,覆盖 issue 验收四条:同目标不超限且精确收敛 / 不同目标收敛到最新 / 缩容与增长预留竞争不过冲 / 注入失败回滚无幽灵预留且可补齐)。**红→绿证据**:原码跑同一测试文件 ⇒ 实时流只剩 1 件(`left: 1, right: 2`)、`workers=7 max=4`。公共面零破坏(仅新增两个只读计数方法)。
+
+### Fixed(cache): 共享缓存的 `K::clone` 移出 mutex(两阶段重验证插入),2026-11-23;GitHub issue#80)
+- **修复**:`SyncLruCache::insert` / `SyncTtlCache::insert` 在持共享 core mutex 时执行 `k.clone()`(map 侧键副本)⇒ 用户 `K::clone` 重入同缓存即自死锁、panic 即投毒锁。现按**两阶段重验证插入**:① 持锁查存在 → 存在则按今日路径更新值与 recency 且**不 clone**;② 不存在则**放锁**、clone map 侧键副本(此刻无锁持有、未发生任何变更,clone panic 在此展开)→ ③ **重取锁再查**(第二次锁定检查 = 操作的**线性化点**);④ 仍不存在则以已 clone 的 map 键插入,锁内路径**永不调 `K::clone`**(core 拆出 `overwrite_if_present` / `insert_new` / `insert_with_map_key`)。⚠️ 本次仅闭合**插入路径 `K::clone`** 边界;共享面的键 `Hash`/`Eq`(#82)与读侧 `V::clone`(#83)**仍在内部 mutex 下执行**,见 #82/#83 条目。
+- **保留现有可观察语义**:覆盖已有键**不调 clone**(不新增用户代码执行与 panic 面);单线程 `LruCache` 路径不变;TTL 校验与过期计算仍在锁前;「已有键重置过期且不 clone」保持;**TTL 路径的第二次存在检查早于过期清扫/淘汰** ⇒ panic 的 clone 不会造成部分变更。
+- **#71 退休批规则保持**:被挤出的键/值与**未被采用的候选克隆键**(竞态落败 / 覆盖路径未采用)全部在放锁后析构,无析构回锁内。
+- **测试**:新 `std-ext/tests/cache_clone_outside_lock.rs`(9 例)——修复前实测 **2 过 7 红**(3 例重入 `Timeout` = 锁内 clone 自死锁;4 例「内部锁已 poison」);含 TTL 未满/已满两种 panic 前置断言与并发首插同键只留一条记录。**变异验证**:注入「无条件预 clone」形状 ⇒ 覆盖不 clone 与并发首插两例双双 FAILED ⇒ 断言有鉴别力。公共面零破坏(无 pub 签名变化)。
+
+### Added(shutdown): watchdog 执行数上限 + live/peak 可见性,2026-11-23;GitHub issue#54)
+- **新增公共面**:`ShutdownCoordinator::with_max_watchdogs(usize)`(容量闸)、`live_watchdogs()` / `peak_watchdogs()`(诊断读数)。`OutcomeKind` / `ShutdownReport` / `ComponentOutcome` 公开形状**零改动**(容量闸不加破坏性枚举变体,按 issue owner 口径用 `Failed{reason}`)。
+- **问题面**:带超时组件的闭包跑在 watchdog 线程上,超时=**放弃等待、线程照跑(detach)**⇒ 组件大量挂死时仍在跑的 watchdog 线程数随组件数**线性增长**,且无上限、无 live 可见性。
+- **机制**:**许可 RAII**——占用发生在 **spawn 之前**,归还于**持有者消亡**(watchdog 线程退出/panic,或起线程失败时 std 丢弃闭包连带归还)⇒ 不靠手写每条分支。许可耗尽时该组件**未启动**(不 spawn 线程、不内联跑闭包),如实记 `Failed{reason: "watchdog capacity exhausted; component not started"}`——**非静默丢弃停机回调**。既有语义保持:超时≠终止(仍 `TimedOut`+detach)、执行用户闭包时不持协调器锁、被拒组件的捕获值也在锁外析构。
+- **默认不限**(`None`)⇒ 既有用户行为零变化;**不盲设**有界默认值(同 #58 口径)。
+- **测试**:新 `skeleton-infra/tests/shutdown_watchdog_bound.rs`(5 例)+ lib 内白盒记账单测。**变异验证**:容量闸差一(`>=`→`>`)⇒ 3 例 FAILED;删许可归还 ⇒ 4 例 FAILED ⇒ 断言有鉴别力。
+
+### Docs(cache): 共享缓存锁边界契约显式化（键 trait 与读侧 `V::clone` 仍在锁内）,2026-11-23;GitHub issue#82/#83)
+- **维护者拍板走「显式限制文档化」路线**,**不做部分重构**:`HashMap` 作权威索引 + 单 mutex ⇒ 键的 `Hash`/`Eq` 在锁内是**固有属性**(查表 `idx_of`→`HashMap::get`、建表项 `map.get`+`map.insert`、删除 `map.remove`、`HashMap` 扩容/rehash,以及借用键 `Q::Hash`/`Q::Eq`);真正的 lock-free 边界需另一种索引协议(快照候选键 + 锁外哈希 + 槽位代次重验证)⇒ **架构重设计,非局部补丁**。**用指纹替代键身份被否决**(指纹不是等价关系,当身份会静默改 `Eq` 语义;也不给通用 API 加应用级键限制)。
+- **读路径 `V::clone` 亦在锁内**:`get`/`peek` 返 owned ⇒ `V::clone` 在内部 mutex 下执行。「锁外 clone + 重验证」**不可安全实现**(放锁后槽位可被替换/移除/淘汰/复用 ⇒ 锁外引用不安全;重取锁再 clone 又回锁内)⇒ 改为显式限制;`Arc<V>` 存储会改所有权模型(`remove`/`pop_lru` 需新增 `V: Clone` 或改返回类型)⇒ 属公共兼容性决策,留待未来大版本(记录为未来选项)。
+- **契约文本**:两个共享缓存类型 + crate 级 cache 契约写明键/值实现须**快、不 panic、不得重入同一缓存**;与 #71 的精确对照并列(**#71 移出锁的是退休值析构;读侧 Clone 仍在锁内**);`remove`/`pop_lru` 仍移动出 owned `V`、**不需要 `V: Clone`**(既有 API 属性未变);单线程 `LruCache`/`TtlCache` 面区分(无共享 mutex,但 `Hash`/`Eq` 仍在调用方栈上同步执行)。
+- **措辞收窄**:仓内「用户代码都在锁外」类宽泛断言逐处收窄——#71 条改为「就退休面而言临界区内只做簿记与所有权转移」,#80 条追加「⚠️ 本条只覆盖插入路径 `K::clone`」,poison 条追加「临界区内用户 trait panic 同样投毒 ⇒ 键/值实现须 panic-free」。
+- **探针**:私有 `try_lock` 单元测试(用户 `Hash`/`Eq`/`Clone` 内部尝试取同一 mutex ⇒ 断言恰为 `WouldBlock`;确定性、非阻塞、无子进程、不会挂死测试进程)——它是「限制确实存在」的可执行证据,且若将来把用户代码移出锁,探针会翻红成为变更探测器。**变异验证**:把探针目标改为无争用的独立 mutex ⇒ 恰好 6 个 LRU 侧探针 FAILED ⇒ 断言有鉴别力、非恒真。
+- **无行为/API 变更**:`pub` 签名逐字未变,`Cargo.toml`/`Cargo.lock` 未动。
+
+### Fixed(cache): 淘汰/过期/摘除的值与键在共享缓存锁**外**析构,2026-11-23;GitHub issue#71)
+- **修复**:`SyncLruCache` / `SyncTtlCache` 在持共享 mutex 时执行用户析构——被淘汰/过期/覆盖的 `V::drop`,以及 `LruCore::remove` / `pop_lru` / `retain` 移除 map 条目或取走 arena 键时的 `K::drop`,全部跑在临界区内(用户 `Drop` 可能很慢、可能重入、可能 panic)。现改为**退休批**:就**退休面**而言临界区内只做簿记与所有权转移(用 `HashMap::remove_entry` 取回 map 键,连同 arena 键/值一起装进 `Retired<K,V>`),**解锁后**按显式顺序(map 键 → arena 键 → 值)析构。覆盖旧值用 `Option::replace` 取走;淘汰全量退休;过期回收值入批。四路(覆盖/淘汰/过期/摘除)一致。⚠️ 本条**只覆盖析构边界**——临界区内仍执行键的 `Hash`/`Eq` 与读侧 `V::clone`(见 #82/#83 条目)。
+- **poison 契约拆分**:锁外析构 panic **不再投毒**缓存(§71 验收口径);**临界区内** panic 仍投毒并 fail-fast 带因——既有 `poisoned_lock_fails_visible` 按新契约改写为两段(析构 panic 不投毒 + 锁内 panic 仍 fail-visible)。
+- **零分配锚不破**:退休批保键+值所有权至解锁后,但**不新增堆分配**(既有 `alloc_anchors` 的「覆盖插入不得分配」锚仍绿)。容量/TTL/LRU/计数语义与公共 API **零破坏**(HEAD 与新版 52 个 `pub fn` 签名逐字相同)。
+- **测试**(新 `std-ext/tests/cache_drop_outside_lock.rs`,11 条):修复前实测 **1 过 10 红**(其中 5 条以超时判红 = 锁内析构自死锁)⇒ 真红且鉴别力强;覆盖值侧四路 + 键侧 remove/pop_lru/retain + 探针在用户 `Drop` 内重入同一缓存并与旁线程握手取锁(通道等待,禁 sleep)。
+- **未覆盖(已另立票)**:`LruCore::insert` 的 map 键副本 `k.clone()` 仍在锁内(用户 `K::clone` 重入同样自锁死)——见 GitHub issue#80 / bd `udf-frame-j1c`。
+
+### Added(scheduler): 有界准入——容量上限 + typed `Full` 拒绝,2026-11-23;GitHub issue#58)
+- **新增公共面**:`Scheduler::set_capacity(usize)` / `capacity()`(0 = 无界,同 `SyncStore::set_capacity` 口径)、`try_after` / `try_every -> Result<TaskHandle, AdmissionError>`、`AdmissionError{Closed, Full}`、`live_registrations()` / `rejected_registrations()`。既有 `after` / `every` 签名**不变**——issue 第 5 条授权的两个选项中取「**加法 typed 面 + 既有方法触顶 fail-visible**」:触顶时 `after`/`every` **panic**(fail-visible,非静默丢回调;返回 `Err(Closed)` 会撒谎)。
+- **默认零影响**:`capacity` 默认 0(无界)⇒ 既有行为与既有测试完全不变;**不预设**有界默认值(#56 第二消费方验证前不盲设)。
+- **计数口径**:活跃注册数 = 堆内待执行条目 **+ 执行中周期任务**(仍可能重臂)——**不等同 `heap.len()`**(墓碑不计入)。额度**恰好一次**释放:一次性点火终态 / 周期任务取消·关闸·panic 四条退役路径共用单一 CAS 闸门(赢家释放)。
+- **取消仍 O(1)**:不扫堆;容量检查与计数同在状态锁内 ⇒ 并发注册不越上界;被拒回调**不入堆**(不部分插入),其捕获在堆锁外析构。
+- **测试**(新 `std-ext/tests/scheduler_bounded_admission.rs`,10 条):容量 N 恰收 N 条且下一条 typed `Full` 无部分插入 / 一次性点火释放额度 / 周期任务重臂保留额度 / 周期任务执行中被取消恰好释放一次且不再重臂 / 关闸释放堆内全部注册 / 并发注册·取消·tick·关闸竞争下计数精确且不越上界 / 被拒捕获在堆锁外析构 / legacy 触顶 panic。**变异验证**:去掉容量闸 ⇒ 6 个 #58 用例红;停用清扫 ⇒ 恰好墓碑回收用例红 ⇒ 断言有鉴别力。
+- **未做**:benchmark 条款(1k/10k/100k 注册与取消吞吐)——std-ext 无 `[[bench]]` 目标且新增需改 `Cargo.toml`,已单开 bd 票跟踪。
+
+### Fixed(scheduler): 已取消的远期条目在原 deadline 之前被回收,2026-11-23;GitHub issue#52)
+- **修复**:调度器此前对取消只用惰性墓碑(堆条目到原定 deadline 弹顶时才摘除)⇒ 取消密集 + 远期 `after` 的负载会长期占住已取消的 task cell 与其捕获闭包。现新增**独立触发**的清扫(`reclaim_cancelled`):取消路径**仍 O(1)、零锁、零扫堆**(弱引用记账 + 墓碑计数),清扫按**绝对下限 16 / 比例阈值 4** 在状态锁内重建堆只留 PENDING 条目(O(n) heapify),被摘条目**移出锁外**析构。
+- **驱动唤醒精度**:取消 earliest-deadline 时通知驱动并**重算 park 锚**——驱动不再为堆顶墓碑多醒一拍;`next_deadline` 同样在锁外析构被剪条目。
+- **执行语义零变化**:已出堆检查-执行窗口内落地的取消**仍不可撤、仍照跑**;`tick`/重臂/关闸/取消的线性化语义未改。墓碑计数是近似量(清扫期间落地的那次取消会漂移,良性——额度上限由 CAS 闸门精确管理)。
+- **测试**(同上文件):已取消的远期条目必在原 deadline 之前被回收(实现前实测 **0/48** 被回收 ⇒ 真红;实现后全绿,连跑 3 次无抖动)。
+
+### Fixed(docs): 架构蓝图 ADR 治理口径 + README 快起完成边界 + bench feature 表对齐,2026-11-23;GitHub issue#50)
+- **ADR 治理口径过期**(蓝图 §2):此前写「有意把 `docs/adr/` 排除在 Git 之外、决策副本仅存本地」——实际 `docs/adr/ADR-0001..0010` 与发布清单**已入库**,是规范且版本化的决策记录 ⇒ 蓝图改为「`docs/adr/` 已在库内,ADR 为权威记录,本蓝图表格是索引而非替代」。
+- **README 快起把 per-action 完成写成全局 idle**(根 `README.md`、`skeleton/README.md`、`skeleton-infra/examples/quickstart.rs` 三处逐字同步):「dispatch 返回即 idle」改为「**dispatch 返回 = 本 action 的完成边界**(状态提交 → 效果转发 → 通知返回)且其因果后代终局;**不承诺全局队列为空**」——并发生产者下队列可能仍非空是正常态,不是未排空证据。
+- **bench feature 表漏列**:`docs/reference.md` 两处(必选组合段 + 速查表)写 bench `infra` = `tokio+journal+memgov+testing`,而 `skeleton-infra/Cargo.toml` 的 `[[bench]]` 声明含 `pool` ⇒ 两处补齐 `pool`(照声明组合编译 bench 才不失败;CI 的 `--all-features` 曾掩盖该缺口)。
+- **全仓复查 stale 措辞**:ADR 排除类仅蓝图一处(已改);「返回即 idle」剩余命中分两类——**框架提供 sender 的静默态**与**排空环内部路径**(字面准确,保留)与测试断言消息(已统一为完成边界口径)。代码与测试行为零变化。
+
+### Fixed(scheduler): `TaskHandle::detach` 不再泄漏 TaskCell + 丢弃 `WorkerHandle` 即关闸,2026-11-23;GitHub issue#55/#72)
+- **#55 修复(泄漏)**:`TaskHandle::detach` 原用 `mem::forget(self)` 抑制 Drop-cancel,**连带永久泄漏 `Arc<TaskCell>`**——调度器移除堆条目后泄漏引用仍保活 TaskCell 分配(周期任务的回调与捕获图随之永久留存)。现**取消语义与所有权释放解耦**:新增私有 `armed` 标志,detach 只置 `armed=false`(Drop 不再 cancel),`Arc<TaskCell>` 照常释放。公共面零破坏(`detach`/`cancel` 签名不变,调用方语义不变)。
+- **#72 修复(线程+调度器双泄漏)**:丢弃 `WorkerHandle` 而不 `join` 时,`worker_loop` 持 `Arc<Scheduler>` ⇒ 驱动线程永远 park 在 condvar 上,且**再无公开句柄能关闭它**。现 `WorkerHandle` 增 `Drop`:**drop = 关闸不 join**——关闸唤醒驱动线程退出;**不 join**(句柄可能在 worker 自身回调内被 drop ⇒ 自等死锁),因此该路径**不确认线程终止、不传播 worker panic**(仅 `join` 确认终止并原样重抛 panic)。**行为变更**:丢弃句柄后调度器已关闸,后续注册返回 `Err(Closed)`。
+- **实现**:`WorkerHandle.thread` 改 `Option<JoinHandle<()>>`(类型有 `Drop` impl 时禁止移出字段),`join(mut self)` + `take()` 移出;`close()` 幂等(join 与 drop 两条路径各触发一次,无副作用叠加)。
+- **测试**(新 `std-ext/tests/scheduler_handle_lifecycle.rs`,8 条):detach 后 TaskCell 被回收(`Weak::upgrade` 由 `Some` 转 `None`,断言非恒真)/ 周期任务捕获不滞留 / 丢句柄即关闸 / 回调内丢句柄不自等死锁 / 在途回调中丢句柄仍停线程 / 显式 join 仍关闸并等退出。既有 23 条 scheduler 回归全绿;公共面零破坏(无 pub 签名变化、零新依赖、`Cargo.toml`/`Cargo.lock` 零 diff)。
+
+### Added(显式停机等待面 `close_wait` / `close_wait_timeout`,2026-11-23;GitHub issue#64)
 - **新增公共面**：`SyncStore::close_wait() -> CloseWaitOutcome` 与 `close_wait_timeout(Duration) -> CloseWaitOutcome`（`Drained` / `TimedOutStillRunning` / `Reentrant`）。`close()` 语义**不变**（准入关闭 + best-effort 排空，静默态同步排至 idle、竞争态仅交接即返）——只是其 rustdoc 改为**不承诺 quiescence** 并指向等待面（此前文档高估了竞争路径的保证）。
 - **语义**：等待谓词 = 排空租约已释放 且 活跃队列已空（**不计** #49 deferred 停放记录——非活跃排空工作）。timeout **只界调用方等待**，不取消同步 reducer、不声称已停。同栈重入（本 store 排空帧内调用）立即返回 `Reentrant`，不自等。
 - **实现**：`Condvar` 与 `queue` 锁配对；排空租约释放的两个点（正常出口 + panic unwind 臂）各 `notify_all` 一次，无轮询旗。测试 4 条（阻塞至 gated reducer 退出 / timeout typed 且不取消 / 重入 / panic unwind 后可达 Drained）；legacy 兼容由既有 drain 回归面覆盖。

@@ -230,6 +230,68 @@ jobs:
           base_cpu = baseline.get("_meta", {}).get("cpu")
           same_cpu = (not base_cpu) or (base_cpu == cpu)
 
+          # ── 基线提升完整性闸（#51 / #81）──────────────────────────────
+          # **期望 benchmark key 清单**（显式 manifest）：criterion 的 ID 形态有
+          # 三种——无 group 的函数（`retry_async_first_attempt`）、带 group 的
+          # （`sync_cache/lru_get_hit`）、group+参数（`scheduler/register/1000`）。
+          # ⚠️ **不能用 cargo metadata 的 target 名当期望**：metadata 给的是 bench
+          # target 名（`std_ext`），而 criterion 的 ID 首段是 **group 名**
+          # （`sync_cache`/`scheduler`）——两者无关，用 target 名判会永远判缺。
+          # 期望 key 集合 = 显式清单 ∪ 上一份 good 基线的 key 集合（后者覆盖
+          # 「清单未同步的旧用例被删」这一情形）。
+          EXPECTED_BENCH_IDS = {
+              "sync_cache/lru_get_hit",
+              "sync_cache/lru_insert_existing_key",
+              "sync_cache/ttl_get_hit",
+              "sync_cache/ttl_insert_existing_key",
+              "retry_async_first_attempt",
+              "random_id_v4",
+              "random_fill_8x8",
+              "scheduler/register/1000",
+              "scheduler/register/10000",
+              "scheduler/register/100000",
+              "scheduler/cancel/1000",
+              "scheduler/cancel/10000",
+              "scheduler/cancel/100000",
+              "scheduler/cancel_reclaim/1000",
+              "scheduler/cancel_reclaim/10000",
+              "scheduler/cancel_reclaim/100000",
+              "scheduler/pending_control/1000",
+              "scheduler/pending_control/10000",
+              "scheduler/pending_control/100000",
+          }
+          base_keys = {k for k in baseline if not k.startswith("_")}
+          expected_keys = EXPECTED_BENCH_IDS | base_keys
+          missing_keys = sorted(expected_keys - set(current))
+          # 期望 group 集合 = 显式清单各 ID 的首段（无 group 的一级 ID 其首段
+          # 即自身）⇒ 某 group 整个没出现（如该 bench 二进制中途死了）也判缺。
+          expected_groups = {k.split("/")[0] for k in EXPECTED_BENCH_IDS}
+          present_groups = {b.split("/")[0] for b in current}
+          missing_groups = sorted(expected_groups - present_groups)
+          # criterion ID 首段 = group 名（两级/三级 ID 的首段）；一级 ID 的
+          # 首段即完整 ID。
+          counts = {}
+          for b in current:
+              head = b.split("/")[0]
+              counts[head] = counts.get(head, 0) + 1
+          # 与上一份 good 基线比：每个 group 的条目数**不得少于**上次
+          # （某组中途失败 → 该组条目变少 → 仍被当完整基线提升 = #51 的形态）。
+          # 取舍：维护者**删掉**某个 bench 组时条数也会变少 → 会被判成「疑似部分
+          # 运行」而**保守不提升**（需人工确认后删除基线里的对应条目）。这是刻意
+          # 取的一边：误判成本 = 基线暂时不更新（可人工修），漏判成本 = 部分运行
+          # 永久替换完整基线（不可见）。
+          base_counts = baseline.get("_meta", {}).get("counts", {})
+          shrunk = sorted((t, n, base_counts[t]) for t, n in counts.items()
+                          if t in base_counts and n < base_counts[t])
+          complete = (not missing_keys and not missing_groups and not shrunk)
+          if not complete:
+              if missing_keys:
+                  print(f"::warning::本轮缺少 bench key: {missing_keys}")
+              if missing_groups:
+                  print(f"::warning::本轮缺少 bench group: {missing_groups}")
+              for t, n, prev in shrunk:
+                  print(f"::warning::bench group {t} 本轮条目 {n} < 上次基线 {prev}（疑似部分运行）")
+
           lines = ["# bench 摘要（${{ matrix.os }} · CPU: " + cpu + "）", ""]
           lines.append("| bench | median | mean | vs 上次基线 |")
           lines.append("|---|---|---|---|")
@@ -266,10 +328,25 @@ jobs:
           # 本轮值写回基线目录：cache 步骤在 job 结束时把该目录存成下一轮基线
           # （key 含 run_id → 每次一份新缓存；下次 restore-keys 取最近一份）。
           pathlib.Path("perf-baseline").mkdir(parents=True, exist_ok=True)
-          payload = {"_meta": {"cpu": cpu}}
-          payload.update(current)
-          pathlib.Path("perf-baseline/summary.json").write_text(
-              json.dumps(payload, indent=2, sort_keys=True))
+          if complete:
+              payload = {"_meta": {"cpu": cpu, "counts": counts}}
+              payload.update(current)
+              pathlib.Path("perf-baseline/summary.json").write_text(
+                  json.dumps(payload, indent=2, sort_keys=True))
+          else:
+              # 不完整 ⇒ **不提升基线**：保留上一份 good 基线不覆写（#51：
+              # 部分/失败运行不得替换完整滚动基线）。本轮数据仍作为诊断产物
+              # 上传（artifact 步骤 if: always()），供事后取数。
+              if not pathlib.Path("perf-baseline/summary.json").exists():
+                  pathlib.Path("perf-baseline/summary.json").write_text("{}")
+              note = ("> ⚠️ 本轮 bench 集合不完整 → **未提升基线**（保留上一份完整基线；"
+                      "本轮数据仅作诊断产物）。"
+                      + (f"缺少 key: {missing_keys}。" if missing_keys else "")
+                      + (f"缺少 group: {missing_groups}。" if missing_groups else "")
+                      + ("".join(f" {t} 本轮 {n} < 上次 {p}。" for t, n, p in shrunk)))
+              lines.append(note)
+              pathlib.Path("perf-out/summary.md").write_text("\n".join(lines) + "\n")
+              print("::warning::本轮 bench 集合不完整 → 不提升基线（保留上一份 good 基线）")
           print("\n".join(lines))
           with open(os.environ.get("GITHUB_STEP_SUMMARY", "perf-out/summary.md"), "a", encoding="utf-8") as fh:
               fh.write("\n".join(lines) + "\n")

@@ -62,7 +62,11 @@ fn nofx_drives_zero_effect_store() {
     let store = Store::new(Counter, NoFx);
     store.dispatch(2);
     store.dispatch(3);
-    assert_eq!(*store.snapshot(), 5, "同步排空：dispatch 返回即 idle");
+    assert_eq!(
+        *store.snapshot(),
+        5,
+        "dispatch 返回 = 本 action 的完成边界（并发生产者下队列可能仍非空）"
+    );
     store.close();
     assert!(store.is_closed());
 }

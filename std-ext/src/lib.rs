@@ -32,6 +32,26 @@
 //! | （常驻，零 feature） | `cache`：LRU+TTL 缓存（O(1) get/insert 索引 arena 双向链零 unsafe；get=touch/peek 不 touch；TtlCache 逐条 expire-after-write + 惰性过期 fail-visible 计数；单线程 `&mut` 面 + `SyncLruCache`/`SyncTtlCache` 并发薄包装（`&self`+内部 Mutex，语义一致）） |
 //! | （常驻，零 feature） | `id`：UUIDv7 确定性变体时间有序 id（RFC 9562 §5.7 布局；指纹+挂钟毫秒→同指纹严格递增/跨毫秒时间序/回拨停走；同毫秒 4096 配额耗尽 fail-closed；指纹派生推荐 `crate::hash::stable64`）；凭据级 `RandomId`（UUIDv4，OS CSPRNG 直通 fail-closed 禁弱熵回退）在 `random` 门后 |
 //! | `log-embed` | 行为域 tracing 埋点（七域 41 调用点：backoff 1/fsx 6/iter 2/scheduler 11/ratelimit 4/retry 12/cache 5；默认关=宏消除零依赖零开销；target 沿用 `skeleton::<domain>[::<phase>]` 稳定观测契约） |
+//!
+//! ## cache 域锁边界契约（共享面 = 用户代码**仍在锁内**）
+//!
+//! `cache` 域共享面（[`cache::SyncLruCache`]/[`cache::SyncTtlCache`]）用**一把
+//! `Mutex`** 串行化状态变更 ⇒ 临界区内**仍执行用户代码**。**不是「所有用户代码
+//! 都在缓存锁外」**——issue#71 只把**退休值析构**移出锁、issue#80 只把**插入
+//! 路径的 `K::clone`** 移出锁，二者都**不**使下列两类变成无锁：
+//!
+//! - **键 trait 在锁内**（issue#82）：`K::Hash`、`K::Eq` 与借用键 `Q::Hash`/
+//!   `Q::Eq`（`Borrow<Q>` 路径）**可能在内部 mutex 下执行**（查表
+//!   `idx_of`→`HashMap::get`、插入 `map.get`/`map.insert`、删除 `map.remove`、
+//!   `HashMap` 扩容/rehash）⇒ 键实现必须**快、不 panic、不得重入同一个缓存**。
+//! - **读路径 `V::clone` 在锁内**（issue#83）：`get`/`peek` 返 owned 值 ⇒
+//!   `V::clone` **在内部 mutex 下执行** ⇒ 值实现必须**快、不 panic、不得重入
+//!   同一个缓存**。
+//!
+//! 既有 API 属性未被改动：`remove`/`pop_lru` 仍**移动出 owned `V`**、**不需要
+//! `V: Clone`**。单线程面（[`cache::LruCache`]/[`cache::TtlCache`]）**无共享
+//! mutex** ⇒ 无上述锁内问题，但 `Hash`/`Eq` 仍在调用方栈上同步执行。逐条细则见
+//! `cache` 模块文档「锁边界契约」。
 
 // ── log-embed 埋点宏（feature 门控唯一通道；文本作用域，先于全部模块声明）──
 //
