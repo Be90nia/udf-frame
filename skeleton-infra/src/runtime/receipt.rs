@@ -16,15 +16,20 @@
 //! 结算被记到下一个根的账上（跨归属），故 `reset` 在 debug/test 构建对
 //! 「已终局 + 无在途后代 + 已 claim」做硬断言。
 //!
-//! 阶段（[`Phase`]）只在真实提交边界推进：reducer 前 `Reducing`、快照替换后
-//! `StateCommitted`、效果转发前 `ForwardingEffects`、转发毕 `EffectsForwarded`、
-//! 通知段 `Notifying`——失败分类据此区分「提交前失败」与「提交后部分失败」。
+//! 阶段（[`DispatchPhase`]）只在真实提交边界推进：reducer 前 `Reducing`、快照
+//! 替换后 `StateCommitted`、效果转发前 `ForwardingEffects`、转发毕
+//! `EffectsForwarded`、通知段 `Notifying`——失败分类据此区分「提交前失败」与
+//! 「提交后部分失败」。
+//!
+//! **停放计数（issue#57）**：`Deferred` 携带两个独立计数——`retained`（已留存
+//! 到停放队列、可被 [`super::SyncStore::resume_deferred`] 恢复）与 `rejected`
+//! （停放队列满、续接无法留存）。两者不合并：被拒记录**不是**「已停放」。
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-/// action 处理阶段（终局分类用）。
+/// action 处理阶段（终局分类用；[`DispatchFailure`] 的公开字段）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Phase {
+pub enum DispatchPhase {
     /// 已入队未开始（被排空中断的队列残留）。
     Queued,
     /// reducer 执行中（此刻 panic = 未提交状态）。
@@ -40,12 +45,16 @@ pub(crate) enum Phase {
 }
 
 /// 终局失败分类（bounded：单条失败摘要，禁留 action 载荷）。
-#[derive(Clone, Debug)]
-pub(crate) struct Failure {
+///
+/// 公开面（issue#57）：[`super::SyncStore::dispatch_with_receipt`] 的回执以值
+/// 形式携带它，而**不是**像 legacy `dispatch` 那样 panic——同一条失败信息，
+/// 两种消费形态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DispatchFailure {
     /// 失败 action 的序号（store 内单调）。
     pub seq: u64,
     /// 失败发生时的阶段。
-    pub phase: Phase,
+    pub phase: DispatchPhase,
     /// 失败时状态是否已提交（true = 部分完成，外部效果可能已部分生效）。
     pub state_committed: bool,
     /// 成因摘要（短文本）。
@@ -58,9 +67,13 @@ pub(crate) enum Outcome {
     /// 自身各阶段完成且全部因果后代终局成功。
     Completed,
     /// 自身或某个因果后代失败。
-    Failed(Failure),
+    Failed(DispatchFailure),
     /// 因果后代被回灌预算脱钩续接——本次等待边界以「未完成」收口。
-    Deferred,
+    ///
+    /// `retained` = 已留存到停放队列（可被恢复）的记录数；`rejected` = 停放
+    /// 队列满、续接无法留存的记录数。**两者都是非成功**，且不互相折算
+    /// （被拒记录不是「已停放」）。
+    Deferred { retained: u64, rejected: u64 },
 }
 
 /// 账本状态（锁内）。字段纪律：只留聚合计数与首条失败摘要，不留 action 载荷、
@@ -74,11 +87,14 @@ struct LedgerState {
     /// 已发布终局（发布后不可变）。
     terminal: Option<Outcome>,
     /// 首条失败摘要（先到先得，后续失败只计数）。
-    first_failure: Option<Failure>,
+    first_failure: Option<DispatchFailure>,
     /// 失败总数（bounded 计数，禁留载荷）。
     failure_count: usize,
-    /// 是否有因果后代被回灌预算脱钩（终局取 `Deferred`）。
-    deferred: bool,
+    /// 被回灌预算脱钩且**已留存**到停放队列的因果后代数（终局取 `Deferred`）。
+    deferred: u64,
+    /// 脱钩但**停放队列满、续接无法留存**的记录数（issue#57：独立非成功计数，
+    /// 不并入 `deferred`——被拒记录不是「已停放」）。
+    deferred_rejected: u64,
     /// 是否已被归还到复用池（首次归还者胜——防同一账本被归还两次）。
     released: bool,
     /// 归属 token（issue#84）：本账本属于**等待型根**（`true`）= 外部等待者
@@ -118,7 +134,7 @@ impl Ledger {
     }
 
     /// 后代终局（成功 / 失败 / 脱钩后另行记账）。
-    pub(crate) fn descendant_done(&self, failure: Option<Failure>) {
+    pub(crate) fn descendant_done(&self, failure: Option<DispatchFailure>) {
         let mut st = self.lock();
         // 记账恒减：后代终局与脱钩各减一次（脱钩走 detach_deferred）。
         release_descendant_slot(&mut st);
@@ -132,7 +148,7 @@ impl Ledger {
     }
 
     /// 根 action 自身阶段完成（正常路径）。
-    pub(crate) fn finish_root(&self, failure: Option<Failure>) {
+    pub(crate) fn finish_root(&self, failure: Option<DispatchFailure>) {
         let mut st = self.lock();
         st.root_done = true;
         if let Some(f) = failure {
@@ -147,16 +163,34 @@ impl Ledger {
     /// 因果后代被回灌预算脱钩（迁往续接账本）：本账本记「未完成」并减计数。
     ///
     /// `is_root` = 被脱钩者是否本账本的根（外部根恒 false——外部流量深度恒 0
-    /// 不可能超预算；续接账本的根可能再次超预算）。
-    pub(crate) fn detach_deferred(&self, is_root: bool) {
+    /// 不可能超预算；续接账本的根可能再次超预算）。`retained` = 脱钩记录是否
+    /// **成功留存**到停放队列：`false` = 停放队列满被容量拒收（issue#57 的
+    /// 独立非成功计数，不并入 `deferred`）。
+    pub(crate) fn detach_deferred(&self, is_root: bool, retained: bool) {
         let mut st = self.lock();
         if is_root {
             st.root_done = true;
         } else {
             release_descendant_slot(&mut st);
         }
-        st.deferred = true;
+        if retained {
+            st.deferred += 1;
+        } else {
+            st.deferred_rejected += 1;
+        }
         self.publish(&mut st);
+    }
+
+    /// 恢复路径的等待者认领（issue#49/#57）：停放记录尚未被任何排空者处理 ⇒
+    /// 终局未发布、无归还竞争 ⇒ 此刻把归属 token 翻到等待者一侧（恢复调用者在
+    /// 消费终局后归还，见 [`Self::waiter_release`]）。
+    pub(crate) fn claim_as_waiter(&self) {
+        let mut st = self.lock();
+        debug_assert!(
+            st.terminal.is_none() && !st.released,
+            "恢复的停放记录必须尚未终局、尚未归还（否则账本已被复用）"
+        );
+        st.waiter = true;
     }
 
     /// 等待终局（外部调用者的同步等待面）。中毒锁按 `into_inner` 恢复——
@@ -182,10 +216,13 @@ impl Ledger {
         if !(st.root_done && st.outstanding == 0) {
             return;
         }
-        let outcome = if let Some(f) = st.first_failure.clone() {
+        let outcome = if let Some(f) = st.first_failure {
             Outcome::Failed(f)
-        } else if st.deferred {
-            Outcome::Deferred
+        } else if st.deferred > 0 || st.deferred_rejected > 0 {
+            Outcome::Deferred {
+                retained: st.deferred,
+                rejected: st.deferred_rejected,
+            }
         } else {
             Outcome::Completed
         };
@@ -223,7 +260,8 @@ impl Ledger {
         st.terminal = None;
         st.first_failure = None;
         st.failure_count = 0;
-        st.deferred = false;
+        st.deferred = 0;
+        st.deferred_rejected = 0;
         st.released = false;
         st.waiter = waiter;
     }
@@ -248,12 +286,15 @@ impl Ledger {
     /// 等待者收口后的归还 claim：等待型根的 owner 在 `wait()` 返回终局后调用
     /// （`wait()` 返回即终局已发布）。与 [`Self::claim_release`] 共用
     /// `released` 的恰好一次守卫——两条路径合起来每个账本只进池一次。
+    ///
+    /// 终局未发布即归还（回执句柄被提前丢弃，issue#57）⇒ **不归还**：活账本
+    /// 绝不许进池（`reset` 的不变式），账本随最后一个 `Arc` 消亡——少一次复用，
+    /// 不产生跨归属记账。
     pub(crate) fn waiter_release(&self) -> bool {
         let mut st = self.lock();
-        if st.released {
+        if st.released || st.terminal.is_none() {
             return false;
         }
-        debug_assert!(st.terminal.is_some(), "等待者归还时终局必须已发布");
         st.released = true;
         true
     }
