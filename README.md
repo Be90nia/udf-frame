@@ -13,7 +13,7 @@ action ──▶ Store ──▶ Reducer（纯函数）──▶ 新状态 + 效
 | crate | 层 | 内容 | 依赖 |
 |---|---|---|---|
 | [`skeleton`](skeleton) | 契约层 | trait（`Reducer` 根契约 / `Fragment` 分片契约 / `Store`/`EffectRuntime`/`Driver`/`JournalPort`/`PoolManaged`/`JsonPort`/`SqlDialectPort`/`MarkdownPort`）+ 数据词汇（`Effect`/`EffectBuf`/`EffectId`/`ActionSender`/`Subscription`/`NoFx`/`Restore`/`PoolMetrics`/`Json`/`MdTag`/`MdEvent`）+ 语义契约文本 | **零依赖** |
-| [`std-ext`](std-ext) | 散件层 | 十四域（`text`/`encode`/`hash`/`iter`/`backoff`/`fsx`/`paths`/`clock`/`retry`/`scheduler`/`ratelimit`/`cache`/`id`/`json`；十三域零门常驻、本体纯 std，`json` 域门控 `json` feature）+ `log-embed` 埋点（七域 35 调用点） | 默认树：仅 `skeleton`（workspace 路径依赖）——零三方（开 `json` 门时 `serde_json` 子树按需进树） |
+| [`std-ext`](std-ext) | 散件层 | 十四域（`text`/`encode`/`hash`/`iter`/`backoff`/`fsx`/`paths`/`clock`/`retry`/`scheduler`/`ratelimit`/`cache`/`id`/`json`；十三域零门常驻、本体纯 std；`json` 域门控 `json` feature，`random` 门控凭据级 CSPRNG `RandomId`）+ `log-embed` 埋点（七域 48 调用点） | 默认树：仅 `skeleton`（workspace 路径依赖）——零三方（开 `json` 门时 `serde_json` 子树按需进树） |
 | [`skeleton-infra`](skeleton-infra) | 实现层 | `runtime::SyncStore`（契约参考实现：同步排空环 + 快照广播）+ `audit` 审计事件流 + `pool` 池化管理组合件 + `compose` 组合器 + `view` 语言无关视图桥（ADR 0006）+ `testing` 测试替身（含 `parse_mock` 解析面 mock）+ `shutdown` 停机编排 + 生态绑定（tokio fx / journal / memgov / logx / tracingx / config） | 默认树：仅 `skeleton` + `std-ext`（均 workspace 路径依赖）——零三方 |
 
 契约（约束后面代码长法的形状）与实现（机器）分家：`skeleton` 十分钟读完，`skeleton-infra` 按域查典。核心无 IO 依赖 → reducer「禁 IO」是编译期事实，不是评审约定；副作用只能以 `Effect::Run { op }` 描述值离场，由宿主提供的解释器执行。
@@ -67,12 +67,16 @@ udf-skeleton-infra = { path = "<UDF_ROOT>/skeleton-infra" }
 | `memgov` | 计数分配器 + 有界注册表（淘汰策略必选：满则报错或逐最旧） |
 | `pool`（**默认**） | `PoolBase` 池化管理组合件：resize 校验/水位线/审计/溢出计数公共逻辑写一次，`PoolManaged` 契约（skeleton）+ 双池特化（`MemoryPool`/`ThreadPool`）+ `PooledThreadPool` 互喂组合件（任务闭包内借缓冲→跑→RAII 还） |
 | `testing` | `TestStore` 逐动作断言 + `ScriptedRuntime` 脚本化解释器替身 + `parse_mock` 解析端口三 mock（`MockJson`/`MockSqlDialect`/`MockMarkdown`） |
-| `compose` | `combine`/`combine!` 父子分片组合器：宏一行装配（只依赖契约词汇） |
+| `compose` | `combine`/`combine!` 父子分片组合器：宏一行装配（只依赖契约词汇）；**连带 `runtime`**（`compose = ["runtime"]`，运行时零三方 ⇒ 拉入成本为零） |
 | `view` | `view::ViewBridge` 语言无关视图桥（ADR 0006）：`ViewMap` 投影 + `IntentMap` 意图翻译 + lazy JSON / eager 区域双编码矩阵 + 版本水位 + 未知标签跳过（`view::read` 读侧参考实现）；规范 `docs/view-region-spec.md`，命名工件 `docs/view-bridge-constants/` |
 | `log-fs` | `logx` 文件落盘面（纯 std 零三方：`log-fs` 面自身口径；crate 树见下方 `cargo tree` 段——默认树零三方）：密钥掩码 + 路径解析（契约 `LogPathResolver` 住 `skeleton::logpath`；`DefaultPathResolver` debug=编译期锚**仅框架自身 dogfood 用**——采用方 debug 态必须注入自有 resolver）+ `FileSink` 按日滚动 |
 | `log` | `logx` 门面绑定层（=`log-fs`+log+tracing+tracing-subscriber+tracing-log）：init 系（`init_tracing_from_env`/`init_with_file` console+file 双 sink） |
 | `tracing` | `tracingx`：审计事件流 → tracing 桥 |
-| `log-embed` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 + fx 一域 1 = 7 调用点；`std-ext` 自有同款 feature：七域 35 调用点；合计九域 42，target `skeleton::<domain>[::<phase>]`，级别规范见各模块头注；默认关=宏消除，tracing 不进树） |
+| `log-embed` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 + fx 一域 1 = 7 调用点；`std-ext` 自有同款 feature：七域 48 调用点；合计九域 55——口径=`embed_event!` 宏调用点，排除宏定义/文档注释/`#[cfg(test)]` 之后内容，多行调用按一次计；target `skeleton::<domain>[::<phase>]`，级别规范见各模块头注；默认关=宏消除，tracing 不进树） |
+| `config-json` | `ConfigFile` 分层装配（default→file→层叠合并）+ `save` 原子落盘（serde/serde_json 仅此门可达；契约 `ConfigPort` 住 `skeleton::config`） |
+| `config-toml` | `load_toml`/`save_toml` 类型化直读直写 + `file_layer_toml`（TOML↔值面翻译；toml 仅此门可达；连带 `config-json`） |
+| `full` | 一键全开：上表 14 个消费面叶子并集（`--all-features` = `full` + `unsafe-evidence`；**不**含证据开关） |
+| `unsafe-evidence` | `DrainExclusive` 差分对照变体（Mutex 版）+ 不变量证据门；默认关、不在 `full` 并集内（只服务证据采集，不是消费能力） |
 | （常驻，零 feature） | **std-ext 十四域**（`text` `encode` `hash` `iter` `backoff` `fsx` `paths` `clock` `retry` `scheduler` `ratelimit` `cache` `id` `json`；十三域零门常驻、本体纯 std；`json` 域门控 `json` feature）。逐域职责见 `std-ext` crate 文档与 `docs/reference.md` 域索引）+ 本 crate `shutdown`（行为件面；时间源/配置/日志路径契约已下沉 `skeleton::clock`/`skeleton::config`/`skeleton::logpath`） |
 
 `cargo tree -p udf-std-ext -e normal`：仅 `skeleton`（workspace 路径依赖）——零三方；开 `json` 门时 `serde_json` 子树按需进树。`cargo tree -p udf-skeleton-infra -e normal`：默认 feature 下仅 skeleton + std-ext（workspace 路径依赖）——同样零三方。
@@ -85,6 +89,8 @@ udf-std-ext = "0.1.0"   # lib 名 std_ext；use std_ext::{ratelimit, retry, cach
 
 # 可选：行为域 tracing 埋点（默认关=宏消除零开销、tracing 不进树）
 # udf-std-ext = { version = "0.1.0", features = ["log-embed"] }
+# 可选：凭据级 CSPRNG id（`std_ext::id::RandomId`/UUIDv4；默认关，getrandom 不进树）
+# udf-std-ext = { version = "0.1.0", features = ["random"] }
 ```
 
 ## 池化域（`pool` feature）
@@ -155,7 +161,7 @@ cargo build --workspace --all-features
 cargo test --workspace --all-features
 ```
 
-采用方一键全开（tokio 先例）：`features = ["full"]` = 14 个消费面叶子并集（不含 `unsafe-evidence` 证据开关；`--all-features` = full + unsafe-evidence）；默认集仍最小（零三方），子开关=进阶裁剪。`std-ext` 的七域 35 埋点（`log-embed`）由其自有同款 feature 承载，不随本 crate `full` 点亮（ADR 0005：跨 crate 强制耦合否决）——workspace 全量埋点=两 crate 各自 `--all-features`（CI 同款）。
+采用方一键全开（tokio 先例）：`features = ["full"]` = 14 个消费面叶子并集（不含 `unsafe-evidence` 证据开关；`--all-features` = full + unsafe-evidence）；默认集仍最小（零三方），子开关=进阶裁剪。`std-ext` 的七域 48 埋点（`log-embed`）由其自有同款 feature 承载，不随本 crate `full` 点亮（ADR 0005：跨 crate 强制耦合否决）——workspace 全量埋点=两 crate 各自 `--all-features`（CI 同款）。
 
 ## License
 

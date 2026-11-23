@@ -29,7 +29,7 @@
 //! | `memgov` | `memgov`：内存治理；`alloc_site`：分配站点目录（编译期静态表 + 每站点原子计数/开关 + 查表零分配） |
 //! | `compose` | `compose`：父子分片组合器 |
 //! | `tracing` | `tracingx`：骨架审计事件流 → tracing 桥 |
-//! | `log-embed` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 + fx 一域 1 = 7 调用点；默认关=宏消除零依赖零开销，target `skeleton::<domain>[::<phase>]`。scheduler/ratelimit/retry/cache 四域 26 调用点随批 5-2、backoff/fsx/iter 三域 9 调用点随批 5-1 拆至 `std-ext`（合计 35），由其自有 `log-embed` feature 承载，宏同款副本） |
+//! | `log-embed` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 + fx 一域 1 = 7 调用点；默认关=宏消除零依赖零开销，target `skeleton::<domain>[::<phase>]`。scheduler/ratelimit/retry/cache 四域 39 调用点随批 5-2、backoff/fsx/iter 三域 9 调用点随批 5-1 拆至 `std-ext`（合计 48；口径=`embed_event!` 宏调用点，排除宏定义/文档注释/`#[cfg(test)]` 之后内容），由其自有 `log-embed` feature 承载，宏同款副本） |
 
 // ── log-embed 埋点宏（feature 门控唯一通道；文本作用域，先于全部模块声明）──
 //

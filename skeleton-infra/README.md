@@ -2,7 +2,7 @@
 
 契约实现 + 生态标准件绑定 + 防坑门面。契约（trait 与数据词汇）在姊妹 crate
 [`skeleton`](../skeleton)（零依赖），十四个散件域（十三域零门常驻、
-本体纯 std，`json` 域门控 `json` feature）在
+本体纯 std，`json` 域门控 `json` feature、`random` 门控凭据级 CSPRNG）在
 [`std-ext`](../std-ext)（批 5-1/5-2 物理拆分），本 crate 兑现契约参考实现与
 核+胶水件。crate 级文档（`lib.rs`）为权威域典，本 README 是浏览器视角的域清单。
 
@@ -22,8 +22,11 @@
 | `log-fs` | `logx` | 文件落盘面（纯 std 零三方：`log-fs` 面自身口径，crate 树见下方零依赖口径段）：密钥掩码 + `DefaultPathResolver` 双构建默认根（debug=编译期锚/release=`~/.<项目>/log`；契约 `LogPathResolver` 住 `skeleton::logpath`）+ `FileSink` 按日滚动追加 |
 | `log` | `logx` | 门面绑定层（=`log-fs`+log/tracing/tracing-subscriber/tracing-log）：`init_tracing_from_env`（EnvFilter）+ `init_with_file` console/file 双 sink + `FileSinkWriter` |
 | `tracing` | `tracingx` | 审计事件流 → tracing 桥 |
-| `log-embed` | `shutdown` + `fx` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 + fx 一域 1 = 7 调用点）：shutdown 注册/逐组件开始/终态（Stopped/TimedOut/Failed）/整体报告；fx 托管任务 panic 且句柄已被丢（结果无人消费）=warn，msg=panic 文案（target `skeleton::<domain>[::<phase>]`，级别=正常流转 debug/异常 warn/终态 info；默认关=宏消除零依赖零开销）。批 5-1/5-2 起其余七域 35 调用点由 `std-ext` 自有同款 feature 承载（宏同款文本作用域副本） |
-| `compose` | `compose` | `combine`/`combine!` 父子分片组合器（镜头+路由+效果上提，宏一行装配） |
+| `log-embed` | `shutdown` + `fx` | 行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 + fx 一域 1 = 7 调用点）：shutdown 注册/逐组件开始/终态（Stopped/TimedOut/Failed）/整体报告；fx 托管任务 panic 且句柄已被丢（结果无人消费）=warn，msg=panic 文案（target `skeleton::<domain>[::<phase>]`，级别=正常流转 debug/异常 warn/终态 info；默认关=宏消除零依赖零开销）。批 5-1/5-2 起其余七域 48 调用点（口径=`embed_event!` 宏调用点，见 [docs/reference.md](../docs/reference.md) 的 log-embed 段）由 `std-ext` 自有同款 feature 承载（宏同款文本作用域副本） |
+| `compose` | `compose` | `combine`/`combine!` 父子分片组合器（镜头+路由+效果上提，宏一行装配）；`compose = ["runtime"]` 连带 runtime（零三方成本） |
+| `view` | `view` | `ViewBridge` 语言无关视图桥（ADR 0006）：`ViewMap` 投影 + `IntentMap` 意图翻译 + lazy/eager 区域双编码 + 版本水位；`serde_json` + `udf-std-ext/json` 仅此 feature 可达 |
+| `full` | — | 一键全开：上表 14 个消费面叶子并集（`--all-features` = `full` + `unsafe-evidence`；**不**含证据开关） |
+| `unsafe-evidence` | — | `DrainExclusive` 差分对照变体（Mutex 版）+ 不变量证据门；默认关、不在 `full` 并集内 |
 
 零依赖口径：`cargo tree -p udf-skeleton-infra -e normal`——默认 feature 下仅
 `skeleton` + `std-ext`（均 workspace 路径依赖）——**真正零三方**（连

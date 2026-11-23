@@ -1,5 +1,6 @@
 //! log-embed 埋点验收（std-ext 域切片：backoff/fsx/iter + 批 5-2 scheduler/
-//! ratelimit/retry/cache，共七域 35 调用点；`--features log-embed`
+//! ratelimit/retry/cache，共七域 48 调用点（口径=`embed_event!` 宏调用点，
+//! 见仓库根 `docs/reference.md` 的 log-embed 段）；`--features log-embed`
 //! 开跑。shutdown 一域留在 skeleton-infra/tests/log_embed.rs，两文件捕获
 //! 订阅器同款各一份）：
 //!

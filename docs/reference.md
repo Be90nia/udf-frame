@@ -28,8 +28,8 @@
 | `log-fs` | 零依赖 | — | `logx` 文件落盘面：密钥掩码/路径解析（契约 `LogPathResolver` 住 `skeleton::logpath`）/`FileSink` 按日滚动——单开即可用文件日志 |
 | `log` | `log-fs` + log, tracing, tracing-subscriber, tracing-log | — | `logx` 门面绑定层：init 系（EnvFilter/双 sink）+ `FileSinkWriter` |
 | `tracing` | `runtime` + tracing, tracing-subscriber | — | `tracingx`：审计事件流 → tracing 桥 |
-| `log-embed` | tracing | — | 埋点：skeleton-infra=shutdown 一域 6 + fx 一域 1 = 7 点；std-ext 自有同款 feature=七域 35 点（合计九域 42；默认关=宏消除零依赖零开销） |
-| `compose` | — | — | `combine`/`combine!` 父子分片组合器 |
+| `log-embed` | tracing | — | 埋点：skeleton-infra=shutdown 一域 6 + fx 一域 1 = 7 点；std-ext 自有同款 feature=七域 48 点（合计九域 55；计数口径见 [log-embed 段](#log-embed--埋点规范)；默认关=宏消除零依赖零开销） |
+| `compose` | `runtime` | — | `combine`/`combine!` 父子分片组合器（`compose = ["runtime"]`：单开连带 runtime，零三方成本） |
 | `config-json` | serde, serde_json | — | `ConfigFile` 分层装配 + 原子保存（serde_json::Value 统一值面） |
 | `config-toml` | `config-json` + toml | — | `load_toml`/`save_toml` + `file_layer_toml`（TOML↔值面翻译） |
 | `view` | serde_json + `udf-std-ext/json` | — | `view::ViewBridge` 语言无关视图桥（ADR 0006）：契约词汇住 `skeleton::view`（零依赖）；默认树零三方不变 |
@@ -75,7 +75,7 @@
 | tracing | `tracing` | `tracingx`：审计事件流 → tracing 桥 | [`tracingx`](#tracingx--tracing-桥) |
 | compose | `compose` | `combine`/`combine!` 父子分片组合器 | [`compose`](#compose--父子分片组合器) |
 | view | `view` | `ViewBridge` 语言无关视图桥（投影/意图/双编码矩阵/水位/未知标签跳过） | [`view`](#view--语言无关视图桥) |
-| log-embed | `log-embed` | 九域 42 埋点规范（target/级别/字段纪律） | [`log-embed`](#log-embed--埋点规范) |
+| log-embed | `log-embed` | 九域 55 埋点规范（target/级别/字段纪律） | [`log-embed`](#log-embed--埋点规范) |
 
 ---
 
@@ -411,9 +411,10 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 | 6 | 回灌深度预算 | `runtime` 排空环 | —（固定） | `FEEDBACK_DEPTH_BUDGET = 64`（单次 dispatch 连续回灌链深度） | 停排 + `feedback_budget_exceeded` 计数；触发点 action **脱钩停放（deferred）**（保留来源身份，主队列继续；非 panic 非静默，**不是**退回队尾自动重放） | 显式 `resume_deferred(limit)`（#49）；`DispatchOutcome::Deferred{retained}` 上报 |
 | 7 | deferred 停放队列 | `runtime`（#49） | 不适用（容量独立配置） | `set_deferred_capacity(n)` + `deferred_capacity()` / `deferred_actions()`；默认 `DEFAULT_DEFERRED_CAPACITY = 64`（**已定**，见决定记录）；**独立于 ingress capacity** | 满 ⇒ 新续接拿**显式非成功终局**（`FinishRoot(Failed)`）+ 专用计数 `deferred_capacity_rejected()`，不入队、不消失、不误标成功 deferred | `resume_deferred(limit)`（FIFO、fresh epoch、独立续接收据）；`DispatchOutcome::CapacityRejected` 可观测 |
 | 8 | FxScope 等待/跟踪条目 | `fx`（#13/#39） | 无界（`usize::MAX`，默认） | `with_max_pending(n)` / `with_max_tracked(n)`；默认**均无界** | 拒绝：`try_spawn_tracked` 返回 typed `AdmissionError::{PendingFull,TrackedFull}`（不阻塞不 panic） | 显式设界；`try_reap()` 收割后回落；`counts()` 读数 |
-| 9 | 对象池/线程池 idle 容量 | `pool` | 由 tuning 显式给 | `ObjectPoolTuning` / `ThreadPoolTuning` **显式必填，无默认** | 超 `idle_cap` ⇒ `dropped_overflow` 计数（有界降级） | 调 tuning；`shrink_to`/`prune_idle` 主动回收 |
+| 9 | 对象池/线程池 idle 容量 | `pool` | 由 tuning 显式给 | `ObjectPoolTuning` / `ThreadPoolTuning` **显式必填，无默认**（`SizeClassPool` 逐档继承 tuning，无自有 cap） | 超 `idle_cap` ⇒ `dropped_overflow` 计数（有界降级） | 调 tuning；`shrink_to`/`prune_idle` 主动回收 |
+| 10 | 外部准入队列容量（ingress） | `runtime`（#38） | 无界（默认） | `SyncStore::set_capacity(n)`；默认 **0 = 不限**（等待被 reduce 的 action 数；正在执行的已出队，不计入） | 拒绝：`try_dispatch` ⇒ typed `AdmissionOutcome::Full`；`ActionSender::dispatch` ⇒ `false`；`SyncStore::dispatch`（无失败面）过载 panic fail-visible——均不阻塞、不部分插入；计数 `admission_full_count()` | 显式 `set_capacity(n)`（运行期调整与准入竞争 = 尽力而为）；`admission_full_count()` 读数 |
 
-**数值决定记录（2026-11-23 维护者拍板）**：本表全部默认值**保持现值（keep current）**——具体为：Run-ID `1024`、deferred `64`、审计环/待投递 `1024`、回灌深度 `64` **照旧**；scheduler 与 watchdog 的提案值（`1024` / `4096`）**不采纳，保持无界**（草案见 `reports/2026-11-23-resource-defaults-draft.md`，留痕备查）。依据：#56 Stage C 消费方验收结论「全默认开箱可用，未出现要求把默认值改小的证据」（`reports/2026-11-23-56-stage-c-consumer-validation.md`）；共同约定 2「默认=保守可用，禁为炫技设小界」。`AUDIT_PENDING_CAP` 无配置面、`FEEDBACK_DEPTH_BUDGET` 固定——均按现状记录，不新增配置面。
+**数值决定记录（2026-11-23 维护者拍板）**：本表全部默认值**保持现值（keep current）**——具体为：Run-ID `1024`、deferred `64`、审计环/待投递 `1024`、回灌深度 `64`、ingress 无界 **照旧**；scheduler 与 watchdog 的提案值（`1024` / `4096`）**不采纳，保持无界**（草案见 `reports/2026-11-23-resource-defaults-draft.md`，留痕备查）。依据：#56 Stage C 消费方验收结论「全默认开箱可用，未出现要求把默认值改小的证据」（`reports/2026-11-23-56-stage-c-consumer-validation.md`）；共同约定 2「默认=保守可用，禁为炫技设小界」。`AUDIT_PENDING_CAP` 无配置面、`FEEDBACK_DEPTH_BUDGET` 固定——均按现状记录，不新增配置面。
 
 **修订规则**：某默认值经 #56 Stage B 实测不合格 ⇒ 修订本表一次（改大 = 兼容放宽；改小 = 破坏性，需 ADR 记录理由与迁移路径），各面 rustdoc 随表同步，禁单点改数。
 
@@ -2149,9 +2150,19 @@ pub enum TaskError { Cancelled, Panicked(String), TimedOut }
 pub struct ScopeClosed;   // accepting 闸已关：spawn 拒新（fail-closed 显式）
 
 #[must_use]
+#[non_exhaustive]                    // 字段渐进扩：跨 crate 禁 struct literal（含 ..Default::default()），走 default() 起手
 pub struct ShutdownReport {          // 停机排空报告（fx 域自有；与 shutdown 域 coordinator 报告同名不同型）
+    // 五终局桶（completed/cancelled/panicked/failed/still_running）互斥且穷尽：
+    // 本次排空观测到的每条任务终局恰落一桶。timed_out 与终局桶**正交**（截止事件
+    // 计数，可覆盖截止瞬间已终局但尚未收割的条目）；drain_interrupted 是**报告来源
+    // 标记**而非桶（中断结果不是整 scope 的 canonical 终局）。
+    pub completed: usize,            // 正常终局条数（含滞留至本次排空才收割的条目）
+    pub cancelled: usize,            // 已观测到被中止的条数（abort 已发而终止未观测者进 still_running）
     pub panicked: Vec<String>,       // 排空收割的 panic 消息（句柄被丢也不丢）
-    pub timed_out: usize,            // 截止时未完成数（仅 shutdown_timeout 超时路径 >0）
+    pub failed: usize,               // 非 panic 失败终局条数（errors.len() == failed；常态 0）
+    pub errors: Vec<String>,         // failed 的逐条诊断文案（与计数同点写入，禁静默吞）
+    pub timed_out: usize,            // 正交截止计数：截止时未完成数（仅 shutdown_timeout 超时路径 >0）
+    pub still_running: usize,        // 报告返回时「终止未观测到」的条数（不宣称仍在执行）
     pub drain_interrupted: bool,     // 报告来源：排空 owner 被 drop/panic ⇒ 中断结果（只请求 abort，不确认终止）
 }
 
@@ -2596,7 +2607,7 @@ impl ViewBridge<S, A, M, I, J, R> {
 
 **feature**：`log-embed`（绑 tracing；**默认不开启**——埋点宏展开为空、tracing 依赖不进树，cargo tree 零 tracing 证明；`tracingx`/`logx` 桥不受本 feature 影响）。
 
-九域 42 调用点，覆盖 scheduler/ratelimit/retry/backoff/fsx/cache/shutdown/iter/fx。纪律（lib.rs `embed_event!` 注）：
+九域 55 调用点（`std-ext` 七域 48：scheduler 14 / retry 12 / cache 9 / fsx 6 / ratelimit 4 / iter 2 / backoff 1；本 crate 七点：shutdown 6 + fx 1），覆盖 scheduler/ratelimit/retry/backoff/fsx/cache/shutdown/iter/fx。**计数口径**：「调用点」= `embed_event!` 宏调用——排除宏定义行、`//` 文档/注释行与 `#[cfg(test)]` 之后的内容，多行调用按首行计一次；改埋点后按此口径重数，同步两 crate 的 `lib.rs`/`Cargo.toml` 注与本段。纪律（lib.rs `embed_event!` 注）：
 
 - **只埋行为决策点**（register/cancel/fire/裁决/拒绝/等待分段），禁埋纯计算路径（`backoff_delay` 的 debug 入参事件是派单契约显式点）。
 - **字段化禁格式化**：字段只收数值/布尔/静态串，禁 format!/Display。
@@ -2625,15 +2636,15 @@ target 规范：域=`skeleton::<domain>`，子流程=`skeleton::<domain>::<phase
 
 | 组合 | 形态 | 说明 |
 |---|---|---|
-| `full` | 一键全开 | 本 crate 14 消费面叶子并集（不含 `unsafe-evidence` 证据开关；`--all-features` = full + unsafe-evidence）；采用方默认心智入口——「不懂就 full」，子开关=进阶裁剪。std-ext 七域 35 埋点由其自有 `log-embed` 承载（ADR 0005 否决跨 crate 强制耦合）；workspace 全量=两 crate 各自 `--all-features` |
+| `full` | 一键全开 | 本 crate 14 消费面叶子并集（不含 `unsafe-evidence` 证据开关；`--all-features` = full + unsafe-evidence）；采用方默认心智入口——「不懂就 full」，子开关=进阶裁剪。std-ext 七域 48 埋点由其自有 `log-embed` 承载（ADR 0005 否决跨 crate 强制耦合）；workspace 全量=两 crate 各自 `--all-features` |
 | `--no-default-features` | 纯生态件面 | 常驻 14 域（行为件面；十三域零门常驻、本体纯 std；`json` 域与凭据级 `RandomId`（`random` 门）按需显式开）+ memgov 可独立（`--features memgov`） |
 | 默认 | runtime + pool | pool 连带 memgov；SyncStore/PoolBase/ThreadPool 可用 |
-| `log-fs` 单开 | log-fs 面零三方 | 文件日志可用（mask_secrets/DefaultPathResolver/FileSink），不拉 tracing 四件套；std-ext 常驻依赖（及其 `json` 域 `serde_json`）仍在树内 |
+| `log-fs` 单开 | log-fs 面零三方 | 文件日志可用（mask_secrets/DefaultPathResolver/FileSink），不拉 tracing 四件套；std-ext 常驻依赖仍在树内（**不含** `serde_json`：`json` 域经 `json` feature 才进树，`log-fs` 不点亮它） |
 | testing | tokio + runtime | TestStore/ScriptedRuntime/parse_mock |
 | tracing | runtime + deps | 桥在审计值面上消费 |
 | config-toml | config-json + toml | 值面叠层；toml 仅此 feature 可达 |
 | bench `infra` | tokio+journal+memgov+testing+pool | required-features 并集（hollow gate 纪律） |
 | example `end_to_end` | tokio+journal+testing+compose | 五件套+combine+TestStore+fx/journal 解释器标准形 |
 
-零依赖证明口径：`cargo tree -p udf-skeleton-infra -e normal`（默认 feature 下 `skeleton` + `std-ext`，均 workspace path 非三方；std-ext 的 `json` 域带 `serde_json` 普通依赖进树）；`--no-default-features --features memgov` 仍独立；`--no-default-features --features log-fs` 树内同样含 std-ext 及其 `serde_json` 子树。
+零依赖证明口径：`cargo tree -p udf-skeleton-infra -e normal`（默认 feature 下 `skeleton` + `std-ext`，均 workspace path 非三方——**默认零三方**）；`--no-default-features --features memgov` 仍独立；`--no-default-features --features log-fs` 树内同样只有 workspace 路径依赖（`log-fs` 不点亮 `json`）。`serde_json` 是**门控依赖**（Cargo optional，ADR-0007 依赖隔离门），仅经这些 feature 进树：std-ext 侧 `json`；infra 侧 `view`（连带 `udf-std-ext/json`）、`journal`、`config-json`（后者连带 `config-toml`）。
 

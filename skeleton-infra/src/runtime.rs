@@ -328,9 +328,9 @@ struct NotifyCache<S> {
     slots: Vec<Arc<SubscriptionSlot<S>>>,
 }
 
-/// Run-ID 跟踪视界的保守默认容量（issue#62）。**数值归 #56 拍板**——本票只定
-/// 语义契约与 opt-in 边界，该默认值待 Stage B 消费者证据后由 #56 的资源默认
-/// 值表统一裁定（拿不准时用它，别自选数字）。
+/// Run-ID 跟踪视界的保守默认容量（issue#62）。**数值已拍板 keep current**
+/// （2026-11-23，正典见 `docs/reference.md` §资源上限与默认值 的决定记录）——
+/// 改动走该表修订，别自选数字。
 pub const DEFAULT_RUN_ID_TRACKING_CAPACITY: usize = 1024;
 
 /// Run-ID 三态分类（issue#62）：消费方据此区分「确定未知的 Cancel」与
@@ -493,8 +493,9 @@ struct StoreInner<S, A, Op> {
     deferred_queue: Mutex<VecDeque<ActionRecord<A>>>,
     /// 停放队列容量（issue#49）：**独立于外部准入容量**
     /// （`StoreInner::capacity`）——外部 ingress 与内部 feedback 不共用闸。
-    /// `0` = 不限；默认 `DEFAULT_DEFERRED_CAPACITY`（保守值，**数值待 #56
-    /// 资源默认值表拍板**）。满 ⇒ 续接拿显式非成功终局（不消失、不标成停放）。
+    /// `0` = 不限；默认 `DEFAULT_DEFERRED_CAPACITY`（保守值，**数值已拍板
+    /// keep current**，2026-11-23，见 `docs/reference.md` §资源上限与默认值的
+    /// 决定记录）。满 ⇒ 续接拿显式非成功终局（不消失、不标成停放）。
     deferred_capacity: AtomicUsize,
     /// 停放容量拒收计数（fail-visible）：读侧
     /// [`SyncStore::deferred_capacity_rejected`]。与
@@ -864,9 +865,10 @@ fn public_outcome(outcome: Outcome) -> DispatchOutcome {
 
 /// 停放队列的默认容量（issue#49；朴素有界 + 满则显式拒收）。
 ///
-/// **数值待 #56 资源默认值表拍板**（Stage B 消费方证据后一次性定）：本批只
-/// 取一个保守值并保证可配（[`SyncStore::set_deferred_capacity`]）可观测
-/// （[`SyncStore::deferred_capacity`]），不在这里替 #56 做决定。
+/// **数值已拍板 keep current**（2026-11-23，正典见 `docs/reference.md`
+/// §资源上限与默认值的决定记录）：取保守值并保证可配
+/// （[`SyncStore::set_deferred_capacity`]）可观测
+/// （[`SyncStore::deferred_capacity`]）；改动走该表修订。
 const DEFAULT_DEFERRED_CAPACITY: usize = 64;
 
 /// 入队来源标签：外部流量 = [`ActionOrigin::External`]（深度清零）；
@@ -2035,8 +2037,9 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 停放队列容量（issue#49）：`cap` = 可留存的停放记录数上限；`0` = 不限。
     ///
     /// **与外部准入容量分立**（[`Self::set_capacity`]）：外部 ingress 与内部
-    /// feedback 不共用一个闸。默认 `DEFAULT_DEFERRED_CAPACITY`——**数值待 #56
-    /// 资源默认值表拍板**（本批只保证可配 + 可观测）。满 ⇒ 新续接拿显式非成功
+    /// feedback 不共用一个闸。默认 `DEFAULT_DEFERRED_CAPACITY`——**数值已拍板
+    /// keep current**（2026-11-23，见 `docs/reference.md` §资源上限与默认值的
+    /// 决定记录；只保证可配 + 可观测）。满 ⇒ 新续接拿显式非成功
     /// 终局（[`DispatchOutcome::CapacityRejected`]）并计入
     /// [`Self::deferred_capacity_rejected`]，绝不静默消失、绝不标成「已停放」。
     pub fn set_deferred_capacity(&self, cap: usize) {
@@ -2286,8 +2289,9 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ///
     /// - 窄口径 runtime 诊断设置——不是通用策略/配置框架；`Run`/`Cancel` 的
     ///   转发语义与是否启用无关（诊断只观测）。
-    /// - `capacity`：有界最近 ID 集容量（`0` 视作 1）。**数值默认值归 #56
-    ///   拍板**：拿不准时用 [`DEFAULT_RUN_ID_TRACKING_CAPACITY`]。
+    /// - `capacity`：有界最近 ID 集容量（`0` 视作 1）。**默认值已拍板
+    ///   keep current**（2026-11-23，见 `docs/reference.md` §资源上限与默认值
+    ///   的决定记录）：拿不准时用 [`DEFAULT_RUN_ID_TRACKING_CAPACITY`]。
     /// - **必须在首个准入之前调用**：晚于任何已准入 action 启用 ⇒ 早先的 `Run`
     ///   未被登记，视界残缺 ⇒ miss 只能判 [`RunIdClass::NotTracked`]（保守方向：
     ///   不把可能存在的 id 判成确定未知）。
@@ -2314,8 +2318,8 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         self.inner.run_id_diag.tracked_count()
     }
 
-    /// 配置的跟踪容量（诊断未启用 = 0；默认值归 #56 拍板，见
-    /// [`DEFAULT_RUN_ID_TRACKING_CAPACITY`]）。
+    /// 配置的跟踪容量（诊断未启用 = 0；默认值已拍板 keep current，2026-11-23，
+    /// 见 [`DEFAULT_RUN_ID_TRACKING_CAPACITY`]）。
     pub fn run_id_tracking_capacity(&self) -> usize {
         self.inner.run_id_diag.capacity()
     }

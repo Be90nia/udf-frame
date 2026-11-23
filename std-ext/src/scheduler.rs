@@ -48,7 +48,8 @@
 //! - **溢出 fail-closed**：注册/重臂恒 `checked_add`（clock.rs armor：
 //!   Instant + 巨大 Duration 平台 panic 坑），溢出带因 panic；
 //! - **有界准入**（#58）：[`Scheduler::set_capacity`] 设活跃注册数上限
-//!   （0=无界；默认不盲设有界默认值——#56 是默认资源策略的评审触发点）；
+//!   （0=无界；默认不盲设有界默认值——#56 已评审并拍板保持无界
+//!   2026-11-23，见 `docs/reference.md` §资源上限与默认值的决定记录）；
 //!   触顶 ⇒ typed 拒绝（[`AdmissionError::Full`]，任务**不入堆**、不部分
 //!   插入、禁静默丢回调）；额度随注册退役（点火/取消/关闸/panic）**恰好
 //!   一次**释放；既有 `after`/`every` 触顶时 panic（fail-visible），typed
@@ -238,8 +239,9 @@ struct Shared {
     ///
     /// **不等于 `heap.len()`**：堆内还含已取消的惰性墓碑（#52 清扫前）。
     live: AtomicUsize,
-    /// 活跃注册数上限（#58）：0 = 无界（默认形态——不盲设有界默认值，#56
-    /// 是默认资源策略的评审触发点）。与 `SyncStore::set_capacity` 同款口径。
+    /// 活跃注册数上限（#58）：0 = 无界（默认形态——不盲设有界默认值；#56
+    /// 已评审并拍板保持无界 2026-11-23，见 `docs/reference.md` §资源上限与
+    /// 默认值的决定记录）。与 `SyncStore::set_capacity` 同款口径。
     capacity: AtomicUsize,
     /// 因容量上界被拒的注册次数（#58；闸关拒发不计入，同 `FxCounts::rejected`）。
     rejected: AtomicU64,
@@ -428,7 +430,8 @@ impl Scheduler {
     }
 
     /// 活跃注册数上限（issue#58）：`cap` = 未退役注册数上限；**0 = 无界**
-    /// （默认形态——不盲设有界默认值，#56 是默认资源策略的评审触发点）。
+    /// （默认形态——不盲设有界默认值；#56 已评审并拍板保持无界 2026-11-23，
+    /// 见 `docs/reference.md` §资源上限与默认值的决定记录）。
     ///
     /// 计数口径（含什么、不含什么）：
     ///

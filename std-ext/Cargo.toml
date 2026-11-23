@@ -29,8 +29,9 @@ name = "std_ext"
 # json：JSON 双模解码域（serde_json 解析底座）——默认关=serde_json 子树不进树
 # （ADR 0007：依赖隔离门，非粒度门；`dep:` 前缀关闭同名隐式 feature）。
 json = ["dep:serde_json"]
-# log-embed：行为域 tracing 埋点（七域 41 调用点：backoff 1/fsx 6/iter 2/
-# scheduler 11/ratelimit 4/retry 12/cache 5；默认关=宏消除零依赖零开销）。
+# log-embed：行为域 tracing 埋点（七域 48 调用点：backoff 1/fsx 6/iter 2/
+# scheduler 14/ratelimit 4/retry 12/cache 9；口径=`embed_event!` 宏调用点，
+# 排除宏定义/文档注释/#[cfg(test)] 之后内容；默认关=宏消除零依赖零开销）。
 # target 前缀沿用 `skeleton::<domain>[::<phase>]`——观测
 # 契约跨 crate 稳定（EnvFilter 与断言字符串零改动），不随物理 crate 拆分更名。
 # 宏与纪律注为 skeleton-infra lib.rs 同款文本作用域副本（两 crate 各自一份）。

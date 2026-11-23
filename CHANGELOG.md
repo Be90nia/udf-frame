@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### Docs: 层边界清单落地 + 9 条文档矛盾清零（C1–C9）,2026-11-23;reports/2026-11-23-layer-boundaries.md)
+- **层边界清单**：5 层 / 32 行「职责｜承载者｜依据｜边界点」+ 蓝图 59 条可机判断言逐条核对（48 Conform / 2 Diverged / 9 Not-verifiable）+ 结构级复核（`skeleton ← std-ext ← skeleton-infra` 零反向引用；全仓唯一 `tokio::spawn` 在 `fx.rs`）。
+- **C1**：std-ext `log-embed` 调用点统一为实测 **七域 48 / 合计九域 55**（backoff1/cache9/fsx6/iter2/ratelimit4/retry12/scheduler14；infra 本 crate 7），并写入口径；此前 README/reference/lib.rs/Cargo.toml 分别写 35/41/42。
+- **C2**：`ShutdownReport` 文档代码块 3 字段 → 8 字段；蓝图「six buckets」改为「五终局桶互斥穷尽 + 正交 `timed_out` + 证据标志」。
+- **C3**：`serde_json` 由「std-ext 普通依赖」更正为「门控依赖（ADR-0007），默认零三方」。**C4**：`compose` 依赖面 `—` → `runtime`。
+- **C5**：资源表补第 10 行 ingress（`set_capacity`，0=无界，满 ⇒ typed `Full`/`false`/panic fail-visible，`admission_full_count()` 可观测）。
+- **C6**：代码注释「待 #56 拍板」→「已拍板 keep current（2026-11-23），正典见 reference 资源表」。**C7**：蓝图 `CancelToken` 行号锚改符号锚。**C8**：thread_pool 测试数 30→实测 32。**C9**：README feature 表补 `config-json`/`config-toml`/`full`/`unsafe-evidence`/`random`。
+- 纯文档（11 文件，+76/−47）；ADR 历史计数按「不可变」保留。验证：rustdoc all-features 0；clippy -D warnings 0；fmt 0。
+
 ### Fix(设计对照整改): #72 per-worker 停信标 / #64 闭门先于重入 / #53 示例 / bench 注释纠偏,2026-11-23;reports/2026-11-23-design-conformance.md)
 - **#72（blocker，设计偏离）**：`WorkerHandle::drop` 由「scheduler-wide `close()`」改为 **per-worker 停信标**（`Arc<AtomicBool>`，Drop 在状态锁内置位 + `notify_all`；置位持锁、判定持锁 ⇒ 无丢唤醒）。丢一个句柄**不关闸**、不影响其他 worker 与既有登记；`join` 仍是显式 scheduler-wide 停机；全部句柄丢弃而调度器仍开 ⇒ 注册入堆不点火。测试：新 two-worker 用例（通道握手证明既有/新登记都点火）+ 三条旧用例改写为 worker-local 语义 + 10 次防 flaky；变异（改回 `close()`）3 用例红。
 - **#64（blocker，设计偏离）**：`wait_quiescent` 的 `{lock(sub_gate); closed.store(true)}` 上移到重入判定**之前** ⇒ `Reentrant` 返回时准入已关（外部 `try_dispatch` 得 `Closed`）；重入路径仍不回调 `drain()`；`close_wait`/`close_wait_timeout`/`Reentrant` 三处 rustdoc 对齐。回归：既有重入用例尾部加外层 `try_dispatch == Closed` 断言（**修复前实跑红**：`left: Accepted / right: Closed`）。
