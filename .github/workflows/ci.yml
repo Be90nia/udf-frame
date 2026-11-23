@@ -102,8 +102,10 @@ jobs:
       - name: Test std-ext (all features)
         run: cargo test -p udf-std-ext --all-features
 
-      # infra 六域 feature 矩阵闸：--workspace 只跑 default=[]（P12 零 feature 面），
-      # memgov/journal/log/tokio/testing 全在盲区，单列 all-features 步防漏
+      # infra 全 feature 闸：`--workspace` 只跑 **default 面**（runtime+pool，非空），
+      # 其余 8 个单开面（memgov/journal/log/tokio/testing/log-fs/compose/…）在该步是
+      # 盲区；单列 all-features 步防漏，单开面由 feature-isolation 矩阵 + 新 job
+      # `zero-and-default-face`（零面/default 面）覆盖。
       - name: Test skeleton-infra (all features)
         run: cargo test -p udf-skeleton-infra --all-features
 
