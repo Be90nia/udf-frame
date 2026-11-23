@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Ci+Docs: 挂死护栏、零/default 面闸、停机依赖序、资源表决定回写,2026-11-23;外部对标 F-11-1/F-11-4 + 设计对照 F3/F4)
+- **CI 挂死护栏**：3-OS 主 job `timeout-minutes: 20`、矩阵/MSRV/夹具 job 各 15 —— 2026-11-23 实测一次 lib 测试在 ubuntu 挂死 >16min（Windows 全绿），默认 6h 上限会把 flaky 变成半天排队。
+- **fx 串行复跑步**：`--lib fx:: -- --test-threads=1` 与主步（并行）互为对照——主步红本步绿 ⇒ 并发挤占复现；两步都红 ⇒ 真逻辑（自旋/计时类测试在 4 核 runner 上与其它多线程测试互相挤占）。
+- **零 feature / default 面闸（F-11-4）**：新 job `zero-and-default-face`——`--no-default-features` 的 check+test+doc 与 default 面的 test+doc；此前矩阵 14 叶 + full 从不编译零面、default 面只有 MSRV check。
+- **停机依赖序（F-11-1）**：`shutdown` 域模块头补「停机序=注册序 ⇒ **依赖方必须先注册**（Erlang/OTP 逆启动序口径）」；本域不持依赖图，排序责任归调用方。
+- **资源表（F3 + 维护者拍板）**：行 1/2 标注提案值 `1024`/`4096` **未采纳**（保持无界）；决定记录改为全表 keep current（Run-ID 1024 / deferred 64 / 审计环与待投递 1024 / 回灌深度 64）。
+- **#25 证据回贴（F4）**：Stage A/B/C 证据与 CI 绿 + 资源表决定已贴在 issue#25。
+
 ### Fix(tests)+Docs: 分配锚线程局部化 4 文件 + 资源表数值决定记录（keep current）,2026-11-23;bd udf-frame-2h7)
 - **4 个兄弟文件的同型潜伏一并根治**（`alloc_site` / `run_id_diagnostics` / std-ext `alloc_anchors` / `paths_alloc`）：旧实现「进程级 `static AtomicUsize` + TLS 窗开关」在同一二进制并发测试窗口重叠时会多算别人的事件（`audit_no_subscriber_alloc` 已实测 1 次假红）。统一改为窗口开关与计数同住 `thread_local! Cell<(bool,usize)>`；**顺带纠正** `alloc_anchors`/`paths_alloc` 注释里「已按线程归属」的失实自称（此前实现与注释不符）。4 个目标各 10 连跑全绿，全量两 crate 绿。
 - **资源表数值决定（维护者 2026-11-23 拍板：keep current）**：3/4/5/6/7 行与 watchdog/scheduler/Run-ID 默认值全部保持现值，依据 Stage C「全默认开箱可用、无改小证据」；已写入 `docs/reference.md` 决定记录段，行内「待拍板」标注改为「已定」。

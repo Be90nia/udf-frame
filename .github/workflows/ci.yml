@@ -16,6 +16,9 @@ jobs:
   udf-frame:
     name: fmt / test / bench / clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # 挂死护栏：2026-11-23 实测一次 lib 测试在 ubuntu 上挂死 >16min（Windows 全绿），
+    # 默认 6h 上限会把一次 flaky 变成半天排队。常态 6-9min，20min 足够判红。
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -110,6 +113,13 @@ jobs:
       - name: Test skeleton-infra (release gates)
         run: cargo test -p udf-skeleton-infra --release --features log --test log_file
 
+      # fx 自旋/计时类 lib 测试串行复跑（2026-11-23 挂死护栏）：`shutdown_timeout_*
+      # 与 `*_no_deadlock` 在 4 核 runner 上与其它多线程测试并发时挤占调度，
+      # 曾出现 ubuntu 单测挂死 >16min（Windows 全绿）。串行口径去掉并发挤占，
+      # 与主步（并行）互为对照：主步红而本步绿 ⇒ 并发挤占复现；两步都红 ⇒ 真逻辑。
+      - name: fx spin/timer serial
+        run: "cargo test -p udf-skeleton-infra --all-features --lib fx:: -- --test-threads=1"
+
       # LeakGuard 泄漏断言串行闸（infra §3.3/审计 M9）：泄漏 delta 被同二进制并发
       # 分配污染=flaky-by-construction，CI 确定口径=--test-threads=1
       - name: LeakGuard serial (memgov)
@@ -176,6 +186,7 @@ jobs:
   feature-isolation:
     name: feature isolation (${{ matrix.feature }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -217,6 +228,31 @@ jobs:
           fi
           echo "ok: runtime face normal dep graph is tokio-free"
 
+  # ── 零 feature / default 面闸（2026-11-23 外部对标 F-11-4）─────────────
+  # 矩阵 = 14 叶 + full；但 **零 feature 面从未编译**、default(runtime+pool) 面只有
+  # MSRV job 的 check。cargo-hack --each-feature 口径含这两次运行，补上后矩阵才
+  # 真正覆盖「每个 feature 面都能独立成立」。
+  zero-and-default-face:
+    name: zero-feature / default face
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.96.0 (pinned)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Zero-feature face (check + test + doc)
+        run: |
+          cargo check -p udf-skeleton-infra --no-default-features
+          cargo test  -p udf-skeleton-infra --no-default-features
+          RUSTDOCFLAGS="-D warnings" cargo doc -p udf-skeleton-infra --no-default-features --no-deps
+
+      - name: Default face (test + doc)
+        run: |
+          cargo test -p udf-skeleton-infra
+          RUSTDOCFLAGS="-D warnings" cargo doc -p udf-skeleton-infra --no-deps
+
   # ── std-ext feature 隔离矩阵闸 ──────────────────────────────────
   # std-ext 自身三个门控域（json = serde_json / random = getrandom /
   # log-embed = tracing）都是依赖隔离门：单开面才证「该门不借别的门编过」
@@ -227,6 +263,7 @@ jobs:
   std-ext-feature-isolation:
     name: std-ext feature isolation (${{ matrix.feature }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -260,6 +297,7 @@ jobs:
   msrv:
     name: msrv (1.87, locked)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -299,6 +337,7 @@ jobs:
   consumer-sim:
     name: consumer-sim (clean checkout, sync-only)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
