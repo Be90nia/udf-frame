@@ -34,7 +34,7 @@ assert_eq!(store.snapshot().0, 2); // dispatch 返回 = 本 action 的完成边�
 store.close();
 ```
 
-**完成边界的完整契约**（并发生产者下队列可能仍非空、属正常态）：见 [`docs/reference.md`](docs/reference.md) 的 runtime 章节与 `skeleton::Store` 的 rustdoc。
+**完成边界的完整契约**（并发生产者下队列可能仍非空、属正常态）：见 [`docs/reference.md`](docs/reference.md) 的 runtime 章节与 `skeleton::Store` 的 rustdoc。⚠️ **`Deferred` 例外**：若某因果后代被回灌深度预算停放，`dispatch` 仍正常返回但该子树**未完成**——需要区分「完成 / 停放 / 容量拒收」用 `SyncStore::dispatch_with_receipt`（`DispatchOutcome`），停放记录用 `resume_deferred(limit)` 显式恢复。
 
 **自建项目抄这段时**（`Cargo.toml` 补三行——仓库外建项目，见 [cheatsheet 坑 7](docs/tutorials/cheatsheet.md)；`[workspace]` 装甲行防被上层 workspace 吸收）：
 

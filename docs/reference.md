@@ -85,6 +85,8 @@
 
 `SyncStore<S, A, Op = Infallible>` 兑现 `skeleton::Store` 契约：单写者队列 + 同步排空环（**dispatch 返回 = 本 action 的完成边界**——状态提交 → 效果转发 → 通知返回，且其全部**因果后代**终局；并发生产者下队列可能仍非空，同序 action 序列恒同终态）+ CoW 快照广播 + 停机闸 + 回灌深度预算 + **有界准入**（issue#38）+ **dispatch 回执**（issue#40）。`Op` 缺省 `Infallible` → `Effect::Run` 不可构造，零效果程序编译期证明无副作用（配 `skeleton::NoFx`）。
 
+> **`Deferred` 例外（issue#57）**：void `dispatch` 的「完成边界」**不**证明**完整因果完成**——若某个因果后代被回灌深度预算**停放（deferred）**，`dispatch` 仍正常返回，但该子树并未完成。需要知道「完成 / 停放 / 容量拒收」用 `dispatch_with_receipt(action) -> Result<DispatchReceipt, AdmissionOutcome>`：`wait()` 返回 `DispatchOutcome::{Completed, Deferred{retained}, CapacityRejected{retained, rejected}, Failed}`。停放记录用 `resume_deferred(limit)` 显式恢复（#49）；恢复出的工作拿**独立续接收据**，**不改写**原根的 `Deferred` 终局。⚠️ 该可等待面**禁止在排空回调内等待**（自死锁，代码侧有 fail-visible 断言）。
+
 > **宿主意务（跨线程阻塞）**：外部 `dispatch` **阻塞**至自己的完成边界，而 drain 回调（`EffectRuntime::run`、订阅回调）**运行在排空环内**。宿主若在 drain 回调里 `join` 一个**用阻塞式 `dispatch` 回调同一 store** 的线程 ⇒ **确定性互等死锁**（排空环被 join 卡住，回执只由排空环兑现）。**安全写法**：回调派生的 worker 用**框架提供的** sender（`Store::sender()` 或回调收到的 `back`）的 `dispatch`——**在 drain 回调内该 sender 必处竞争态**（排空权在排空线程）⇒ **纯准入、不等回执**（返回 `true` 只表示**被接受**，不表示已完成）⇒ 回调可以 join 该 worker（worker 不等回执，不与排空环互等），排队的 action 在**回调返回后**按 FIFO 处理。若 worker 确实需要该 action 的**完成结果**才能返回，则它**不得**被跑在同一 store 排空环上的回调同步 join。**自建** sender（`ActionSender::new`）的语义由实现方决定，**不可假定**框架提供的 sender 的任一条路径语义。框架**无法**检测宿主侧的跨线程 join ⇒ **不提供**框架侧防护或超时（义务与规避路径在宿主侧）。可编译示例见 `skeleton_infra::runtime::SyncStore::new` 的文档示例；正向回归场景见 `skeleton-infra/tests/dispatch_receipts.rs`；负向复现（六场景矩阵）见 `verify/2026-11-20-residual-join-risk/`。
 >
 > **框架提供的 sender 的语义是条件性的（两条路径，`bool` 无二义）**：**竞争态**（调用瞬间已有在任排空者）= **纯准入**——框架**只保证**该 action 已入队、**不等**它的完成边界；**返回瞬间该 action 是否已被 reduce，框架不作任何保证**（取决于在任排空者的推进速度：可能尚未被 reduce，也可能已被 reduce 甚至已完成）⇒ 下游**不得**据「竞争态」推断「此刻读状态仍是旧值」。**静默态**（调用瞬间无在任排空者）= 该线程**夺得排空权并同步排空至 idle** ⇒ 返回时该 action **已被 reduce、其完成边界必然已达成**（此路径**强于** `Store::dispatch` 的 per-action 完成边界契约——后者**不**承诺队列为空）。**返回的 `bool` 只承载准入结果**（被 store 接受/已入队 = `true`，被拒 = `false`），**不承载完成状态**：竞争态下是否已被 reduce、静默态下是否已达成完成边界，均**不可**由 `bool` 推断。机械闸（两态各一断言，确定性握手 + 有界超时）：`skeleton-infra/tests/drain_regressions.rs::framework_sender_admission_is_conditional_on_drain_state`；**反向闸**（钉住「不保证」而非「恒未 reduce」——竞争态下该 action 最终被 reduce 且**恰好一次**，**刻意不断言**「返回瞬间是否已被 reduce」）：`skeleton-infra/tests/drain_regressions.rs::competitive_state_does_not_guarantee_reduction_timing`。
@@ -212,7 +214,7 @@ pub enum AdmissionOutcome {
 
 ### 回灌深度预算
 
-`FEEDBACK_DEPTH_BUDGET = 64`：单任排空内连续回灌链深度超限即停排 + `feedback_budget_exceeded` 计数；触发点回灌 action 原值退回队尾（零丢失），本任 dispatch 随即返回——非 panic 非静默。预算按 dispatch 调用栈深度统一计数（TLS 在途深度，back 通道不绕预算）。时间线现场 = `AuditEventKind::FeedbackBudgetExceeded`。
+`FEEDBACK_DEPTH_BUDGET = 64`：单任排空内连续回灌链深度超限即停排 + `feedback_budget_exceeded` 计数；**触发点回灌 action 被脱钩停放（deferred）——主队列继续处理其他工作，停放记录保留其来源身份**，等宿主显式恢复（`resume_deferred(limit)`，#49）或以 `DispatchOutcome::Deferred` 形式如实上报——非 panic 非静默，**不是**「退回队尾自动重放」。预算按 dispatch 调用栈深度统一计数（TLS 在途深度，back 通道不绕预算）。时间线现场 = `AuditEventKind::FeedbackBudgetExceeded`。
 
 ### effect 执行两档（同步档 / 托管档）
 
@@ -401,8 +403,8 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 | 3 | 历史 Run-ID 诊断注册表 | `runtime`（#62） | 不适用（关 = 不登记） | `enable_run_id_diagnostics(capacity)`，**默认关闭**（不登记、零 per-Run 锁与分配）；启用后容量 = `DEFAULT_RUN_ID_TRACKING_CAPACITY = 1024`（**数值待本表拍板**） | 饱和/驱逐 ⇒ 三态判 `not-tracked`（**绝不**判 `definitely-unknown`）；`cancel_unknown_id` 驱逐后停止增长 | 窄口径 opt-in；`run_id_tracked_count` / `run_id_tracking_capacity` / `run_id_evicted_count` 可观测 |
 | 4 | 审计环容量（权威历史） | `SyncStore::subscribe_events` / `PoolBase` | 视作 `1`（调用方给 `0` 时取 `max(1)`） | `SyncStore`：**调用方显式给**；池域：`AUDIT_RING_DEFAULT_CAP = 1024` | 溢出丢最旧（`seq` 空洞 = 显式证据；`take_events` 取走不留空洞） | 调大 `subscribe_events(cap, ..)` / 池域容量；完整性靠「权威历史」不靠实时回调 |
 | 5 | 审计待投递 FIFO | `SyncStore` / 池域（#65/#75） | —（固定） | `AUDIT_PENDING_CAP = 1024`（**无配置面**，两处同值） | 溢出丢最旧 + **独立投递丢弃计数**（`audit_delivery_drops()`，与环溢出分账） | 消费慢 ⇒ 改用 `take_events` 取权威历史 |
-| 6 | 回灌深度预算 | `runtime` 排空环 | —（固定） | `FEEDBACK_DEPTH_BUDGET = 64`（单次 dispatch 连续回灌链深度） | 停排 + `feedback_budget_exceeded` 计数；触发点 action **原值退回队尾**（零丢失，非 panic 非静默） | `Effect::Emit` 回灌受限 ⇒ 改用托管任务（`FxScope`）或显式分帧 |
-| 7 | deferred 停放队列 | `runtime`（#49） | —（现状无界） | 现状**无界**（停放记录不被排队预算挡，见 #61 四 population 分列） | 现状：不拒绝（无上限）；#49 提案显式上限 + `resume_deferred(limit)` | 显式 recovery API（#49）；`CloseReport::deferred_actions` 可查残留 |
+| 6 | 回灌深度预算 | `runtime` 排空环 | —（固定） | `FEEDBACK_DEPTH_BUDGET = 64`（单次 dispatch 连续回灌链深度） | 停排 + `feedback_budget_exceeded` 计数；触发点 action **脱钩停放（deferred）**（保留来源身份，主队列继续；非 panic 非静默，**不是**退回队尾自动重放） | 显式 `resume_deferred(limit)`（#49）；`DispatchOutcome::Deferred{retained}` 上报 |
+| 7 | deferred 停放队列 | `runtime`（#49） | 不适用（容量独立配置） | `set_deferred_capacity(n)` + `deferred_capacity()` / `deferred_actions()`；默认 `DEFAULT_DEFERRED_CAPACITY = 64`（**占位值，数值待本表拍板**）；**独立于 ingress capacity** | 满 ⇒ 新续接拿**显式非成功终局**（`FinishRoot(Failed)`）+ 专用计数 `deferred_capacity_rejected()`，不入队、不消失、不误标成功 deferred | `resume_deferred(limit)`（FIFO、fresh epoch、独立续接收据）；`DispatchOutcome::CapacityRejected` 可观测 |
 | 8 | FxScope 等待/跟踪条目 | `fx`（#13/#39） | 无界（`usize::MAX`，默认） | `with_max_pending(n)` / `with_max_tracked(n)`；默认**均无界** | 拒绝：`try_spawn_tracked` 返回 typed `AdmissionError::{PendingFull,TrackedFull}`（不阻塞不 panic） | 显式设界；`try_reap()` 收割后回落；`counts()` 读数 |
 | 9 | 对象池/线程池 idle 容量 | `pool` | 由 tuning 显式给 | `ObjectPoolTuning` / `ThreadPoolTuning` **显式必填，无默认** | 超 `idle_cap` ⇒ `dropped_overflow` 计数（有界降级） | 调 tuning；`shrink_to`/`prune_idle` 主动回收 |
 

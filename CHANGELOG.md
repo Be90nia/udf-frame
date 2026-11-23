@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Added(runtime): result-bearing 完成面 + deferred 有界恢复,2026-11-23;GitHub issue#57 / #49)
+- **#57 可等待完成面（加法，不动 `Store` trait）**：`SyncStore::dispatch_with_receipt(action) -> Result<DispatchReceipt, AdmissionOutcome>`——`wait()`（可重复）返回 `DispatchOutcome::{Completed, Deferred{retained}, CapacityRejected{retained, rejected}, Failed}`。语义：正常根子因果树完成 ⇒ `Completed`；后代被回灌深度预算停放 ⇒ **`Deferred`（不是成功）**；deferred 队列满导致续接无法保留 ⇒ **独立非成功容量结局 + 专用计数**（不报 `Completed`、不把被拒记录算成 retained）。`try_dispatch` 与 `ActionSender` 仍 admission-only；`DispatchFailure`/`DispatchPhase` 公开化。**硬约束**：禁止在排空回调内等待该收据（自死锁）——rustdoc 写明 + 代码侧 fail-visible 断言。
+- **#49 有界续接**：`resume_deferred(limit) -> DeferredResume{resumed, remaining, deferred_again, capacity_rejected}`——FIFO 取最旧、持队列锁搬运（与 close/准入串行、不插队）、每条开**新回灌深度 epoch** 并保留原 action 序号与 deferral 来源；恢复出的工作拿**独立续接收据**，**原根收据保持终局不可变（`Deferred`）**；闭门后恢复返回 `resumed=0` + `remaining`（可观测而非静默）。
+- **停放容量独立可配**：`set_deferred_capacity` / `deferred_capacity()` / `deferred_actions()` / `deferred_capacity_rejected()`；**独立于 ingress `capacity`**；默认 `DEFAULT_DEFERRED_CAPACITY = 64`（**占位，数值归资源表 #56**）。
+- **清理**：删除 #44 时代「退回队尾 / 后续 dispatch 有界重放」等过时注释（改成停放 + 显式恢复口径）；`deferred_queue` 的「flush_deferred 尚未实现」一并改写。
+- **测试**：新 `tests/dispatch_outcome.rs`（5 例：完成 / 停放不冒充完成 / 容量拒收独立 / 关闭后无收据 / 无关并发根不窃取结局）与 `tests/deferred_recovery.rs`（6 例：FIFO+limit / fresh epoch / 原根收据不可改写 / 恢复与 close 串行 / 容量拒收独立计数 / 恢复排已准入外部工作之后），5 轮复跑全绿；**变异验证**：`Resumed` 不重置深度 ⇒ 5 红；容量拒收冒充 retained ⇒ 2 红。
+- **未做（明示）**：`ActionSender::try_dispatch_with_receipt`（本批加法面在 `SyncStore` 侧）。
+
 ### Fixed(runtime): 完成账本在仍有在途后代时被归还复用池（收据记账错配）,2026-11-23;GitHub issue#84)
 - **缺陷**:`release_ledger` 只按「根 && 非等待者」归还，不检查账本是否终局 ⇒ 非等待型根（`try_dispatch` / `ActionSender::dispatch`）在 `Effect::Emit` 后代仍排队（`outstanding > 0`）时把账本推进复用池；并发外部准入 pop 后 `reset` 清掉这些后代的计数 ⇒ **另一个根可能提前发布终局，或携带别的 action 的失败**（收据正确性缺陷，非仅池卫生）。
 - **修复（维护者定稿：终局门控）**:账本侧 `claim_release` 四查（未 released / 非等待型根 / **终局已发布** / `outstanding == 0`）；**每个可能使账本终局的转移**（`finish_root` / 最后一个 `descendant_done` / `detach_deferred`）与**三条调用面**（正常结算 / 当前记录 unwind / 摘队 sweep）都走同一 claim——旧的「无条件按根归还」判据与 `ActionRecord/CurrentMeta.waiter` 字段**整体删除**；入池在**账本锁外**（claim 锁内、push 锁外，queue→ledger 序不变）。
@@ -253,7 +261,7 @@
 - 机制：新增 `runtime/receipt.rs`（完成账本 `Ledger` + 阶段/失败分类），账本走复用池且**归还者唯一**（首发者胜）。
 - 测试：新增 `tests/dispatch_receipts.rs`（7 用例）与 `tests/bounded_admission.rs`（4 用例）；`memgov` 三个零分配硬锚照跑通过。
 - 变异三则：跳过 `ledger.wait()` ⇒ 红；中断批次误报成功 ⇒ 红；容量判定 off-by-one ⇒ 红（`left: Accepted, right: Full`）。
-- 未做（明示）：`close_and_wait()`、显式反馈纪元恢复（`flush_deferred` / `resume_deferred`）、`ActionSender::try_dispatch_with_receipt`；因果屏障只覆盖有等待者的根（无等待者的根不分配账本）。
+- 未做（明示）：`close_and_wait()`、`ActionSender::try_dispatch_with_receipt`（本批的 result-bearing 面在 `SyncStore` 侧，见 issue#57）；因果屏障只覆盖有等待者的根（无等待者的根不分配账本）。
 - PM 亲验：仓库级四门（test `--all-features` 串行 / clippy `-D warnings` / fmt `--check` / rustdoc `-D warnings`）全 exit 0。
 
 ### Fixed（契约表述更正 + 宿主意务入契约，2026-11-20；GitHub issue#46 / #40）
