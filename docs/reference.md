@@ -305,6 +305,8 @@ impl EffectKind {
 
 **当前状态（2026-11-23）**：**`SyncStore` 审计实时回调与池域审计流均已升级为「串行派发」**——并发发射事件入队补投（`SyncStore` 侧 #65 主路线① / 池域 #75）、FIFO 有界、**独立的投递丢弃计数**（`SyncStore::audit_delivery_drops()` / `PoolBase::audit_delivery_drops()` / `ObjectPool::audit_delivery_drops()`，与 ring 溢出**分账**）、回调 panic **fail-close 本代次**（排队事件不投递给替换订阅）。权威历史 = 环 + `seq`（`seq` 在入环临界区内分配 ⇒ 环序 = `seq` 序）。状态订阅 / 异步 `NotifySink` 两面**仍为 best-effort 观测面**，其契约与计数以各自 rustdoc 为准，词表统一按本节。
 
+**回调内 dispatch 的因果归属（issue#59）**：夺得排空租约的那次调用，在投递**首条 pop 记录**的 `Enqueued` 回调**之前**即建立临时同栈帧（装帧与闸判是**同一次** load ⇒ 不存在「判闸未订阅、随后并发订阅装上、回调却无帧」的窗口）。回调内的同 store dispatch 因此归为该首条记录的**因果后代**——共享其账本、回灌深度 +1、**只入队即返**（不等待外层排空；外层排空环在回调返回后覆盖它）。缺这一帧 = 嵌套 dispatch 被判外部根而 `draining` 已置 ⇒ 调用方在无界账本等待上**等自己 = 确定性死锁**。**因果父 = 正在投递其 `Enqueued` 回调的首条记录**，不一定是夺得排空权的外部调用点（回调先于该记录 reduce 投递，首条记录甚至可能不是调用者的 action）。首条记录自身的深度不因临时帧被重复计（嵌套 dispatch 深度 = 首条记录深度 + 1，环内 `Enqueued` 深度序列 = `[0, 1]`）。本规则**先于** #65 的待投递 FIFO 生效（事件序不变，FIFO 只改并发 emitter 间的补投顺序）。
+
 ### 最小示例
 
 ```rust
@@ -346,6 +348,20 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 2. **持有快照的代价**：长期持有 `snapshot()` 会让后续每次 dispatch 都付一次 State 深克隆（成本随 State 体量线性增长）——快照是「一致性视图」，不是「廉价引用」。
 3. **`Arc<Inner>` 模式**：把大载荷放进 `Arc<Inner>`、State 只持 Arc 句柄——`S::clone` 退化为 Arc 计数克隆。但**仅此不够**：审计实测「Arc 包裹 State」与深克隆 State 比率 1.0x，因为 reducer 内部仍整体克隆载荷；此模式要真正省下深拷贝，reducer 侧须经 `Arc::make_mut` 之类 CoW 路径只克隆被改动的部分（**该用法本仓未实测**，属采用方侧选择，框架不代为保证）。
 4. **`S::clone` 必须 panic-free**：clone 在 state 锁内执行，panic 即毒锁——实例整体报废且状态不可取出（见上文「Panic 契约」）。
+
+#### 状态布局建议（issue#53 证据，bench 可复现）
+
+分片（每片独立 `Arc` + reducer 内 `Arc::make_mut` 只改受影响片）**不是**默认答案，是**按条件换收益**的取舍。bench 矩阵：`cargo bench -p udf-skeleton-infra --all-features --bench infra -- state_layout`（三组：`state_layout_update` / `state_layout_update_scope` / `state_layout_retention`）。
+
+| 形状 | 结论（本机读数；同机跨 run 噪声 ±20-40% 属常态） |
+|---|---|
+| 大状态 + 只改一小块 + 有读者持快照 | 分片大幅占优：1 MiB 选择性更新 `212 µs`（整体）vs `2.30 µs`（16 片），16 MiB `3.28 ms` vs `214 µs` |
+| **小状态（≈1 KiB）** | **反例**：分片反而慢 2.0×（16 片）／8.0×（256 片改一片）——逐片 `Arc` 计数压过拷贝本身 |
+| **更新要触碰全部分片** | **反例**：1 MiB 全片更新的优势从 90× 塌到 3×（字节工作量相同，分片只多出 16 倍分配事件） |
+| 单片分装（同样字节、只多一层 `Arc` + 根 `Vec`） | 与整体态基本持平（213 vs 225 µs）——分片粒度粗到「一片就是全部」只付壳的代价 |
+| 留存成本 | 持有一份快照 ⇒ 下一次发布对被改动的那片深拷贝一次：整体态 ≈ 全量（1 MiB ≈ 1,048,624 B/份），16 片选择性 ≈ 1/16（65,752 B/份）；留存**深度**不改每拍工作量，只按份数线性增内存 |
+
+计量口径（读 bench 数据前必读）：分配计数只见**事件**不见 memcpy 字节；单次分配跨过分配器 mmap 阈值（≥1 MiB）后每字节成本跳变（本机 1 MiB ≈ 210 µs vs 64 KiB ≈ 2.3 µs），故跨布局倍数里含**分配器类别效应**，不是纯带宽差。**不要**把上述倍数外推成「分片总是更快」。
 
 ---
 

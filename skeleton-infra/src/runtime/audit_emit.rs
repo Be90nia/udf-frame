@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::lock;
 use super::panic_cause_summary;
-use super::{ActionOrigin, StoreInner};
+use super::{ActionOrigin, ActionRecord, StoreInner, record_depth, temp_drain_frame};
 use crate::audit::{AuditCallback, AuditEvent, AuditEventKind, AuditSink};
 
 /// 待投递 FIFO 上限（issue#65 主路线①）：回调在途窗口内的并发 emit 排队上限。
@@ -97,10 +97,7 @@ impl Drop for AuditCallbackGuard {
 
 /// 入队事件发射（[`audit_emit`] 的 Enqueued 收口：来源标签 → 回灌深度）。
 pub(super) fn audit_enqueued<S, A, Op>(inner: &StoreInner<S, A, Op>, origin: ActionOrigin) {
-    let feedback_depth = match origin {
-        ActionOrigin::External => 0,
-        ActionOrigin::Feedback(depth) => depth,
-    };
+    let feedback_depth = record_depth(origin);
     audit_emit(inner, AuditEventKind::Enqueued { feedback_depth });
 }
 
@@ -117,7 +114,9 @@ pub(super) fn audit_dispatch_reset<S, A, Op>(inner: &StoreInner<S, A, Op>, gen: 
     disp.inflight = false;
 }
 
-/// 审计发射唯一收口（issue#65 主路线①：显式串行派发器）。
+/// 审计发射收口（issue#65 主路线①：显式串行派发器）。唯一实现在
+/// [`audit_emit_prepared`]；夺租约路径的 `Enqueued` 走
+/// [`audit_enqueued_as_lease_winner`]（多一次临时排空帧，见 issue#59）。
 ///
 /// 未订阅 = 一次 gate load 即返；订阅态 = 有界环入账（`seq` 在入环临界区内
 /// 分配 ⇒ 环序 = `seq` 序；溢出丢最旧）+ 实时回调**串行派发**：
@@ -132,9 +131,39 @@ pub(super) fn audit_dispatch_reset<S, A, Op>(inner: &StoreInner<S, A, Op>, gen: 
 /// 替代回调（同 store 重入会死锁）。take/归还窗口内订阅被替换则宁弃旧回调禁
 /// 覆盖新槽。
 pub(super) fn audit_emit<S, A, Op>(inner: &StoreInner<S, A, Op>, kind: AuditEventKind) {
+    audit_emit_prepared(inner, kind, None);
+}
+
+/// 夺租约路径的 `Enqueued` 投递（issue#59）：首条被 pop 的记录在**其**
+/// `Enqueued` 回调投递期间即构成同栈重入上下文——帧安装与闸判是同一次 load，
+/// 故不存在「判闸 false 之后订阅并发装上、回调却无帧」的窗口。归属规则见
+/// [`super::temp_drain_frame`]。
+pub(super) fn audit_enqueued_as_lease_winner<S, A, Op>(
+    inner: &StoreInner<S, A, Op>,
+    origin: ActionOrigin,
+    first: Option<&ActionRecord<A>>,
+) {
+    audit_emit_prepared(
+        inner,
+        AuditEventKind::Enqueued {
+            feedback_depth: record_depth(origin),
+        },
+        first,
+    );
+}
+
+/// 闸判之后的唯一投递实现：`first = Some` ⇒ 先装临时排空帧（issue#59）再跑
+/// 实时回调；帧随本函数返回（含 panic 展开）弹出。
+fn audit_emit_prepared<S, A, Op>(
+    inner: &StoreInner<S, A, Op>,
+    kind: AuditEventKind,
+    first: Option<&ActionRecord<A>>,
+) {
     if !inner.audit_gate.load(Ordering::Acquire) {
+        // 无订阅 = 无回调可跑 ⇒ 不装帧（零订阅稳态 dispatch 热路径零 TLS 操作）。
         return;
     }
+    let _temp_frame = first.map(|first| temp_drain_frame(inner.store_id, first));
     // 同 store 重入（回调在本线程在途）：只录环不投递——封死自指递归。
     if AUDIT_CB_IN_FLIGHT.with(Cell::get) == Some(inner.store_id) {
         record(inner, kind);

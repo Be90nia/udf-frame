@@ -36,7 +36,9 @@ mod receipt;
 #[cfg(feature = "unsafe-evidence")]
 mod evidence;
 
-use audit_emit::{AuditDispatch, audit_dispatch_reset, audit_emit, audit_enqueued};
+use audit_emit::{
+    AuditDispatch, audit_dispatch_reset, audit_emit, audit_enqueued, audit_enqueued_as_lease_winner,
+};
 pub use close_wait::CloseWaitOutcome;
 pub use local_subs::LocalSubscription;
 use local_subs::{local_notify, next_local_sub_id};
@@ -91,7 +93,7 @@ fn back_sender<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                     // 强于 Store::dispatch 的 per-action 完成边界契约——后者不承诺
                     // 队列为空。契约（两条路径 + bool 的唯一含义）见
                     // skeleton::ActionSender::dispatch 的 rustdoc。
-                    audit_enqueued(&inner, origin);
+                    audit_enqueued_as_lease_winner(&inner, origin, first.as_ref());
                     drain_owned(&inner, first);
                     true
                 }
@@ -643,6 +645,41 @@ fn reentrant_context(store_id: u64) -> Option<(u64, Arc<Ledger>)> {
     })
 }
 
+/// 记录的回灌深度：外部 action = 0；同栈回灌 = 产生它的 action 深度 + 1。
+fn record_depth(origin: ActionOrigin) -> u64 {
+    match origin {
+        ActionOrigin::External => 0,
+        ActionOrigin::Feedback(depth) => depth,
+    }
+}
+
+/// 首条竞争记录的**临时排空帧**（issue#59 定稿：临时帧方案，非延迟投递）。
+///
+/// 三条夺租约路径（[`SyncStore::dispatch`] / [`SyncStore::try_dispatch`] /
+/// 框架 [`ActionSender`]）在投递首条 pop 记录的 `Enqueued` 回调**之前**安装它
+/// ⇒ 回调期间 `admission_context` 看到同栈上下文 ⇒ 回调内的同 store `dispatch`
+/// 归为**因果后代**（共享本帧账本、计深 +1、`wait=false` 只入队即返），不会
+/// 同步等外层排空。缺这一帧 = 嵌套 dispatch 被判为外部根（`wait=true`），而此
+/// 刻 `draining` 已置 ⇒ `enqueue` 返回 `Queued` ⇒ 调用方在无界的 `Ledger::wait`
+/// 上等自己 = 确定性单线程死锁。
+///
+/// **归属规则**：嵌套 action 的因果父 = **正在投递其 `Enqueued` 回调的首条
+/// 记录**，不一定是恰好夺得排空权的外部调用点（回调跑在夺租约者的
+/// [`drain_owned`] 之前，首条记录甚至可能不是它的 action）。
+///
+/// 守卫 RAII 弹出（panic 展开亦然），且返回即弹出——**先于** [`drain_owned`]
+/// 安装该记录的真排空帧 ⇒ 首条记录自身的回灌深度不被重复计。
+fn temp_drain_frame<A>(store_id: u64, first: &ActionRecord<A>) -> DrainFrameGuard {
+    DRAIN_FRAMES.with(|cell| {
+        cell.borrow_mut().push(DrainFrame {
+            store_id,
+            depth: record_depth(first.origin),
+            ledger: Arc::clone(&first.ledger),
+        });
+    });
+    DrainFrameGuard
+}
+
 /// 已准入的 action 记录（队列元素）：序号 + 载荷 + 来源 + 账本。
 ///
 /// 序号 store 内单调；**外部入队**路径在 queue 锁内分配（入队线性化点），
@@ -867,7 +904,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
                 ledger
             }
             Enqueue::Draining(ledger, first) => {
-                audit_enqueued(&self.inner, origin);
+                audit_enqueued_as_lease_winner(&self.inner, origin, first.as_ref());
                 drain_owned(&self.inner, first);
                 ledger
             }
@@ -1591,7 +1628,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
                 AdmissionOutcome::Accepted
             }
             Enqueue::Draining(_, first) => {
-                audit_enqueued(&self.inner, origin);
+                audit_enqueued_as_lease_winner(&self.inner, origin, first.as_ref());
                 drain_owned(&self.inner, first);
                 AdmissionOutcome::Accepted
             }
@@ -1752,6 +1789,12 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ///   dispatch 行为不变——观测面禁改变被观测者），该代次排队事件作废（不投
     ///   递给替换订阅）并计数，成因计入 [`Self::subscriber_panics`] /
     ///   [`Self::subscriber_panic_last_cause`]。
+    /// - **回调内 dispatch 的因果归属**（issue#59）：**夺得排空租约**的那次
+    ///   调用在投递首条 pop 记录的 `Enqueued` 回调**之前**即建立临时同栈帧 ⇒
+    ///   回调内的同 store dispatch 归为**因果后代**（共享该首条记录的账本、
+    ///   计深 +1、只入队即返，不同步等外层排空）。因果父 = **正在投递其
+    ///   `Enqueued` 回调的首条记录**，不必然是夺得排空权的外部调用点（回调先于
+    ///   外层 action 的 reduce 投递，首条记录甚至可能不是调用者的 action）。
     /// - 票据 Drop = 关闭；被覆盖的旧票据 Drop 凭代次对账，禁误杀后继流。
     ///
     /// # Examples
@@ -2339,10 +2382,7 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // 外部 action 深度 0，同栈回灌 = 产生它的 action 深度 + 1。自指回灌环
         // 在预算点止步，dispatch 必返回（修复前排空环永不达空，dispatch 永挂；
         // 修复前 back 通道同栈回灌标 External 深度清零，预算永不触发）。
-        let feedback_depth = match record.origin {
-            ActionOrigin::External => 0,
-            ActionOrigin::Feedback(depth) => depth,
-        };
+        let feedback_depth = record_depth(record.origin);
         if feedback_depth > FEEDBACK_DEPTH_BUDGET {
             // 超限：结构化错误上浮（计数读侧可见），当前 action 原值退回队尾
             //（零丢失、无半执行态；队尾重排让位外部流量——队首退回会让深度

@@ -280,6 +280,13 @@ jobs:
               "byte_budget_contention/budgeted_single_thread",
               "byte_budget_contention/unbudgeted_four_threads",
               "byte_budget_contention/budgeted_four_threads",
+              # ── State 布局证据组（issue#53）——每组代表 + 关键反例臂 ──
+              # 只钉「组整组消失/中途死掉」；尺寸/参数表属调参面，不逐条钉。
+              "state_layout_update/mono_1k_noretain",
+              "state_layout_update/sharded_16m_retain",
+              "state_layout_update_scope/mono_whole_noretain",
+              "state_layout_update_scope/sharded_16parts_all_retain",
+              "state_layout_retention/mono_window16",
           }
           base_keys = {k for k in baseline if not k.startswith("_")}
           expected_keys = EXPECTED_BENCH_IDS | base_keys

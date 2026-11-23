@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+### Fixed(runtime): 审计回调在夺租约 dispatch 首条 Enqueued 上的单线程确定性死锁,2026-11-23;GitHub issue#59)
+- **缺陷**:夺租约路径在 `drain_owned` **之前**投递首条 pop 记录的 `Enqueued` 回调，而排空帧只在 `drain_owned` 内 push ⇒ 回调期间 `admission_context` 看不到重入帧，把嵌套 `Store::dispatch` 判为**外部根**（`wait=true`）；此刻 `draining` 已置 ⇒ `enqueue` 返回 `Queued` ⇒ 调用方在无界账本等待上**等自己 = 单线程确定性死锁**（不需要并发）。三条夺租约路径同形：`Store::dispatch` / `SyncStore::try_dispatch` / 框架 `ActionSender::dispatch`。
+- **修复（维护者定稿：临时帧，不延迟投递事件）**：在首条记录的 `Enqueued` 回调**之前**安装临时 RAII 排空帧（携带 store 身份 + 回灌深度 + 账本）⇒ 回调内的同 store dispatch 归为**因果后代**（共享账本、深度 +1、`wait=false` 只入队即返）。帧随投递函数返回（含 panic 展开）弹出，**先于** `drain_owned` 装真帧 ⇒ 首条记录自身深度不被重复计。**装帧与闸判下沉到同一次无锁 load**（`audit_emit_prepared`）——否则两次 load 之间会重开「判未订阅 → 并发订阅 → 回调无帧」的新竞态；零订阅稳态仍零 TLS/零 `Arc`。
+- **归属规则（已入文档）**：嵌套 action 的因果父 = **正在投递其 `Enqueued` 回调的首条记录**，不一定是夺得排空权的外部调用点。
+- **测试**:新 `skeleton-infra/tests/audit_callback_reentrancy.rs`(5 例,**有界** harness 10s：死锁判红而非挂住 CI):三条夺租约路径各一例（回调内同 store dispatch 恰好一次）+ panic 展开仍 5s 内排空且帧已弹 + 控制例钉 `Enqueued`-before-`Reduced`。**红→绿**:修复前 `1 passed; 3 failed`（三例均 10s 超时判红，`EXIT=101`）→ 修复后 5/5 绿 `EXIT=0`（0.00s）。深度断言：环内 `Enqueued` 深度序列 `== [0, 1]`（漏帧 0、重复计 2 两种错法均红）。
+- 公共面零改动（仅内部帧 + rustdoc）；无依赖/feature 变更。
+
+### Added(bench): State 布局证据三组（#53）+ 补 `#[global_allocator]` 使既有两组预算闸真正生效,2026-11-23;GitHub issue#53)
+- **新增三组**（32 臂，扩充既有 `infra` bench 目标，无新目标/无新依赖）：`state_layout_update/`（整体 vs 16 片 × 1 KiB/64 KiB/1 MiB/16 MiB × 有/无留存）、`state_layout_update_scope/`（选择性 vs 整体更新 + 分片粒度，含**四类反例臂**）、`state_layout_retention/`（陈旧长持 vs 滚动窗口的留存成本模型）。每臂附 `allocs/beat`·`frees/beat` 与留存字节读数。
+- **反例必须存在**（定稿要求）：1 KiB 分片慢 2.0×／256 片慢 8.0×；1 MiB 全片更新优势从 90× 塌到 3×；单片分装与整体态持平。
+- **发现并修复一处静默假绿**：`benches/infra.rs` 此前**没有** `#[global_allocator]` 声明 ⇒ 既有 `effect_steady_state` / `notify_dispatch` 的分配预算闸一直是 `0 - 0 == 0` 恒真（永不失败）。现补声明 + `assert_allocator_instrumented()` 前提闸（配表但未装表即红）。
+- **副作用（需知）**：既有性能读数会因计数分配器（每块 +16B 头、每分配 2 次原子加）整体轻微偏移 ⇒ perf 基线须重取。
+- **文档**：`docs/reference.md` runtime 锚段新增「状态布局建议（#53 证据）」——正向建议 + 三类反例 + 留存成本模型 + 计量口径局限（分配计数只见事件不见字节；≥1 MiB 跨 mmap 阈值每字节成本跳变）。
+
 ### Added(fx): 并发停机契约（RAII drain-owner 守卫 + 中断结果）,2026-11-23;GitHub issue#70)
 - **问题面**:`shutdown`/`shutdown_timeout` 并发调用时,排空状态此前不是共享状态机——并发叫者会**先于排空完成**拿到一份全零 `ShutdownReport`;owner future 被弃置(select 竞败)时会**永久停在排空中**,等待者等于等一个永不产生的报告。
 - **契约(三角色)**:① **owner** = 首个进入排空者,`Open→Draining` 在**取 JoinSet 之前**原子发布(两段无 await),由它决定策略并发布 **canonical 报告**;实现为 RAII 守卫,**每条退出路径(成功/超时/panic/取消)先结算共享谓词再通知等待者**,锁内只碰报告自有数据(不跑用户代码/用户析构)。② **等待者** 醒来拿同一份 canonical 报告;自身截止到期只按自身读数返回,**不得改写 owner 策略**,其报告**非 canonical**。③ **已结算** 再调用返回默认报告(顺序二次调用语义不变)。守卫被 drop ⇒ 发布**中断结果**(新公共字段 `ShutdownReport::drain_interrupted` + 中断时已知计数)再让 JoinSet drop 请求 abort,**绝不**停在 `Draining`。
