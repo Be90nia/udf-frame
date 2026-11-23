@@ -19,9 +19,8 @@
 #![cfg(feature = "runtime")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
@@ -86,29 +85,35 @@ fn store() -> (SyncStore<u32, Msg, ()>, Arc<Tally>) {
 
 // ---- 本线程事件计数分配器（形态照 tests/run_id_diagnostics.rs / alloc_site.rs）----
 
-static EVENTS: AtomicUsize = AtomicUsize::new(0);
-
 struct EventCounting;
 
-// 计数窗门：仅窗内本线程的分配计入事件。const 初始化 TLS 无惰性分配、
-// 无析构注册，在分配器内读取不会递归进分配。
+// 线程局部分配计数（根因：旧实现 `EVENTS` 是进程级原子 + 窗开关是 TLS ⇒ 同二进制
+// 另一测试的窗口与自检窗口重叠时，本线程读数会多算别人的事件（审计复审实测 1 次
+// 假红）。窗口开关与计数同住一格 ⇒ 读数天然按线程隔离，无需串行步。
+// const 初始化 TLS：无惰性分配、无析构注册（在分配器内读取安全）。
 thread_local! {
-    static IN_WINDOW: Cell<bool> = const { Cell::new(false) };
+    static WINDOW: std::cell::Cell<(bool, usize)> = const { std::cell::Cell::new((false, 0)) };
+}
+
+// 计数窗门：仅窗内本线程的分配计入事件（窗口与计数同一 TLS 格）。
+fn note_event() {
+    let _ = WINDOW.try_with(|c| {
+        let (open, n) = c.get();
+        if open {
+            c.set((true, n + 1));
+        }
+    });
 }
 
 // SAFETY: 纯转发 System，仅在窗内转发前累加事件计数；null 原样透传（alloc 契约）。
 unsafe impl GlobalAlloc for EventCounting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if IN_WINDOW.try_with(Cell::get).unwrap_or(false) {
-            EVENTS.fetch_add(1, Ordering::Relaxed);
-        }
+        note_event();
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if IN_WINDOW.try_with(Cell::get).unwrap_or(false) {
-            EVENTS.fetch_add(1, Ordering::Relaxed);
-        }
+        note_event();
         unsafe { System.alloc_zeroed(layout) }
     }
 
@@ -117,9 +122,7 @@ unsafe impl GlobalAlloc for EventCounting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if IN_WINDOW.try_with(Cell::get).unwrap_or(false) {
-            EVENTS.fetch_add(1, Ordering::Relaxed);
-        }
+        note_event();
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -129,12 +132,15 @@ static COUNTING: EventCounting = EventCounting;
 
 /// op 执行期的分配事件数（瞬时生灭也计入；只计本线程窗内）。
 fn allocs<T>(op: impl FnOnce() -> T) -> usize {
-    IN_WINDOW.with(|w| w.set(true));
-    let before = EVENTS.load(Ordering::Relaxed);
+    WINDOW.with(|c| c.set((true, 0)));
     let out = op();
     black_box(&out);
-    let events = EVENTS.load(Ordering::Relaxed) - before;
-    IN_WINDOW.with(|w| w.set(false));
+    let events = WINDOW.with(|c| {
+        let (open, n) = c.get();
+        c.set((open, n));
+        n
+    });
+    WINDOW.with(|c| c.set((false, 0)));
     events
 }
 

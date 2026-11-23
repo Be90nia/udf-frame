@@ -124,7 +124,7 @@ jobs:
         run: cargo test -p udf-std-ext --test paths_alloc -- --test-threads=1
 
       # bench 编译门（infra §3.3/P10 一级）：bench 三组 required-features 为五件并集
-      # （fx/journal/memgov/testing/pool，见 skeleton-infra/Cargo.toml），--no-run 裸跑
+      # （tokio/journal/memgov/testing/pool，见 skeleton-infra/Cargo.toml），--no-run 裸跑
       # 会整目标跳过（hollow gate），故 all-features；`-p udf-skeleton` 无 bench 目标
       # （恒空跑），保留只为覆盖将来新增。
       - name: Bench compile gate

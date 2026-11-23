@@ -387,7 +387,8 @@ pub struct ShutdownReport {
     /// 此时各终局桶只统计中断前已收割的条目，[`Self::still_running`] 为中断时集内
     /// 条数。中断只**请求** abort（JoinSet drop 语义），**不**确认任务终止——任务
     /// 守卫与 [`FxScope::in_flight`] 在任务真正退出前具权威。中断后排空已结算：
-    /// 后续 [`FxScope::shutdown`] 调用的顺序语义不变（默认报告）。
+    /// 后续 [`FxScope::shutdown`] 调用返回**该次报告的副本**（canonical 可见面，
+    /// 不降级为空报告——审计 F3）。
     pub drain_interrupted: bool,
 }
 
@@ -1063,8 +1064,9 @@ impl FxScope {
     /// 报告供其余等待者。
     ///
     /// **该报告不是整 scope 的 canonical 结果**（终局桶恒空，只含自己的截止读数）：
-    /// 判断「整 scope 已停机完成」请以共享排空已结算（再调用 `shutdown` 返回默认
-    /// 报告）或 [`Self::in_flight`] 归零为准，勿把等待者的到期报告当终局账。
+    /// 判断「整 scope 已停机完成」请以共享排空已结算（再调用 `shutdown` 返回该次
+    /// 排空的 canonical 报告副本）或 [`Self::in_flight`] 归零为准，勿把等待者的到期
+    /// 报告当终局账。
     pub async fn shutdown_timeout(&self, d: Duration) -> ShutdownReport {
         match self.begin_drain() {
             DrainSlot::Owner => {

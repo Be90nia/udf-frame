@@ -9,8 +9,10 @@
 - **F2（Stage A 在 CI 空跑）**：夹具断言住在 `fn main()` ⇒ `cargo test` 对纯 bin 包 0 tests；CI 新增真跑两夹具 bin（async 根 + sync workflow，`--locked`），exit 0 才算端到端。
 - **F3（并发停机报告窄窗丢载荷）**：`DrainSlot::Settled` 携带该次排空的 canonical 报告，`begin_drain` 改**单次 borrow** 同时取状态与载荷 ⇒ 结算瞬间到达的调用也拿到 canonical 报告（此前会拿默认报告、panic 载荷静默丢）；`shutdown`/`shutdown_timeout` 两分支同步；`reference.md` 口径更正。
 - **F4（`try_reap` release 下溢）**：加 `debug_assert` 锚住「tokio 任务析构先于 JoinError 观测」外部不变量并注释；release zero-cost。
-- **F6**：CI bench 注释改「五件并集（fx/journal/memgov/testing/pool）」+ 注明 `-p udf-skeleton` 无 bench 目标。
+- **F6**：CI bench 注释改「五件并集（tokio/journal/memgov/testing/pool，`fx` 是模块不是 feature）」+ 注明 `-p udf-skeleton` 无 bench 目标。
 - **F7（fmt 闸对夹具空心）**：三个夹具是独立 workspace，根 `cargo fmt --all` 看不到 ⇒ CI Rustfmt 步逐仓 `--check`（3 行）；并已 `cargo fmt` 排好 5 个文件（纯格式）。
+- **F3 文案补完**：`drain_interrupted` 公共 rustdoc 与 `shutdown_timeout` rustdoc 改「该次排空的 canonical 报告副本」；`fx_lifecycle` 测试注同步；CHANGELOG #70 条目加「已被 F3 修订」标注。
+- **F8（复审新观察）**：`tests/audit_no_subscriber_alloc.rs` 的分配锚改**真·线程局部**（窗口开关与计数同住一格 `Cell<(bool,usize)>`）——旧实现进程级 `EVENTS` + TLS 窗开关，同二进制并发测试窗口重叠时会多算别人的事件（复审实测 1 次假红）；改后 10 连跑全绿，无需串行步。
 - **未改（P3 保留）**：F5 `Display` 中英混排（与 `shutdown.rs` 既有惯例同形，排文案批次）。
 
 ### Ci(docs): 单开 feature 面 doc 闸 + 面内 intra-doc 断链清偿,2026-11-23;bd udf-frame-ilh)
@@ -94,7 +96,7 @@
 
 ### Added(fx): 并发停机契约（RAII drain-owner 守卫 + 中断结果）,2026-11-23;GitHub issue#70)
 - **问题面**:`shutdown`/`shutdown_timeout` 并发调用时,排空状态此前不是共享状态机——并发叫者会**先于排空完成**拿到一份全零 `ShutdownReport`;owner future 被弃置(select 竞败)时会**永久停在排空中**,等待者等于等一个永不产生的报告。
-- **契约(三角色)**:① **owner** = 首个进入排空者,`Open→Draining` 在**取 JoinSet 之前**原子发布(两段无 await),由它决定策略并发布 **canonical 报告**;实现为 RAII 守卫,**每条退出路径(成功/超时/panic/取消)先结算共享谓词再通知等待者**,锁内只碰报告自有数据(不跑用户代码/用户析构)。② **等待者** 醒来拿同一份 canonical 报告;自身截止到期只按自身读数返回,**不得改写 owner 策略**,其报告**非 canonical**。③ **已结算** 再调用返回默认报告(顺序二次调用语义不变)。守卫被 drop ⇒ 发布**中断结果**(新公共字段 `ShutdownReport::drain_interrupted` + 中断时已知计数)再让 JoinSet drop 请求 abort,**绝不**停在 `Draining`。
+- **契约(三角色)**:① **owner** = 首个进入排空者,`Open→Draining` 在**取 JoinSet 之前**原子发布(两段无 await),由它决定策略并发布 **canonical 报告**;实现为 RAII 守卫,**每条退出路径(成功/超时/panic/取消)先结算共享谓词再通知等待者**,锁内只碰报告自有数据(不跑用户代码/用户析构)。② **等待者** 醒来拿同一份 canonical 报告;自身截止到期只按自身读数返回,**不得改写 owner 策略**,其报告**非 canonical**。③ **已结算** 再调用返回默认报告(顺序二次调用语义不变)。〔已被同日 F3 条目修订：现在返回该次排空的 canonical 报告副本，不再返回默认报告〕守卫被 drop ⇒ 发布**中断结果**(新公共字段 `ShutdownReport::drain_interrupted` + 中断时已知计数)再让 JoinSet drop 请求 abort,**绝不**停在 `Draining`。
 - **不声称取消确认终止**:中断/超时都只请求 abort;任务守卫与 `in_flight` 在任务真正退出前具权威(与 #67 同一口径)。
 - **测试**:新 `skeleton-infra/tests/fx_cancel_and_shutdown_owner.rs`(7 例,确定性握手禁 sleep,含用户析构重入探针):并发等待者共享 canonical 报告(修复前实得全零报告)/ 更短截止的等待者不改写 owner 策略 / owner future 被 drop 时所有等待者以文档化中断结果醒来 / 超时 owner 向等待者发布截止报告 / 既有唤醒与顺序二次调用回归。**红→绿**:修复前 6 FAILED / 1 passed。
 - **公共面**:仅新增 `ShutdownReport::drain_interrupted` 字段(`#[non_exhaustive]` 内,非破坏)与既有方法的行为修复;无依赖/feature 变更。

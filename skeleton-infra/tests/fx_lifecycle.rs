@@ -259,8 +259,9 @@ async fn mixed_outcomes_classified_without_deadline() {
     );
 }
 
-/// 幂等：`close()` / `cancel()` / `shutdown()`（含超时形）重复调用安全；空集
-/// 报告恒为 `default`，且 `ShutdownReport::default()` 可用（向后兼容面）。
+/// 幂等：`close()` / `cancel()` / `shutdown()`（含超时形）重复调用安全；已结算的
+/// 重复调用返回**该次排空的 canonical 报告副本**（审计 F3；旧实现返回空默认报告），
+/// 且 `ShutdownReport::default()` 仍可用（向后兼容面）。
 #[tokio::test]
 async fn close_cancel_and_shutdown_are_idempotent() {
     // cancel 幂等（观察面恒 true，重复取消不 panic 不改语义）。
