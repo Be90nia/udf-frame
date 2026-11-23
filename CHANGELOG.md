@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Fix(tests)+Docs: 分配锚线程局部化 4 文件 + 资源表数值决定记录（keep current）,2026-11-23;bd udf-frame-2h7)
+- **4 个兄弟文件的同型潜伏一并根治**（`alloc_site` / `run_id_diagnostics` / std-ext `alloc_anchors` / `paths_alloc`）：旧实现「进程级 `static AtomicUsize` + TLS 窗开关」在同一二进制并发测试窗口重叠时会多算别人的事件（`audit_no_subscriber_alloc` 已实测 1 次假红）。统一改为窗口开关与计数同住 `thread_local! Cell<(bool,usize)>`；**顺带纠正** `alloc_anchors`/`paths_alloc` 注释里「已按线程归属」的失实自称（此前实现与注释不符）。4 个目标各 10 连跑全绿，全量两 crate 绿。
+- **资源表数值决定（维护者 2026-11-23 拍板：keep current）**：3/4/5/6/7 行与 watchdog/scheduler/Run-ID 默认值全部保持现值，依据 Stage C「全默认开箱可用、无改小证据」；已写入 `docs/reference.md` 决定记录段，行内「待拍板」标注改为「已定」。
+
 ### Fix(audit 整改): 12 维审计 4 条 P2 + 2 条 P3 清偿,2026-11-23;reports/2026-11-23-12dim-audit.md)
 - **F1（#60 测试鉴别力）**：落闸改走 `AuditTicket::store_gate_under_slot_lock`，debug 下用 `audit.try_lock().is_err()` 断言「闸落必持槽锁」——把落闸挪出临界区（#60 缺陷形状）时测试**直接红**，不再依赖暂停钩子位置。release 零成本。
 - **F2（Stage A 在 CI 空跑）**：夹具断言住在 `fn main()` ⇒ `cargo test` 对纯 bin 包 0 tests；CI 新增真跑两夹具 bin（async 根 + sync workflow，`--locked`），exit 0 才算端到端。

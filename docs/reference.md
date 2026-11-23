@@ -397,19 +397,21 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 4. **界是准入闸（hard cap），不是指标**：指标（borrowed/idle/dropped…）与准入闸分离，禁一个计数兼任两职（#28 教训）。
 5. **pre-publication 时钟**：默认值一旦发布即表现层契约——**改大 = 兼容放宽，改小 = 破坏性变更（走 ADR）**。
 
-### 当前策略（基线 = 实现现状；提案值待 #56 Stage B 证据后统一拍板）
+### 当前策略（基线 = 实现现状；默认值已由维护者拍板 keep current，见下方决定记录）
 
 | # | 资源项 | 所在面 | `0` 含义 | **当前基线** | 超界行为 | 逃生口 |
 |---|---|---|---|---|---|---|
 | 1 | 活跃注册数上限 | `std_ext::scheduler`（#58） | 无界（默认） | `Scheduler::set_capacity(cap)`；默认**无界** | 拒绝：`register` 返回 typed `SchedulerFull`（任务未入堆，不静默丢） | 显式 `set_capacity(n)`；调低到当前活跃数以下不驱逐既有任务 |
 | 2 | watchdog 执行数上限 | `shutdown::ShutdownCoordinator`（#54） | 无界（`None`，默认） | `with_max_watchdogs(n)`；默认**不限** | 拒绝启动：该组件记 `Failed{reason: watchdog capacity exhausted}`（**不**内联跑闭包、不静默） | 显式 `with_max_watchdogs(n)`；`live_watchdogs()` / `peak_watchdogs()` 读数 |
-| 3 | 历史 Run-ID 诊断注册表 | `runtime`（#62） | 不适用（关 = 不登记） | `enable_run_id_diagnostics(capacity)`，**默认关闭**（不登记、零 per-Run 锁与分配）；启用后容量 = `DEFAULT_RUN_ID_TRACKING_CAPACITY = 1024`（**数值待本表拍板**） | 饱和/驱逐 ⇒ 三态判 `not-tracked`（**绝不**判 `definitely-unknown`）；`cancel_unknown_id` 驱逐后停止增长 | 窄口径 opt-in；`run_id_tracked_count` / `run_id_tracking_capacity` / `run_id_evicted_count` 可观测 |
+| 3 | 历史 Run-ID 诊断注册表 | `runtime`（#62） | 不适用（关 = 不登记） | `enable_run_id_diagnostics(capacity)`，**默认关闭**（不登记、零 per-Run 锁与分配）；启用后容量 = `DEFAULT_RUN_ID_TRACKING_CAPACITY = 1024`（**已定**，见决定记录） | 饱和/驱逐 ⇒ 三态判 `not-tracked`（**绝不**判 `definitely-unknown`）；`cancel_unknown_id` 驱逐后停止增长 | 窄口径 opt-in；`run_id_tracked_count` / `run_id_tracking_capacity` / `run_id_evicted_count` 可观测 |
 | 4 | 审计环容量（权威历史） | `SyncStore::subscribe_events` / `PoolBase` | 视作 `1`（调用方给 `0` 时取 `max(1)`） | `SyncStore`：**调用方显式给**；池域：`AUDIT_RING_DEFAULT_CAP = 1024` | 溢出丢最旧（`seq` 空洞 = 显式证据；`take_events` 取走不留空洞） | 调大 `subscribe_events(cap, ..)` / 池域容量；完整性靠「权威历史」不靠实时回调 |
 | 5 | 审计待投递 FIFO | `SyncStore` / 池域（#65/#75） | —（固定） | `AUDIT_PENDING_CAP = 1024`（**无配置面**，两处同值） | 溢出丢最旧 + **独立投递丢弃计数**（`audit_delivery_drops()`，与环溢出分账） | 消费慢 ⇒ 改用 `take_events` 取权威历史 |
 | 6 | 回灌深度预算 | `runtime` 排空环 | —（固定） | `FEEDBACK_DEPTH_BUDGET = 64`（单次 dispatch 连续回灌链深度） | 停排 + `feedback_budget_exceeded` 计数；触发点 action **脱钩停放（deferred）**（保留来源身份，主队列继续；非 panic 非静默，**不是**退回队尾自动重放） | 显式 `resume_deferred(limit)`（#49）；`DispatchOutcome::Deferred{retained}` 上报 |
-| 7 | deferred 停放队列 | `runtime`（#49） | 不适用（容量独立配置） | `set_deferred_capacity(n)` + `deferred_capacity()` / `deferred_actions()`；默认 `DEFAULT_DEFERRED_CAPACITY = 64`（**占位值，数值待本表拍板**）；**独立于 ingress capacity** | 满 ⇒ 新续接拿**显式非成功终局**（`FinishRoot(Failed)`）+ 专用计数 `deferred_capacity_rejected()`，不入队、不消失、不误标成功 deferred | `resume_deferred(limit)`（FIFO、fresh epoch、独立续接收据）；`DispatchOutcome::CapacityRejected` 可观测 |
+| 7 | deferred 停放队列 | `runtime`（#49） | 不适用（容量独立配置） | `set_deferred_capacity(n)` + `deferred_capacity()` / `deferred_actions()`；默认 `DEFAULT_DEFERRED_CAPACITY = 64`（**已定**，见决定记录）；**独立于 ingress capacity** | 满 ⇒ 新续接拿**显式非成功终局**（`FinishRoot(Failed)`）+ 专用计数 `deferred_capacity_rejected()`，不入队、不消失、不误标成功 deferred | `resume_deferred(limit)`（FIFO、fresh epoch、独立续接收据）；`DispatchOutcome::CapacityRejected` 可观测 |
 | 8 | FxScope 等待/跟踪条目 | `fx`（#13/#39） | 无界（`usize::MAX`，默认） | `with_max_pending(n)` / `with_max_tracked(n)`；默认**均无界** | 拒绝：`try_spawn_tracked` 返回 typed `AdmissionError::{PendingFull,TrackedFull}`（不阻塞不 panic） | 显式设界；`try_reap()` 收割后回落；`counts()` 读数 |
 | 9 | 对象池/线程池 idle 容量 | `pool` | 由 tuning 显式给 | `ObjectPoolTuning` / `ThreadPoolTuning` **显式必填，无默认** | 超 `idle_cap` ⇒ `dropped_overflow` 计数（有界降级） | 调 tuning；`shrink_to`/`prune_idle` 主动回收 |
+
+**数值决定记录（2026-11-23 维护者拍板）**：本表 3/4/5/6/7 行及 watchdog 4096 / scheduler 1024 / Run-ID 1024 的默认值**全部保持现值（keep current）**。依据：#56 Stage C 消费方验收结论「全默认开箱可用，未出现要求把默认值改小的证据」（`reports/2026-11-23-56-stage-c-consumer-validation.md`）；共同约定 2「默认=保守可用，禁为炫技设小界」。`AUDIT_PENDING_CAP` 无配置面、`FEEDBACK_DEPTH_BUDGET` 固定——均按现状记录，不新增配置面。
 
 **修订规则**：某默认值经 #56 Stage B 实测不合格 ⇒ 修订本表一次（改大 = 兼容放宽；改小 = 破坏性，需 ADR 记录理由与迁移路径），各面 rustdoc 随表同步，禁单点改数。
 
