@@ -2,6 +2,8 @@
 //!
 //! 全部用握手（channel）驱动，禁 sleep——阻塞中/已返回的判定都靠有界超时。
 
+#![cfg(feature = "runtime")]
+
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
 use std::time::Duration;
