@@ -261,3 +261,36 @@ jobs:
 
       - name: Check infra all-features (locked)
         run: cargo check -p udf-skeleton-infra --locked --all-features
+
+  # ── 第二消费方可复现性闸（issue#56 Stage A）──────────────────────────
+  # 夹具必须**在 fresh clone 上可独立构建**——它自带空 [workspace] 表（不被
+  # 上级 workspace 吸收）、自带 Cargo.lock、path 依赖指向本仓三个 crate。
+  # 这条闸就是「clean checkout 证据」本身：只有夹具本体会入库（编译产物由
+  # .gitignore 的 validation/**/target/ 覆盖），不依赖维护者本地被忽略的
+  # verify/ 残留 ⇒ clone 即复现。
+  # 断言两条：① 夹具能构建并通过自身用例（--locked，锁文件漂移即红）；
+  # ② sync-only 面的依赖树**无 tokio**（架构回归 §13 行 1 在消费方视角再钉
+  # 一次——这是外部 crate 视角，同 crate 豁免规则不生效）。
+  # 只跑 ubuntu：夹具与平台无关，三 OS 重复只拉长队列。Stage B 的 async
+  # 面 crate 到位后由各自步骤单独加入（其树**应**含 tokio，口径相反）。
+  consumer-sim:
+    name: consumer-sim (clean checkout, sync-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.96.0 (pinned)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Build + test sync-only fixture (locked)
+        run: |
+          cargo build --manifest-path validation/consumer-sim/workflow/Cargo.toml --locked
+          cargo test --manifest-path validation/consumer-sim/workflow/Cargo.toml --locked
+
+      - name: Assert fixture dependency tree has no Tokio
+        shell: bash
+        run: |
+          if cargo tree --manifest-path validation/consumer-sim/workflow/Cargo.toml -e normal | grep -q tokio; then
+            echo "::error::sync-only fixture dependency tree contains tokio"
+            exit 1
+          fi
