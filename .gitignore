@@ -19,10 +19,10 @@ verify/
 /AGENTS.md
 /CLAUDE.md
 
-# 调研/决策/流程类文档不入库（2026-10-28 用户决定：仓库只留面向 API 消费方的文档）
+# 调研/流程类文档不入库（2026-10-28 用户决定：仓库只留面向 API 消费方的文档）
 # 保留：docs/reference.md（API 正典）、docs/view-region-spec.md + 镜像工件、docs/tutorials/
-# 移出：docs/research/（调研底稿）、docs/adr/（决策档案）、docs/PUBLISHING.md（内部流程单）、reports/（审计与对标报告）
+# 移出：docs/research/（调研底稿）、reports/（审计与对标报告）
+# 改判（2026-11-23 用户拍板）：docs/adr/ 与 docs/PUBLISHING.md 转入库——ADR 已是 #25 蓝图评审
+# ratify 的正典架构拍板载体（外部可见决议，clone 可见），不再属于「本地决策草稿」。
 /docs/research/
-/docs/adr/
-/docs/PUBLISHING.md
 /reports/
