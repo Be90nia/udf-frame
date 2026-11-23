@@ -191,6 +191,41 @@ fn cli_entry_runs_submit_cancel_and_shutdown() {
 #[cfg(feature = "tokio")]
 mod async_face {
     use skeleton_infra::fx::{cancel_pair, FxScope};
+    use tokio::sync::oneshot;
+
+    /// G1 修复后的消费方实证：`CancelSource: Clone`（同一取消态第二句柄）⇒
+    /// 预先 clone 的 handle 可在 `with_source` 接线后触发取消，scope token 与
+    /// 任务同拍可见。oneshot 握手（无 sleep）保证取消发生在任务启动之后。
+    #[tokio::test]
+    async fn cloned_source_cancels_attached_scope_during_lifetime() {
+        let (source, token) = cancel_pair();
+        let handle = source.clone();
+        let scope = FxScope::new().with_source(source);
+
+        let scope_token = scope.token();
+        assert!(!scope_token.is_cancelled(), "接线时未取消");
+
+        let task_token = scope_token.clone();
+        let (started_tx, started_rx) = oneshot::channel::<()>();
+        let spawned = scope
+            .spawn_tracked(async move {
+                let _ = started_tx.send(());
+                task_token.cancelled().await;
+            })
+            .expect("spawn 应准入");
+        started_rx.await.expect("任务未进入等待点就结束");
+
+        // scope 存续期，用接线前 clone 的句柄触发取消。
+        handle.cancel();
+        assert!(handle.is_cancelled(), "句柄自身可见");
+        assert!(token.is_cancelled(), "原 token 可见");
+        assert!(scope.token().is_cancelled(), "scope token 可见");
+
+        spawned.join().await.expect("任务应在取消后下一让渡点结束");
+        let report = scope.shutdown().await;
+        assert_eq!(scope.in_flight(), 0, "停机后无在途");
+        assert_eq!(report.completed, 1, "任务正常终局（取消是协作式返回，非 abort）");
+    }
 
     #[tokio::test]
     async fn cancellation_is_visible_and_scope_drains() {
