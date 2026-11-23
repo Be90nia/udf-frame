@@ -144,7 +144,8 @@ impl skeleton::Reducer for BatchProducer {
     fn reduce(&self, s: &u64, _a: u64, out: &mut skeleton::EffectBuf<u64, Beep>) -> u64 {
         for i in 0..self.per_action {
             out.push(Effect::Run {
-                // id 每拍复用（run_ids 是只增集合，固定 id ⇒ 稳态不涨内存）。
+                // id 每拍复用：历史 Run-ID 诊断默认关闭（issue#62）⇒ 本臂不登记
+                // 任何 run id；启用后才是「有界最近集」（不再是只增集合）。
                 id: skeleton::EffectId::new(i + 1),
                 op: Beep::One,
             });
@@ -309,6 +310,10 @@ fn dispatch_per_beat(c: &mut Criterion) {
     for _ in 0..1_000u64 {
         cancel.dispatch(0);
     }
+    // ⚠️ 2026-11-23（issue#62）语义变更：历史 Run-ID 诊断**默认关闭** ⇒ 本臂
+    // 现在测的是「Cancel 投递的门闸-only 路径」（不再有 run_ids 查表 + miss
+    // 留痕）。ID 保留以延续基线曲线，但**跨该日期的基线不可直接对比**；
+    // 启用诊断的路径**未加臂**（未覆盖）。
     group.bench_function("cancel_unknown_id", |b| {
         b.iter(|| cancel.dispatch(black_box(0)))
     });

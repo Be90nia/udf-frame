@@ -226,7 +226,10 @@ fn audit_preempted_concurrent_subscribes_are_exact() {
 
 #[test]
 fn cancel_unknown_id_concurrent_dangling_cancels_are_exact() {
-    let store = Arc::new(Store::new(RunCancel, NoFxC));
+    let mut store = Arc::new(Store::new(RunCancel, NoFxC));
+    Arc::get_mut(&mut store)
+        .expect("独占")
+        .enable_run_id_diagnostics(skeleton_infra::runtime::DEFAULT_RUN_ID_TRACKING_CAPACITY);
     assert_eq!(store.cancel_unknown_id(), 0, "基线");
     store.dispatch(CMsg::Run1);
     assert_eq!(store.cancel_unknown_id(), 0, "Run 登记不计数");

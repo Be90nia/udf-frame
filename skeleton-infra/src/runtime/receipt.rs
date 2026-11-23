@@ -9,6 +9,13 @@
 //!   根账本不可能在后代被接受之前发布终局（无「已接受但未计数」的缝）。
 //! - 终局结果一经发布即不可变（`Completed` / `Failed` / `Deferred` 三者互斥）。
 //!
+//! **复用生命周期（issue#84）**：`Arc` 克隆可在飞行中保留到**全部因果后代
+//! 结算**；账本进复用池只在**终局发布**且**指定 owner 让渡**之后开始——
+//! 非等待型根由框架在终局发布点归还（`claim_release`），等待型根由外部等待者
+//! 消费 `Outcome` 后归还（`waiter_release`）。终局发布前入池 = 在途后代的
+//! 结算被记到下一个根的账上（跨归属），故 `reset` 在 debug/test 构建对
+//! 「已终局 + 无在途后代 + 已 claim」做硬断言。
+//!
 //! 阶段（[`Phase`]）只在真实提交边界推进：reducer 前 `Reducing`、快照替换后
 //! `StateCommitted`、效果转发前 `ForwardingEffects`、转发毕 `EffectsForwarded`、
 //! 通知段 `Notifying`——失败分类据此区分「提交前失败」与「提交后部分失败」。
@@ -74,6 +81,11 @@ struct LedgerState {
     deferred: bool,
     /// 是否已被归还到复用池（首次归还者胜——防同一账本被归还两次）。
     released: bool,
+    /// 归属 token（issue#84）：本账本属于**等待型根**（`true`）= 外部等待者
+    /// 持有归还权（消费终局后归还）；`false` = 非等待型根，框架在其终局发布
+    /// 时归还。显式落在账本状态里——不由任何后代记录的 `waiter` 推断（后代
+    /// 记录的该字段恒 false）。
+    waiter: bool,
 }
 
 /// 完成账本：`Mutex<LedgerState>` + `Condvar`（等待面与发布面同一把锁——
@@ -85,9 +97,16 @@ pub(crate) struct Ledger {
 
 impl Ledger {
     /// 新建账本（外部根 action 的唯一分配点）。
-    pub(crate) fn new() -> Arc<Self> {
+    ///
+    /// `waiter` = 本根是否有外部等待者：等待型根的 owner 是外部等待者（它消费
+    /// 终局后自行归还）；非等待型根由框架在其**终局发布**时归还（issue#84——
+    /// 归属 token 落在账本状态里显式化，不由任何后代记录的字段推断）。
+    pub(crate) fn new(waiter: bool) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(LedgerState::default()),
+            state: Mutex::new(LedgerState {
+                waiter,
+                ..LedgerState::default()
+            }),
             cv: Condvar::new(),
         })
     }
@@ -102,7 +121,7 @@ impl Ledger {
     pub(crate) fn descendant_done(&self, failure: Option<Failure>) {
         let mut st = self.lock();
         // 记账恒减：后代终局与脱钩各减一次（脱钩走 detach_deferred）。
-        st.outstanding = st.outstanding.saturating_sub(1);
+        release_descendant_slot(&mut st);
         if let Some(f) = failure {
             st.failure_count += 1;
             if st.first_failure.is_none() {
@@ -134,7 +153,7 @@ impl Ledger {
         if is_root {
             st.root_done = true;
         } else {
-            st.outstanding = st.outstanding.saturating_sub(1);
+            release_descendant_slot(&mut st);
         }
         st.deferred = true;
         self.publish(&mut st);
@@ -184,8 +203,21 @@ impl Ledger {
 
     /// 复位到空闲态（复用池取出时调用）：清空终局、计数与失败摘要。
     /// 复位在账本锁内完成——复用方拿到的账本必是干净态。
-    pub(crate) fn reset(&self) {
+    ///
+    /// **不变式（issue#84）**：只允许复位**已终局且已 claim 归还**的账本。
+    /// 活账本被复位 = 在途后代把结算记到下一个根的账上（跨归属）；debug/test
+    /// 构建把违反现场直接咬住（release 构建保持零开销）。
+    pub(crate) fn reset(&self, waiter: bool) {
         let mut st = self.lock();
+        debug_assert!(
+            st.terminal.is_some(),
+            "复位非终局账本：账本在终局发布前被放回复用池（在途后代会被记到下一个根上）"
+        );
+        debug_assert_eq!(
+            st.outstanding, 0,
+            "复位仍有在途后代的账本（终局谓词未成立）"
+        );
+        debug_assert!(st.released, "复位未被 claim 归还的账本");
         st.outstanding = 0;
         st.root_done = false;
         st.terminal = None;
@@ -193,16 +225,57 @@ impl Ledger {
         st.failure_count = 0;
         st.deferred = false;
         st.released = false;
+        st.waiter = waiter;
     }
 
-    /// 归还标记：首次归还者返回 `true`（账本进复用池），其后一律 `false`
-    /// ——同一账本只可能进池一次（双重归还 = 两个使用者共用一个账本 = 状态互毁）。
-    pub(crate) fn mark_released(&self) -> bool {
+    /// 框架侧复用资格判定与 claim：**终局发布是唯一可复用边界**。
+    ///
+    /// 全部成立才 claim（`released` 保证每个账本恰好一次入池）：
+    /// - 终局已发布（`root_done && outstanding == 0` 曾成立）；
+    /// - 本账本属于**非等待型根**——等待型根的 owner 是外部等待者，由
+    ///   [`Self::waiter_release`] 归还。
+    ///
+    /// 判定在账本锁内完成；调用方放锁后才取 `ledger_pool`（禁同时持两把锁）。
+    pub(crate) fn claim_release(&self) -> bool {
         let mut st = self.lock();
-        if st.released {
+        if st.released || st.waiter || st.terminal.is_none() {
             return false;
         }
         st.released = true;
         true
+    }
+
+    /// 等待者收口后的归还 claim：等待型根的 owner 在 `wait()` 返回终局后调用
+    /// （`wait()` 返回即终局已发布）。与 [`Self::claim_release`] 共用
+    /// `released` 的恰好一次守卫——两条路径合起来每个账本只进池一次。
+    pub(crate) fn waiter_release(&self) -> bool {
+        let mut st = self.lock();
+        if st.released {
+            return false;
+        }
+        debug_assert!(st.terminal.is_some(), "等待者归还时终局必须已发布");
+        st.released = true;
+        true
+    }
+}
+
+/// 后代计数递减（后代终局与脱钩共用的唯一记账点）。
+///
+/// issue#84：**不用 `saturating_sub` 掩盖**重复/迟到结算——debug/test 构建在
+/// 计数已为 0 时直接咬住（正是「账本被提前复用」的现场）；release 构建取饱和
+/// 语义保持零开销。
+fn release_descendant_slot(st: &mut LedgerState) {
+    debug_assert!(
+        st.outstanding > 0,
+        "后代结算/脱钩时未终局后代计数已为 0：重复结算或账本在终局前被复用"
+    );
+    st.outstanding = st.outstanding.saturating_sub(1);
+}
+
+#[cfg(test)]
+impl Ledger {
+    /// 测试读侧：终局是否已发布（复用池不变式断言用）。
+    pub(crate) fn terminal_published(&self) -> bool {
+        self.lock().terminal.is_some()
     }
 }

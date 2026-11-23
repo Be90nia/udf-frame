@@ -12,7 +12,7 @@ use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use skeleton::notify::{Notify, NotifySink};
@@ -327,6 +327,141 @@ struct NotifyCache<S> {
     slots: Vec<Arc<SubscriptionSlot<S>>>,
 }
 
+/// Run-ID 跟踪视界的保守默认容量（issue#62）。**数值归 #56 拍板**——本票只定
+/// 语义契约与 opt-in 边界，该默认值待 Stage B 消费者证据后由 #56 的资源默认
+/// 值表统一裁定（拿不准时用它，别自选数字）。
+pub const DEFAULT_RUN_ID_TRACKING_CAPACITY: usize = 1024;
+
+/// Run-ID 三态分类（issue#62）：消费方据此区分「确定未知的 Cancel」与
+/// 「不可判定」——**被驱逐的 id 绝不判成 [`RunIdClass::DefinitelyUnknown`]**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunIdClass {
+    /// 保留视界内见过：该 id 的 `Run` 在跟踪窗内发出过。
+    Known,
+    /// 保留视界内**确定**未见过（诊断启用、视界完整且从未发生驱逐）。
+    DefinitelyUnknown,
+    /// 不可判定：诊断未启用 / 视界残缺（启用晚于首个准入）/ 已饱和驱逐
+    /// （该 id 可能已被驱逐）。**不承诺**该 id 存在或不存在。
+    NotTracked,
+}
+
+/// 历史 Run-ID 诊断（issue#62）：**默认关闭**的窄口径 runtime 诊断置
+/// （[`SyncStore::enable_run_id_diagnostics`]）——不是通用策略/配置框架。
+///
+/// 契约（维护者定稿）：
+/// - 默认关闭；`Run`/`Cancel` 的转发路径与诊断是否启用**无关**（诊断只观测）；
+/// - 禁用路径零锁零分配：一次 `OnceLock::get` 即返（不登记、不分配）；
+/// - 启用后是有界最近集：容量满即驱逐最旧，驱逐计数显式上浮；
+/// - 三态分类见 [`RunIdClass`]；旧 [`SyncStore::cancel_unknown_id`] 只数
+///   **视界完整且无驱逐时的精确 miss**（不静默改义——见该读侧文档）。
+struct RunIdDiag {
+    /// `None` = 未启用。`OnceLock` 的读侧是一次原子 load（禁用路径的全部成本）。
+    track: OnceLock<Mutex<RunIdTrack>>,
+}
+
+/// 跟踪窗状态（只在启用后存在）。
+struct RunIdTrack {
+    /// 有界最近集容量（≥ 1）。
+    capacity: usize,
+    /// 视界是否完整：必须在**首个准入之前**启用——否则早先的 `Run` 未被登记，
+    /// miss 只能判 `NotTracked`（保守方向：不把可能存在的 id 判成未知）。
+    horizon_complete: bool,
+    /// 最近 ID（插入序 = 驱逐序）。
+    order: VecDeque<u64>,
+    /// 精确成员表（与 `order` 同步维护；驱逐时两处同删）。
+    ids: HashSet<u64>,
+    /// 饱和驱逐计数（> 0 ⇒ 之后一切 miss 均为 `NotTracked`）。
+    evicted: u64,
+    /// 精确 miss 计数：[`SyncStore::cancel_unknown_id`] 的唯一来源。
+    exact_unknown: u64,
+}
+
+impl RunIdDiag {
+    const fn new() -> Self {
+        Self {
+            track: OnceLock::new(),
+        }
+    }
+
+    /// 门闸：禁用路径的全部成本 = 这一次原子 load。
+    fn is_enabled(&self) -> bool {
+        self.track.get().is_some()
+    }
+
+    /// 首次启用生效；已启用时是 no-op（容量与视界在首次启用时固定）。
+    fn enable(&self, capacity: usize, horizon_complete: bool) {
+        let _ = self.track.set(Mutex::new(RunIdTrack {
+            capacity: capacity.max(1),
+            horizon_complete,
+            order: VecDeque::new(),
+            ids: HashSet::new(),
+            evicted: 0,
+            exact_unknown: 0,
+        }));
+    }
+
+    fn note_run(&self, id: u64) {
+        let Some(track) = self.track.get() else {
+            return;
+        };
+        let mut t = lock(track);
+        if t.ids.contains(&id) {
+            return;
+        }
+        while t.order.len() >= t.capacity {
+            let Some(oldest) = t.order.pop_front() else {
+                break;
+            };
+            t.ids.remove(&oldest);
+            t.evicted += 1;
+        }
+        t.ids.insert(id);
+        t.order.push_back(id);
+    }
+
+    fn note_cancel(&self, id: u64) {
+        let Some(track) = self.track.get() else {
+            return;
+        };
+        let mut t = lock(track);
+        // 只有「视界完整 + 从未驱逐」的 miss 才是**精确**未知（旧计数口径）。
+        if t.ids.contains(&id) || !t.horizon_complete || t.evicted > 0 {
+            return;
+        }
+        t.exact_unknown += 1;
+    }
+
+    fn classify(&self, id: u64) -> RunIdClass {
+        let Some(track) = self.track.get() else {
+            return RunIdClass::NotTracked;
+        };
+        let t = lock(track);
+        if t.ids.contains(&id) {
+            RunIdClass::Known
+        } else if t.horizon_complete && t.evicted == 0 {
+            RunIdClass::DefinitelyUnknown
+        } else {
+            RunIdClass::NotTracked
+        }
+    }
+
+    fn tracked_count(&self) -> usize {
+        self.track.get().map_or(0, |t| lock(t).ids.len())
+    }
+
+    fn capacity(&self) -> usize {
+        self.track.get().map_or(0, |t| lock(t).capacity)
+    }
+
+    fn evicted_count(&self) -> u64 {
+        self.track.get().map_or(0, |t| lock(t).evicted)
+    }
+
+    fn cancel_unknown_count(&self) -> u64 {
+        self.track.get().map_or(0, |t| lock(t).exact_unknown)
+    }
+}
+
 struct StoreInner<S, A, Op> {
     reducer: Arc<dyn Reducer<State = S, Action = A, Op = Op> + Send + Sync>,
     state: Mutex<Arc<S>>,
@@ -342,8 +477,11 @@ struct StoreInner<S, A, Op> {
     capacity: AtomicUsize,
     /// 容量满拒绝计数（fail-visible）：读侧 [`SyncStore::admission_full_count`]。
     admission_full: AtomicU64,
-    /// 完成账本复用池（issue#40 性能协议：稳态零分配）：空闲账本待取用，
-    /// 取出即复位、归还者唯一（防双重归还）。池容量 = 并发等待者数（有界）。
+    /// 完成账本复用池（issue#40 性能协议：稳态零分配；issue#84 生命周期）：
+    /// 空闲账本待取用，取出即复位、归还者唯一（防双重归还）。池容量 = 并发
+    /// 等待者数（有界）。**池内不变量**：池内每个账本必是「终局已发布 + 无在途
+    /// 后代 + 已 claim 归还」（`Ledger::reset` 在 debug/test 构建硬断言）——
+    /// 终局发布前入池会让在途后代的结算记到下一个根的账上（跨归属）。
     ledger_pool: Mutex<Vec<Arc<Ledger>>>,
     /// 回灌预算止步的**停放队列**（issue#40）：超预算的 action 脱钩（续接
     /// 账本）后停放在此，**不留在主队列**——留在主队列会让它顶在队首把外部
@@ -429,14 +567,10 @@ struct StoreInner<S, A, Op> {
     /// 回灌深度预算触发计数：单任排空连续回灌超 [`FEEDBACK_DEPTH_BUDGET`]
     /// 即停排+自增。读侧 [`SyncStore::feedback_budget_exceeded`]。
     feedback_exceeded: AtomicU64,
-    /// Cancel 寻址校验：本 store 见过的 `Run` id 登记（reducer 发出即记，
-    /// 摘除不可行——Run 的自然完成核心不可见，见 `SyncStore::cancel_unknown_id`
-    /// 文档）。只在 Cancel/Run 效果流经转发环时触达，零效果路径零开销。
-    run_ids: Mutex<HashSet<u64>>,
-    /// Cancel 寻址校验计数：`Effect::Cancel` 引用从未发出的 `Run` id 即 +1
-    /// （id 纪律漂移的直接证据：打错数字、撞车后引用了他域 id、Cancel 早于
-    /// Run 的时序 bug）。读侧 [`SyncStore::cancel_unknown_id`]。
-    cancel_unknown_id: AtomicU64,
+    /// 历史 Run-ID 诊断（issue#62）：**默认关闭**。启用后是有界最近集 + 三态
+    /// 分类（known / definitely-unknown / not-tracked）；禁用路径零锁零分配
+    /// （`Run`/`Cancel` 只多一次门闸 load，转发语义与诊断无关）。
+    run_id_diag: RunIdDiag,
     /// Emit 回灌累计重入计数：`Effect::Emit` 永不
     /// 进效果转发路径（回环以 Action 重入队列），本计数供 [`TestStore::receive`]
     /// 空队列时如实归因「本轮产过 N 个回灌 Emit」——区别于「真没产效果」。
@@ -699,9 +833,6 @@ struct ActionRecord<A> {
     ledger: Arc<Ledger>,
     /// 是否本账本的根（外部根 / 续接根 = true；因果后代 = false）。
     root: bool,
-    /// 本记录是否有等待者（外部 dispatch = true）：决定账本归还复用池的时机
-    /// ——等待者归还（它先醒），无等待者由排空者结算后归还。
-    waiter: bool,
 }
 
 /// push 四态结果（锁消融：push/夺权/首 pop 同临界区一次获取）。
@@ -747,26 +878,40 @@ fn admission_context(store_id: u64, wait: bool) -> Admission {
 
 /// 账本复用池取用（issue#40 性能协议：稳态零分配）：池空则新建；取出即复位
 /// （终局 / 计数 / 失败摘要清零）。锁序 queue → pool（与入队同临界区）。
-fn acquire_ledger<S, A, Op>(inner: &Arc<StoreInner<S, A, Op>>) -> Arc<Ledger> {
+///
+/// `waiter` = 新根的归属 token（issue#84）：等待型根由外部等待者归还，非等待
+/// 型根由框架在其终局发布时归还——token 随取用写进账本状态。池内账本必经
+/// **已终局 + 已 claim 归还**（`reset` 的不变式断言兜底）。
+fn acquire_ledger<S, A, Op>(inner: &Arc<StoreInner<S, A, Op>>, waiter: bool) -> Arc<Ledger> {
     let mut pool = lock(&inner.ledger_pool);
     match pool.pop() {
         Some(ledger) => {
-            ledger.reset();
+            ledger.reset(waiter);
             ledger
         }
-        None => Ledger::new(),
+        None => Ledger::new(waiter),
     }
 }
 
-/// 账本归还复用池：首次归还者胜（`mark_released`）——同一账本只可能进池一次
-/// （双重归还 = 两个使用者共用一个账本 = 状态互毁）。
+/// 账本归还复用池（issue#84）：**终局发布是唯一可复用边界**。资格判定与 claim
+/// 在账本锁内完成（`released` 保证恰好一次入池），放锁后才取 `ledger_pool`
+/// 入池——禁同时持账本锁与池锁。
 ///
-/// 归还时机：等待者醒后归还（它持有账本）；无等待者的记录由排空者结算后归还。
-/// 归还后仍可能有排空侧的克隆体在途（它只做引用计数递减，不再触碰账本状态）
-/// ——复用安全。
-fn release_ledger<S, A, Op>(inner: &Arc<StoreInner<S, A, Op>>, ledger: Arc<Ledger>) {
-    if ledger.mark_released() {
-        lock(&inner.ledger_pool).push(ledger);
+/// 归还时机：任何可能使账本终局的转移之后（`finish_root` / `descendant_done`
+/// / `detach_deferred`）都尝试一次——非等待型根的最后一个后代结算时正是终局
+/// 发布点。等待型根不走本路径（其 owner 是外部等待者，见
+/// [`release_ledger_by_waiter`]）。
+fn release_ledger<S, A, Op>(inner: &Arc<StoreInner<S, A, Op>>, ledger: &Arc<Ledger>) {
+    if ledger.claim_release() {
+        lock(&inner.ledger_pool).push(Arc::clone(ledger));
+    }
+}
+
+/// 等待者归还（等待型根的 owner）：`wait()` 返回终局后调用——**消费** `Outcome`
+/// 之后账本才可复用（issue#84：后代结算绝不把等待型根的账本放进池子）。
+fn release_ledger_by_waiter<S, A, Op>(inner: &Arc<StoreInner<S, A, Op>>, ledger: &Arc<Ledger>) {
+    if ledger.waiter_release() {
+        lock(&inner.ledger_pool).push(Arc::clone(ledger));
     }
 }
 
@@ -819,8 +964,9 @@ fn enqueue<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'stat
             (Arc::clone(parent), false)
         }
         None => {
-            // 外部根：自持账本（复用池取用——稳态零分配）。
-            (acquire_ledger(inner), true)
+            // 外部根：自持账本（复用池取用——稳态零分配）。归属 token 随取用
+            // 固化进账本状态（issue#84）：等待型根由等待者归还。
+            (acquire_ledger(inner, admission.wait), true)
         }
     };
     let record = ActionRecord {
@@ -829,7 +975,6 @@ fn enqueue<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'stat
         origin: admission.origin,
         ledger: Arc::clone(&ledger),
         root,
-        waiter: admission.wait,
     };
     queue.push_back(record);
     // AcqRel：RMW 恒见修改序最新值；Acquire 侧同步前任 Release 放旗，Release 侧
@@ -914,8 +1059,9 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
         // 同步等待本 action 的完成边界（外部根；同栈回灌不等待——自死锁）。
         if is_root {
             let outcome = ledger.wait();
-            // 账本归还复用池（等待者持有它——归还时机在此）。
-            release_ledger(&self.inner, ledger);
+            // 等待型根的 owner 在消费终局后归还账本（issue#84：后代结算的归还
+            // 资格被归属 token 排除，不会把它放进池子）。
+            release_ledger_by_waiter(&self.inner, &ledger);
             match outcome {
                 Outcome::Completed => {}
                 Outcome::Deferred => {
@@ -1377,8 +1523,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             reducer_panics: AtomicU64::new(0),
             feedback_exceeded: AtomicU64::new(0),
             feedback_emitted: AtomicU64::new(0),
-            run_ids: Mutex::new(HashSet::new()),
-            cancel_unknown_id: AtomicU64::new(0),
+            run_id_diag: RunIdDiag::new(),
             audit_gate: Arc::new(AtomicBool::new(false)),
             audit: Arc::new(Mutex::new(None)),
             audit_seq: AtomicU64::new(0),
@@ -1751,16 +1896,67 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         self.inner.feedback_exceeded.load(Ordering::SeqCst)
     }
 
-    /// Cancel 寻址校验读数：[`Effect::Cancel`] 引用
-    /// 从未发出的 `Run` id 的累计次数（转发环留痕，只计数不拦截——迟到
-    /// Cancel 是合法时序，见 `StoreInner::cancel_unknown_id` 文档）。
+    /// Cancel 寻址校验读数：**精确**的「Cancel 引用了保留视界内从未发出的
+    /// `Run` id」次数（只计数不拦截——迟到 Cancel 是合法时序，见
+    /// [`Self::classify_run_id`]）。
+    ///
+    /// **口径（issue#62，显式化，不静默改义）**：
+    /// - 只数**诊断启用**（[`Self::enable_run_id_diagnostics`]）且**视界完整、
+    ///   从未发生饱和驱逐**时的 miss。默认关闭 ⇒ 本读数恒 0；
+    /// - 一旦发生驱逐（[`Self::run_id_evicted_count`] > 0），之后的 miss 可能是
+    ///   合法迟到的 Cancel ⇒ 本计数**停止增长**（不再声称精确），改由三态分类的
+    ///   [`RunIdClass::NotTracked`] 承载不可判定的那部分；
+    /// - 视界残缺（诊断启用晚于首个准入）时同样不计数。
     ///
     /// 非零读数 = id 纪律漂移的直接证据：Cancel 打错数字、多效果域撞 id 后
     /// 引用了他域 id、或 Cancel 早于 Run 的时序 bug。持续上升的读数需在
-    /// reducer 侧修 id 指派（唯一性纪律见 [`EffectId`]
-    /// 文档）。
+    /// reducer 侧修 id 指派（唯一性纪律见 [`EffectId`] 文档）。
     pub fn cancel_unknown_id(&self) -> u64 {
-        self.inner.cancel_unknown_id.load(Ordering::SeqCst)
+        self.inner.run_id_diag.cancel_unknown_count()
+    }
+
+    /// 启用历史 Run-ID 诊断（issue#62）：**默认关闭**，本方法是唯一开关。
+    ///
+    /// - 窄口径 runtime 诊断设置——不是通用策略/配置框架；`Run`/`Cancel` 的
+    ///   转发语义与是否启用无关（诊断只观测）。
+    /// - `capacity`：有界最近 ID 集容量（`0` 视作 1）。**数值默认值归 #56
+    ///   拍板**：拿不准时用 [`DEFAULT_RUN_ID_TRACKING_CAPACITY`]。
+    /// - **必须在首个准入之前调用**：晚于任何已准入 action 启用 ⇒ 早先的 `Run`
+    ///   未被登记，视界残缺 ⇒ miss 只能判 [`RunIdClass::NotTracked`]（保守方向：
+    ///   不把可能存在的 id 判成确定未知）。
+    /// - 幂等：已启用时再调用不改动（容量与视界在首次启用时固定）。
+    /// - 禁用路径零锁零分配（`Run` 效果不登记、不分配；见
+    ///   `tests/run_id_diagnostics.rs` 的零分配锚）。
+    pub fn enable_run_id_diagnostics(&mut self, capacity: usize) {
+        let first_admission_seen = self.inner.next_seq.load(Ordering::SeqCst) > 0;
+        self.inner
+            .run_id_diag
+            .enable(capacity, !first_admission_seen);
+    }
+
+    /// Run-ID 三态分类读数（issue#62）：`known` / `definitely-unknown`（保留
+    /// 视界内确定未见过）/ `not-tracked`（未启用、视界残缺或已发生驱逐——
+    /// **被驱逐的 id 绝不判成确定未知**）。诊断默认关闭 ⇒ 恒
+    /// [`RunIdClass::NotTracked`]。
+    pub fn classify_run_id(&self, id: u64) -> RunIdClass {
+        self.inner.run_id_diag.classify(id)
+    }
+
+    /// 已跟踪的最近 Run-ID 数（诊断未启用 = 0）。
+    pub fn run_id_tracked_count(&self) -> usize {
+        self.inner.run_id_diag.tracked_count()
+    }
+
+    /// 配置的跟踪容量（诊断未启用 = 0；默认值归 #56 拍板，见
+    /// [`DEFAULT_RUN_ID_TRACKING_CAPACITY`]）。
+    pub fn run_id_tracking_capacity(&self) -> usize {
+        self.inner.run_id_diag.capacity()
+    }
+
+    /// 饱和驱逐计数：每次容量满驱逐最旧 +1。> 0 ⇒ 保留视界已不全，miss 只能
+    /// 判 [`RunIdClass::NotTracked`]（旧 [`Self::cancel_unknown_id`] 同时停止增长）。
+    pub fn run_id_evicted_count(&self) -> u64 {
+        self.inner.run_id_diag.evicted_count()
     }
 
     /// Emit 回灌累计重入计数（crate 内读侧：testing 域 TestStore 归因用，
@@ -2249,8 +2445,6 @@ struct CurrentMeta {
     ledger: Arc<Ledger>,
     /// 是否账本的根。
     root: bool,
-    /// 本记录是否有等待者（决定账本归还时机）。
-    waiter: bool,
 }
 
 impl<S, A, Op> DrainGuard<'_, S, A, Op> {
@@ -2285,10 +2479,8 @@ impl<S, A, Op> Drop for DrainGuard<'_, S, A, Op> {
             } else {
                 meta.ledger.descendant_done(Some(failure));
             }
-            // 无等待者的根账本归还复用池（等待者的由等待者归还）。
-            if meta.root && !meta.waiter {
-                release_ledger(self.inner, Arc::clone(&meta.ledger));
-            }
+            // 终局发布才是可复用边界：资格由账本判定（等待型根/仍有后代 ⇒ 不入池）。
+            release_ledger(self.inner, &meta.ledger);
         }
         // 2. 队列残留：整批摘下并结算失败（不留在队列里无主，也不重放——
         //    被中断的 action 可能已有部分外部副作用，重放会重复副作用）。
@@ -2319,9 +2511,7 @@ impl<S, A, Op> Drop for DrainGuard<'_, S, A, Op> {
             } else {
                 record.ledger.descendant_done(Some(failure));
             }
-            if record.root && !record.waiter {
-                release_ledger(self.inner, Arc::clone(&record.ledger));
-            }
+            release_ledger(self.inner, &record.ledger);
         }
     }
 }
@@ -2392,7 +2582,11 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
             // 不留在主队列——留在主队列会让它顶在队首把外部流量反复顶住
             // （饿死健康流量），且每任排空都要重新脱钩（链停不下来）。
             // 停放 = 保留序号与载荷（零丢失）+ 留痕，等待显式恢复。
+            let origin_ledger = Arc::clone(&record.ledger);
             let deferred = detach_deferred(record);
+            // 脱钩把**原账本**以 Deferred 收口：它可能在此刻终局 ⇒ 按同一归还
+            // 规则尝试一次（续接账本是独立账本，不随原账本入池——issue#84）。
+            release_ledger(inner, &origin_ledger);
             lock(&inner.deferred_queue).push_back(deferred);
             inner.feedback_exceeded.fetch_add(1, Ordering::SeqCst);
             // 取证时间线的病理终点（R1-2）：预算止步以事件收尾，环结构可重建。
@@ -2419,7 +2613,6 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
             seq: record.seq,
             ledger: Arc::clone(&record.ledger),
             root: record.root,
-            waiter: record.waiter,
         });
         guard.phase = Phase::Reducing;
         guard.committed = false;
@@ -2552,21 +2745,17 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
             record.ledger.descendant_done(None);
         }
         guard.current = None;
-        // 无等待者的根账本在此归还复用池（等待者的账本由等待者归还）。
-        if record.root && !record.waiter {
-            release_ledger(inner, Arc::clone(&record.ledger));
-        }
+        // 每个可能使账本终局的转移后都尝试归还：非等待型根的**最后一个后代**
+        // 结算即终局发布点（issue#84——终局发布是唯一可复用边界）。
+        release_ledger(inner, &record.ledger);
     }
 }
 
-/// 回灌预算止步的脱钩续接（issue#40）：把被脱钩的记录迁到**新**账本（续接
-/// 账本），原账本记「未完成」（终局 `Deferred`）并减后代计数——原账本的终局
-/// 一经发布不可变，续接记录的后续结果不得改写它。
-///
-/// 续接记录保留序号、载荷与 FIFO 位（队尾重排让位外部流量）。
 fn detach_deferred<A: Send + 'static>(mut record: ActionRecord<A>) -> ActionRecord<A> {
     let origin_ledger = Arc::clone(&record.ledger);
-    let continuation = Ledger::new();
+    // 续接账本是**独立**账本（非等待型根：归属框架，终局发布时归还）——原账本
+    // 的终局一经发布不可变，续接记录的后续结果不得改写它（issue#84 ⑥）。
+    let continuation = Ledger::new(false);
     origin_ledger.detach_deferred(record.root);
     record.ledger = continuation;
     record.root = true;
@@ -2676,7 +2865,6 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                     origin: ActionOrigin::Feedback(feedback_depth + 1),
                     ledger: Arc::clone(parent),
                     root: false,
-                    waiter: false,
                 });
                 drop(queue);
                 // 回灌入队与外部入队同一事件节点（深度链 = 环结构重建键）
@@ -2694,24 +2882,18 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                 // 而 Emit 已在上方分支分流）。
                 let (effect_kind, effect_id) = EffectKind::of(&effect)
                     .expect("非 Emit 效果必经解释器（EffectKind::of 仅对 Emit 返回 None）");
-                // Cancel 寻址校验（fail-visible 留痕，不改转发语义）：
-                // Run 发出即登记 id；Cancel 引用未见过的 id 只计数不拦截——
-                // 拦截（panic/丢弃）会把「Cancel 语义由解释器自证」的契约
-                // （EffectRuntime 责任边界注）改写成核心语义：迟到 Cancel
-                // （Run 已自然完成）是合法时序，核心无生命周期汇报面，无法
-                // 区分「迟到」与「漂移」。读数 = SyncStore::cancel_unknown_id。
-                match &effect {
-                    Effect::Run { id, .. } => {
-                        lock(&inner.run_ids).insert(id.get());
+                // 历史 Run-ID 诊断（issue#62，**默认关闭**）：门闸不成立时只花
+                // 一次原子 load——不登记、不分配、不取锁；Run/Cancel 的转发
+                // 语义与诊断是否启用无关（诊断只观测，不改解释器责任边界：
+                // Cancel 语义由解释器自证，迟到 Cancel 是合法时序）。
+                if inner.run_id_diag.is_enabled() {
+                    match &effect {
+                        Effect::Run { id, .. } => inner.run_id_diag.note_run(id.get()),
+                        Effect::Cancel { id } => inner.run_id_diag.note_cancel(id.get()),
+                        // Effect 词表 non_exhaustive（跨 crate match 须通配）：
+                        // 未知新变体与寻址校验无关，原样落下方解释器转发
+                        _ => {}
                     }
-                    // guard 形态（clippy collapsible_match）：Cancel 命中已见
-                    // id 时落 `_`，与未知新变体同路——均无需留痕
-                    Effect::Cancel { id } if !lock(&inner.run_ids).contains(&id.get()) => {
-                        inner.cancel_unknown_id.fetch_add(1, Ordering::Relaxed);
-                    }
-                    // Effect 词表 non_exhaustive（跨 crate match 须通配）：
-                    // 未知新变体与寻址校验无关，原样落下方解释器转发
-                    _ => {}
                 }
                 // 解释器 panic 毒化 runtime 锁，此后每个产效果 dispatch
                 // 恒 panic（半砖：reduce 照常执行、状态持续前进，效果路径
@@ -3022,14 +3204,13 @@ mod tests {
             // 白盒注入：直推队列须带来源标签（回灌深度预算的入队纪律）
             // 白盒注入：直推队列须带完整记录（序号 + 账本 + 来源标签——回灌深度
             // 预算与回执结算的入队纪律）
-            let ledger = Ledger::new();
+            let ledger = Ledger::new(false);
             lock(&store.inner.queue).push_back(ActionRecord {
                 seq: store.inner.next_seq.fetch_add(1, Ordering::SeqCst),
                 action: Tick::Tick,
                 origin: ActionOrigin::External,
                 ledger,
                 root: true,
-                waiter: false,
             });
         }
         store.close();
@@ -3241,5 +3422,206 @@ mod tests {
         assert_eq!(store.subscriber_count(), 1, "毒订阅者已摘除");
         store.dispatch(Tick::Tick); // 健康者照常通知
         assert_eq!(store.subscriber_panics(), 1, "已摘除者不得重复计数");
+    }
+
+    /// 两段闸（白盒编排用）：进入点 + 放行点（确定性握手，禁 sleep 竞速）。
+    struct PoolGate {
+        entered: (Mutex<bool>, Condvar),
+        release: (Mutex<bool>, Condvar),
+    }
+
+    impl PoolGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: (Mutex::new(false), Condvar::new()),
+                release: (Mutex::new(false), Condvar::new()),
+            })
+        }
+
+        fn mark_entered(&self) {
+            let mut g = self.entered.0.lock().unwrap();
+            *g = true;
+            self.entered.1.notify_all();
+        }
+
+        fn wait_entered(&self) {
+            let mut g = self.entered.0.lock().unwrap();
+            while !*g {
+                g = self.entered.1.wait(g).unwrap();
+            }
+        }
+
+        fn open(&self) {
+            let mut g = self.release.0.lock().unwrap();
+            *g = true;
+            self.release.1.notify_all();
+        }
+
+        fn wait_release(&self) {
+            let mut g = self.release.0.lock().unwrap();
+            while !*g {
+                g = self.release.1.wait(g).unwrap();
+            }
+        }
+    }
+
+    enum PoolAct {
+        Hold,
+        Root,
+        Child,
+    }
+
+    struct PoolFixture {
+        hold: Arc<PoolGate>,
+        child: Arc<PoolGate>,
+    }
+
+    impl Reducer for PoolFixture {
+        type State = u32;
+        type Action = PoolAct;
+        type Op = Infallible;
+
+        fn initial(&self) -> u32 {
+            0
+        }
+
+        fn reduce(&self, s: &u32, a: PoolAct, out: &mut EffectBuf<PoolAct, Infallible>) -> u32 {
+            match a {
+                PoolAct::Hold => {
+                    self.hold.mark_entered();
+                    self.hold.wait_release();
+                    s + 1
+                }
+                PoolAct::Root => {
+                    out.push(Effect::Emit(PoolAct::Child));
+                    s + 1
+                }
+                PoolAct::Child => {
+                    self.child.mark_entered();
+                    self.child.wait_release();
+                    s + 1
+                }
+            }
+        }
+    }
+
+    fn pooled(store: &SyncStore<u32, PoolAct, Infallible>) -> Vec<Arc<Ledger>> {
+        lock(&store.inner.ledger_pool).clone()
+    }
+
+    /// issue#84（①）：非等待型根的账本在**终局发布前**绝不进复用池——最后一个
+    /// 后代结算 ⇒ 终局发布 ⇒ **恰好一次**归还，且池内账本必是终局态（`reset`
+    /// 的不变式断言兜底：活账本被复位即在 debug 构建直接咬住）。
+    #[test]
+    fn non_waiting_root_ledger_pooled_only_after_terminal() {
+        let hold = PoolGate::new();
+        let child = PoolGate::new();
+        let store = Arc::new(SyncStore::new(
+            PoolFixture {
+                hold: Arc::clone(&hold),
+                child: Arc::clone(&child),
+            },
+            skeleton::NoFx,
+        ));
+
+        // A：等待型根持有排空权，并闸在 reducer 内（其账本由 A 在消费终局后
+        // 归还 ⇒ 断言窗内池只可能来自 Root）。
+        let store_a = Arc::clone(&store);
+        let handle_a = std::thread::spawn(move || store_a.dispatch(PoolAct::Hold));
+        hold.wait_entered();
+
+        // 非等待型根：只入队（其后代在途期间正是旧实现入池的窗口）。
+        assert_eq!(
+            store.try_dispatch(PoolAct::Root),
+            AdmissionOutcome::Accepted,
+            "前置：非等待型根必须被接受"
+        );
+        hold.open();
+        child.wait_entered();
+
+        // Root 已结算（root_done + 1 个在途后代）⇒ 不得入池。
+        assert!(
+            pooled(&store).is_empty(),
+            "终局发布前账本不得进复用池（在途后代会把结算记到被复用的账本上）"
+        );
+
+        child.open();
+        handle_a.join().expect("排空者不得 panic");
+
+        // 每个账本恰好一次入池：Hold 的根账本 + Root 的根账本 = 2（重复 push 会更多）。
+        let ledgers = pooled(&store);
+        assert_eq!(ledgers.len(), 2, "每个终局的非等待型根账本恰好一次归还");
+        assert!(
+            ledgers.iter().all(|l| l.terminal_published()),
+            "池内账本必须已发布终局"
+        );
+    }
+
+    /// issue#84（④ unwind）：排空展开路径不得把非终局账本入池——当前记录在
+    /// 解释器 panic 时仍有排队后代（`outstanding == 1`），摘队 sweep 结算后才
+    /// 终局；池内只能有终局账本。
+    #[test]
+    fn unwind_path_pools_only_terminal_ledgers() {
+        enum UnwindAct {
+            Root,
+            Child,
+        }
+
+        enum UnwindOp {
+            Tick,
+        }
+
+        struct PanicFx;
+
+        impl EffectRuntime<UnwindAct, UnwindOp> for PanicFx {
+            fn run(&mut self, effect: Effect<UnwindAct, UnwindOp>, _: &ActionSender<UnwindAct>) {
+                if let Effect::Run { .. } = effect {
+                    panic!("interpreter detonation (unwind path)");
+                }
+            }
+        }
+
+        struct UnwindFixture;
+
+        impl Reducer for UnwindFixture {
+            type State = u32;
+            type Action = UnwindAct;
+            type Op = UnwindOp;
+
+            fn initial(&self) -> u32 {
+                0
+            }
+
+            fn reduce(
+                &self,
+                s: &u32,
+                a: UnwindAct,
+                out: &mut EffectBuf<UnwindAct, UnwindOp>,
+            ) -> u32 {
+                match a {
+                    UnwindAct::Root => {
+                        // 先产出回灌后代（入队后 outstanding=1），再让解释器 panic。
+                        out.push(Effect::Emit(UnwindAct::Child));
+                        out.push(Effect::Run {
+                            id: EffectId::new(1),
+                            op: UnwindOp::Tick,
+                        });
+                        s + 1
+                    }
+                    UnwindAct::Child => s + 1,
+                }
+            }
+        }
+
+        let store = SyncStore::new(UnwindFixture, PanicFx);
+        let outcome = catch_unwind(AssertUnwindSafe(|| store.try_dispatch(UnwindAct::Root)));
+        assert!(outcome.is_err(), "解释器 panic 必须照常上浮（禁吞）");
+
+        let ledgers = lock(&store.inner.ledger_pool).clone();
+        assert!(!ledgers.is_empty(), "终局账本必须被归还（不得静默漏归还）");
+        assert!(
+            ledgers.iter().all(|l| l.terminal_published()),
+            "展开路径不得把非终局账本放进复用池"
+        );
     }
 }

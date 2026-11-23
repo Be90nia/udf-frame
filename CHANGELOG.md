@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+### Fixed(runtime): 完成账本在仍有在途后代时被归还复用池（收据记账错配）,2026-11-23;GitHub issue#84)
+- **缺陷**:`release_ledger` 只按「根 && 非等待者」归还，不检查账本是否终局 ⇒ 非等待型根（`try_dispatch` / `ActionSender::dispatch`）在 `Effect::Emit` 后代仍排队（`outstanding > 0`）时把账本推进复用池；并发外部准入 pop 后 `reset` 清掉这些后代的计数 ⇒ **另一个根可能提前发布终局，或携带别的 action 的失败**（收据正确性缺陷，非仅池卫生）。
+- **修复（维护者定稿：终局门控）**:账本侧 `claim_release` 四查（未 released / 非等待型根 / **终局已发布** / `outstanding == 0`）；**每个可能使账本终局的转移**（`finish_root` / 最后一个 `descendant_done` / `detach_deferred`）与**三条调用面**（正常结算 / 当前记录 unwind / 摘队 sweep）都走同一 claim——旧的「无条件按根归还」判据与 `ActionRecord/CurrentMeta.waiter` 字段**整体删除**；入池在**账本锁外**（claim 锁内、push 锁外，queue→ledger 序不变）。
+- **owner 资格显式化**：等待型根的 owner 是外部等待者（`wait()` 消费 `Outcome` 后 `waiter_release`）；非等待型根由因果链最后一次转移归还——**不由任何后代记录的 `waiter` 推断**。
+- **不变式硬化**：`reset` 在 debug 构建断言「终局 + `outstanding == 0` + 已 claim 归还」；后代计数递减前断言为正（**不再用 `saturating_sub` 掩盖**重复/迟到完成）。
+- **测试**：新 `skeleton-infra/tests/ledger_reuse_ownership.rs`（4 例，确定性闸门禁 sleep）：后代被闸住时账本不在池中且第二根提前发布终局=红 / 后代失败归属不串根 / 当前记录与摘队两条 unwind 路径 / 等待型根在 waiter 消费前不可复用 / deferred detach 后旧账本按终局结算。**修复前真红**（`left: 0, right: 1` 提前返回 + 错 `phase`），修复后 4/4 绿。
+
+### Added(runtime): 历史 Run-ID 诊断改为窄口径 opt-in + 三态分类（默认关闭）,2026-11-23;GitHub issue#62)
+- **策略（维护者定稿）**：历史 Run-ID 诊断**默认关闭**；`Run`/`Cancel` 转发路径**不变、不依赖**诊断是否启用。
+- **新公共面**（窄口径，非通用策略框架）：`SyncStore::enable_run_id_diagnostics(&mut self, capacity)`、`classify_run_id(&self, EffectId) -> RunIdClass`、`run_id_tracked_count()` / `run_id_tracking_capacity()` / `run_id_evicted_count()`、常量 `DEFAULT_RUN_ID_TRACKING_CAPACITY`（容量**数值归资源表 #56 拍板**，此处为保守默认）。
+- **三态**：`Known` / `DefinitelyUnknown`（**仅视界完整且无驱逐**）/ `NotTracked`（未启用 / 饱和 / 已驱逐）——**被驱逐的 id 绝不判 `DefinitelyUnknown`**。
+- **旧计数语义显式化（不静默改义）**：`cancel_unknown_id` 现在只数「启用 + 视界完整 + 无驱逐」时的精确 miss；**默认关闭恒 0**，驱逐/饱和后停止增长（此后未知分类走三态读数）。
+- **禁用路径零成本**：门闸前只有一次 `OnceLock` load，无 per-Run 锁、无分配——由 `run_id_diagnostics.rs::disabled_path_registers_nothing_and_allocates_nothing`（32 次新 id 的 `Run` ⇒ 分配事件 0、`tracked_count == 0`）钉住。
+- **测试**：新 `skeleton-infra/tests/run_id_diagnostics.rs`（6 例：默认关闭不影响转发 / 视界内精确 / 饱和不误判 / 迟到启用视界不完整 / 分配计数锚）。既有 `api_polish` 与 `counter_concurrency` 各加一行 opt-in（**原断言不动**，语义变为「启用后仍精确」）。默认启用变异 ⇒ 2 例红（有鉴别力）。
+- **行为变更（需知）**：`dispatch_per_beat/cancel_unknown_id` bench 臂现在测的是**门闸-only 路径**（不再有查表 + miss 留痕），跨该日期的性能基线不可直接对比。
+
 ### Fixed(fx): `CancelSource` 实现 `Clone`——接线后宿主仍可触发取消,2026-11-23;GitHub issue#56（Stage B G1）
 - **缺口（第二消费方实测）**：`CancelSource` 非 `Clone` 且 `FxScope::with_source(src)` **按值取走** ⇒ 宿主外接取消源后**再没有任何句柄能触发取消**（`source.clone()` → E0599），只剩「接线前已取消」的粘性用例可测。
 - **修复**：`#[derive(Clone)]`（底层 `watch::Sender` 本身可 Clone）。**Clone = 同一取消态的第二句柄，不是独立源**——所有句柄共享同一 watch 值，任一句柄 `cancel()` 全体可见；取消幂等、单向（`false → true`，不回落；与 #68 的无接收者粘性叠加）。

@@ -117,10 +117,23 @@ where S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
     pub fn subscriptions_after_close(&self) -> u64;
     pub fn local_missed_notifications(&self) -> u64;
     pub fn audit_preempted(&self) -> u64;
+    /// issue#62：**仅 opt-in 且视界完整、无驱逐**时才计数的精确 miss；默认关闭恒 0，
+    /// 驱逐/饱和后停止增长（语义显式化，不静默改义）。
     pub fn cancel_unknown_id(&self) -> u64;
     pub fn runtime_panic_count(&self) -> u64;
     pub fn reducer_panic_count(&self) -> u64;
     pub fn feedback_budget_exceeded(&self) -> u64;
+
+    // ── issue#62：历史 Run-ID 诊断（默认关闭，窄口径 opt-in）─────────────
+    pub const DEFAULT_RUN_ID_TRACKING_CAPACITY: usize;   // 保守默认（数值待 #56 拍板）
+    /// 启用有界最近 ID 集 + 三态分类（`&mut self`：构造期/装配期一次性设置）。
+    /// 关闭路径零 per-Run 锁与分配（门闸前仅一次 `OnceLock` load）。
+    pub fn enable_run_id_diagnostics(&mut self, capacity: usize);
+    /// 三态：`Known` / `DefinitelyUnknown`（仅视界内）/ `NotTracked`（未启用/饱和/已驱逐）。
+    pub fn classify_run_id(&self, id: EffectId) -> RunIdClass;
+    pub fn run_id_tracked_count(&self) -> usize;
+    pub fn run_id_tracking_capacity(&self) -> usize;
+    pub fn run_id_evicted_count(&self) -> u64;
     pub fn subscribe_events(&self, capacity: usize,
         on_event: impl FnMut(&AuditEvent) + Send + 'static) -> AuditTicket;
     pub fn take_events(&self) -> Vec<AuditEvent>;
@@ -167,6 +180,8 @@ pub enum AdmissionOutcome {
 
 **停机等待（#64）**：`close()` 是 **best-effort**——静默态（本调用夺得排空租约）同步排至 idle；**竞争态**（他线程已持租约）只完成交接即返，返回时排空可能仍在进行。要「等静止」用 `close_wait()` / `close_wait_timeout(d)`，结果 `Drained` / `TimedOutStillRunning` / `Reentrant`（同栈重入不自等）。谓词 = 租约释放 + 活跃队列空，**不计 deferred 停放记录**（#49 口径）；timeout 只界等待、不取消同步 reducer。宿主要真屏障（flush/drop 依赖前）用此等待面，勿依赖 `close()` 的返回时机。
 
+**完成账本的复用边界（#84）**：账本进复用池**只在终局发布（`root_done && outstanding == 0`）且指定 owner 让渡之后**——非等待型根（`try_dispatch` / `ActionSender::dispatch`）的 owner 是它的**因果链**：`finish_root` / 最后一个 `descendant_done` / `detach_deferred` 三个转移点各尝试一次 claim（恰好一次入池）；等待型根的 owner 是**外部等待者**，它在 `wait()` 克隆并返回 `Outcome` 之后才归还。`Arc<Ledger>` 克隆可随在途后代存活到全部结算；`reset` 只在「终局 + `outstanding == 0` + 已 claim 归还」三不变式下执行（debug 构建断言兜底）。⇒ **不同根的收据记账永不交叉**（此前可提前入池并被 `reset` 擦掉在途后代计数）。
+
 **终态报告与保留后缀（#61）**：`close()` **不是效果 flush**，**不承诺**终态 pending 效果快照。要「闭门 + 等静止 + 一次拿到终态报告」用 `SyncStore::close_wait_with_report(d)`——返回和类型，**只有 `Drained` 携带快照**：`Drained(CloseReport)` / `TimedOutStillRunning` / `Reentrant`（超时与重入**不带快照**，防调用方误当终态；`Reentrant` 时准入**已关**，闭门先于重入判定）。报告四个 population **分列、禁合并成一个 pending 计数**：`queued_actions`（`Drained` 恒 0）、`deferred_actions`（#49 停放记录，**不影响 `Drained` 判定**）、`pending_effects`（已提交未转发的效果后缀：总条数 + 段级身份 `origin_action_seq` / `next_effect_index` / 条数）、`interrupted_effect`（最近一次中断的归属：`dispatch_action_seq` / `origin_action_seq` / `effect_index` / 种类 / `EffectId`，与 #48 词汇同源）。报告**只读**——后缀在报告后**仍被 store 持有**、可重复报告检视；唯一解决面是 `discard_pending_effects()`（显式、返回精确条数与段身份；`None` = 未关闭或未静止，**什么都没丢**）。**close 与 discard 都不跑宿主 `EffectRuntime` 代码**（含 `Effect::Emit`：丢弃不回灌；载荷析构在锁外）。**不做 post-close 转发**：转发需要独立的 drain-to-idle continuation epoch 与回执归属，保留为独立规格；也**不提供** one-effect pop。与 #64 共用同一谓词与同一 Condvar（不复制等待机器），差别只有「闭门先于重入判定」与「`Drained` 后才快照」。
 
 ### 订阅双档
@@ -185,7 +200,7 @@ pub enum AdmissionOutcome {
 | `try_subscribe` | 闭门后登记成功但永不触发 | 显式 `Err(StoreClosed)`（旧 `subscribe` 保留，闭门登记仍计入 `subscriptions_after_close`） |
 | `local_missed_notifications` | 跨线程 dispatch 时本地订阅零触达 | 累计计数（读侧；命中路径零分支零开销） |
 | `audit_preempted` | 审计事件流二次订阅静默覆盖前订 | 累计计数（`subscribe_events` 覆盖旧槽前留痕） |
-| `cancel_unknown_id` | `Effect::Cancel` 指向从未发出的 `Run` id | 累计计数（不拦截——迟到 Cancel 属合法时序，核心无生命周期汇报面无法区分漂移；id 唯一性由采用方纪律保证） |
+| `cancel_unknown_id` | `Effect::Cancel` 指向从未发出的 `Run` id | 累计计数，但**语义已显式化（issue#62）**：仅当 opt-in 启用诊断且视界完整、无驱逐时才是精确 miss；**默认关闭恒 0**，饱和/驱逐后**停止增长**（此后未知分类走三态 `NotTracked`，绝不判 `DefinitelyUnknown`）。转发路径不依赖该诊断。 |
 | `Combine::route_misses` | `combine` 路由 miss 静默吞 action | 累计计数（分片装配一次持有，读侧无锁无原子量之外成本） |
 
 ### Panic 契约
@@ -383,7 +398,7 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 |---|---|---|---|---|---|---|
 | 1 | 活跃注册数上限 | `std_ext::scheduler`（#58） | 无界（默认） | `Scheduler::set_capacity(cap)`；默认**无界** | 拒绝：`register` 返回 typed `SchedulerFull`（任务未入堆，不静默丢） | 显式 `set_capacity(n)`；调低到当前活跃数以下不驱逐既有任务 |
 | 2 | watchdog 执行数上限 | `shutdown::ShutdownCoordinator`（#54） | 无界（`None`，默认） | `with_max_watchdogs(n)`；默认**不限** | 拒绝启动：该组件记 `Failed{reason: watchdog capacity exhausted}`（**不**内联跑闭包、不静默） | 显式 `with_max_watchdogs(n)`；`live_watchdogs()` / `peak_watchdogs()` 读数 |
-| 3 | 历史 Run-ID 诊断注册表 | `runtime`（#62） | —（见右） | 现状 = 追踪全开、历史无界；**目标 = opt-in 默认关**（#62 落地后更新本行数值与字段名） | 饱和/驱逐 ⇒ 三态判 `not-tracked`（**绝不**判 `definitely-unknown`） | 窄口径 runtime 诊断设置 opt-in；容量参数化（数值待 #56） |
+| 3 | 历史 Run-ID 诊断注册表 | `runtime`（#62） | 不适用（关 = 不登记） | `enable_run_id_diagnostics(capacity)`，**默认关闭**（不登记、零 per-Run 锁与分配）；启用后容量 = `DEFAULT_RUN_ID_TRACKING_CAPACITY = 1024`（**数值待本表拍板**） | 饱和/驱逐 ⇒ 三态判 `not-tracked`（**绝不**判 `definitely-unknown`）；`cancel_unknown_id` 驱逐后停止增长 | 窄口径 opt-in；`run_id_tracked_count` / `run_id_tracking_capacity` / `run_id_evicted_count` 可观测 |
 | 4 | 审计环容量（权威历史） | `SyncStore::subscribe_events` / `PoolBase` | 视作 `1`（调用方给 `0` 时取 `max(1)`） | `SyncStore`：**调用方显式给**；池域：`AUDIT_RING_DEFAULT_CAP = 1024` | 溢出丢最旧（`seq` 空洞 = 显式证据；`take_events` 取走不留空洞） | 调大 `subscribe_events(cap, ..)` / 池域容量；完整性靠「权威历史」不靠实时回调 |
 | 5 | 审计待投递 FIFO | `SyncStore` / 池域（#65/#75） | —（固定） | `AUDIT_PENDING_CAP = 1024`（**无配置面**，两处同值） | 溢出丢最旧 + **独立投递丢弃计数**（`audit_delivery_drops()`，与环溢出分账） | 消费慢 ⇒ 改用 `take_events` 取权威历史 |
 | 6 | 回灌深度预算 | `runtime` 排空环 | —（固定） | `FEEDBACK_DEPTH_BUDGET = 64`（单次 dispatch 连续回灌链深度） | 停排 + `feedback_budget_exceeded` 计数；触发点 action **原值退回队尾**（零丢失，非 panic 非静默） | `Effect::Emit` 回灌受限 ⇒ 改用托管任务（`FxScope`）或显式分帧 |

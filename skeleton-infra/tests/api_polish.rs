@@ -310,7 +310,8 @@ fn cancel_unknown_id_counts_dangling_addressing() {
         fn run(&mut self, _: Effect<Msg, ()>, _: &ActionSender<Msg>) {}
     }
 
-    let store = Store::new(RunCancelFeature, Sink);
+    let mut store = Store::new(RunCancelFeature, Sink);
+    store.enable_run_id_diagnostics(skeleton_infra::runtime::DEFAULT_RUN_ID_TRACKING_CAPACITY);
     assert_eq!(store.cancel_unknown_id(), 0);
     store.dispatch(Msg::Cancel9);
     assert_eq!(

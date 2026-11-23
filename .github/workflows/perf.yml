@@ -268,6 +268,9 @@ jobs:
               "effect_steady_state",
               "effect_batch_forward/k1",
               "dispatch_per_beat/hit",
+              # ⚠️ 2026-11-23（issue#62）：该臂语义已变——历史 Run-ID 诊断默认
+              # 关闭 ⇒ 现在测「Cancel 投递的门闸-only 路径」。ID 保留以延续曲线，
+              # 但**跨该日期的基线不可直接对比**（闸的判缺能力不受影响）。
               "dispatch_per_beat/cancel_unknown_id",
               "notify_dispatch/no_subscriber",
               "notify_dispatch/one_subscriber",
