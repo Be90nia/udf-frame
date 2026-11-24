@@ -11,6 +11,7 @@
 ### Fix(tests): OS 截止线程可取消并确保回收
 - `bounded` 的独立 OS 截止线程由不可取消的 10s sleep 改为 OS 截止时间 + `park_timeout`；目标 future 提前完成时 RAII guard 设置取消信标、unpark 并 join，避免遗留睡眠线程。
 - 截止线程按绝对截止时间循环，容忍 `park_timeout` 虚假唤醒；新增回归测试验证提前 drop 能在远早于 10s 的时间内完成回收。
+- 将限流器「睡眠不持锁」测试改为可控虚拟 Sleeper + 显式闸门，去掉 50ms 真实时间窗口与 100 次探测跨过回填时刻的竞态。
 - 明确边界：若同步自旋占死整个 current-thread runtime 线程，内部 select 仍无法运行，CI job timeout 继续作为外层进程护栏。
 
 
