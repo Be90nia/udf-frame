@@ -26,4 +26,6 @@ tokio = ["dep:tokio", "udf-skeleton-infra/tokio"]
 udf-skeleton = { path = "../../../skeleton" }
 # compose 只为 Fragment 组合（combine!/combine），纯 std 零 tokio 增量。
 udf-skeleton-infra = { path = "../../../skeleton-infra", features = ["compose"] }
-tokio = { version = "1", features = ["rt", "macros", "sync"], optional = true }
+# rt-multi-thread：multi-thread profile（issue#97）直接依赖该 feature——测试自己
+# 选 runtime flavor，UDF 侧不创建 runtime；不依赖 skeleton-infra 的 feature 并集。
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"], optional = true }
