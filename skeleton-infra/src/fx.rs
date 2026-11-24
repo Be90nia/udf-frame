@@ -1159,37 +1159,57 @@ impl FxScope {
     ///
     /// 锁内禁 await：`try_join_next` 同步不挂起，临界区保持短（与 spawn 同口径）。
     ///
-    /// 防御分支：包装体自带 catch_unwind，panic 理论到不了 JoinSet 层；若出现
-    /// （包装被绕过/未来改动破坏前提），按载荷映射 [`TaskError::Panicked`] 显式
-    /// 上报，禁静默丢条目。
+    /// **锁边界（issue#91）**：`self.set` 锁内只把条目**搬出**集合（`JoinError` 原样
+    /// 带出，不归一）；`into_panic` / `panic_message` / downcast / 字符串分配，以及
+    /// panic payload 的最终 Drop 全在锁外。payload 是宿主提供的任意 `Any + Send`，
+    /// 其 Drop 可重入本 scope（持锁则自锁）或自身 panic（持锁则毒化集合锁）。
+    ///
+    /// 防御分支：包装体自带 catch_unwind，poll 期 panic 理论到不了 JoinSet 层；若
+    /// 出现（包装被绕过 / panic 发生在 future 自身的 Drop），按载荷映射
+    /// [`TaskError::Panicked`] 显式上报，禁静默丢条目。
     pub fn try_reap(&self) -> Vec<TaskError> {
-        let mut set = lock(&self.set);
         let mut reaped = Vec::new();
-        let mut harvested = 0usize;
-        while let Some(outcome) = set.try_join_next() {
-            harvested += 1;
-            match outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(te)) => reaped.push(te),
-                Err(je) if je.is_cancelled() => reaped.push(TaskError::Cancelled),
-                Err(je) => reaped.push(TaskError::Panicked(panic_message(je.into_panic()))),
+        // `JoinError` 承载宿主 payload：只搬出，不在此析构（见「锁边界」段）。
+        let mut join_failures = Vec::new();
+        {
+            let mut set = lock(&self.set);
+            let mut harvested = 0usize;
+            while let Some(outcome) = set.try_join_next() {
+                harvested += 1;
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(te)) => reaped.push(te),
+                    Err(je) => join_failures.push(je),
+                }
+            }
+            // 收割记账：条目出集合 ⇒ 保留数与未收割数各减一（锁序 set → caps）。
+            // 记账留在 `set` 锁内：与 `close_and_take` 的「取走集合 + 记账归零」互斥，
+            // 否则「先取集、后减账」的窗会让归零之后的减法下溢（低估 ⇒ 准入超上界）。
+            // 锁内只做短同步账目变更，不触碰任何宿主载荷。
+            //
+            // 安全性依赖**外部**不变量：tokio 保证任务析构先于 JoinError 观测 ⇒ 出集合
+            // 的条目必然已计入这两项。release 下 usize 减法无下溢保护（wrap 成巨值），
+            // 故 debug 构建显式锚住该前提（审计 F4；zero-cost in release）。
+            if harvested > 0 {
+                let mut caps = lock(&self.caps);
+                debug_assert!(
+                    caps.tracked >= harvested && caps.completed_unreaped >= harvested,
+                    "卡账不变量破损：tracked={} completed_unreaped={} harvested={}（tokio 任务析构先于 JoinError 观测之前提被破坏）",
+                    caps.tracked,
+                    caps.completed_unreaped,
+                    harvested
+                );
+                caps.tracked -= harvested;
+                caps.completed_unreaped -= harvested;
             }
         }
-        // 收割记账：条目出集合 ⇒ 保留数与未收割数各减一（锁序 set → caps）。
-        // 安全性依赖**外部**不变量：tokio 保证任务析构先于 JoinError 观测 ⇒ 出集合
-        // 的条目必然已计入这两项。release 下 usize 减法无下溢保护（wrap 成巨值），
-        // 故 debug 构建显式锚住该前提（审计 F4；zero-cost in release）。
-        if harvested > 0 {
-            let mut caps = lock(&self.caps);
-            debug_assert!(
-                caps.tracked >= harvested && caps.completed_unreaped >= harvested,
-                "卡账不变量破损：tracked={} completed_unreaped={} harvested={}（tokio 任务析构先于 JoinError 观测之前提被破坏）",
-                caps.tracked,
-                caps.completed_unreaped,
-                harvested
-            );
-            caps.tracked -= harvested;
-            caps.completed_unreaped -= harvested;
+        // 锁外归一：downcast、字符串分配、payload 的最终 Drop 都在集合锁之外。
+        for je in join_failures {
+            reaped.push(if je.is_cancelled() {
+                TaskError::Cancelled
+            } else {
+                TaskError::Panicked(panic_message(je.into_panic()))
+            });
         }
         reaped
     }
@@ -1906,5 +1926,171 @@ mod tests {
         wait_idle(&scope).await; // abort 生效（FlightGuard 归零 = 任务体已 drop）
         assert_eq!(scope.try_reap(), vec![TaskError::Cancelled]);
         assert!(scope.try_reap().is_empty(), "二次收割空（幂等）");
+    }
+
+    /// 锁边界（issue#91 验收①②）：panic payload 的 downcast / 摘要分配 / 最终 Drop
+    /// 全在 `set` 锁外。
+    ///
+    /// 构造：future 里挂一枚 panic 炸弹，abort 时 tokio 在 `cancel_task` 的
+    /// catch_unwind 内析构 future ⇒ 炸弹 panic 成 `JoinError` 的负载（poll 期 panic
+    /// 会被包装体的 catch_unwind 吃掉，到不了集合层）。炸弹 panic 的**负载本身**是
+    /// 探针：它的 Drop 只在 `into_panic()` 之后被裁掉时运行。
+    ///
+    /// 探针只做 `try_lock`（阻塞式 `lock` 在缺陷态会挂死而非报红）与受控重入。
+    #[tokio::test]
+    async fn try_reap_drops_payload_outside_set_lock() {
+        struct Probe {
+            scope: std::sync::Weak<FxScope>,
+            lock_free: Arc<AtomicBool>,
+            reentered: Arc<AtomicBool>,
+        }
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let Some(scope) = self.scope.upgrade() else {
+                    return; // 观察位留 false 由断言报红（禁静默通过）
+                };
+                let free = match scope.set.try_lock() {
+                    Ok(guard) => {
+                        drop(guard);
+                        true
+                    }
+                    Err(_) => false,
+                };
+                self.lock_free.store(free, Ordering::SeqCst);
+                if free {
+                    // 受控重入：探针已证明锁空闲 ⇒ 需要 set 锁的公开入口不会阻塞。
+                    let inner = scope.try_reap();
+                    self.reentered.store(inner.is_empty(), Ordering::SeqCst);
+                }
+            }
+        }
+
+        struct PanicOnDrop {
+            scope: std::sync::Weak<FxScope>,
+            lock_free: Arc<AtomicBool>,
+            reentered: Arc<AtomicBool>,
+        }
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                // panic 发生在 future 自身析构（不是 poll）：负载进 JoinError。
+                std::panic::panic_any(Probe {
+                    scope: self.scope.clone(),
+                    lock_free: Arc::clone(&self.lock_free),
+                    reentered: Arc::clone(&self.reentered),
+                });
+            }
+        }
+
+        let scope = Arc::new(FxScope::new());
+        let lock_free = Arc::new(AtomicBool::new(false));
+        let reentered = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let bomb = PanicOnDrop {
+            scope: Arc::downgrade(&scope),
+            lock_free: Arc::clone(&lock_free),
+            reentered: Arc::clone(&reentered),
+        };
+        let started_in_task = Arc::clone(&started);
+        let handle = scope
+            .spawn_tracked(async move {
+                let _bomb = bomb;
+                started_in_task.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        wait_until("任务体已开跑", || started.load(Ordering::SeqCst)).await;
+        handle.abort();
+
+        let mut reaped = Vec::new();
+        wait_until("abort 条目可收割", || {
+            reaped = scope.try_reap();
+            !reaped.is_empty()
+        })
+        .await;
+        assert_eq!(
+            reaped,
+            vec![TaskError::Panicked("non-string panic payload".to_owned())],
+            "自定义负载仍走非字符串占位摘要（错误分类不变）"
+        );
+        assert!(
+            lock_free.load(Ordering::SeqCst),
+            "payload 析构期间 set 锁必须空闲（锁内析构即 issue#91 缺陷）"
+        );
+        assert!(
+            reentered.load(Ordering::SeqCst),
+            "锁外 payload Drop 可受控重入 try_reap（不死锁且收割为空）"
+        );
+        scope.expect_body_idle();
+        scope.expect_fully_reaped_idle();
+    }
+
+    /// 并发准入 + 收割下的记账（issue#91 验收③）：`completed_unreaped` 既不下溢
+    /// （wrap 成巨值）也不越过 `max_tracked`；收割后容量回落，重复收割不重复计数。
+    ///
+    /// 载入器走 [`FxScope::spawn_detached`]（脱管 ⇒ 不进生命周期集，不干扰被测记账；
+    /// 也算框架唯一合法的 spawn 口，`tokio::spawn` 直调被 clippy.toml 拦下）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_reap_accounting_holds_under_concurrent_admission() {
+        const SPAWNERS: usize = 4;
+        const ROUNDS: usize = 200;
+        const MAX_TRACKED: usize = 4;
+        let scope = Arc::new(FxScope::new().with_max_tracked(MAX_TRACKED));
+        let mut spawners = Vec::new();
+        for _ in 0..SPAWNERS {
+            let worker = Arc::clone(&scope);
+            let handle = scope
+                .spawn_detached(async move {
+                    let (mut admitted, mut rejected) = (0usize, 0usize);
+                    for round in 0..ROUNDS {
+                        match worker.try_spawn_tracked(async {}) {
+                            // 句柄即丢：条目滞留集合至收割（不入 oneshot 旁路）。
+                            Ok(handle) => {
+                                admitted += 1;
+                                drop(handle);
+                            }
+                            Err(_) => rejected += 1,
+                        }
+                        if round % 16 == 0 {
+                            tokio::task::yield_now().await; // 与收割循环交错
+                        }
+                    }
+                    (admitted, rejected)
+                })
+                .expect("脱管载入器启动");
+            spawners.push(handle);
+        }
+        while spawners.iter().any(|handle| !handle.is_finished()) {
+            let unreaped = scope.counts().completed_unreaped;
+            assert!(
+                unreaped <= MAX_TRACKED,
+                "未收割数越界（记账下溢 wrap 或准入超上限）：{unreaped} > {MAX_TRACKED}"
+            );
+            let _ = scope.try_reap();
+            tokio::task::yield_now().await;
+        }
+        let (mut admitted, mut rejected) = (0usize, 0usize);
+        for handle in spawners {
+            let (a, r) = handle.await.expect("载入器正常返回");
+            admitted += a;
+            rejected += r;
+        }
+        assert_eq!(
+            admitted + rejected,
+            SPAWNERS * ROUNDS,
+            "每次准入尝试要么成功要么 typed 拒绝（结果守恒）"
+        );
+        assert!(admitted > 0, "至少有一次准入成功");
+        wait_until("集合收割净", || scope.try_reap().is_empty()).await;
+        assert_eq!(
+            scope.counts().completed_unreaped,
+            0,
+            "收割后未收割数归零（容量回落）"
+        );
+        scope.expect_body_idle();
+        scope.expect_fully_reaped_idle();
+        assert!(scope.try_reap().is_empty(), "重复收割不重复计数");
+        assert_eq!(scope.counts().completed_unreaped, 0);
     }
 }
