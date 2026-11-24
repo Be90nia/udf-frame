@@ -6,7 +6,7 @@
 
 ### Fix(perf): 修正 Scheduler 基准清单误判 + PR 路径验证
 - Criterion 实际 Scheduler ID 使用 `scheduler/register_1000` 等下划线形式；旧期望清单误写斜杠，导致已跑出的 12 个基准被误判缺失，阻止完整性能基线提升。
-- 修正 12 个期望 ID；perf workflow 增加仅针对自身配置与 bench 定义变更的 PR 路径触发，仍只产出数据、不作为合并阻断闸。
+- 修正 12 个期望 ID；perf workflow 增加仅针对自身配置与 bench 定义变更的 PR 路径触发，并设 45 分钟 job 上限，仍只产出数据、不作为合并阻断闸。
 
 ### Fix(tests): OS 截止线程可取消并确保回收
 - `bounded` 的独立 OS 截止线程由不可取消的 10s sleep 改为 OS 截止时间 + `park_timeout`；目标 future 提前完成时 RAII guard 设置取消信标、unpark 并 join，避免遗留睡眠线程。
