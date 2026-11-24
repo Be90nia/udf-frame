@@ -9,7 +9,47 @@
 #![allow(dead_code)]
 
 use std::future::Future;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
+
+/// 可取消的 OS 截止线程：目标 future 提前结束时立即唤醒线程，不让它白睡满 10s。
+struct DeadlineWake {
+    thread: Thread,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for DeadlineWake {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.thread.unpark();
+    }
+}
+
+fn spawn_deadline(fire: tokio::sync::oneshot::Sender<()>) -> DeadlineWake {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let worker = thread::Builder::new()
+        .name("udf-test-deadline".into())
+        .spawn(move || {
+            if !worker_cancelled.load(Ordering::Acquire) {
+                thread::park_timeout(CALL_LIMIT);
+            }
+            if !worker_cancelled.load(Ordering::Acquire) {
+                let _ = fire.send(());
+            }
+        })
+        .expect("创建 OS 截止线程失败");
+    let guard = DeadlineWake {
+        thread: worker.thread().clone(),
+        cancelled,
+    };
+    drop(worker); // detached；由 guard 在 future 完成/超时时取消并唤醒
+    guard
+}
 
 /// 等待条件成立的上限（远小于 job 超时，远大于正常抖动）。
 const WAIT_LIMIT: Duration = Duration::from_secs(5);
@@ -34,16 +74,15 @@ pub async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
 /// 测试面可接受，换来的正是「护栏不依赖 tokio 时间驱动」。
 pub async fn bounded<F: Future>(what: &str, fut: F) -> F::Output {
     let (fire, fired) = tokio::sync::oneshot::channel::<()>();
-    std::thread::spawn(move || {
-        std::thread::sleep(CALL_LIMIT);
-        // 目标先完成时接收端已 drop ⇒ send 失败即正常收场。
-        let _ = fire.send(());
-    });
-    tokio::select! {
+    let deadline = spawn_deadline(fire);
+    let output = tokio::select! {
         biased;
         output = fut => output,
         _ = fired => panic!(
             "等待 {CALL_LIMIT:?} 仍未见「{what}」：不变量可能已被破坏，或运行时已被自旋饿死（有界等待，禁挂死）"
         ),
-    }
+    };
+    // 提前完成时取消 OS 截止线程；超时 panic 路径则由 Drop 同样清理。
+    drop(deadline);
+    output
 }
