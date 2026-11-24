@@ -81,6 +81,20 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .expect("pool lock poisoned (prior holder panicked)")
 }
 
+/// 闸翻转（issue#89 线性化点的机械锚）：**必须在订阅槽锁内调用**——槽摘除/
+/// 替换与 gate 翻转是一次状态变更。debug 构建用 `try_lock` 断言调用点确实持锁：
+/// 若有人把翻转挪出临界区（#89 的缺陷形状），任何订阅/退订测试立刻红，鉴别力
+/// 不再依赖测试暂停钩子恰好落在窗口内（Store 域 #60 的 F1 教训）。release 下
+/// `debug_assert` 编译为空，热路径零增量（`emit` 不受影响）。
+#[inline]
+fn store_gate_under_slot_lock(gate: &AtomicBool, audit: &Mutex<Option<AuditSlot>>, value: bool) {
+    debug_assert!(
+        audit.try_lock().is_err(),
+        "池审计闸翻转必须在订阅槽锁内（#89）：槽摘除/替换与 gate 翻转未串行"
+    );
+    gate.store(value, Ordering::Release);
+}
+
 /// 核心账本（单权威锁内）：边界 + 计数。seq/代次走独立原子（发射路径与账本
 /// 锁分离——回调锁外可重入一切读入口，持账本锁发射即死锁）。
 struct PoolCore {
@@ -144,26 +158,24 @@ impl PoolAuditSink {
         }
     }
 
-    /// 开审计流：落闸 + 建槽（容量环 `cap` 钳到 ≥1——恒保最新一件）。再次订阅
+    /// 开审计流：建槽 + 开闸（容量环 `cap` 钳到 ≥1——恒保最新一件）。再次订阅
     /// = 替换现役槽，被替换票据凭代次对账 inert（Drop 不误杀新流）。
+    ///
+    /// **槽可见与开闸是一次状态变更**（issue#89）：装槽与 `gate=true` 同处
+    /// `audit` 临界区（先例 = Store 域 `audit.rs` 的 #60）。分离时留下「槽已换、
+    /// 闸未开」的窗口——此间的 emit 读到旧闸值直接返回，事件既不进环也不进回调。
+    /// 旧槽（含用户闭包）移入局部 `retired` 后**锁外**析构（#88）：本线性化不把
+    /// 闭包析构挪回锁内。
     pub(crate) fn subscribe_audit(
         &self,
         cap: usize,
         f: impl FnMut(&PoolAuditEvent) + Send + 'static,
     ) -> PoolAuditTicket {
         let gen = self.gen.fetch_add(1, Ordering::Relaxed) + 1;
+        let retired;
         {
             let mut guard = lock(&self.audit);
-            // 替换旧槽：旧槽未投递完的队列随旧代次作废（禁泄漏进新订阅）——
-            // 作废件数计入投递丢弃计数（fail-visible，禁静默丢）。
-            if let Some(old) = guard.as_ref() {
-                let abandoned = old.pending.len() as u64;
-                if abandoned > 0 {
-                    self.audit_delivery_drops
-                        .fetch_add(abandoned, Ordering::Relaxed);
-                }
-            }
-            *guard = Some(AuditSlot {
+            retired = guard.replace(AuditSlot {
                 ring: VecDeque::new(),
                 cap: cap.max(1),
                 gen,
@@ -171,18 +183,39 @@ impl PoolAuditSink {
                 inflight: false,
                 pending: VecDeque::new(),
             });
+            // 替换旧槽：旧槽未投递完的队列随旧代次作废（禁泄漏进新订阅）——
+            // 作废件数计入投递丢弃计数（fail-visible，禁静默丢）。
+            if let Some(old) = &retired {
+                let abandoned = old.pending.len() as u64;
+                if abandoned > 0 {
+                    self.audit_delivery_drops
+                        .fetch_add(abandoned, Ordering::Relaxed);
+                }
+            }
+            store_gate_under_slot_lock(&self.gate, &self.audit, true);
         }
-        self.gate.store(true, Ordering::Release);
+        // 旧槽锁外析构（#88）：用户闭包绝不在持锁时 drop。
+        drop(retired);
         let gate = Arc::clone(&self.gate);
         let audit = Arc::clone(&self.audit);
         PoolAuditTicket::new(move || {
-            let mut guard = lock(&audit);
-            // 代次对账在锁内完成：现役票据才落闸清槽；已被后订替换的旧票据禁动。
-            if guard.as_ref().is_some_and(|slot| slot.gen == gen) {
-                *guard = None;
-                drop(guard);
-                gate.store(false, Ordering::Release);
+            let mut retired = None;
+            {
+                let mut guard = lock(&audit);
+                // 代次对账在锁内完成：现役票据才清槽落闸；已被后订替换的旧票据
+                // 绝不触碰闸（inert）。
+                if guard.as_ref().is_some_and(|slot| slot.gen == gen) {
+                    retired = guard.take();
+                    // 暂停点恰好落在 #89 的缺陷窗口（槽已摘、闸未落）：修复后它在
+                    // 锁内——新订阅装不进来；旧形态下锁已放，新订阅能装入再被落闸打死。
+                    #[cfg(test)]
+                    drop_pause::pause(Arc::as_ptr(&gate), gen);
+                    // 清槽与落闸同一临界区（issue#89）：先 detach 再落闸，都在锁内；
+                    // 解锁后才析构旧槽（#88）。
+                    store_gate_under_slot_lock(&gate, &audit, false);
+                }
             }
+            drop(retired);
         })
     }
 
@@ -549,8 +582,14 @@ impl PoolBase {
         (keep, out)
     }
 
-    /// 开审计流：落闸 + 建槽（容量环 `cap` 钳到 ≥1——恒保最新一件）。再次订阅
+    /// 开审计流：建槽 + 开闸（容量环 `cap` 钳到 ≥1——恒保最新一件）。再次订阅
     /// = 替换现役槽，被替换票据凭代次对账 inert（Drop 不误杀新流）。
+    ///
+    /// **订阅代次与闸的线性化（issue#89）**：装槽/清槽与 `gate` 翻转在同一个
+    /// `audit` 临界区内完成——被替换旧票据的 Drop 不可能把新一代的闸关掉（旧代次
+    /// 对账失配即 inert，什么都不碰）；现役票据 Drop 后新 emit 不再进环也不回调。
+    /// 旧槽（含用户回调闭包）移入局部后**锁外**析构（#88）。发射快路径不变：
+    /// 未订阅 = 一次 Acquire load 即返，无新增锁或原子。
     ///
     /// **投递语义（issue#75）**：实时回调是**串行且不丢事件**的观测面——
     /// 回调在途窗口内的并发 emit 进入**待投递 FIFO**，由在途者按 `seq` 序在
@@ -1575,5 +1614,242 @@ fn worker_loop(shared: Arc<Shared>, mut first: Option<Task>) {
         } else {
             g.completed += 1;
         }
+    }
+}
+
+/// 测试专用暂停点（`cfg(test)`，**不进公共面**）：让「槽已摘、闸未落」这一窗口
+/// 可被确定性插进来（issue#89 的回归夹具——不暂停就只能靠概率竞速）。键 =
+/// (闸 Arc 身份, 订阅代次)：闸 Arc 每池一个，跨测试并行运行不会误命中别人的票据。
+#[cfg(test)]
+mod drop_pause {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+
+    pub(super) struct Hook {
+        pub(super) gate: *const AtomicBool,
+        pub(super) gen: u64,
+        pub(super) reached: mpsc::Sender<()>,
+        pub(super) resume: mpsc::Receiver<()>,
+    }
+
+    // SAFETY（Mutex 包裹）：`Hook` 只被一次取走并在测试线程间移动（Sender/
+    // Receiver 均 Send）；`*const AtomicBool` 只作身份比较，不解引用。
+    unsafe impl Send for Hook {}
+
+    static SLOT: Mutex<VecDeque<Hook>> = Mutex::new(VecDeque::new());
+
+    pub(super) fn install(hook: Hook) {
+        SLOT.lock()
+            .expect("drop_pause 槽中毒：测试线程已 panic")
+            .push_back(hook);
+    }
+
+    /// 命中（闸身份 + 代次）则取走该钩子并阻塞到测试放行——一次性。
+    pub(super) fn pause(gate: *const AtomicBool, gen: u64) {
+        let hook = {
+            let mut slot = SLOT.lock().expect("drop_pause 槽中毒：测试线程已 panic");
+            match slot.iter().position(|h| h.gate == gate && h.gen == gen) {
+                Some(idx) => slot.remove(idx),
+                None => return,
+            }
+        };
+        if let Some(hook) = hook {
+            // 通道失败 = 测试线程已退出（测试本来就失败了）：此处**不可** panic
+            // ——本函数在票据 Drop 里被调用，二次 panic 会直接 abort 掩盖真因。
+            let _ = hook.reached.send(());
+            let _ = hook.resume.recv();
+        }
+    }
+}
+
+/// issue#89 回归：陈旧票据落闸 vs 替换订阅的竞态（确定性交错，非概率竞速）。
+///
+/// 白盒测试住本模块：夹具要 `cfg(test)` 暂停点与 sink 的闸身份/代次（crate 内
+/// 可见、**不扩公共面**）。三观测面（回调 / 环 / 闸）分开断言，互不掩盖。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// 强制交错的观测面。
+    struct ForcedRace {
+        /// 新订阅是否在「旧票据已摘槽、闸未落」的暂停窗内装入完成。
+        installed_during_pause: bool,
+        /// 随后一个事件命中**当前代次**回调的次数（恰好 1）。
+        current_hits: usize,
+        /// 随后一个事件的环历史。
+        events: Vec<PoolAuditEvent>,
+        /// 旧票据回调的命中次数（它已被摘除，必须 0）。
+        stale_hits: usize,
+        /// 发事件前闸的读数（当前代次在册 ⇒ 必须开着）。
+        gate_open: bool,
+    }
+
+    /// 序列：旧票据 Drop 暂停在「槽已摘、闸未落」→ 新订阅抢在暂停窗内装入 →
+    /// 放行旧 Drop → 发一个事件。
+    fn force_stale_drop_before_new_subscription() -> ForcedRace {
+        let sink = Arc::new(PoolAuditSink::new());
+        let stale_hits = Arc::new(AtomicUsize::new(0));
+        let stale = {
+            let hits = Arc::clone(&stale_hits);
+            sink.subscribe_audit(16, move |_| {
+                hits.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let gate_ptr = Arc::as_ptr(&sink.gate);
+        let stale_gen = sink.gen.load(Ordering::Relaxed);
+
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        drop_pause::install(drop_pause::Hook {
+            gate: gate_ptr,
+            gen: stale_gen,
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+
+        let dropper = thread::spawn(move || drop(stale));
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("旧票据 Drop 未进入暂停点");
+
+        // 替换订阅：修复后（装槽与开闸同处 audit 锁）被挡到 Drop 结束；缺陷形态下
+        // 会直接装入并开闸。修复后它确定阻塞在取锁上，故此处只需有界观察，不 sleep。
+        let current_hits = Arc::new(AtomicUsize::new(0));
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let subscriber = {
+            let sink = Arc::clone(&sink);
+            let hits = Arc::clone(&current_hits);
+            thread::spawn(move || {
+                let ticket = sink.subscribe_audit(16, move |_| {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                });
+                installed_tx.send(()).expect("install 信号通道");
+                ticket
+            })
+        };
+        let installed_during_pause = installed_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_ok();
+
+        resume_tx.send(()).expect("放行旧票据 Drop");
+        dropper.join().expect("dropper 线程");
+        let ticket_b = subscriber.join().expect("subscriber 线程");
+
+        let gate_open = sink.gate.load(Ordering::Acquire);
+        sink.emit(PoolAuditKind::Borrowed);
+        let race = ForcedRace {
+            installed_during_pause,
+            current_hits: current_hits.load(Ordering::SeqCst),
+            events: sink.take_events(),
+            stale_hits: stale_hits.load(Ordering::SeqCst),
+            gate_open,
+        };
+        drop(ticket_b);
+        race
+    }
+
+    /// ① 陈旧旧票据**绝不能**禁用新一代的实时回调。
+    #[test]
+    fn stale_ticket_drop_never_disables_newer_callback() {
+        let race = force_stale_drop_before_new_subscription();
+        assert_eq!(
+            race.current_hits, 1,
+            "陈旧票据的落闸关掉了当前代次的实时回调（#89 竞态）"
+        );
+        assert_eq!(race.stale_hits, 0, "已被摘除的旧回调不得再收到事件");
+    }
+
+    /// ② 被误关的闸**不得**压制环历史（取证面与实时流分账）。
+    #[test]
+    fn stale_ticket_drop_never_suppresses_ring_history() {
+        let race = force_stale_drop_before_new_subscription();
+        assert_eq!(
+            race.events.len(),
+            1,
+            "陈旧票据的落闸压制了环历史（随后一个事件零记录，取证面静默）"
+        );
+        assert_eq!(race.events[0].kind, PoolAuditKind::Borrowed);
+    }
+
+    /// ③ 闸与槽的翻转必须**串行在同一把 audit mutex 上**（窗口被结构性消除，
+    /// 而非「碰巧没撞上」）：暂停窗内新订阅装不进来，且装完后闸是开的。
+    #[test]
+    fn stale_ticket_drop_serializes_with_new_subscription() {
+        let race = force_stale_drop_before_new_subscription();
+        assert!(
+            !race.installed_during_pause,
+            "旧票据落闸与新订阅装槽未串行（暂停窗内装入成功 ⇒ #89 窗口仍在）"
+        );
+        assert!(
+            race.gate_open,
+            "新代次在册但闸是关的（#89：闸被陈旧票据关掉）"
+        );
+    }
+
+    /// ④ 反序守卫：新订阅先装入、旧票据后 Drop（代次失配）——旧票据不得动新流。
+    #[test]
+    fn superseded_ticket_drop_leaves_current_stream_live() {
+        let sink = PoolAuditSink::new();
+        let stale_hits = Arc::new(AtomicUsize::new(0));
+        let stale = {
+            let hits = Arc::clone(&stale_hits);
+            sink.subscribe_audit(16, move |_| {
+                hits.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let current_hits = Arc::new(AtomicUsize::new(0));
+        let current = {
+            let hits = Arc::clone(&current_hits);
+            sink.subscribe_audit(16, move |_| {
+                hits.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        drop(stale); // 代次失配：既不清槽也不落闸
+
+        assert!(
+            sink.gate.load(Ordering::Acquire),
+            "被取代票据的 drop 关了新一代的闸"
+        );
+        sink.emit(PoolAuditKind::Returned);
+        assert_eq!(
+            sink.take_events().len(),
+            1,
+            "环历史被被取代票据的 drop 压制"
+        );
+        assert_eq!(
+            current_hits.load(Ordering::SeqCst),
+            1,
+            "被取代票据的 drop 禁用了当前代次的回调"
+        );
+        assert_eq!(
+            stale_hits.load(Ordering::SeqCst),
+            0,
+            "被取代票据的回调不得再收到事件"
+        );
+        drop(current);
+    }
+
+    /// ⑤ 顺序守卫 + 快路径：现役票据 Drop 后闸落、emit 早退（环不再入账）。
+    #[test]
+    fn dropping_current_ticket_without_replacement_closes_the_stream() {
+        let sink = PoolAuditSink::new();
+        let ticket = sink.subscribe_audit(16, |_| {});
+        sink.emit(PoolAuditKind::Borrowed);
+        assert_eq!(sink.take_events().len(), 1, "订阅期事件应入环");
+        drop(ticket);
+        assert!(
+            !sink.gate.load(Ordering::Acquire),
+            "现役票据 Drop 后闸必须关上（零开销恢复）"
+        );
+        sink.emit(PoolAuditKind::Borrowed);
+        assert!(
+            sink.take_events().is_empty(),
+            "无订阅者时环历史必须为空（闸 = 槽，emit 快路径直接返回）"
+        );
     }
 }
