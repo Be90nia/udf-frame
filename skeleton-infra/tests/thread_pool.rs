@@ -1098,3 +1098,204 @@ fn resize_rollback_must_not_retire_core_workers_via_stale_shrink_token() {
     pool.shutdown();
     join_bounded(&pool, "线程池停机排空");
 }
+
+// ── issue#99：ThreadPool resize 的事件时序与代次窗口 ─────────────────────
+//
+// 旧实现先 `base.resize`（同步发 `Resized`）再领 epoch ⇒ 回调内重入 resize 的
+// 目标会被外层迟到代次覆盖（「最后发起的目标生效」反转），回调也能看到 base
+// 新值 + worker 旧目标。以下测试用 `feature = "testing"` 的锁探针与一次性代次
+// 钩子确定性复现（禁 sleep 控交错）。
+
+#[cfg(feature = "testing")]
+mod resize_event_timing {
+    use super::*;
+
+    const HANDOFF: Duration = Duration::from_secs(5);
+
+    /// `Resized` 回调内重入 `resize`：外层必须返回、内层（后发起）目标生效且
+    /// 不被外层迟到代次覆盖；回调读到的 core/max 必须是外层已提交配置。
+    #[test]
+    fn resized_callback_reenters_resize_and_last_initiated_target_wins() {
+        let pool = Arc::new(ThreadPool::new(tuning(1, 8, 8)));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let nested = Arc::new(Mutex::new(Vec::new()));
+        let ticket = {
+            let weak = Arc::downgrade(&pool);
+            let seen = Arc::clone(&seen);
+            let nested = Arc::clone(&nested);
+            pool.subscribe_audit(move |e| {
+                if e.kind != PoolAuditKind::Resized {
+                    return;
+                }
+                let Some(inner) = weak.upgrade() else { return };
+                let (inner_free, core_free) = inner.resize_locks_free();
+                let m = inner.metrics();
+                seen.lock()
+                    .expect("seen")
+                    .push(((m.core, m.shape.max), inner_free && core_free));
+                // 后发起的内层目标：必须赢过外层的迟到代次。
+                nested
+                    .lock()
+                    .expect("nested results")
+                    .push(inner.resize(tuning(4, 8, 8)));
+            })
+        };
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let outer = {
+            let p = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                done_tx
+                    .send(p.resize(tuning(2, 8, 8)))
+                    .expect("send result");
+            })
+        };
+        done_rx
+            .recv_timeout(HANDOFF)
+            .expect("Resized 回调内重入 resize 不得卡在内部锁")
+            .expect("outer resize");
+        outer.join().expect("outer thread");
+        drop(ticket);
+
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.len(), 1, "一次成功 resize 恰一次 Resized 回调");
+        assert_eq!(
+            seen[0].0,
+            (2, 8),
+            "回调必须看到外层已提交的 core/max（不得是 base 新值 + worker 旧目标）"
+        );
+        assert!(seen[0].1, "回调运行时调度锁与 base 账本锁均须空闲");
+        drop(seen);
+        let nested = nested.lock().expect("nested results");
+        assert!(nested[0].is_ok(), "内层 resize 必须成功：{nested:?}");
+        drop(nested);
+
+        wait_until_diag(
+            "内层目标 core=4 生效（外层迟到代次不得覆盖）",
+            Duration::from_secs(5),
+            || {
+                let m = pool.metrics();
+                m.core == 4 && m.workers == 4
+            },
+            || format!("metrics={:?}", pool.metrics()),
+        );
+        pool.shutdown();
+        join_bounded(&pool, "线程池停机排空");
+    }
+
+    /// 确定性交错：首个 resize 停在「领号 → 目标提交」窗，后发起者必须拿到
+    /// 更高代次并最终生效（#69 的「last initiated wins」在该窗口的遗漏）。
+    #[test]
+    fn later_initiated_resize_wins_when_earlier_is_paused_after_epoch_claim() {
+        let pool = Arc::new(ThreadPool::new(tuning(1, 8, 8)));
+        let (paused_tx, paused_rx) = mpsc::channel::<u64>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        pool.set_resize_epoch_hook(move |epoch| {
+            paused_tx.send(epoch).expect("report paused epoch");
+            // 阻塞到测试放行：确定性暂停在「领号 → 目标提交」窗（禁 sleep）。
+            release_rx.recv().expect("release signal");
+        });
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let a = {
+            let p = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                done_tx
+                    .send(p.resize(tuning(2, 8, 8)))
+                    .expect("send result");
+            })
+        };
+        assert_eq!(
+            paused_rx.recv_timeout(HANDOFF).expect("A 必须停在领号后"),
+            1,
+            "首个 resize 领取代次 1"
+        );
+
+        // B 后发起：领更高代次并完整提交。
+        pool.resize(tuning(5, 8, 8)).expect("B resize");
+        assert_eq!(pool.metrics().core, 5, "后发起的 B 先提交目标");
+
+        release_tx.send(()).expect("release A");
+        done_rx
+            .recv_timeout(HANDOFF)
+            .expect("A 必须返回")
+            .expect("A resize");
+        a.join().expect("A thread");
+
+        let m = pool.metrics();
+        assert_eq!(m.core, 5, "外层迟到代次不得覆盖后发起的目标");
+        assert_eq!(m.shape.max, 8);
+        assert_eq!(m.workers, 5);
+        pool.shutdown();
+        join_bounded(&pool, "线程池停机排空");
+    }
+
+    /// `ResizeRejected` 回调内重入 resize：拒绝事件也在锁外发射。
+    #[test]
+    fn rejected_callback_reenters_resize_without_self_lock() {
+        let pool = Arc::new(ThreadPool::new(tuning(1, 4, 8)));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let nested = Arc::new(Mutex::new(Vec::new()));
+        let ticket = {
+            let weak = Arc::downgrade(&pool);
+            let seen = Arc::clone(&seen);
+            let nested = Arc::clone(&nested);
+            pool.subscribe_audit(move |e| {
+                if e.kind != PoolAuditKind::ResizeRejected {
+                    return;
+                }
+                let Some(inner) = weak.upgrade() else { return };
+                let (inner_free, core_free) = inner.resize_locks_free();
+                seen.lock().expect("seen").push(inner_free && core_free);
+                nested
+                    .lock()
+                    .expect("nested results")
+                    .push(inner.resize(tuning(3, 4, 8)));
+            })
+        };
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let outer = {
+            let p = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                // core(5) > max(4)：纯校验拒绝。
+                done_tx
+                    .send(p.resize(tuning(5, 4, 8)))
+                    .expect("send result");
+            })
+        };
+        let error = done_rx
+            .recv_timeout(HANDOFF)
+            .expect("ResizeRejected 回调内重入 resize 不得卡在内部锁")
+            .expect_err("illegal tuning");
+        outer.join().expect("outer thread");
+        drop(ticket);
+
+        assert!(
+            matches!(error, PoolResizeError::IdleCapExceedsMax { .. }),
+            "拒绝成因：{error:?}"
+        );
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.len(), 1, "拒绝路径恰一次 ResizeRejected 回调");
+        assert!(seen[0], "Rejected 回调运行时调度锁与 base 账本锁均须空闲");
+        drop(seen);
+        let nested = nested.lock().expect("nested results");
+        assert!(
+            nested[0].is_ok(),
+            "拒绝事件在锁外发射 ⇒ 回调内 resize 必须成功：{nested:?}"
+        );
+        drop(nested);
+
+        wait_until_diag(
+            "回调内 resize 的目标 core=3 生效",
+            Duration::from_secs(5),
+            || {
+                let m = pool.metrics();
+                m.core == 3 && m.workers == 3
+            },
+            || format!("metrics={:?}", pool.metrics()),
+        );
+        pool.shutdown();
+        join_bounded(&pool, "线程池停机排空");
+    }
+}

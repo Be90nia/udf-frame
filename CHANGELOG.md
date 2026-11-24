@@ -4,6 +4,48 @@
 
 ## [Unreleased]
 
+### Fix(fx): spawn 的 runtime 上下文前置条件显式化 + timeout 前置条件文档化（issue#92）
+- 新增 `AdmissionError::NoRuntime`：`try_spawn_tracked` / `spawn_detached` 在**取任何内部锁之前**做 `Handle::try_current()` 预检；无 runtime ⇒ typed 拒绝，不入容量账（`admitted/tracked/active/waiting/rejected` 全不变）、不消费宿主 Future。
+- **破坏性**（0.1.0）：`spawn_detached` 返回类型 `ScopeClosed` → `AdmissionError`；`AdmissionError` 仍非 `#[non_exhaustive]` ⇒ 跨 crate 穷尽 `match` 需补 `NoRuntime` 臂（仓内 `validation/consumer-sim` 已同步）。`spawn_tracked` 作为 fail-visible 旧口：无 runtime 带因 panic（新增 `# Panics` 并指向 typed 口）。
+- 入集改 `JoinSet::spawn_on(fut, &handle)`、脱管改 `handle.spawn`（不再有裸 `tokio::spawn` 与 clippy allow 豁免）；`shutdown_timeout` / `Spawned::join_timeout` 仅新增 `# Panics`（需 `enable_time()` 的 runtime），签名与返回面零变化。
+- 验证：6 条确定性测试（typed 拒绝且锁外 / 不等待 `set` 锁 / legacy 带因 panic / runtime 停机时任务被丢弃且无残留 / 准入路径不变 / timeout 两类环境故障分开）；三处变异（预检挪到 `admit_gate` 后、挪到 `reserve_slot` 后、搬进持锁区）各自红；crate 全量 629 passed。
+
+### Fix(runtime): 本地订阅 entry 整条移出后析构（issue#90）
+- `local_sub_unregister` 与 `local_notify` 的毒回调摘除段：`retain` 改「定位 + `remove` 移出」，表借用释放后再析构——用户闭包/捕获对象的 `Drop` 重入本地订阅不再撞 `RefCell` 借用（`BorrowMutError`）。
+- 通知序、命中数、摘除数、成因摘要与「注销即时可见 / 死订阅不复活」语义不变；`LocalSubscription::drop` 体不动、`!Send + !Sync` 与公共 API 不变。
+- 验证：三条 `DropProbe` 路径测试（普通退订 / 通知中途退订 / panic 摘除）；两处变异回 `retain` 各自红（第三条为快照强引用路径，结构性不敏感，已在回执说明）；crate 全量 611 passed。
+
+### Test(journal): 用例目录进程唯一 + RAII 清理（bd udf-frame-9ez）
+- `case_dir()` 路径加 `-<pid>-<seq>`，两进程并发跑同 crate 测试不再互删目录；新增 `CaseDir` 守卫（`Drop` 清理，含 panic 路径），删掉 16 处收尾 `remove_dir_all(..).unwrap()`（并发下的 `NotFound` 触发点）。
+- 鉴别力：修复前固定目录并发 5/5 轮至少一方红；修复后双进程并发 5 轮 10/10 绿，`target-iso/journal-tests/` 零残留。断言语义零改动。
+
+### Fix(pool): MemoryPool 归还裁决与槽位提交合成一个 core 临界区（issue#98）
+- `PoolBase` 新增内部协作入口 `note_return_with(commit)`：持 `core` 裁决后、释放 core 之前执行实现方的真实入槽/配额回吐；`note_return` 保留「裁决与提交分离」供 ObjectPool 等实现方，文档写明两者适用面。
+- `MemoryPool::PoolGuard::drop` 改走协作入口 ⇒ 「账本已改、槽位未提交」窗口消失；审计事件恒描述已提交状态（回调重入 `acquire/metrics` 不再看到半提交），事件仍在锁外发射。
+- `resize` 整段事务留在 `resizing` 串行闸内；**被裁掉的用户对象析构移到闸外**（闸内析构会让用户 Drop 重入 resize 自死锁）。
+- 验证：`memory_pool` 20 passed ×3；负向验证（旧实现）稳定复现 `idle > idle_cap` / `created > max` 与审计半状态；变异（析构放回闸内）⇒ 新用例有界失败；crate 全量 608 passed。
+
+### Fix(fx): try_reap 两阶段收割——JoinError/panic 载荷归一移到 JoinSet 锁外（issue#91）
+- `FxScope::try_reap`：`set` 锁内只搬出已完成结果，`is_cancelled`/`into_panic`/`panic_message` 与 payload 最终 Drop 全在锁外；记账与条目搬出同区（不低估，宁可短暂高估保守拒），锁序 `set → caps` 不变。
+- 承重事实：tokio 1.53.3 里 future 的 Drop panic 在 harness `complete()` 被 `catch_unwind` 吞掉，只有 `cancel_task()` 转 `JoinError` ⇒ 确定性复现只能走 abort（测试据此构造）。
+- 验证：payload Drop 内 `set.try_lock()` 探针（旧代码红/新代码绿）+ 并发准入压测；reap 组 6 轮无 flaky；crate 全量 607 passed。
+
+### Fix(std-ext): 注入 Clock 调用移到 cache/scheduler/ratelimit 内部锁外（issue#101）
+- `SyncTtlCache::insert`：满插清扫时间快照改为取锁前取样；`Scheduler::worker_loop`：删除持 state 锁的取钟，改用本轮锁外样本 + 持锁复检（停信标/关闸/堆顶更早 deadline）；`TokenBucket::settle_and_take`：锁外采样，旧样本晚提交记 0 且不倒退 `last`、不 panic。
+- 类型/方法 rustdoc 写明「Clock 锁外 / 键 Hash·Eq 锁内 / 读路径 V::clone 锁内」三类边界分开记。
+- 验证：14 条新测（探针 + 故意持锁对照 + 可重入 + panic + 丢唤醒 + 逆序提交）；五处变异各自红；std-ext 492 passed；clippy/fmt/doc 0。
+
+### Fix(scheduler): OS 线程创建失败可观察（issue#87）
+- `Scheduler::spawn_worker` 原先直接 `thread::spawn`，OS 创建失败只能以 panic 呈现、调用方无从恢复。新增 `Scheduler::try_spawn_worker -> io::Result<WorkerHandle>`（`Builder::spawn`，`io::Error` 原样返回、kind 不变，失败零残留：不产生 WorkerHandle / 停信标 / 线程句柄）。
+- 保留 `spawn_worker` 原签名作为 fail-visible 入口：内部委托新入口，失败带因 panic（消息含 `io::Error` 与 kind），rustdoc 标 `# Panics` 并指向新入口。
+- 失败后调度器保持开放：注册照常受理，显式 `tick()` 仍按 deadline 点火；`WorkerHandle::drop` 仍只停本 worker（#72 语义不变）；不引入 worker 计数/启动状态原子。
+- 测试注入缝为 `fn` 指针（仅起 worker 时一次间接调用，注册/点火/取消热路径零触碰），非 test 构建整体不存在。验证：std-ext 478 passed / 0 failed；变异（撤回注入缝）三条新测试全红。
+
+### Docs(fx): FxScope 阻塞边界与截止保证（issue#94）
+- `fx.rs` 模块文档新增「执行模型与阻塞边界」：三类阻塞（协作式 async / 同步阻塞·长时不 yield / 真正 blocking work）、截止不是硬墙钟上限、`TaskError::TimedOut` 与 `ShutdownReport::timed_out/still_running` 只表示「截止已过 / 已请求 abort / 终止未观测」。
+- `spawn_tracked` / `try_spawn_tracked` / `Spawned::join` / `shutdown_timeout` / `join_timeout` 补对应保证边界；框架不做 blocking adapter（不承诺强制终止任意 Rust 代码、不在 `FxScope` 内造 watchdog 线程）的理由落点写清。
+- `docs/reference.md` fx 章节三条 + `README.md` 消费方节（`spawn_blocking` / 独立 `ThreadPool` 写法；current-thread 禁用 `block_in_place`），证据引用 `f9b413d` 的两条边界测试。零代码/零测试改动。
+
 ### Fix(tests): 挂死类收口——护栏单源化 + 进程级兜底 + #94 两项确定性证明（issue#102/#94）,2026-11-24)
 - **现象**：CI 两次 job 撞 `timeout-minutes: 20`（run 45311454174 / 45312409945），日志 `test fx::tests::shutdown_timeout_aborts_inflight_and_join_yields_cancelled has been running for over 60 seconds`。
 - **机理（tokio 1.53.3 逐函数核实）**：`yield_now()` 已改为把 waker 交给当前 worker 延迟冲洗（`context::defer`）；带延迟 waker 的 worker 反复做 0 超时 `park_yield`，期间短暂独占 IO driver；另一 worker 此时 park 抢不到 driver 即回退为**不持 driver 的普通休眠**；时间轮只在 worker 进 `park_internal` 时被处理、注册 timer 只去打断正在 IO park 的线程 ⇒ 自旋任务占住原 driver 持有者后再不返回，全 runtime 无人在 driver 上，50ms 截止永不到期。

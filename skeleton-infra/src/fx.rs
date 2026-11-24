@@ -71,6 +71,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 
@@ -80,6 +81,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .expect("mutex poisoned: prior panic while holding the lock")
+}
+
+/// runtime 上下文预检（issue#92）：**必须在取任何内部锁（`set` / `caps`）之前**调用。
+///
+/// 环境错误先于准入判定 = 宿主 Future 不会在锁持有期析构（其 Drop 可重入本 scope，
+/// 持锁即自锁），环境错误也不会以 panic 形态从锁内炸出。
+fn runtime_handle() -> Result<Handle, AdmissionError> {
+    Handle::try_current().map_err(|_| AdmissionError::NoRuntime)
 }
 
 /// 任务结局（闭合 enum；Panicked 经 catch_unwind 归一）。
@@ -124,6 +133,9 @@ impl fmt::Display for ScopeClosed {
 impl std::error::Error for ScopeClosed {}
 
 /// 有界准入的 typed 拒绝原因（issue#39）：过载**不** panic、**不**阻塞调用方。
+///
+/// 非 `#[non_exhaustive]`（0.1.0 未发布，按 ADR 0005 先例直迁）：新增变体对跨 crate
+/// 穷尽 `match` 属破坏性变更——[`Self::NoRuntime`]（issue#92）即此形态，采用方补一条臂。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionError {
     /// accepting 闸已关（scope 关闭中）——与 [`ScopeClosed`] 同义。
@@ -132,6 +144,11 @@ pub enum AdmissionError {
     PendingFull,
     /// `max_tracked` 触顶：生命周期集合保留的条目数（含已完成未收割）达上界。
     TrackedFull,
+    /// 调用线程不在 Tokio runtime 上下文（`Handle::try_current` 失败）：spawn 的
+    /// 环境前置条件不成立（issue#92）。**不入容量账**——不是过载也不是闸关：
+    /// `admitted` / `tracked` / `active` / `waiting` / `rejected` 全不变，宿主
+    /// Future 不入集。
+    NoRuntime,
 }
 
 impl fmt::Display for AdmissionError {
@@ -144,6 +161,9 @@ impl fmt::Display for AdmissionError {
             Self::TrackedFull => {
                 f.write_str("fx scope tracked capacity exhausted (max_tracked reached)")
             }
+            Self::NoRuntime => f.write_str(
+                "no Tokio runtime context: spawn must be called from within a Tokio runtime",
+            ),
         }
     }
 }
@@ -856,6 +876,18 @@ impl FxScope {
     ///
     /// 本口只收 `Send` future；`!Send` future 走 `tokio::task::spawn_local`
     /// （须 LocalSet 同线程驱动），其句柄禁跨 runtime/LocalSet await（契约外行为）。
+    ///
+    /// # Panics
+    ///
+    /// **调用方必须处于 Tokio runtime 上下文**（issue#92）。本口是 fail-visible 旧签名
+    /// ——错误类型仍是 [`ScopeClosed`]，加不了 typed 变体 ⇒ 环境错误以带因 panic 表达：
+    /// 没有当前 runtime 时在**取任何内部锁之前** panic（消息含 runtime 前置条件与指向
+    /// [`Self::try_spawn_tracked`] 的指引），宿主 Future 随之在锁外析构一次。需要
+    /// [`AdmissionError::NoRuntime`] typed 结果的调用方走 [`Self::try_spawn_tracked`]。
+    ///
+    /// 这只是「完全没有 runtime」一条。另一条残差（Handle 所属 runtime 恰在停机）**不**
+    /// panic：实测 tokio 1.53 把该任务直接丢弃、句柄落 [`TaskError::Cancelled`]，记账
+    /// 仍自洽（`in_flight` 由 FlightGuard 归零，集合条目由收割/停机排空闲清）。
     pub fn spawn_tracked<T>(
         &self,
         fut: impl Future<Output = T> + Send + 'static,
@@ -863,13 +895,21 @@ impl FxScope {
     where
         T: Send + 'static,
     {
+        // runtime 预检在全函数第一句：环境错误不得在 `set` / `caps` 锁内炸开（issue#92）。
+        let rt = match Handle::try_current() {
+            Ok(rt) => rt,
+            Err(err) => panic!(
+                "FxScope::spawn_tracked requires a Tokio runtime context: {err}; \
+                 use FxScope::try_spawn_tracked for a typed AdmissionError::NoRuntime"
+            ),
+        };
         let mut set = self.admit_gate()?;
         // 无界档准入（legacy 口）：不施加 `max_pending` / `max_tracked` 上界 ⇒
         // 预留恒成功（触顶分支不可达）。
         let (permit, slot) = self
             .reserve_slot(None)
             .expect("unbounded admission must not hit a limit (no limits configured)");
-        Ok(self.spawn_reserved(&mut set, fut, permit, slot))
+        Ok(self.spawn_reserved(&mut set, fut, permit, slot, &rt))
     }
 
     /// 有界准入口（issue#39）：typed 准入结果——成功 / 闸关 / 过载。
@@ -883,6 +923,11 @@ impl FxScope {
     /// 其余语义与 [`Self::spawn_tracked`] 一致（生命周期集托管、oneshot 旁路、
     /// `Spawned::join()` 只消费结果、**不**移除集合条目）。阻塞边界同
     /// [`Self::spawn_tracked`]：有界准入不改变「只承载非阻塞 async」的前提。
+    ///
+    /// **runtime 上下文前置条件**（issue#92）：没有当前 Tokio runtime 时返回
+    /// [`AdmissionError::NoRuntime`]——该判定发生在**取 `set` / `caps` 锁之前**，
+    /// 不动 accepting 闸、不动容量账（`admitted` / `tracked` / `active` / `waiting`
+    /// / `rejected` 全不变），宿主 Future 不入集（随调用返回在锁外析构一次）。
     pub fn try_spawn_tracked<T>(
         &self,
         fut: impl Future<Output = T> + Send + 'static,
@@ -890,10 +935,12 @@ impl FxScope {
     where
         T: Send + 'static,
     {
+        // runtime 预检先于一切内部锁（issue#92）：环境错误 ≠ 过载 ≠ 闸关。
+        let rt = runtime_handle()?;
         // 闸关与 tracked 侧同义（`ScopeClosed` 无载荷 ⇒ 1:1 映射，无信息丢失）。
         let mut set = self.admit_gate().map_err(|_| AdmissionError::Closed)?;
         let (permit, slot) = self.reserve_slot(Some((self.max_pending, self.max_tracked)))?;
-        Ok(self.spawn_reserved(&mut set, fut, permit, slot))
+        Ok(self.spawn_reserved(&mut set, fut, permit, slot, &rt))
     }
 
     /// 取集合锁并核验 accepting 闸（闸核验 = 原子 RMW 而非 plain load：close
@@ -963,13 +1010,15 @@ impl FxScope {
         ))
     }
 
-    /// 入集：把已预留的槽位与任务装进生命周期集（`set` 锁已持）。
+    /// 入集：把已预留的槽位与任务装进生命周期集（`set` 锁已持；`rt` = 准入前预检
+    /// 取得的显式 Handle，不读隐式当前位置）。
     fn spawn_reserved<T>(
         &self,
         set: &mut JoinSet<Result<(), TaskError>>,
         fut: impl Future<Output = T> + Send + 'static,
         permit: Option<OwnedSemaphorePermit>,
         slot: SlotGuard,
+        rt: &Handle,
     ) -> Spawned<T>
     where
         T: Send + 'static,
@@ -978,11 +1027,18 @@ impl FxScope {
         let (tx, rx) = oneshot::channel();
         let sem = self.sem.clone();
         let flight = FlightGuard(Arc::clone(&self.in_flight));
-        // tokio ≥1.53：JoinSet::spawn 直接返回 AbortHandle（旧版 JoinHandle::abort_handle 已废）。
-        let abort = set.spawn(async move {
-            let _flight = flight; // abort/panic/完成三路必经 drop——归零契约的落点
-            task_body(sem, permit, fut, tx, slot).await
-        });
+        // tokio ≥1.53：`JoinSet::spawn_on` 用显式 Handle 入集，同样返回 AbortHandle。
+        //
+        // 入集本身不失败（预检之后的唯一残差是「Handle 所属 runtime 恰在停机」，实测
+        // tokio 1.53 把该任务直接丢弃、句柄落 cancelled 而不 panic）⇒ 不需要 spawn 失败
+        // 回滚：记账由 FlightGuard/SlotGuard 与集合收割自然闭合，预留账即为真实入集账。
+        let abort = set.spawn_on(
+            async move {
+                let _flight = flight; // abort/panic/完成三路必经 drop——归零契约的落点
+                task_body(sem, permit, fut, tx, slot).await
+            },
+            rt,
+        );
         Spawned { handle: abort, rx }
     }
 
@@ -996,13 +1052,19 @@ impl FxScope {
     /// 泄漏排查与停机契约都不覆盖它，须自行持 JoinHandle 等待或让任务自终止。
     /// 「只是不想等」不是用它的理由——[`Self::spawn_tracked`] 的 [`Spawned`]
     /// Drop 已不 abort，等净面还覆盖它。
+    ///
+    /// **runtime 上下文前置条件**（issue#92）：没有当前 Tokio runtime 时返回
+    /// [`AdmissionError::NoRuntime`]（与 tracked 侧同口：判定在任何内部锁与
+    /// accepting 闸核验之前；宿主 Future 随返回析构一次，不入集）。脱管语义不变。
     pub fn spawn_detached<T>(
         &self,
         fut: impl Future<Output = T> + Send + 'static,
-    ) -> Result<tokio::task::JoinHandle<T>, ScopeClosed>
+    ) -> Result<tokio::task::JoinHandle<T>, AdmissionError>
     where
         T: Send + 'static,
     {
+        // runtime 预检在闸核验之前（issue#92）：环境错误不带崩 accepting 闸语义。
+        let rt = runtime_handle()?;
         // 闸核验同 tracked 的原子 RMW 口径（close 并发下 spawn 的线性化点）；
         // 不进锁——detached 不与 abort_all 串行（语义上就不被 shutdown 覆及）。
         if self
@@ -1010,14 +1072,12 @@ impl FxScope {
             .compare_exchange(true, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err(ScopeClosed);
+            return Err(AdmissionError::Closed);
         }
-        // 本仓唯一 `tokio::spawn` 直调点：spawn_detached 本身就是「显式脱管口」的
-        // API 落点（armor 定案双命名），accepting 闸核验在同函数体内——脱管不经
-        // 生命周期集是它的语义而非漏管。clippy.toml disallowed 清单以本 allow 为
-        // 唯一豁免，新增直调点仍应被闸拦下。
-        #[allow(clippy::disallowed_methods)] // 唯一合法脱管口：本函数=闸本体
-        Ok(tokio::spawn(fut))
+        // 显式 Handle 而非 `tokio::spawn`（issue#92）：隐式当前位置读取在预检之后
+        // 已无必要，显式句柄把「用哪个 runtime」摆在调用点。`tokio::spawn` 的
+        // clippy.toml 禁令仍拦其它直调点（本函数本就是命名闸内唯一脱管口）。
+        Ok(rt.spawn(fut))
     }
 
     /// 尝试成为排空 owner（issue#70）：`Open → Draining` 的原子转换**先于**取走
@@ -1122,6 +1182,14 @@ impl FxScope {
     /// `timed_out` = 截止已过计数，`still_running` = 报告返回时终止仍未观测到——
     /// 两者都**不**表示已终止。含 blocking work 的消费方须选 multi-thread runtime
     /// 并把 blocking 工作移出 executor（见模块文档「执行模型与阻塞边界」）。
+    ///
+    /// # Panics
+    ///
+    /// 需要**启用 time driver 的 Tokio runtime 上下文**（issue#92）：`tokio::time::timeout`
+    /// 的截止句柄在构造时向当前 runtime 的 time driver 注册。用没开 `.enable_time()`
+    /// 的合法 runtime（如 `Builder::new_current_thread().build()`）调用即 panic，而不是
+    /// 返回结构化的超时结果；完全没有 runtime 时同样 panic。这属环境前置条件、不是
+    /// 可恢复错误面——签名与返回面（[`ShutdownReport`]）按 #92 取舍保持不变。
     pub async fn shutdown_timeout(&self, d: Duration) -> ShutdownReport {
         match self.begin_drain() {
             DrainSlot::Owner => {
@@ -1327,6 +1395,14 @@ impl<T: Send + 'static> Spawned<T> {
     /// 才拿到 `TimedOut` ⇒ `d` **不是**硬墙钟上限。CPU / 阻塞 IO 应移出 executor
     /// （`tokio::task::spawn_blocking` 或独立 `ThreadPool`），见模块文档「执行模型与
     /// 阻塞边界」。
+    ///
+    /// # Panics
+    ///
+    /// 需要**启用 time driver 的 Tokio runtime 上下文**（issue#92）：截止句柄在构造
+    /// 时向当前 runtime 的 time driver 注册——没开 `.enable_time()` 的合法 runtime
+    /// （如 `Builder::new_current_thread().build()`）下调用即 panic，而不是返回
+    /// [`TaskError::TimedOut`]；完全没有 runtime 时同样 panic。环境前置条件而非可恢复
+    /// 错误面：签名与 [`TaskError`] 返回面按 #92 取舍保持不变。
     pub async fn join_timeout(self, d: Duration) -> Result<T, TaskError> {
         match tokio::time::timeout(d, self.rx).await {
             Ok(Ok(result)) => result,
@@ -2092,5 +2168,240 @@ mod tests {
         scope.expect_fully_reaped_idle();
         assert!(scope.try_reap().is_empty(), "重复收割不重复计数");
         assert_eq!(scope.counts().completed_unreaped, 0);
+    }
+
+    /// future 析构探针（issue#92 锁边界）：记录析构次数，以及析构瞬间 `set` / `caps`
+    /// 两把内部锁是否都空闲。锁内析构（其 Drop 可重入本 scope ⇒ 自锁）会把它压成 false。
+    struct DropProbe {
+        scope: std::sync::Weak<FxScope>,
+        locks_free: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            let Some(scope) = self.scope.upgrade() else {
+                return; // 观察位留 false 由断言报红（禁静默通过）
+            };
+            // try_lock 而非 lock：缺陷态（探针在持锁期析构）要报红，不要挂死。
+            let set_free = scope.set.try_lock().is_ok();
+            let caps_free = scope.caps.try_lock().is_ok();
+            self.locks_free
+                .store(set_free && caps_free, Ordering::SeqCst);
+        }
+    }
+
+    /// 带探针的 pending future：永不就绪，析构时运行探针。
+    fn probed_pending(
+        scope: &Arc<FxScope>,
+        locks_free: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let probe = DropProbe {
+            scope: Arc::downgrade(scope),
+            locks_free,
+            drops,
+        };
+        async move {
+            let _probe = probe;
+            std::future::pending::<()>().await
+        }
+    }
+
+    /// runtime 上下文预检（issue#92 验收①）：无 runtime ⇒ typed `NoRuntime`——不 panic、
+    /// 不消费 Future、不触碰任何内部锁、不动任何计数（tracked / admitted / active /
+    /// waiting / rejected 全不变）。
+    #[test]
+    fn no_runtime_admission_is_typed_and_lock_free() {
+        let scope = Arc::new(FxScope::new());
+        let locks_free = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        let outcome = scope.try_spawn_tracked(probed_pending(
+            &scope,
+            Arc::clone(&locks_free),
+            Arc::clone(&drops),
+        ));
+        assert!(
+            matches!(outcome, Err(AdmissionError::NoRuntime)),
+            "无 runtime ⇒ typed NoRuntime（不 panic）"
+        );
+        assert_eq!(
+            scope.counts(),
+            FxCounts::default(),
+            "NoRuntime 不入容量账（active/waiting/completed_unreaped/rejected 全 0）"
+        );
+        assert_eq!(scope.in_flight(), 0, "NoRuntime 不动 in_flight");
+        assert!(!scope.is_closed(), "NoRuntime 不触碰 accepting 闸");
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "宿主 Future 恰析构一次");
+        assert!(
+            locks_free.load(Ordering::SeqCst),
+            "Future 析构不得发生在 set / caps 锁持有期（锁内析构 = 自锁面）"
+        );
+
+        // 脱管口同一前置条件（typed 错误，不 panic）。
+        let outcome = scope.spawn_detached(probed_pending(
+            &scope,
+            Arc::clone(&locks_free),
+            Arc::clone(&drops),
+        ));
+        assert!(
+            matches!(outcome, Err(AdmissionError::NoRuntime)),
+            "spawn_detached 无 runtime ⇒ 明确 typed 错误"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 2, "每个入口恰析构一次");
+        assert!(locks_free.load(Ordering::SeqCst));
+        assert_eq!(scope.in_flight(), 0, "两套入口都不动 in_flight");
+        assert_eq!(scope.counts(), FxCounts::default());
+    }
+
+    /// 锁边界直证（issue#92 验收②的确定性形态）：另一线程持着 `set` 锁时，无 runtime
+    /// 的拒绝仍须**立刻**返回。实现若先取锁再预检，这次调用会排在锁上 ⇒ 本测试超时判红。
+    #[test]
+    fn no_runtime_rejection_does_not_wait_for_the_set_lock() {
+        let scope = Arc::new(FxScope::new());
+        let held = lock(&scope.set); // 同模块直取私有锁：模拟「锁已被人持有」的窗口
+        let (tx, rx) = std::sync::mpsc::channel();
+        let caller_scope = Arc::clone(&scope);
+        let caller = std::thread::spawn(move || {
+            let outcome = caller_scope.try_spawn_tracked(std::future::pending::<()>());
+            let _ = tx.send(matches!(outcome, Err(AdmissionError::NoRuntime)));
+        });
+        let typed = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("无 runtime 的拒绝必须发生在取 set 锁之前（持锁时仍须立即返回，而非排队等锁）");
+        drop(held);
+        assert!(typed);
+        caller.join().expect("调用线程正常结束");
+    }
+
+    /// legacy `spawn_tracked` 无 runtime ⇒ 带因 panic（`# Panics` 契约，指向 typed
+    /// 入口），且容量账零残留、Future 在锁外析构。
+    #[test]
+    fn legacy_spawn_tracked_without_runtime_panics_with_cause() {
+        let scope = Arc::new(FxScope::new());
+        let locks_free = Arc::new(AtomicBool::new(false));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let fut = probed_pending(&scope, Arc::clone(&locks_free), Arc::clone(&drops));
+        let payload = match catch_unwind(AssertUnwindSafe(|| scope.spawn_tracked(fut))) {
+            Ok(_) => panic!(
+                "无 runtime 的 legacy 入口必须 fail-visible panic（返回 Ok 即静默丢环境错误）"
+            ),
+            Err(payload) => payload,
+        };
+        let msg = panic_message(payload);
+        assert!(msg.contains("Tokio runtime context"), "panic 带因: {msg}");
+        assert!(
+            msg.contains("try_spawn_tracked"),
+            "panic 指向 typed 入口: {msg}"
+        );
+        assert_eq!(scope.counts(), FxCounts::default(), "panic 后容量账零残留");
+        assert_eq!(scope.in_flight(), 0, "panic 后 in_flight 零残留");
+        assert!(!scope.is_closed(), "panic 不动 accepting 闸");
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "宿主 Future 恰析构一次");
+        assert!(locks_free.load(Ordering::SeqCst), "Future 在锁外析构");
+    }
+
+    /// 停机竞态面（issue#92 第 6 条实证）：预检通过但 Handle 所属 runtime 已停机时，
+    /// tokio 1.53 **不** panic——任务入集即被丢弃、句柄落 `Cancelled`，记账仍自洽
+    /// （无 `tracked` / `in_flight` 残留）。这条钉住「预检之后无需 spawn 失败回滚」。
+    #[tokio::test]
+    async fn shutdown_runtime_admission_yields_cancelled_without_residue() {
+        let dead = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("multi-thread runtime");
+        let dead_handle = dead.handle().clone();
+        dead.shutdown_background();
+        let scope = FxScope::new();
+        let spawned = {
+            // 进入已停机的 handle 上下文：`try_current` 成功 ⇒ 预检放行（真实竞态面）。
+            let _entered = dead_handle.enter();
+            scope
+                .try_spawn_tracked(std::future::ready(9u8))
+                .expect("停机中的 runtime 入集不 panic（tokio 丢弃任务、句柄落 cancelled）")
+        };
+        assert_eq!(
+            spawned.join().await,
+            Err(TaskError::Cancelled),
+            "入集即被丢弃 ⇒ 句柄落 Cancelled"
+        );
+        wait_until("停机任务条目可收割", || {
+            !scope.try_reap().is_empty()
+        })
+        .await;
+        assert_eq!(scope.counts().completed_unreaped, 0, "收割后未收割数归零");
+        assert_eq!(scope.in_flight(), 0, "FlightGuard 随任务丢弃归零");
+        scope.expect_body_idle();
+        scope.expect_fully_reaped_idle();
+    }
+
+    /// runtime 上下文内的入口照常（issue#92 回归面）：typed 入场成功且 join 语义不变，
+    /// detached 仍脱管（不计 in_flight、不被 shutdown 等待）。
+    #[tokio::test]
+    async fn runtime_context_admission_paths_unchanged() {
+        let scope = FxScope::new();
+        let handle = scope
+            .try_spawn_tracked(async { 7u8 })
+            .expect("runtime 内 typed 准入成功");
+        assert_eq!(handle.join().await, Ok(7));
+        let detached = scope
+            .spawn_detached(std::future::ready(()))
+            .expect("runtime 内脱管口成功");
+        detached.await.expect("脱管任务正常结束");
+        assert_eq!(scope.in_flight(), 0, "detached 不计 in_flight");
+        scope.expect_body_idle();
+    }
+
+    /// 环境故障分离（issue#92 评论 1）：**没有 time driver** 的合法 runtime 下，两个
+    /// timeout API 按 `# Panics` 契约 panic（而不是返回结构化超时结果）；随后用开
+    /// `.enable_time()` 的 runtime 跑通原分类，证明约束只在时间驱动前置条件上。
+    #[test]
+    fn timeout_apis_panic_without_time_driver_and_keep_classification_with_it() {
+        // 完全合法但未 enable_time 的 current-thread runtime。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime（未 enable_time）");
+        let scope = FxScope::new();
+        assert!(
+            catch_unwind(AssertUnwindSafe(
+                || rt.block_on(scope.shutdown_timeout(Duration::from_millis(10)))
+            ))
+            .is_err(),
+            "无 time driver ⇒ shutdown_timeout 必须 panic（不是结构化超时报告）"
+        );
+        drop(rt);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime（未 enable_time）");
+        let scope = FxScope::new();
+        let spawned = rt.block_on(async { scope.spawn_tracked(async { 1u8 }).unwrap() });
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| rt.block_on(async move {
+                spawned.join_timeout(Duration::from_millis(10)).await
+            })))
+            .is_err(),
+            "无 time driver ⇒ join_timeout 必须 panic（不是 TaskError::TimedOut）"
+        );
+        drop(rt);
+
+        // 开了 time driver：原超时分类与返回面不变。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread runtime（enable_time）");
+        let scope = FxScope::new();
+        let report = rt.block_on(scope.shutdown_timeout(Duration::from_millis(10)));
+        assert_eq!(report, ShutdownReport::default(), "空 scope：无事件报告");
+        // shutdown_timeout 关闸（close 是停机①段）⇒ join 面另起 scope 测。
+        let scope = FxScope::new();
+        let handle = rt.block_on(async { scope.spawn_tracked(async { 5u8 }).unwrap() });
+        assert_eq!(
+            rt.block_on(handle.join_timeout(Duration::from_secs(1))),
+            Ok(5),
+            "time driver 就位 ⇒ 正常直传结果（分类不变）"
+        );
     }
 }

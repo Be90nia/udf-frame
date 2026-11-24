@@ -3,7 +3,8 @@
 # 闸完全惰性——「效果只经 FxScope 命名口（tracked/detached）」在此落地。
 disallowed-methods = [
   # tokio::spawn 直调：任务脱离 JoinSet 生命周期集/accepting 闸/取消令牌树——
-  # 效果只经 skeleton_infra::fx::FxScope 命名口（tracked/detached，tokio feature）；
-  # 全仓唯一 allow 豁免 = spawn_detached 本体（fx.rs，闸内合法脱管口）
+  # 效果只经 skeleton_infra::fx::FxScope 命名口（tracked/detached，tokio feature）。
+  # 注（issue#92）：脱管口已改用 Handle::spawn（spawn_detached 内，无 allow 豁免）；
+  # 本清单只拦裸 tokio::spawn，Handle::spawn / JoinSet::spawn_on 的连封见 bd 待办。
   "tokio::spawn",
 ]

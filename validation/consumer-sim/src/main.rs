@@ -469,6 +469,8 @@ fn main() {
             Err(AdmissionError::PendingFull) => {}
             Err(AdmissionError::TrackedFull) => {}
             Err(AdmissionError::Closed) => {}
+            // issue#92：runtime 上下文前置条件不成立（本处已在 block_on 内，不可达）。
+            Err(AdmissionError::NoRuntime) => {}
         }
         // 三轴计数从外部 crate 可读（字段全 pub，非 non_exhaustive）。
         let counts = scope.counts();
