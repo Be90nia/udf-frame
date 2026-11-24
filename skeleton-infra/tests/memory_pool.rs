@@ -959,3 +959,266 @@ mod return_atomicity {
         assert_quiescent(&p, "缩容弃置");
     }
 }
+
+// ── issue#99：resize 审计事件在跨层事务提交、全部内部锁释放后发射 ─────────
+//
+// 旧实现持 `resizing` 闸调 `PoolBase::resize`，后者同步发 `Resized`/
+// `ResizeRejected` ⇒ 回调重入 `resize` 在同线程等非重入闸（确定性自锁），且回调
+// 能看到「base 新值 + inner 旧值」。以下测试用 `feature = "testing"` 的锁探针 +
+// 有界通道把两种失效记成红而不是挂死（禁 sleep 控交错）。
+
+#[cfg(feature = "testing")]
+mod resize_event_timing {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    const HANDOFF: Duration = Duration::from_secs(5);
+
+    type SharedPool = Arc<MemoryPool<Vec<u8>, fn() -> Vec<u8>>>;
+
+    fn shared_pool(max: usize, idle_cap: usize) -> SharedPool {
+        Arc::new(pool(max, idle_cap))
+    }
+
+    /// 外层 resize 放到独立线程：回调若自等内部锁，本测试以超时记红（禁挂死）。
+    fn resize_bounded(p: &SharedPool, tuning: MemoryTuning) -> Result<(), PoolResizeError> {
+        let (done_tx, done_rx) = mpsc::channel();
+        let p = Arc::clone(p);
+        let handle = thread::spawn(move || {
+            done_tx.send(p.resize(tuning)).expect("send resize result");
+        });
+        let result = done_rx
+            .recv_timeout(HANDOFF)
+            .expect("resize 不得卡在内部锁（审计回调重入路径）");
+        handle.join().expect("resize thread");
+        result
+    }
+
+    /// `Resized` 回调内重入同一个池的 `resize`：外层必须完成返回、内层必须有
+    /// 确定结果（旧实现在 `resizing` 闸上确定性自锁）。
+    #[test]
+    fn resized_callback_reenters_resize_without_self_lock() {
+        let p = shared_pool(4, 2);
+        let nested = Arc::new(Mutex::new(Vec::new()));
+        let ticket = {
+            let weak = Arc::downgrade(&p);
+            let nested = Arc::clone(&nested);
+            PoolManaged::subscribe_audit(&*p, move |e| {
+                if e.kind != PoolAuditKind::Resized {
+                    return;
+                }
+                let Some(inner) = weak.upgrade() else { return };
+                let result = inner.resize(MemoryTuning {
+                    max: 8,
+                    idle_cap: 4,
+                });
+                nested.lock().expect("nested results").push(result);
+            })
+        };
+
+        resize_bounded(
+            &p,
+            MemoryTuning {
+                max: 6,
+                idle_cap: 3,
+            },
+        )
+        .expect("outer resize");
+        drop(ticket);
+
+        let nested = nested.lock().expect("nested results");
+        assert_eq!(nested.len(), 1, "一次成功 resize 恰触发一次 Resized 回调");
+        assert!(
+            nested[0].is_ok(),
+            "回调内重入 resize 必须有确定结果：{nested:?}"
+        );
+        drop(nested);
+        let m = p.metrics();
+        assert_eq!(
+            (m.core.max, m.idle_cap),
+            (8, 4),
+            "内层（后发起）目标必须生效"
+        );
+    }
+
+    /// `ResizeRejected` 同款：拒绝事件也在锁外发射（旧实现在 `resizing` 闸内发）。
+    #[test]
+    fn rejected_callback_reenters_resize_without_self_lock() {
+        let p = shared_pool(4, 2);
+        let nested = Arc::new(Mutex::new(Vec::new()));
+        let locks_free = Arc::new(Mutex::new(Vec::new()));
+        let ticket = {
+            let weak = Arc::downgrade(&p);
+            let nested = Arc::clone(&nested);
+            let locks_free = Arc::clone(&locks_free);
+            PoolManaged::subscribe_audit(&*p, move |e| {
+                if e.kind != PoolAuditKind::ResizeRejected {
+                    return;
+                }
+                let Some(inner) = weak.upgrade() else { return };
+                locks_free
+                    .lock()
+                    .expect("locks")
+                    .push(inner.resize_locks_free());
+                let result = inner.resize(MemoryTuning {
+                    max: 4,
+                    idle_cap: 2,
+                });
+                nested.lock().expect("nested results").push(result);
+            })
+        };
+
+        let error = resize_bounded(
+            &p,
+            MemoryTuning {
+                max: 0,
+                idle_cap: 1,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, PoolResizeError::ZeroMax);
+        drop(ticket);
+
+        let locks = locks_free.lock().expect("locks");
+        assert_eq!(locks.len(), 1, "拒绝路径恰一次 ResizeRejected 回调");
+        assert_eq!(
+            locks[0],
+            (true, true, true),
+            "ResizeRejected 回调运行时 resizing/inner/core 均须空闲"
+        );
+        drop(locks);
+        let nested = nested.lock().expect("nested results");
+        assert!(
+            nested[0].is_ok(),
+            "拒绝事件在锁外发射 ⇒ 回调内 resize 必须成功：{nested:?}"
+        );
+        drop(nested);
+        let m = p.metrics();
+        assert_eq!((m.core.max, m.idle_cap), (4, 2), "拒绝路径零状态变更");
+    }
+
+    /// `Resized` 回调看到的是 base 边界 + inner 槽位的**同一已提交配置**，且能
+    /// 重入 `acquire`/`metrics`（旧实现会看到 inner 旧值、锁被占用）。
+    #[test]
+    fn resized_callback_observes_committed_config_and_can_acquire() {
+        let p = shared_pool(4, 2);
+        // 预热两件闲槽（逐个借还只会复用同一件，闲槽到不了裁剪线）。
+        let warm: Vec<_> = (0..2)
+            .map(|_| p.acquire(Duration::ZERO).expect("warm slot"))
+            .collect();
+        drop(warm);
+        assert_eq!(p.slot_snapshot(), (2, 2));
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let ticket = {
+            let weak = Arc::downgrade(&p);
+            let observed = Arc::clone(&observed);
+            PoolManaged::subscribe_audit(&*p, move |e| {
+                if e.kind != PoolAuditKind::Resized {
+                    return;
+                }
+                let Some(inner) = weak.upgrade() else { return };
+                let locks = inner.resize_locks_free();
+                let m = inner.metrics();
+                // 回调内借一件再还：必须能拿到已提交进槽位的件。
+                let acquired = inner.acquire(Duration::ZERO).is_ok();
+                observed.lock().expect("observed").push((
+                    m.core.max,
+                    m.idle_cap,
+                    m.core.idle,
+                    locks,
+                    acquired,
+                ));
+            })
+        };
+
+        p.resize(MemoryTuning {
+            max: 3,
+            idle_cap: 1,
+        })
+        .expect("legal shrink");
+        drop(ticket);
+
+        let observed = observed.lock().expect("observed");
+        assert_eq!(observed.len(), 1, "一次成功 resize 恰一次 Resized 回调");
+        let (max, idle_cap, idle, locks, acquired) = observed[0];
+        assert_eq!(
+            (max, idle_cap),
+            (3, 1),
+            "回调必须看到 base 与 inner 同一已提交配置"
+        );
+        assert_eq!(idle, 1, "账本 idle 必须已是裁剪后的值（旧实现读到 2）");
+        assert_eq!(
+            locks,
+            (true, true, true),
+            "回调运行时 resizing/inner/core 均须空闲"
+        );
+        assert!(acquired, "回调内 acquire 必须拿到已提交的闲槽");
+        drop(observed);
+        let m = p.metrics();
+        assert_eq!(
+            (m.core.max, m.idle_cap, m.core.idle, m.core.borrowed),
+            (3, 1, 1, 0)
+        );
+        assert_eq!(p.slot_snapshot(), (1, 1));
+    }
+
+    /// 并发 resize（`_serial` 串行化 base+inner 成对写）：每个回调读到的
+    /// `(core.max, idle_cap)` 必须成对来自某次提交（禁撕裂），且最后发射的事件
+    /// 描述最终提交配置。
+    #[test]
+    fn concurrent_resizes_never_expose_a_torn_config() {
+        let p = shared_pool(4, 2);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let ticket = {
+            let weak = Arc::downgrade(&p);
+            let observed = Arc::clone(&observed);
+            PoolManaged::subscribe_audit(&*p, move |e| {
+                if e.kind != PoolAuditKind::Resized {
+                    return;
+                }
+                let Some(inner) = weak.upgrade() else { return };
+                let locks = inner.resize_locks_free();
+                let m = inner.metrics();
+                observed
+                    .lock()
+                    .expect("observed")
+                    .push(((m.core.max, m.idle_cap), locks));
+            })
+        };
+
+        let spawn = |tuning: MemoryTuning| {
+            let p = Arc::clone(&p);
+            thread::spawn(move || p.resize(tuning).expect("legal tuning"))
+        };
+        let a = spawn(MemoryTuning {
+            max: 6,
+            idle_cap: 3,
+        });
+        let b = spawn(MemoryTuning {
+            max: 5,
+            idle_cap: 4,
+        });
+        a.join().expect("resize A");
+        b.join().expect("resize B");
+        drop(ticket);
+
+        let observed = observed.lock().expect("observed");
+        assert!(!observed.is_empty(), "并发 resize 至少一个提交者发事件");
+        for ((max, idle_cap), locks) in observed.iter() {
+            assert!(
+                (*max, *idle_cap) == (6, 3) || (*max, *idle_cap) == (5, 4),
+                "回调读到撕裂的 base/inner 配置：({max}, {idle_cap})"
+            );
+            assert_eq!(*locks, (true, true, true), "回调运行时不得持有内部锁");
+        }
+        let m = p.metrics();
+        let last = observed.last().expect("非空");
+        assert_eq!(
+            last.0,
+            (m.core.max, m.idle_cap),
+            "最后发射的事件必须描述最终提交配置"
+        );
+    }
+}

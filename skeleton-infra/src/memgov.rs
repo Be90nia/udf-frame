@@ -401,7 +401,7 @@ mod memory_pool {
         PoolAuditEvent, PoolAuditTicket, PoolManaged, PoolMetrics, PoolResizeError,
     };
 
-    use crate::pool::{AUDIT_RING_DEFAULT_CAP, PoolBase};
+    use crate::pool::{AUDIT_RING_DEFAULT_CAP, PoolBase, ResizeOutcome};
 
     /// std Mutex 取锁：中毒 = 持锁方已 panic——fail-fast 传播（同 `pool::lock`
     /// 纪律）。收口一处，调用点只见加锁。
@@ -682,53 +682,94 @@ mod memory_pool {
         /// 借出句柄不受影响——归还时由内部协作入口 `note_return_with` 在 core
         /// 临界区内按**新**边界裁决并同区完成真实入槽（issue#98：归还若先赢
         /// core，它必在释放 core 前提交槽位，故本方法的 inner 裁剪必能看见它；
-        /// 本方法先赢 core 则归还只能按新 cap/max 裁决）。`core` 边界写 →
-        /// inner 裁剪 → 账本 idle 回写整段都在 `resizing` 串行闸内（并发 resize
-        /// 不交错出 base/inner 边界不一致）；**弃置对象在闸外析构**（用户类型
-        /// `Drop` 可重入公开入口，闸内析构 ⇒ 重入 resize 自死锁）。末尾
-        /// notify_all：扩容即时唤醒等待者（调参暂停窗零等待）。
+        /// 本方法先赢 core 则归还只能按新 cap/max 裁决）。
+        ///
+        /// 事务边界（issue#99）：`resizing` 串行闸内只做纯状态提交——base 边界写
+        /// （无事件原语）→ inner 边界与裁剪 → 账本 idle 回写；**闸释放后**才发
+        /// `Resized`/`ResizeRejected` 并析构弃置对象。故审计回调与用户对象 `Drop`
+        /// 都能重入本池公开入口（`resize`/`acquire`/`metrics`）而不自等内部锁，
+        /// 且看到的是 base 与 inner **同一已提交配置**。末尾 notify_all：扩容即时
+        /// 唤醒等待者（调参暂停窗零等待）。
         ///
         /// # Errors
         ///
-        /// [`PoolResizeError`]：非法参数（拒绝路径零状态变更）。
+        /// [`PoolResizeError`]：非法参数（拒绝路径零状态变更；`ResizeRejected`
+        /// 同样在闸外发射）。
         pub fn resize(&self, tuning: MemoryTuning) -> Result<(), PoolResizeError> {
-            let _serial = lock(&self.resizing);
-            self.base.resize(tuning.max, tuning.idle_cap)?;
-            let excess = {
-                let mut inner = lock(&self.inner);
-                inner.max = tuning.max;
-                inner.idle_cap = tuning.idle_cap;
-                if inner.idle.len() > tuning.idle_cap {
-                    let excess = inner.idle.split_off(tuning.idle_cap);
-                    inner.created = inner
-                        .created
-                        .checked_sub(excess.len())
-                        .expect("created below idle on shrink (bookkeeping bug)");
-                    Some(excess)
+            // 闸内：纯状态提交（校验 → base 边界 → inner 裁剪 → 账本回写）。
+            // 被裁对象带出闸外析构、事件也在闸外发——两者都可能跑用户代码，
+            // 持 `resizing` 跑用户代码 ⇒ 重入 resize 自死锁（issue#99）。
+            let (outcome, excess) = {
+                let _serial = lock(&self.resizing);
+                let outcome = self.base.resize_deferred(tuning.max, tuning.idle_cap);
+                if let ResizeOutcome::Rejected(_) = outcome {
+                    // 纯校验拒绝：零状态变更，落到闸外发拒绝事件。
+                    (outcome, None)
                 } else {
-                    None
+                    let (max, idle_cap) = (tuning.max, tuning.idle_cap);
+                    let excess = {
+                        let mut inner = lock(&self.inner);
+                        inner.max = max;
+                        inner.idle_cap = idle_cap;
+                        if inner.idle.len() > idle_cap {
+                            let excess = inner.idle.split_off(idle_cap);
+                            inner.created = inner
+                                .created
+                                .checked_sub(excess.len())
+                                .expect("created below idle on shrink (bookkeeping bug)");
+                            Some(excess)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(excess) = &excess {
+                        // 账本 idle 与槽位裁剪同批提交（core 临界区在 inner 之后，
+                        // 无反向嵌套）。
+                        self.base.note_idle_delta(-(excess.len() as isize));
+                    }
+                    (outcome, excess)
                 }
-            };
-            if let Some(excess) = excess {
-                self.base.note_idle_delta(-(excess.len() as isize));
-                // 账本与槽位提交已完成：串行闸先放——`excess` 是用户类型，其
-                // `Drop` 可重入本池公开入口（重入 resize 会在同线程上等本闸，
-                // std Mutex 非重入 ⇒ 自死锁），故析构必须在闸外。
-                drop(_serial);
-                drop(excess);
-            } else {
-                drop(_serial);
+            }; // `resizing` 闸在此释放
+            match outcome {
+                ResizeOutcome::Resized => {
+                    // 锁外：先发事件（描述已提交状态，回调可重入一切公开入口），
+                    // 再析构弃置对象（用户 `Drop` 同样可重入）。
+                    self.base.emit_resize(outcome);
+                    drop(excess);
+                    self.cv.notify_all();
+                    Ok(())
+                }
+                ResizeOutcome::Rejected(error) => {
+                    self.base.emit_resize(outcome);
+                    Err(error)
+                }
             }
-            self.cv.notify_all();
-            Ok(())
         }
 
-        /// 指标快照：核心形（PoolBase 账本单锁 Copy）+ 特有读数 `idle_cap`。
-        /// O(1) 顺序两锁零分配（实测锚见 `examples/memory_pool_profile.rs`）。
+        /// 指标快照：核心形（PoolBase 账本单锁 Copy）+ 特有读数 `idle_cap`
+        /// （槽位锁）。O(1) 顺序两锁零分配（实测锚见
+        /// `examples/memory_pool_profile.rs`）。
+        ///
+        /// **快照语义 = 逐面观测、非原子复合快照**（issue#99 拍板）：两把锁顺序
+        /// 各取一次，并发 `resize` 间隙里 `core.max` 与 `idle_cap` 可能来自相邻
+        /// 时刻（各自都是已提交值，但不成对）。观测热路径不为低频 setter 加锁；
+        /// 需成对读请在 resize 后静止点取，或由调用方外部串行化。
         pub fn metrics(&self) -> MemoryPoolMetrics {
             let core = self.base.metrics();
             let idle_cap = lock(&self.inner).idle_cap;
             MemoryPoolMetrics { core, idle_cap }
+        }
+
+        /// 测试面（`feature = "testing"`）：`resizing` / `inner` / base `core`
+        /// 三把内部锁当前是否空闲——审计回调重入探针用（issue#99）。
+        #[cfg(feature = "testing")]
+        #[doc(hidden)]
+        pub fn resize_locks_free(&self) -> (bool, bool, bool) {
+            (
+                self.resizing.try_lock().is_ok(),
+                self.inner.try_lock().is_ok(),
+                self.base.core_lock_free(),
+            )
         }
 
         /// 测试面（`feature = "testing"`）：归还窗口闸——把归还线程挂进

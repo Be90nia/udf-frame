@@ -60,6 +60,19 @@ pub(crate) fn validate(max: usize, idle_cap: usize) -> Result<(), PoolResizeErro
     Ok(())
 }
 
+/// resize 事务结果（内部，issue#99）：状态已提交（或纯校验拒绝），**事件待发射**。
+///
+/// [`PoolBase::resize_deferred`] 只做校验与账本提交并把本值交回；由特化池在
+/// 自己的账本提交完成、**全部内部锁释放后**调 [`PoolBase::emit_resize`]——
+/// 审计回调按契约可重入池的一切公开入口，持着任何内部锁发射即违反该契约。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResizeOutcome {
+    /// 边界已提交：发射 `Resized`。
+    Resized,
+    /// 纯校验拒绝、零状态变更：发射 `ResizeRejected` 并原样返回该错误。
+    Rejected(PoolResizeError),
+}
+
 /// std Mutex 取锁：中毒 = 持锁方已 panic——fail-fast 传播（同 runtime::lock
 /// 纪律）。收口一处，调用点只见加锁。
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -80,6 +93,10 @@ struct PoolCore {
 
 /// 审计回调闭包（模块内别名收口 type_complexity，同 `audit::AuditCallback` 先例）。
 type AuditCallback = Box<dyn FnMut(&PoolAuditEvent) + Send>;
+
+/// resize 代次钩子（测试面，同一别名收口 type_complexity 的先例）。
+#[cfg(feature = "testing")]
+type ResizeEpochHook = Box<dyn FnMut(u64) + Send>;
 
 /// 审计槽（订阅态的单槽内容）：容量环 + 实时回调 + 订阅代次（形态同
 /// `audit::AuditSink`）+ **在途派发状态 + 待投递 FIFO**（issue#75）。
@@ -372,24 +389,57 @@ impl PoolBase {
     /// 缩容不夺借出：只调边界，已借出句柄不受影响；归还时 [`Self::note_return`]
     /// 按新边界裁决（槽满 = 丢弃 + 计数）。
     ///
+    /// 线性化：账本写与事件是两步（事件在账本提交后、无外层锁时发射）；用本件
+    /// 做跨层事务的特化池必须用 crate 内无回调原语（`resize_deferred` +
+    /// `emit_resize`）把事件推迟到自身账本也提交、全部内部锁释放之后
+    /// （issue#99）。
+    ///
     /// 性能：O(1)；校验纯函数零锁，合法路径单次取锁 + 两次原子发射。
     pub fn resize(&self, max: usize, idle_cap: usize) -> Result<(), PoolResizeError> {
+        let outcome = self.resize_deferred(max, idle_cap);
+        // 自身状态已提交、无外层锁：立即发射（回调可重入本池一切入口）。
+        self.emit_resize(outcome);
+        match outcome {
+            ResizeOutcome::Resized => Ok(()),
+            ResizeOutcome::Rejected(error) => Err(error),
+        }
+    }
+
+    /// 内部无回调 resize 原语（issue#99）：校验 + 账本提交，**不发射任何审计
+    /// 事件**，把本应发射的结果交回调用方。特化池（[`crate::memgov::MemoryPool`]、
+    /// [`ThreadPool`]）用它把 base 边界与自身账本纳入同一事务，事件迟发到自身
+    /// 状态提交、全部内部锁释放之后。
+    ///
+    /// 性能：O(1)；拒绝路径零锁（校验纯函数）。
+    pub(crate) fn resize_deferred(&self, max: usize, idle_cap: usize) -> ResizeOutcome {
         // 校验与状态变更分离（性能纪律）：拒绝路径不碰锁。
-        if let Err(e) = validate(max, idle_cap) {
-            self.emit(PoolAuditKind::ResizeRejected);
-            return Err(e);
+        if let Err(error) = validate(max, idle_cap) {
+            return ResizeOutcome::Rejected(error);
         }
         {
             let mut core = lock(&self.core);
             core.max = max;
             core.idle_cap = idle_cap;
         }
-        self.emit(PoolAuditKind::Resized);
-        Ok(())
+        ResizeOutcome::Resized
+    }
+
+    /// 发射 resize 事务结果（[`Self::resize_deferred`] 的配对出口）：**调用方
+    /// 须已释放全部内部锁**——回调可重入池的一切公开入口（`resize`/`metrics`/
+    /// `acquire`…）。
+    pub(crate) fn emit_resize(&self, outcome: ResizeOutcome) {
+        match outcome {
+            ResizeOutcome::Resized => self.emit(PoolAuditKind::Resized),
+            ResizeOutcome::Rejected(_) => self.emit(PoolAuditKind::ResizeRejected),
+        }
     }
 
     /// 指标快照（可观测）：值语义 `Copy` 读数，含水位线（`borrowed / max`，
     /// 可 >1.0 = 缩容后借出数尚高于新池深——合法中间态，读数如实呈现不钳位）。
+    ///
+    /// 线性化：单次 `core` 临界区读数 = 本账本的**单面原子快照**。本快照不与
+    /// 特化池自己的槽位/worker 锁复合——实现方把本件读数与自身锁读数拼成复合
+    /// 指标时**不保证跨面原子**（见 [`crate::memgov::MemoryPool::metrics`]）。
     ///
     /// 性能：O(1) 单次取锁 + Copy（契约面纪律；无锁演进时预期更低）。
     pub fn metrics(&self) -> PoolMetrics {
@@ -401,6 +451,14 @@ impl PoolBase {
             dropped_overflow: core.dropped_overflow,
             watermark: core.borrowed as f64 / core.max as f64,
         }
+    }
+
+    /// 测试面（`feature = "testing"`）：`core` 账本锁当前是否空闲——供重入探针
+    /// 证明审计回调运行时本锁未被调用栈持有（issue#99）。
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn core_lock_free(&self) -> bool {
+        self.core.try_lock().is_ok()
     }
 
     /// 借出记账（实现方 acquire 成功后调用）：借出数 +1，发射 `Borrowed`。
@@ -535,6 +593,12 @@ impl PoolBase {
     /// 审计发射唯一收口：未订阅 = 一次 gate load 即返（热路径零分配零锁）；
     /// 订阅态 = seq 单调入账（容量环溢出丢最旧）+ **锁外**实时回调（回调可
     /// 重入本池一切入口，持锁即死锁）。热路径禁格式化。
+    ///
+    /// resize 事务的两件事件（`Resized`/`ResizeRejected`）由特化池在 base 边界
+    /// 与自身账本**都提交、全部内部锁释放后**经 [`Self::emit_resize`] 发射
+    /// （issue#99）：回调内重入 `resize` 不会自等内部锁，且读到的配置是完整的
+    /// 已提交态。并发 resize 的事件顺序 = 各自解锁后发射的实际次序（事件不带
+    /// 目标载荷；要读生效配置请走 `metrics()`）。
     fn emit(&self, kind: PoolAuditKind) {
         self.sink.emit(kind)
     }
@@ -806,6 +870,10 @@ struct Shared {
     /// 目标更新按代次串行化——**最后发起**的 resize 目标生效（并发 resize 到
     /// 不同目标时收敛到最新目标，与 spawn 完成顺序无关）。
     next_epoch: AtomicU64,
+    /// 测试面一次性钩子（`feature = "testing"`）：resize 领号后调用一次，供
+    /// 确定性交错测试暂停在「领号 → 目标提交」窗（issue#99）。
+    #[cfg(feature = "testing")]
+    resize_epoch_hook: Mutex<Option<ResizeEpochHook>>,
 }
 
 struct Inner {
@@ -1033,6 +1101,8 @@ impl<G: SpawnGate> ThreadPool<G> {
             work: Condvar::new(),
             retired: Condvar::new(),
             next_epoch: AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            resize_epoch_hook: Mutex::new(None),
         });
         let pool = Self {
             base,
@@ -1115,15 +1185,21 @@ impl<G: SpawnGate> ThreadPool<G> {
         }
     }
 
-    /// 运行时调参（[`PoolManaged`] 契约）：core/max 校验委托 [`PoolBase::resize`]
-    /// （同源规则 + Resized/ResizeRejected 审计白送）；queue_cap 零值在进基座
-    /// 前拒绝（直通管道语义复用 `IdleCapZero`——此路径不进审计流，非法参数
-    /// 病理面如实降档）。
+    /// 运行时调参（[`PoolManaged`] 契约）：core/max 校验与拒绝留痕同源（`validate`
+    /// 纯函数 + `ResizeRejected` 事件）；queue_cap 零值在进基座前拒绝（直通管道
+    /// 语义复用 `IdleCapZero`——此路径不进审计流，非法参数病理面如实降档）。
     ///
     /// 生效语义：扩容补建至新 core（返回即到数）；缩容发退出令牌（差额 worker
     /// 处理完当前任务即退；差额按真实存活计——在途创建席位不计，issue#34
     /// stale 令牌防护）；回扩重算待退令牌（撤销未消费的缩容）；queue_cap
     /// 只拦未来入队（既有积压照常排空）。
+    ///
+    /// **提交与事件时序（issue#69/#99）**：代次在**入口**领取（任何执行用户回调
+    /// 的步骤之前）⇒「最后发起的目标生效」按调用发起顺序定代次；base 边界与
+    /// `Inner` 目标在同一临界区提交（旧代次迟到时整体跳过，禁旧目标覆盖新配置）；
+    /// `Resized` 只在目标提交后、**全部内部锁释放后**发射——回调内重入 `resize`
+    /// 拿到更高代次，不会被外层迟到代次覆盖。`Resized` 只声称「目标边界已提交」，
+    /// 不声称 worker 已到数（创建失败/异步退役是合法的 actual-vs-target 差异）。
     ///
     /// **worker 创建失败**（§7 Runtime/infrastructure 类）：扩容补建时 OS 线程
     /// 创建失败 → **typed Err**（[`PoolResizeError::SpawnFailed`]）——错误对象
@@ -1131,27 +1207,54 @@ impl<G: SpawnGate> ThreadPool<G> {
     /// 指标即可判断池处于什么状态（已建 worker 继续服务，可重试 resize 补齐）。
     /// 失败另经 [`ThreadPoolMetrics::spawn_failures`] 计数留痕（fail-visible）。
     pub fn resize(&self, t: ThreadPoolTuning) -> Result<(), PoolResizeError> {
+        // ① 纯校验（零锁、零状态变更）：此刻没有任何内部锁在持，拒绝事件可就地
+        //    发射（issue#99：拒绝事件也必须在锁外）。
         if t.queue_cap == 0 {
             return Err(PoolResizeError::IdleCapZero);
         }
-        self.base.resize(t.max, t.core)?;
-        let mut spawn_failure = None;
-        // 目标代次（issue#69）：入口领号 ⇒ **最后发起**的 resize 目标生效
-        // （并发 resize 到不同目标时收敛到最新目标，与 spawn 完成顺序无关）。
+        if let Err(error) = validate(t.max, t.core) {
+            self.base.emit_resize(ResizeOutcome::Rejected(error));
+            return Err(error);
+        }
+        // ② 目标代次（issue#69/#99）：**入口领号**——任何用户回调（审计回调/
+        //    创建闸）之前领取，保证「最后发起的目标生效」按调用发起顺序定代次。
         let epoch = self.shared.next_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        #[cfg(feature = "testing")]
+        {
+            // 测试 seam（issue#99 确定性交错）：领号后、目标提交前的窗。
+            let hook = lock(&self.shared.resize_epoch_hook).take();
+            if let Some(mut hook) = hook {
+                hook(epoch);
+            }
+        }
+        // ③ 目标提交：base 边界与 Inner 目标同一临界区（池内锁序 inner →
+        //    base.core；本池无持 core 取 inner 的反向路径）——更晚代次已提交时
+        //    整体跳过，禁旧目标把新 base/inner 写回。纯校验已过 ⇒ 必 `Resized`。
+        let committed = {
+            let mut g = lock(&self.shared.inner);
+            if epoch >= g.target_epoch {
+                g.target_epoch = epoch;
+                g.core = t.core;
+                g.max = t.max;
+                g.queue_cap = t.queue_cap;
+                let outcome = self.base.resize_deferred(t.max, t.core);
+                debug_assert_eq!(
+                    outcome,
+                    ResizeOutcome::Resized,
+                    "validated tuning must commit"
+                );
+                true
+            } else {
+                // 更新发起的 resize 已提交目标：本次目标作废（禁覆盖新配置）。
+                false
+            }
+        };
+        let mut spawn_failure = None;
         loop {
-            // ① 锁内：目标更新（按代次串行化）+ 缺口席位预留 + 缩容令牌对账。
-            //    同一临界区 ⇒ 并发 resize 的目标更新互斥（issue#69 的「在途
-            //    resize 协调器」等价物：代次 + 状态锁），OS 线程创建在锁外（见下）。
+            // ① 锁内：缺口席位预留 + 缩容令牌对账（目标已在上面提交；OS 线程
+            //    创建在锁外，见下）。
             let (ids, shrink_pending) = {
                 let mut g = lock(&self.shared.inner);
-                if epoch >= g.target_epoch {
-                    // 最新发起的目标覆盖旧目标（core/max/queue_cap 同批更新）。
-                    g.target_epoch = epoch;
-                    g.core = t.core;
-                    g.max = t.max;
-                    g.queue_cap = t.queue_cap;
-                }
                 // 缩容令牌：只从**可退休的真实 worker** 计（issue#34：在途席位
                 // 不是可退役 worker），按**最新 core** 对账（issue#69：陈旧令牌
                 // 禁留——并发 resize 后按最新目标收敛）。
@@ -1199,27 +1302,40 @@ impl<G: SpawnGate> ThreadPool<G> {
             // ③ 下一轮：对账最新目标（并发 resize 期间目标可能已变）——补足到
             // 最新 core（issue#69：收敛到最新目标，不留永久偏小的 core）。
         }
+        // ④ 部分生效现场先取快照（单锁内 → 释放），事件与错误构造都在锁外。
+        let spawn_failure = spawn_failure.map(|error| {
+            // 部分生效报告：调参已落地但 worker 未建够——错误对象自带生效
+            // 状态（目标 core / 实际存活数——剔除在途席位，与 metrics/缩容
+            // 差额同一分母），池保持有效（已建 worker 继续服务，计数准确）。
+            let workers = {
+                let g = lock(&self.shared.inner);
+                g.workers - g.reservations
+            };
+            PoolResizeError::SpawnFailed {
+                kind: error.io_error().kind(),
+                target_core: t.core,
+                workers,
+            }
+        });
+        // ⑤ 事件（issue#99）：目标已提交、全部内部锁已释放——回调可重入
+        //    resize/execute/metrics。目标被更晚发起的调用覆盖时不发（那次调用负责）。
+        if committed {
+            self.base.emit_resize(ResizeOutcome::Resized);
+        }
         match spawn_failure {
             None => Ok(()),
-            Some(error) => {
-                // 部分生效报告：调参已落地但 worker 未建够——错误对象自带生效
-                // 状态（目标 core / 实际存活数——剔除在途席位，与 metrics/
-                // 缩容差额同一分母），池保持有效（已建 worker 继续服务，计数
-                // 准确）。
-                let workers = {
-                    let g = lock(&self.shared.inner);
-                    g.workers - g.reservations
-                };
-                Err(PoolResizeError::SpawnFailed {
-                    kind: error.io_error().kind(),
-                    target_core: t.core,
-                    workers,
-                })
-            }
+            Some(error) => Err(error),
         }
     }
 
-    /// 指标快照（值语义 `Copy`，O(1) 单次取锁）。
+    /// 指标快照（值语义 `Copy`，O(1) 单次取锁）：**单锁一致快照**——目标配置
+    /// （core/max/queue_cap）与 worker/队列实况取自同一 `Inner` 临界区，且 base
+    /// 边界与目标在同一临界区提交（见 [`Self::resize`]），不存在「base 新值 +
+    /// 目标旧值」的混合读。
+    ///
+    /// 快照**不是**「worker 已达标」的证明：实际 worker 数与目标 core 的差异是
+    /// 合法过渡态（创建失败未补齐 / 异步退役未完成），调用方按目标与实际的差值
+    /// 自行判断收敛。
     pub fn metrics(&self) -> ThreadPoolMetrics {
         let g = lock(&self.shared.inner);
         ThreadPoolMetrics {
@@ -1242,6 +1358,25 @@ impl<G: SpawnGate> ThreadPool<G> {
                 watermark: g.busy as f64 / g.max as f64,
             },
         }
+    }
+
+    /// 测试面（`feature = "testing"`）：安装一次性 resize 代次钩子——领号后、
+    /// 目标提交前调用一次（issue#99 的确定性交错窗）。
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn set_resize_epoch_hook(&self, hook: impl FnMut(u64) + Send + 'static) {
+        *lock(&self.shared.resize_epoch_hook) = Some(Box::new(hook));
+    }
+
+    /// 测试面（`feature = "testing"`）：调度锁与 base 账本锁当前是否空闲——供
+    /// 审计回调重入探针证明回调运行时内部锁均未被调用栈持有（issue#99）。
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn resize_locks_free(&self) -> (bool, bool) {
+        (
+            self.shared.inner.try_lock().is_ok(),
+            self.base.core_lock_free(),
+        )
     }
 
     /// 关闭入口：停止接收新提交（后续提交走拒绝策略），已入队任务排空后
