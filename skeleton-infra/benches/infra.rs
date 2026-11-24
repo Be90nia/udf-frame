@@ -16,14 +16,21 @@
 //! **只产数据**：池组不设阈值、不写机器相关基线注释（§9 性能实践——基线走
 //! `perf.yml` 滚动 + artifacts）；本机实测数字落在 verify 报告里，不进源码。
 //!
+//! 多生产者准入/完成面（issue#96 / bd udf-frame-7is）两组：
+//! `multi_producer_admission`（`try_dispatch` 纯准入）与
+//! `multi_producer_dispatch`（`dispatch_with_receipt(..).wait()` 端到端）——
+//! 矩阵（baseline / contention / bounded / slow reducer / causal feedback）与
+//! 装置纪律见下方该节头注。
+//!
 //! 跑法（required-features 并集，见 Cargo.toml）：
 //! `cargo bench -p udf-skeleton-infra --all-features --bench infra`
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
@@ -36,7 +43,7 @@ use skeleton_infra::objpool::{ByteBudget, ObjectPool};
 use skeleton_infra::pool::{
     AbortPolicy, CallerRunsPolicy, RejectPolicy, ThreadPool, ThreadPoolTuning,
 };
-use skeleton_infra::runtime::SyncStore;
+use skeleton_infra::runtime::{AdmissionOutcome, DispatchOutcome, SyncStore};
 use skeleton_infra::{Journal, JournalError, JsonlJournal};
 
 // 分配面计量前提：CountingAllocator 必须是本二进制的全局分配器，否则
@@ -1126,6 +1133,545 @@ fn state_layout_retention(c: &mut Criterion) {
     );
 }
 
+// ---- multi-producer 准入 / 完成面（issue#96 / bd udf-frame-7is）----
+//
+// 矩阵：baseline / contention(2·4·8·16·32) / bounded admission(small·saturated) /
+// slow reducer / causal feedback。issue 的「try_dispatch 与 dispatch 不可混成一个
+// 吞吐数」落在 **ID 面**（两个 group）：
+//
+// - `multi_producer_admission`：`try_dispatch` 纯准入（不等待完成边界）；
+// - `multi_producer_dispatch`：`dispatch_with_receipt(..).wait()` 端到端完成边界
+//   （与 `Store::dispatch` 同一完成承诺；用回执面是因为有界臂的 `Full` 在 legacy
+//   `dispatch` 上是 panic——那是刻意选的 fail-visible 面，不是本组要测的东西）。
+//
+// 装置纪律（issue#96 实验实现约束 1–4）：
+// ① 时序协调只用 `Barrier` + `mpsc`（启动 / 排空者入场 / 受控停顿），无 sleep；
+// ② 生产者与排空者线程在**样本内创建一次**（`thread::scope`），计时窗只覆盖
+//    「生产者开闸 → 全部返回」，线程创建不在窗内；
+// ③ 每样本新建 Store（队列 / 账本池 / 订阅者从零起），warm-up 与测量由
+//    criterion 分开；
+// ④ 计时窗内**无 per-op 计时器** ⇒ 吞吐读数干净；p50/p95/p99 只在首个样本的
+//    首轮采样（criterion 的 warm-up 轮），读数含每 op 两次 `Instant::now` 开销
+//    （~20-30 ns/op，Windows）——量级判读用，绝对值不作 SLA。
+//
+// 指标口径：
+// - 吞吐 = 元素/秒，元素 = **提交尝试数**（含 Full 拒绝）⇒ bounded 臂的吞吐是
+//   「尝试率」，不是完成率；完成数另列；
+// - 队列深 max/avg 由**生产者侧**抽样（每 1/8 提交量读一次 `pending_actions()`，
+//   该读取两次队列锁，抽样成本 ~1/125 op）；正在 reduce 的 action 已出队 ⇒
+//   不计入队列深（issue 明确要求）；
+// - bounded saturated 臂：排空者持租约阻塞在 `MpAct::Pause` 的 channel 令牌上，
+//   队列填满后剩余提交走 `Full`；`release_depth` = **放行前真实排队 population**
+//   = 一次排空批的大小（唯一可直读 batch 的形态）+ `放行→排空` 墙钟；
+// - slow reducer 臂 = reducer-heavy 控制组（定长确定性自旋，`black_box` 防折叠），
+//   使「准入 / 排队 / 服务」三段可分离；
+// - causal feedback 臂 = 每条外部 action 在 reducer 内 `Effect::Emit` 一条子动作，
+//   与同 producer 数的 contention 臂之差即回灌成本。
+//
+// 两处非对称，都是装置可运行性要求，不是被测语义差异：
+// ① **放行点**：admission 组生产者不阻塞 ⇒ 全批跑完再放行（提交期全程饱和，
+//    便于量 Full 率与拒绝成本）；dispatch 组生产者阻塞在回执上 ⇒ 必须由主线程
+//    观测到 `admission_full_count() > 0` 后放行（等全批跑完 = 死锁）。
+// ② **公平性非保证**：并发生产者之间没有跨线程公平 FIFO（契约只承诺单生产者
+//    程序序与入队线性化序）。本组按生产者统计完成数以**观测**饥饿，不做公平性
+//    断言、也不暗示 mutex 提供严格公平。
+//
+// 不可直读项：contention 臂的「一次排空处理的批大小」无读侧计数（本票不改 src）；
+// 只能由队列深抽样与尾延迟形态间接判读，见报告「未覆盖」段。
+
+/// 生产者 / 排空者的动作域。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MpAct {
+    /// 轻量外部动作。
+    Nop,
+    /// 因果回灌：reducer 内 Emit 一条子动作（同栈续转，不经解释器）。
+    EmitChild,
+    /// 受控停顿（只由排空者提交）：reducer 内等 channel 令牌，不用 sleep。
+    Pause,
+    /// reducer-heavy：定长确定性自旋（服务时间控制组）。
+    Heavy,
+}
+
+/// 两个 API 面 = 两个 group（issue 约束 3）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MpMode {
+    /// `try_dispatch`：只测准入，不等完成边界。
+    Admission,
+    /// `dispatch_with_receipt(..).wait()`：端到端完成边界。
+    Dispatch,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MpState {
+    reduced: u64,
+}
+
+/// 受控停顿通道 + 服务时间控制。每次样本新建 store 时随之新建（无跨样本残留）。
+struct MpReducer {
+    /// 停顿放行通道（`MpAct::Pause` 的 reduce 里 recv 一条令牌）。
+    gate: Mutex<mpsc::Receiver<()>>,
+    /// 停顿入场信号：阻塞**之前**发一条 ⇒ 保证「排空者已持租约」先于生产者开闸，
+    /// 否则生产者会自己夺租约、把停顿搬到自己的调用栈上。
+    entered: Mutex<mpsc::Sender<()>>,
+    /// `MpAct::Heavy` 的自旋轮数（0 = 不适用）。
+    spin: u32,
+}
+
+impl skeleton::Reducer for MpReducer {
+    type State = MpState;
+    type Action = MpAct;
+    type Op = std::convert::Infallible;
+
+    fn initial(&self) -> MpState {
+        MpState { reduced: 0 }
+    }
+
+    fn reduce(&self, s: &MpState, action: MpAct, out: &mut skeleton::EffectBuf<MpAct>) -> MpState {
+        match action {
+            MpAct::Pause => {
+                // 先报到场（主线程据此开闸），再阻塞等放行令牌。
+                let _ = self.entered.lock().expect("entered 锁").send(());
+                let _ = self.gate.lock().expect("gate 锁").recv();
+            }
+            MpAct::EmitChild => out.push(Effect::Emit(MpAct::Nop)),
+            MpAct::Heavy => {
+                let mut acc = s.reduced;
+                for _ in 0..self.spin {
+                    acc = acc
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                }
+                black_box(acc);
+            }
+            MpAct::Nop => {}
+        }
+        MpState {
+            reduced: s.reduced + 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MpPlan {
+    producers: usize,
+    per_producer: u64,
+    action: MpAct,
+    mode: MpMode,
+    /// 0 = unbounded（外部 ingress 不限）。
+    capacity: usize,
+    /// 排空者是否先进入受控停顿（bounded saturated 形态）。
+    pause: bool,
+    spin: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MpProducerStats {
+    submitted: u64,
+    accepted: u64,
+    full: u64,
+    completed: u64,
+    depth_max: usize,
+    depth_sum: u64,
+    depth_n: u64,
+}
+
+#[derive(Default)]
+struct MpSample {
+    producers: Vec<MpProducerStats>,
+    /// 首个样本首轮采样（含 per-op 计时开销）。
+    latencies: Vec<u64>,
+    /// 放行前排队 population（= 一次排空批大小）。
+    release_depth: usize,
+    /// 放行 → 排空完成的墙钟。
+    recovery_ns: u64,
+    /// 样本结束时状态里的 reduce 计数（装置闸：应与「准入 + 排空者自提交」相符）。
+    reduced: u64,
+    /// 外部准入 Full 计数（store 读侧，fail-visible 面）。
+    full_counter: u64,
+}
+
+fn mp_store(
+    plan: &MpPlan,
+) -> (
+    SyncStore<MpState, MpAct>,
+    mpsc::Sender<()>,
+    mpsc::Receiver<()>,
+) {
+    let (release_tx, gate) = mpsc::channel();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let store = SyncStore::new(
+        MpReducer {
+            gate: Mutex::new(gate),
+            entered: Mutex::new(entered_tx),
+            spin: plan.spin,
+        },
+        skeleton::NoFx,
+    );
+    if plan.capacity > 0 {
+        store.set_capacity(plan.capacity);
+    }
+    (store, release_tx, entered_rx)
+}
+
+/// 一个样本 = 一个新建 Store + 一轮（`iters` 次重复）。返回样本墙钟与统计。
+///
+/// 线程模型：N 个生产者 + 1 个排空者 + 本线程（计时与放行）。四个 Barrier 对应
+/// 「开闸 → 排空者就位 → 生产者返回 → 本轮排空完成」四相位。
+fn mp_sample(plan: &MpPlan, iters: u64, collect_lat: bool) -> (Duration, MpSample) {
+    let (store, release_tx, entered_rx) = mp_store(plan);
+    let store = Arc::new(store);
+    let n = plan.producers;
+    let start = Barrier::new(n + 2);
+    let armed = Barrier::new(n + 1);
+    let finished = Barrier::new(n + 1);
+    let drained = Barrier::new(2);
+    let mut residue = 0u64;
+    // 装置闸的违规先记下来、**出计时窗后**再断言：在 scope 内 panic 会卡在
+    // thread::scope 的 join 上（worker 还挂在 Barrier 上）⇒ 进程挂住、exe 被占。
+    let mut saturated_missing = false;
+    let mut residue_stuck = false;
+    let drainer_own = AtomicU64::new(0);
+    let (stats_tx, stats_rx) = mpsc::channel::<(MpProducerStats, Vec<u64>)>();
+    let depth_every = (plan.per_producer / 8).max(1);
+    let mut total = Duration::ZERO;
+    let mut sample = MpSample::default();
+
+    thread::scope(|scope| {
+        // 引用（Copy）捕获：N 个生产者闭包共享同一组 Barrier / 原子，不各自持一份。
+        let (start, armed, finished, drained) = (&start, &armed, &finished, &drained);
+        let drainer_own = &drainer_own;
+        for _ in 0..n {
+            let store = Arc::clone(&store);
+            let stats_tx = stats_tx.clone();
+            scope.spawn(move || {
+                let mut st = MpProducerStats::default();
+                let mut lats: Vec<u64> = Vec::new();
+                for round in 0..iters {
+                    start.wait();
+                    armed.wait();
+                    let timed = collect_lat && round == 0;
+                    for i in 0..plan.per_producer {
+                        let t0 = Instant::now();
+                        match plan.mode {
+                            MpMode::Admission => match store.try_dispatch(plan.action) {
+                                AdmissionOutcome::Accepted => st.accepted += 1,
+                                AdmissionOutcome::Full => st.full += 1,
+                                AdmissionOutcome::Closed => panic!("bench store 不闭门"),
+                            },
+                            MpMode::Dispatch => match store.dispatch_with_receipt(plan.action) {
+                                Ok(receipt) => {
+                                    st.accepted += 1;
+                                    if receipt.wait() == DispatchOutcome::Completed {
+                                        st.completed += 1;
+                                    }
+                                }
+                                Err(AdmissionOutcome::Full) => st.full += 1,
+                                Err(AdmissionOutcome::Closed) => panic!("bench store 不闭门"),
+                                Err(AdmissionOutcome::Accepted) => {
+                                    unreachable!("Accepted 不出现在 Err 位（回执面契约）")
+                                }
+                            },
+                        }
+                        if timed {
+                            lats.push(t0.elapsed().as_nanos() as u64);
+                        }
+                        if i % depth_every == 0 {
+                            let d = store.pending_actions();
+                            st.depth_max = st.depth_max.max(d);
+                            st.depth_sum += d as u64;
+                            st.depth_n += 1;
+                        }
+                    }
+                    st.submitted += plan.per_producer;
+                    finished.wait();
+                }
+                let _ = stats_tx.send((st, lats));
+            });
+        }
+        {
+            let store = Arc::clone(&store);
+            scope.spawn(move || {
+                for _ in 0..iters {
+                    start.wait();
+                    if plan.pause {
+                        // 夺租约 → 阻塞在受控停顿 → 放行后同一排空环把队列排空；
+                        // 该调用返回即本轮的恢复点。
+                        store.dispatch(MpAct::Pause);
+                        drainer_own.fetch_add(1, Ordering::SeqCst);
+                        drained.wait();
+                    } else {
+                        // 每轮只提**一条**自身动作：占住「无孤儿排空」的线性化点，
+                        // 又不对扩展曲线造成固定份额的偏置。**不做**「排空到 idle」
+                        // 的循环——那会与本轮生产者互相喂活（一方不断提交、另一方
+                        // 的排空环永不空）⇒ 活锁 + 队列无界增长（2026-11-24 实测
+                        // 撞到 20 GiB 分配失败）。单租约是结构不变量，不由本线程独享：
+                        // 谁在无租约时准入，谁就排空（store 的既有语义）。
+                        if let Ok(receipt) = store.dispatch_with_receipt(MpAct::Nop) {
+                            let _ = receipt.wait();
+                            drainer_own.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            });
+        }
+        for _ in 0..iters {
+            start.wait();
+            if plan.pause {
+                entered_rx.recv().expect("排空者必须进入受控停顿");
+            }
+            armed.wait();
+            let t0 = Instant::now();
+            if plan.pause && plan.mode == MpMode::Dispatch {
+                // 完成边界面：生产者阻塞在各自回执上 ⇒ 必须观测到「队列已满」后
+                // 放行；等全批返回 = 死锁。
+                let mut guard = 0u64;
+                while guard < 50_000_000 && store.admission_full_count() == 0 {
+                    guard += 1;
+                    std::hint::spin_loop();
+                }
+                if store.admission_full_count() == 0 {
+                    // 观测不到 Full = 形态没成立；**照样放行**让本轮收敛，出窗后报红。
+                    saturated_missing = true;
+                }
+                sample.release_depth = sample.release_depth.max(store.pending_actions());
+                let _ = release_tx.send(());
+            }
+            finished.wait();
+            total += t0.elapsed();
+            if plan.pause {
+                if plan.mode == MpMode::Admission {
+                    // 准入面生产者不阻塞 ⇒ 全批跑完再放行（提交期全程饱和）。
+                    sample.release_depth = sample.release_depth.max(store.pending_actions());
+                    let _ = release_tx.send(());
+                }
+                let t1 = Instant::now();
+                drained.wait();
+                sample.recovery_ns = sample.recovery_ns.max(t1.elapsed().as_nanos() as u64);
+            } else {
+                // 本轮残留在**计时窗外**收干净：否则它会被算进下一轮，破坏
+                // 「每样本独立」口径（守卫防装置失真导致的静默挂死）。
+                let mut guard = 0u32;
+                while guard < 10_000 && store.pending_actions() > 0 {
+                    guard += 1;
+                    if let Ok(receipt) = store.dispatch_with_receipt(MpAct::Nop) {
+                        let _ = receipt.wait();
+                        residue += 1;
+                    }
+                }
+                if store.pending_actions() > 0 {
+                    residue_stuck = true;
+                }
+            }
+        }
+    });
+    drop(stats_tx);
+    for (st, lats) in stats_rx.iter() {
+        sample.producers.push(st);
+        sample.latencies.extend(lats);
+    }
+    sample.reduced = store.snapshot().reduced;
+    sample.full_counter = store.admission_full_count();
+    assert!(
+        !saturated_missing,
+        "bounded saturated 臂未观测到 Full（装置失真：饱和形态不成立）"
+    );
+    assert!(!residue_stuck, "残留排空未收敛（装置失真）");
+    mp_check(plan, &sample, drainer_own.load(Ordering::SeqCst) + residue);
+    (total, sample)
+}
+
+/// 装置闸（**非性能阈值**）：读数若成立不了这些结构性事实，就说明装置失真、
+/// 数字无意义，宁可红。
+fn mp_check(plan: &MpPlan, sample: &MpSample, own_reduces: u64) {
+    assert_eq!(
+        sample.producers.len(),
+        plan.producers,
+        "生产者统计缺失：有生产者线程未交付读数"
+    );
+    let accepted: u64 = sample.producers.iter().map(|p| p.accepted).sum();
+    let expected = accepted
+        * if plan.action == MpAct::EmitChild {
+            2
+        } else {
+            1
+        }
+        + own_reduces;
+    assert_eq!(
+        sample.reduced, expected,
+        "reduce 计数与准入统计不符（accepted={accepted} + 排空侧自提交/残留={own_reduces}，\
+         feedback 臂应翻倍）：有 action 丢失或被重复处理"
+    );
+    if plan.pause {
+        assert_eq!(
+            sample.release_depth, plan.capacity,
+            "bounded saturated 臂放行前队列应恰好填满容量（实测 {} / 容量 {}）",
+            sample.release_depth, plan.capacity
+        );
+        assert!(
+            sample.full_counter > 0,
+            "bounded saturated 臂未产生任何 Full：饱和形态未成立"
+        );
+    }
+}
+
+fn mp_print(id: &str, plan: &MpPlan, sample: &MpSample, iters: u64) {
+    let per: Vec<String> = sample
+        .producers
+        .iter()
+        .map(|p| format!("{}/{}/{}/{}", p.submitted, p.accepted, p.full, p.completed))
+        .collect();
+    let depth_max = sample
+        .producers
+        .iter()
+        .map(|p| p.depth_max)
+        .max()
+        .unwrap_or(0);
+    let depth_sum: u64 = sample.producers.iter().map(|p| p.depth_sum).sum();
+    let depth_n: u64 = sample.producers.iter().map(|p| p.depth_n).sum();
+    let avg = if depth_n == 0 {
+        0.0
+    } else {
+        depth_sum as f64 / depth_n as f64
+    };
+    let mut lat = sample.latencies.clone();
+    lat.sort_unstable();
+    let pct = |q: usize| {
+        if lat.is_empty() {
+            0
+        } else {
+            lat[(lat.len() - 1) * q / 100]
+        }
+    };
+    eprintln!(
+        "[multi-producer] {id} —— 生产者={} 每生产者提交/轮={} action={:?} 模式={:?} 容量={} 轮数={iters}",
+        plan.producers, plan.per_producer, plan.action, plan.mode, plan.capacity
+    );
+    eprintln!("  每生产者 提交/准入/Full/完成 = {}", per.join(" | "));
+    eprintln!(
+        "  full_counter={} reduced={} 队列深 max/avg={}/{}（生产者侧抽样 {} 次）",
+        sample.full_counter, sample.reduced, depth_max, avg, depth_n
+    );
+    if plan.pause {
+        eprintln!(
+            "  release_depth(一次排空批)={} 放行→排空={:.1} µs",
+            sample.release_depth,
+            sample.recovery_ns as f64 / 1000.0
+        );
+    }
+    eprintln!(
+        "  p50/p95/p99 = {} / {} / {} ns（首轮样本，含 per-op 计时开销）",
+        pct(50),
+        pct(95),
+        pct(99)
+    );
+    // 饥饿观测：已准入但一次都没完成的生产者（公平性非 API 保证，只如实报告）。
+    // 准入面不等待完成边界 ⇒ 该面的 completed 恒 0，只在完成边界面对照。
+    let starved: Vec<usize> = if plan.mode == MpMode::Dispatch {
+        sample
+            .producers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.accepted > 0 && p.completed == 0)
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !starved.is_empty() {
+        eprintln!("  WARN 生产者 {starved:?} 有准入但零完成（观测到饥饿，非 API 保证）");
+    }
+}
+
+fn mp_id(plan: &MpPlan) -> String {
+    let n = plan.producers;
+    match plan.action {
+        MpAct::Heavy => format!("slow_reducer_p{n}"),
+        MpAct::EmitChild => format!("causal_feedback_p{n}"),
+        MpAct::Nop if plan.pause => format!("bounded_saturated_p{n}"),
+        MpAct::Nop if plan.capacity > 0 => format!("bounded_small_p{n}"),
+        MpAct::Nop if n == 1 => "baseline_p1".to_string(),
+        MpAct::Nop => format!("contention_p{n}"),
+        MpAct::Pause => unreachable!("Pause 只由排空者提交"),
+    }
+}
+
+fn mp_plans(mode: MpMode) -> Vec<MpPlan> {
+    let mut plans = Vec::new();
+    let mut push = |producers, per_producer, action, capacity, pause, spin| {
+        plans.push(MpPlan {
+            producers,
+            per_producer,
+            action,
+            mode,
+            capacity,
+            pause,
+            spin,
+        })
+    };
+    push(1, 2000, MpAct::Nop, 0, false, 0);
+    for n in [2, 4, 8, 16, 32] {
+        push(n, 1000, MpAct::Nop, 0, false, 0);
+    }
+    for n in [2, 4, 8, 16, 32] {
+        push(n, 1000, MpAct::Nop, 64, false, 0);
+    }
+    for n in [4, 8, 16, 32] {
+        // 饱和形态：容量 2 **必须**小于生产者数——完成边界面每个生产者同时只
+        // 有 1 条在途（阻塞在自己的回执上），队列占用的上界 = min(n, cap)；
+        // n ≤ cap 时永远填不满 ⇒ 观测不到 Full（实测 n=2/cap=8 即此形态）。
+        push(n, 5000, MpAct::Nop, 2, true, 0);
+    }
+    for n in [1, 2, 4, 8, 16] {
+        push(n, 100, MpAct::Heavy, 0, false, 1000);
+    }
+    push(4, 1000, MpAct::EmitChild, 0, false, 0);
+    plans
+}
+
+fn mp_group(c: &mut Criterion, mode: MpMode) {
+    let name = match mode {
+        MpMode::Admission => "multi_producer_admission",
+        MpMode::Dispatch => "multi_producer_dispatch",
+    };
+    let mut group = c.benchmark_group(name);
+    // 臂多（22）× 每臂都要起线程，故把单臂测量窗与样本数收窄（臂间差距远大于
+    // 采样噪声；完整矩阵的绝对值判读留给 perf.yml 的滚动基线）。
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_secs(1));
+    for plan in mp_plans(mode) {
+        let id = mp_id(&plan);
+        group.throughput(Throughput::Elements(
+            plan.producers as u64 * plan.per_producer,
+        ));
+        group.bench_function(&id, |b| {
+            // 每臂独立的统计闸：延迟采样只在**本臂**的首个样本（warm-up 轮）做，
+            // 统计块每臂打一次——共用变量会让第二个臂起全部静默。
+            let mut lat_done = false;
+            let mut printed = false;
+            b.iter_custom(|iters| {
+                let collect_lat = !lat_done;
+                let (spent, sample) = mp_sample(&plan, iters, collect_lat);
+                lat_done |= collect_lat;
+                if !printed {
+                    printed = true;
+                    mp_print(&id, &plan, &sample, iters);
+                }
+                spent
+            });
+        });
+    }
+    group.finish();
+}
+
+fn multi_producer_admission(c: &mut Criterion) {
+    mp_group(c, MpMode::Admission);
+}
+
+fn multi_producer_dispatch(c: &mut Criterion) {
+    mp_group(c, MpMode::Dispatch);
+}
+
 criterion_group!(
     benches,
     fxscope_spawn_join,
@@ -1140,6 +1686,8 @@ criterion_group!(
     byte_budget_contention,
     state_layout_update,
     state_layout_update_scope,
-    state_layout_retention
+    state_layout_retention,
+    multi_producer_admission,
+    multi_producer_dispatch
 );
 criterion_main!(benches);

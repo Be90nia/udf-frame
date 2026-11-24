@@ -120,7 +120,7 @@ jobs:
       # （与 ci.yml 的 bench 编译门同一口径；--all-features 防 required-features
       #  整目标跳过 = hollow gate）
       - name: Bench compile gate
-        run: cargo bench --workspace --all-features --no-run
+        run: cargo bench --workspace --all-features --locked --no-run
 
       # bench 目标清点：如实标注哪些 crate 根本没有 bench 目标（下方据此跳过，
       # 不假装跑了）。产物落 perf-out/bench-targets.txt 随 artifact 留存。
@@ -159,7 +159,7 @@ jobs:
             echo "udf-skeleton-infra: 无 bench 目标 -> 跳过（如实标注）"
             exit 0
           fi
-          cargo bench -p udf-skeleton-infra --all-features
+          cargo bench -p udf-skeleton-infra --all-features --locked
 
       - name: Run bench - udf-std-ext
         continue-on-error: true
@@ -168,7 +168,7 @@ jobs:
             echo "udf-std-ext: 无 bench 目标 -> 跳过（如实标注）"
             exit 0
           fi
-          cargo bench -p udf-std-ext --all-features
+          cargo bench -p udf-std-ext --all-features --locked
 
       # 摘要 + 基线对比：只告警不改退出码（性能漂移常态，不制造随机红）。
       - name: Summarize bench results and compare with previous baseline
@@ -297,6 +297,21 @@ jobs:
               "state_layout_update_scope/mono_whole_noretain",
               "state_layout_update_scope/sharded_16parts_all_retain",
               "state_layout_retention/mono_window16",
+              # ── 多生产者准入/完成面（issue#96）——两组各自的代表臂 ──
+              # 只钉「组整组消失/中途死掉」与四类场景各有产物；producer 数与参数表
+              # 属 bench 自己的调参面，不逐条钉（改了不该红）。
+              # try_dispatch（纯准入）与 dispatch（完成边界）是**两个** group：
+              # 两种 API 的吞吐不混一个数（issue 实现约束 3）。
+              "multi_producer_admission/baseline_p1",
+              "multi_producer_admission/contention_p4",
+              "multi_producer_admission/bounded_saturated_p4",
+              "multi_producer_admission/slow_reducer_p1",
+              "multi_producer_admission/causal_feedback_p4",
+              "multi_producer_dispatch/baseline_p1",
+              "multi_producer_dispatch/contention_p4",
+              "multi_producer_dispatch/bounded_saturated_p4",
+              "multi_producer_dispatch/slow_reducer_p4",
+              "multi_producer_dispatch/causal_feedback_p4",
           }
           base_keys = {k for k in baseline if not k.startswith("_")}
           expected_keys = EXPECTED_BENCH_IDS | base_keys
