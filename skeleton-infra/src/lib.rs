@@ -83,6 +83,11 @@ pub mod runtime;
 #[cfg(feature = "tokio")]
 pub mod fx;
 
+// 测试面共享件（有界护栏单源）：只在本 crate 的单元测试构建里存在，库内无
+// watchdog 线程（issue#94/#102 明令）。集成测试用 `#[path]` 直接引入同名文件。
+#[cfg(all(test, feature = "tokio"))]
+mod test_support;
+
 #[cfg(feature = "testing")]
 pub mod testing;
 

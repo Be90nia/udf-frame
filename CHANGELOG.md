@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Fix(tests): 挂死类收口——护栏单源化 + 进程级兜底 + #94 两项确定性证明（issue#102/#94）,2026-11-24)
+- **现象**：CI 两次 job 撞 `timeout-minutes: 20`（run 45311454174 / 45312409945），日志 `test fx::tests::shutdown_timeout_aborts_inflight_and_join_yields_cancelled has been running for over 60 seconds`。
+- **机理（tokio 1.53.3 逐函数核实）**：`yield_now()` 已改为把 waker 交给当前 worker 延迟冲洗（`context::defer`）；带延迟 waker 的 worker 反复做 0 超时 `park_yield`，期间短暂独占 IO driver；另一 worker 此时 park 抢不到 driver 即回退为**不持 driver 的普通休眠**；时间轮只在 worker 进 `park_internal` 时被处理、注册 timer 只去打断正在 IO park 的线程 ⇒ 自旋任务占住原 driver 持有者后再不返回，全 runtime 无人在 driver 上，50ms 截止永不到期。
+- **修复**：①护栏单源化到 `skeleton-infra/src/test_support/guard.rs`（crate 内单测与 5 个集成测试共用；`tests/common/guards.rs` 删除，无 shim、无第二份实现）；②`wait_until` / `bounded` 均加**进程级兜底**——OS 截止 → `fire` → 2s 宽限轮询**被守护线程栈上**的完成位（正常返回与 panic 展开都置位 ⇒ 零误杀）→ 具名诊断（测试名、上限、耗时、线程 id、指向性提示）+ `std::process::abort()`，把 20 分钟 job 超时变成 ≈12s 具名失败；库内不新增 watchdog 线程；③自旋握手后补一记 `kick_scheduler`（走既有 `spawn_detached` 通道，零新增 clippy 豁免；闸已关的站点用一次性 scope 发起），唤醒无 driver 的休眠 worker 让它接手时间轮；④crate 内 2 处、集成测试 6 处计时器 await 接入 `bounded`（业务断言零改动）。
+- **#94 设计验证·两项确定性证明**（`tests/fx_lifecycle.rs`）：multi-thread——一个 worker 被同步阻塞时另一 worker 仍按期观察 shutdown 截止（`timed_out=1 / still_running=1 / completed=0 / cancelled=0`，被阻塞任务不被标成已终止）；current-thread——受控 Future 在 poll 中同步阻塞唯一 executor 线程，50ms 截止在 300ms 内不前进，放行后才观察到已过期 timeout。**顺带钉死一条口径**：current-thread 上 `shutdown_timeout` 的 `timed_out` 结构上恒 0——读截止必须拿到执行权，而拿到执行权那一刻 abort 早已处理（`in_flight` 已归零）。
+- **验证**：`58 targets / 600 passed / 0 failed / 1 ignored`（基线 597 → +2 证明 +1 lib 侧护栏单测）；`--lib fx::` 与 5 个集成目标各 ×10 连跑全绿；满核压测一轮 0 失败、`over 60 seconds` 0 次、护栏诊断 0 次；变异一（外部线程永不放行）= 12.02s 具名 abort（rc `0xC0000409`）；变异二（阻塞改可让渡）= 负向断言转红；clippy `-D warnings` / fmt / doc 全 0；改动文件 LF + 严格 UTF-8。本机 16 核在 18/64 忙循环下均未复现 CI 的 2 核抢占窗口（新旧构造各 200/200，K=0），机理证据 = 源码推演 + CI 侧观察，持续观察留给 main CI。
+- 注：上文 2026-11-23 条目所述 `tests/common/guards.rs` 为当时路径；自本条目起护栏已迁至 `src/test_support/guard.rs`。
+
 ### Fix(perf): 修正 Scheduler 基准清单误判 + PR 路径验证
 - Criterion 实际 Scheduler ID 使用 `scheduler/register_1000` 等下划线形式；旧期望清单误写斜杠，导致已跑出的 12 个基准被误判缺失，阻止完整性能基线提升。
 - 修正 12 个期望 ID；perf workflow 增加仅针对自身配置与 bench 定义变更的 PR 路径触发，并设 45 分钟 job 上限，仍只产出数据、不作为合并阻断闸。

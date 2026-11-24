@@ -23,10 +23,10 @@ use std::time::Duration;
 use skeleton_infra::fx::{FxScope, Spawned, TaskError};
 use tokio::sync::oneshot;
 
-#[path = "common/guards.rs"]
+#[path = "../src/test_support/guard.rs"]
 mod guards;
 
-use guards::wait_until;
+use guards::{bounded, kick_scheduler, wait_until};
 
 /// 自旋段放行闸的 RAII 兜底：断言 panic 时也必须放开自旋段——否则 worker 线程
 /// 滞留在无 await 的 poll 里，运行时拆除期等它 ⇒ 测试挂死（CI 上表现成 job 超时，
@@ -39,7 +39,8 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
-// 有界等待条件成立见 `common/guards.rs`（OS 时钟，不依赖 tokio 计时器）。
+// 有界等待条件成立见 `src/test_support/guard.rs`（OS 时钟 + 进程级兜底，不依赖
+// tokio 计时器）。
 
 /// 等任务体终局可见（在途计数归零 **且** 终局记账已落）⇒ body-idle 断言可安全执行。
 ///
@@ -142,8 +143,21 @@ async fn join_timeout_returns_while_task_body_is_still_running() {
 
     // 握手：任务体确已进入自旋段（否则下面的 in_flight 断言无意义）。
     entered_rx.await.expect("任务体须进入非让渡段");
+    // 自旋段占住原 driver 持有者：kick 一台普通休眠 worker 重新 park（接手 driver
+    // 处理时间轮），否则 50ms 截止永不到期（issue#102 机理）。
+    kick_scheduler(
+        "唤醒在 driver 上 park 的 worker（自旋段占住原 driver 持有者）",
+        FxScope::new()
+            .spawn_detached(async {})
+            .expect("一次性 kick scope 新开 ⇒ 闸必开"),
+    )
+    .await;
 
-    let outcome = handle.join_timeout(Duration::from_millis(50)).await;
+    let outcome = bounded(
+        "join_timeout 有界返回",
+        handle.join_timeout(Duration::from_millis(50)),
+    )
+    .await;
     assert_eq!(outcome, Err(TaskError::TimedOut));
 
     // 终止**未**确认：任务体仍在自旋段里跑。
@@ -164,8 +178,21 @@ async fn consumed_handle_keeps_scope_lifecycle_tracking() {
     let (handle, gate, entered_rx) = spawn_spinning_task(&scope);
 
     entered_rx.await.expect("任务体须进入非让渡段");
+    // 自旋段占住原 driver 持有者：kick 一台普通休眠 worker 重新 park（接手 driver
+    // 处理时间轮），否则 50ms 截止永不到期（issue#102 机理）。
+    kick_scheduler(
+        "唤醒在 driver 上 park 的 worker（自旋段占住原 driver 持有者）",
+        FxScope::new()
+            .spawn_detached(async {})
+            .expect("一次性 kick scope 新开 ⇒ 闸必开"),
+    )
+    .await;
     assert_eq!(
-        handle.join_timeout(Duration::from_millis(50)).await,
+        bounded(
+            "join_timeout 有界返回",
+            handle.join_timeout(Duration::from_millis(50)),
+        )
+        .await,
         Err(TaskError::TimedOut)
     );
 

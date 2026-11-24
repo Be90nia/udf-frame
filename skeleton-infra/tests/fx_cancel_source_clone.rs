@@ -12,7 +12,7 @@
 
 use skeleton_infra::fx::{FxScope, cancel_pair};
 
-#[path = "common/guards.rs"]
+#[path = "../src/test_support/guard.rs"]
 mod guards;
 
 use guards::{bounded, wait_until};

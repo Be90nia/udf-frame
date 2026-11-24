@@ -26,10 +26,10 @@ use std::time::Duration;
 use skeleton_infra::fx::{FxScope, ShutdownReport, TaskError, cancel_pair};
 use skeleton_infra::objpool::ObjectPool;
 
-#[path = "common/guards.rs"]
+#[path = "../src/test_support/guard.rs"]
 mod guards;
 
-use guards::{bounded, wait_until};
+use guards::{bounded, kick_scheduler, wait_until};
 
 // ── 共享判别式（真实实现与「错误语义桩」走同一条，见文末变异守卫）─────────
 
@@ -85,7 +85,8 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
-// 有界等待握手条件 / future 完成见 `common/guards.rs`（OS 时钟，不依赖 tokio 计时器）。
+// 有界等待握手条件 / future 完成见 `src/test_support/guard.rs`（OS 时钟 + 进程级
+// 兜底，不依赖 tokio 计时器）。
 
 // ── 生命周期：close ≠ cancel，且最终等净 ────────────────────────────────
 
@@ -224,6 +225,15 @@ async fn timeout_reports_survivors_without_claiming_termination() {
     wait_until("自旋任务已进入不可让渡段", || {
         holding.load(Ordering::Relaxed)
     })
+    .await;
+    // 自旋段占住原 driver 持有者：kick 一台普通休眠 worker 重新 park（接手 driver
+    // 处理时间轮），否则 50ms 截止永不到期（issue#102 机理）。
+    kick_scheduler(
+        "唤醒在 driver 上 park 的 worker（自旋段占住原 driver 持有者）",
+        FxScope::new()
+            .spawn_detached(async {})
+            .expect("一次性 kick scope 新开 ⇒ 闸必开"),
+    )
     .await;
 
     let report = bounded(

@@ -1269,6 +1269,7 @@ impl<T: Send + 'static> Spawned<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::guard::{bounded, kick_scheduler, wait_until};
 
     /// abort 的取消 poll 异步生效：等计数归零（1ms 实时钟轮询，5s 墙钟上限，防挂死）。
     /// 不能用纯让渡预算：让渡不释放 OS 线程，wrapper drop 序列（tx drop 唤醒在前、
@@ -1349,7 +1350,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            handle.join_timeout(Duration::from_secs(1)).await,
+            bounded(
+                "join_timeout 有界返回",
+                handle.join_timeout(Duration::from_secs(1)),
+            )
+            .await,
             Err(TaskError::TimedOut)
         );
         wait_idle(&scope).await;
@@ -1420,11 +1425,26 @@ mod tests {
             .unwrap();
         // 握手：任务确实滞留在 poll 段内（未启动任务的 abort=免运行即撤，模拟不了该场景）。
         hold.store(true, Ordering::Relaxed);
-        while !holding.load(Ordering::Relaxed) {
-            tokio::task::yield_now().await;
-        }
+        wait_until(
+            "自旋任务已进入不可让渡段（留在 poll 内不让渡）",
+            || holding.load(Ordering::Relaxed),
+        )
+        .await;
+        // 自旋段占住原 driver 持有者：kick 一台普通休眠 worker 重新 park，让它以
+        // driver 身份 park 并处理时间轮——否则 50ms 截止永不到期（issue#102 机理）。
+        kick_scheduler(
+            "唤醒在 driver 上 park 的 worker（自旋段占住原 driver 持有者）",
+            FxScope::new()
+                .spawn_detached(async {})
+                .expect("一次性 kick scope 新开 ⇒ 闸必开"),
+        )
+        .await;
         let started = Instant::now();
-        let report = scope.shutdown_timeout(Duration::from_millis(50)).await;
+        let report = bounded(
+            "shutdown_timeout 有界返回",
+            scope.shutdown_timeout(Duration::from_millis(50)),
+        )
+        .await;
         assert!(
             started.elapsed() >= Duration::from_millis(50),
             "超时必达：提前返回即守卫失效"
@@ -1585,10 +1605,25 @@ mod tests {
             .unwrap();
         // 握手：任务确实滞留在 poll 段内（免运行即撤模拟不了该场景）。
         hold.store(true, Ordering::Relaxed);
-        while !holding.load(Ordering::Relaxed) {
-            tokio::task::yield_now().await;
-        }
-        let report = scope.shutdown_timeout(Duration::from_millis(50)).await;
+        wait_until(
+            "自旋任务已进入不可让渡段（留在 poll 内不让渡）",
+            || holding.load(Ordering::Relaxed),
+        )
+        .await;
+        // 自旋段占住原 driver 持有者：kick 一台普通休眠 worker 重新 park，让它以
+        // driver 身份 park 并处理时间轮——否则 50ms 截止永不到期（issue#102 机理）。
+        kick_scheduler(
+            "唤醒在 driver 上 park 的 worker（自旋段占住原 driver 持有者）",
+            FxScope::new()
+                .spawn_detached(async {})
+                .expect("一次性 kick scope 新开 ⇒ 闸必开"),
+        )
+        .await;
+        let report = bounded(
+            "shutdown_timeout 有界返回",
+            scope.shutdown_timeout(Duration::from_millis(50)),
+        )
+        .await;
         assert_eq!(report.timed_out, 1, "超时收割：截止时未完成任务数显式计数");
         hold.store(false, Ordering::Relaxed); // 放行让渡，abort 在下一 await 点生效
         assert_eq!(
@@ -1759,7 +1794,11 @@ mod tests {
             drop(handle);
         }
         wait_idle(&scope).await;
-        let report = scope.shutdown_timeout(Duration::from_secs(1)).await;
+        let report = bounded(
+            "shutdown_timeout 有界返回",
+            scope.shutdown_timeout(Duration::from_secs(1)),
+        )
+        .await;
         assert_eq!(
             report,
             ShutdownReport {

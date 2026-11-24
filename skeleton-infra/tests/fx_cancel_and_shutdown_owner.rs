@@ -20,10 +20,10 @@ use std::time::Duration;
 
 use skeleton_infra::fx::{CancelToken, FxScope, cancel_pair};
 
-#[path = "common/guards.rs"]
+#[path = "../src/test_support/guard.rs"]
 mod guards;
 
-use guards::{bounded, wait_until};
+use guards::{bounded, kick_scheduler, wait_until};
 
 /// 把 future 轮询**一次**：`biased` 保证先 poll 目标、再落到让渡分支。
 ///
@@ -236,13 +236,27 @@ async fn shorter_deadline_waiter_does_not_rewrite_owner_policy() {
     let scope = FxScope::new();
     let spinner = spawn_spinner(&scope);
     spinner.enter().await;
+    // 自旋段占住原 driver 持有者：kick 一台普通休眠 worker 重新 park（接手 driver
+    // 处理时间轮），否则后面 50ms 截止永不到期（issue#102 机理）。闸在 owner 首
+    // poll 里关，故 kick 用一次性 scope 发起（闸必开，不依赖被测 scope 时序）。
+    kick_scheduler(
+        "唤醒在 driver 上 park 的 worker（自旋段占住原 driver 持有者）",
+        FxScope::new()
+            .spawn_detached(async {})
+            .expect("一次性 kick scope 新开 ⇒ 闸必开"),
+    )
+    .await;
 
     let mut owner = Box::pin(scope.shutdown());
     let early = poll_once(&mut owner).await;
     assert!(early.is_none(), "owner 必须停在自旋任务的 join_next 上");
 
     // 等待者自己的（更短）截止到期：只停止自己的等待。
-    let waiter_report = scope.shutdown_timeout(Duration::from_millis(50)).await;
+    let waiter_report = bounded(
+        "等待者按自己的截止返回",
+        scope.shutdown_timeout(Duration::from_millis(50)),
+    )
+    .await;
     assert_eq!(
         waiter_report.timed_out, 1,
         "#70：等待者按自己的截止如实申报仍在排空中的条数"
@@ -342,6 +356,15 @@ async fn timed_out_owner_publishes_deadline_report_to_waiters() {
     let scope = FxScope::new();
     let spinner = spawn_spinner(&scope);
     spinner.enter().await;
+    // 自旋段占住原 driver 持有者：kick 一台普通休眠 worker 重新 park（接手 driver
+    // 处理时间轮），否则 50ms 截止永不到期（issue#102 机理）。
+    kick_scheduler(
+        "唤醒在 driver 上 park 的 worker（自旋段占住原 driver 持有者）",
+        FxScope::new()
+            .spawn_detached(async {})
+            .expect("一次性 kick scope 新开 ⇒ 闸必开"),
+    )
+    .await;
 
     let mut owner = Box::pin(scope.shutdown_timeout(Duration::from_millis(50)));
     let early = poll_once(&mut owner).await;
