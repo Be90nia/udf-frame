@@ -6,7 +6,7 @@
 //! SystemClock 短时长（50ms 级），覆盖锁空闲面与并发活性。
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -54,6 +54,36 @@ impl Sleeper for CountingSleeper {
 
 fn offset_of(clock: &CountingSleeper) -> Duration {
     clock.clock.unix_offset()
+}
+
+/// 可控阻塞的虚拟 Sleeper：进入 sleep 后通知测试线程，等待显式放行再推进 MockClock。
+/// 用于确定性验证锁外等待，不依赖真实 50ms 时间窗口。
+struct BlockingSleeper {
+    clock: MockClock,
+    entered: mpsc::Sender<Duration>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl Clock for BlockingSleeper {
+    fn now_instant(&self) -> Instant {
+        self.clock.now_instant()
+    }
+
+    fn now_system(&self) -> SystemTime {
+        self.clock.now_system()
+    }
+}
+
+impl Sleeper for BlockingSleeper {
+    fn sleep(&self, d: Duration) {
+        self.entered.send(d).expect("测试线程仍在观察 sleep 入口");
+        self.release
+            .lock()
+            .unwrap()
+            .recv()
+            .expect("测试线程必须显式放行虚拟 sleep");
+        self.clock.advance(d);
+    }
 }
 
 // ---- 构造不变量（fail-closed 纪律，RetryPolicy 同款）----
@@ -246,23 +276,43 @@ fn acquire_recheck_rounds_are_bounded() {
 
 #[test]
 fn blocked_acquire_does_not_hold_lock() {
-    let bucket = Arc::new(TokenBucket::new(Arc::new(SystemClock), 1.0, 20.0)); // 50ms/token
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let sleeper = Arc::new(BlockingSleeper {
+        clock: MockClock::new(),
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    });
+    let bucket = Arc::new(TokenBucket::new(sleeper, 1.0, 20.0)); // 50ms/token（虚拟时间）
     bucket.try_acquire(1).unwrap(); // 清桶
     let b2 = Arc::clone(&bucket);
     let waiter = thread::spawn(move || b2.acquire(1).expect("回填后成功"));
-    thread::sleep(Duration::from_millis(5)); // 让 waiter 进入锁外睡眠
-    let t0 = Instant::now();
-    // waiter 睡满 50ms；期间反复进锁判定（恒 Err 但走临界区）：
-    // 若实现持锁睡眠，这里第一趟就卡 50ms，100 趟=5s 超时量级可辨。
-    for _ in 0..100 {
-        assert!(bucket.try_acquire(1).is_err());
-    }
-    let guard_free = t0.elapsed();
-    assert!(
-        guard_free < Duration::from_millis(25),
-        "acquire 睡眠期间锁必须空闲（100 趟临界区耗时 {guard_free:?}，持锁睡眠面即红）"
+
+    assert_eq!(
+        entered_rx.recv_timeout(Duration::from_secs(1)).expect("waiter 应进入 sleep"),
+        Duration::from_millis(50)
     );
+
+    // Sleeper 已停在显式闸门上。此时若 acquire 持锁睡眠，checker 无法在期限内取得锁；
+    // MockClock 未推进，所以正确实现下 try_acquire 必须快速返回 Insufficient，不会消费令牌。
+    let b3 = Arc::clone(&bucket);
+    let (checked_tx, checked_rx) = mpsc::channel();
+    let checker = thread::spawn(move || {
+        let _ = checked_tx.send(b3.try_acquire(1));
+    });
+    let lock_free = checked_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+
+    // 无论断言结果如何都放行足够的虚拟时间，保证 waiter/checker 可收尾，不留下挂死线程。
+    for _ in 0..3 {
+        release_tx.send(()).unwrap();
+    }
     waiter.join().unwrap();
+    checker.join().unwrap();
+
+    assert!(
+        lock_free,
+        "acquire 睡眠期间锁必须空闲；try_acquire 未能在 250ms 内取得锁"
+    );
 }
 
 // ---- 并发活性：有限 acquirer 集合内无永久饥饿（真睡，短时长）----
