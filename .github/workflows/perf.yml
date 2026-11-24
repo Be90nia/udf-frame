@@ -6,10 +6,10 @@
 #   macOS 定时任务、Windows Defender 扫描……），同一份代码在不同机器上
 #   波动 10%~30% 属常态。把它塞进 push/PR 闸 = 用不可靠信号判红绿，
 #   结果是开发者学会忽略红灯（告警疲劳），比没有闸更糟。
-# - 因此本 workflow **只在 workflow_dispatch（手动）与 schedule（每日一次，
-#   固定 04:23 UTC——避开整点/半点拥堵时段，CI 队列在高负载时段排队更久）**
-#   触发，产出**数据**（criterion 输出 + bench 摘要 artifact + 基线对比），
-#   不参与任何合并决策。
+# - 因此本 workflow 在 workflow_dispatch（手动）与 schedule（每日一次，
+#   固定 04:23 UTC）触发；另外仅当 PR 改动本工作流或 bench 定义时触发
+#   （路径过滤），用来验证 benchmark 清单/产物映射。所有触发都只产出**数据**
+#   （criterion 输出 + bench 摘要 artifact + 基线对比），不参与合并决策。
 # - Rust 版本 pin 1.96.0 与 ci.yml 一致（防工具链漂移让性能数不可比）；
 #   components 含 clippy/rustfmt 与 ci.yml 同款，便于本地复现同一环境。
 # - 矩阵仅 ubuntu-latest + macos-latest：Windows 性能数据本地已有
@@ -38,6 +38,11 @@ name: udf-frame perf
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/perf.yml"
+      - "skeleton-infra/benches/**"
+      - "std-ext/benches/**"
   schedule:
     # 每日一次，04:23 UTC——避开整点（CI 调度高峰）。手动触发不受此限。
     - cron: "23 4 * * *"
