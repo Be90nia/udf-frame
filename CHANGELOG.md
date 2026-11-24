@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+### Fix(perf): 修正 12 条 scheduler 期望 ID —— 滚动基线恢复提升（#96 发现）
+- `perf.yml` 的 `EXPECTED_BENCH_IDS` 曾把 scheduler 组写成下划线形态（`scheduler/register_1000`），而 bench 实际注册的是 group+参数形态（`scheduler/register/1000`）⇒ 完整性闸每轮判缺 12 条、`complete=false` ⇒ **滚动基线从未提升**（性能回归对比等于失效）。
+- 按 `cargo bench ... -- --list` 实测改正 12 条；复核对 manifest ∪ 两 crate `--list`：expected 51 / actual 125、`missing_keys=[]`、`missing_groups=[]`。闸的 `complete` 逻辑与「不完整不提升基线」策略未动。
+- 纪律：期望清单今后以 `--list` 实测为准，不凭记忆；删/改 bench 组时同步清单并在 PR 里给出 `--list` 对照。
+
+### Fix(pool/audit): 审计订阅 gate 线性化 + 回调闭包整槽退役（issue#88/#89）
+- #89：池域 `subscribe_audit` 与 `PoolAuditTicket` Drop 把「槽替换/摘除 + `gate` 翻转」放进同一 `audit` 临界区（对齐 Store 域 #60）——旧票据被替换后 Drop 为 inert，绝不关掉新代次的闸；新增机械锚 `store_gate_under_slot_lock`（debug 构建 `try_lock` 断言调用点持锁，release 零成本），`emit` 快路径零改动。
+- #88：Store 域 `AuditTicket::drop` 与 `SyncStore::subscribe_events` 改为**整槽退役**——锁内只 `take`/`replace` 并完成代次/gate 线性化，锁外 `drop(retired)`；池域核对 #89 已满足。`AuditSink` 文档写明「只 take `notify` 而把其余字段留锁内析构」= 同缺陷变体。
+- 验证：两域各 4 条测试（票据 Drop / 订阅替换 / 在途回调只销毁一次 / **控制臂**：跨线程持锁时同一探针必报 Held）+ 5 条池域 gate 交错测试；变异红（`retired` 放回锁内、`gate` 翻转移出锁）各自归因；crate 全量 645 passed。
+
+### Fix(runtime): 三个容量 setter 与各自 population 共锁线性化（issue#95）
+- `SyncStore::set_capacity`（`inner.queue` 锁）/ `set_deferred_capacity`（`inner.deferred_queue` 锁）/ `Scheduler::set_capacity`（`shared.state` 锁）在锁内发布 ⇒ 与 `enqueue`/停放/`register`（同锁内读 cap）线性化；删掉「运行期调整与准入竞争 = 尽力而为」。
+- 契约：缩容**不回溯**既有记录/注册；扩容与 `0`（无界）即时生效；三个 population/三个 cap 互不合并；热路径零新增锁（enqueue/停放/register 一行未动）。
+- 测试闸为 `#[cfg(test)]` **私有**件（`std-ext` 无 `testing` feature，公共面零变化、生产零检查）；7 条确定性用例（锁内停靠 + 有界负向断言，放行先于断言 ⇒ 变异时是失败而非挂死）+ 3 变异红。
+
+### Fix/Docs(pool): resize 事件时序 + 工厂预留语义（issue#99/#100）
+- #99：`PoolBase` 新增无回调 resize 原语；`MemoryPool`/`ThreadPool` 先提交自身状态、**释放全部内部锁后**再发 `Resized`/`ResizeRejected`（回调可重入 `resize`/`acquire`/`metrics`）；`ThreadPool::resize` 的 epoch 在**任何用户回调之前**领取（「最后发起的目标生效」补 #69 遗留窗口）；两个 `metrics()` 明确为**逐面非原子快照**。
+- #100：`created` 定义为「池宇宙已占席位 = idle + 已借出 + 工厂创建中预留」；缩容**不撤销**已取得的创建预留（`created` 可短时高于新 max，新 acquire 一律按新 max）；`borrowed` 不含在途预留、`PoolMetrics` 非完整预留账本，创建中数量用 `slot_snapshot().created − idle − borrowed` 反推（`feature = "testing"`）；不新增公共 `creating` 指标。
+- 验证：#99 七条确定性用例（重入/半状态/并发撕裂/暂停后 epoch 顺序）+#100 三条 barrier 工厂测试 + 两处变异红；crate 全量 645 passed。
+
 ### Fix(fx): spawn 的 runtime 上下文前置条件显式化 + timeout 前置条件文档化（issue#92）
 - 新增 `AdmissionError::NoRuntime`：`try_spawn_tracked` / `spawn_detached` 在**取任何内部锁之前**做 `Handle::try_current()` 预检；无 runtime ⇒ typed 拒绝，不入容量账（`admitted/tracked/active/waiting/rejected` 全不变）、不消费宿主 Future。
 - **破坏性**（0.1.0）：`spawn_detached` 返回类型 `ScopeClosed` → `AdmissionError`；`AdmissionError` 仍非 `#[non_exhaustive]` ⇒ 跨 crate 穷尽 `match` 需补 `NoRuntime` 臂（仓内 `validation/consumer-sim` 已同步）。`spawn_tracked` 作为 fail-visible 旧口：无 runtime 带因 panic（新增 `# Panics` 并指向 typed 口）。
