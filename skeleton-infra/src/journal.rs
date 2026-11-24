@@ -692,15 +692,39 @@ mod tests {
         count: u64,
     }
 
-    /// 临时目录收在 crate 构建目录内（禁系统 TEMP/用户目录），
-    /// 每用例独立子目录；通过用例收尾 remove_dir_all，失败用例残留留调试（gitignore 覆盖）。
-    fn case_dir(name: &str) -> PathBuf {
+    /// 用例独享临时目录（收在 crate 构建目录内，禁系统 TEMP/用户目录）：路径含
+    /// **进程 id + 进程内序号** ⇒ 并发测试进程互不干扰（固定路径会被对方
+    /// `remove_dir_all` 连坐：读侧 NotFound、写侧读到半截）。清理归 [`CaseDir`] 的
+    /// Drop（含 panic 路径）；断言仍按真实文件内容判定，目录缺失不跳过。
+    fn case_dir(name: &str) -> CaseDir {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target-iso/journal-tests")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&dir); // 重跑残留清理
+            .join(format!("{name}-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // 同 pid 重跑残留清理
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        CaseDir(dir)
+    }
+
+    /// 用例目录守卫：Drop 收尾清理（含 panic 路径）——断言失败也留不下垃圾。
+    struct CaseDir(PathBuf);
+
+    impl std::ops::Deref for CaseDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for CaseDir {
+        fn drop(&mut self) {
+            // 清理失败不掩盖真实断言：残留只占 target-iso（gitignore 覆盖）。
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// 批 6A 关联类型化后调用面：直呼零标注（A/S 被 Self 钉死）——helper 只
@@ -752,7 +776,6 @@ mod tests {
             assert_eq!(got, acts);
             assert_eq!(r.skipped_unknown(), 1); // 仅版本头
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -791,7 +814,6 @@ mod tests {
             }
             other => panic!("expected Io(AlreadyExists), got {other:?}"),
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 版本头静默吞未知字段
@@ -806,7 +828,6 @@ mod tests {
             Err(JournalError::Corrupt { line, .. }) => assert_eq!(line, 1),
             other => panic!("expected Corrupt at line 1, got {other:?}"),
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Io 错误 Display 必须携带文件路径——多账本进程里「哪个文件撞了」不再靠猜
@@ -817,7 +838,6 @@ mod tests {
         let path = dir.join("ledger.jsonl");
         JsonlJournal::<Act, St>::create(&path).unwrap();
         let second = JsonlJournal::<Act, St>::create(&path); // 撞已存在
-        std::fs::remove_dir_all(&dir).unwrap();
         match second {
             Ok(_) => panic!("create 撞已存在文件必须 Err"),
             Err(e) => {
@@ -869,7 +889,6 @@ mod tests {
             assert_eq!(got, vec![a1, a2]);
             assert_eq!(r.skipped_unknown(), 3); // 版本头+future_tag+无 tag
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -900,7 +919,6 @@ mod tests {
             Some(Err(ReplayError::Corrupt { line, .. })) => assert_eq!(line, 3),
             other => panic!("expected Corrupt at line 3, got {other:?}"),
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -926,7 +944,6 @@ mod tests {
             assert_eq!(got, vec![a1, a2]); // "s" 行不混入
             assert_eq!(r.skipped_unknown(), 2); // 版本头+"s" 行
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -954,7 +971,6 @@ mod tests {
             assert_eq!(got, vec![a1, a2]);
         }
         drop(j);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 恒 Err 的序列化替身（保证 Err(Serialize) 路径确定性）。
@@ -980,7 +996,6 @@ mod tests {
         // 先序列化后写：Err 时文件只有版本头，无残行。
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "{\"v\":1}\n");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 顶层 `"t"` 为行 tag
@@ -1012,7 +1027,6 @@ mod tests {
         // 先序列化后写：Err 时文件只有版本头，无残行。
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "{\"v\":1}\n");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1039,7 +1053,6 @@ mod tests {
             assert_eq!(got[0].label.len(), big.len());
             assert_eq!(got[1], a_small);
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1075,7 +1088,6 @@ mod tests {
             let got: Vec<Act> = r.by_ref().map(Result::unwrap).collect();
             assert_eq!(got, vec![a1, a2]); // 恰见完整序列，无 Corrupt
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1123,7 +1135,6 @@ mod tests {
             let j0 = JsonlJournal::<Act, St>::create(&empty).unwrap();
             assert!(rest(&j0).is_none());
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 恒 Err 的状态序列化替身（零覆盖 #11：snapshot() 序列化失败面）。
@@ -1163,7 +1174,6 @@ mod tests {
             "版本头 + 已 append 的 action，无快照残行"
         );
         assert!(!content.contains("\"t\":\"s\""), "失败快照不得落盘");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 零覆盖 #10：restore 扫描面遇「账本声称的快照读不出」fail-closed——
@@ -1207,7 +1217,6 @@ mod tests {
             }
             Err(e) => panic!("expected Corrupt at line 5, got {e:?}"),
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 恢复反转回归钉（perf-journal §3-C）：中点快照恢复必须不慢于全量重放。
@@ -1260,6 +1269,5 @@ mod tests {
             snap_ms < full_ms,
             "快照恢复慢于全量重放=反转回归：snap={snap_ms}ms full={full_ms}ms"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
