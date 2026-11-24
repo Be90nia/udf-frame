@@ -79,12 +79,20 @@ fn local_sub_register(store_id: u64, sub_id: u64, notify: Box<dyn LocalNotify>) 
 }
 
 /// 注销（注册线程执行——票据 `!Send`，Drop 只会发生在注册线程）。
+///
+/// 整条登记移出表、在 `with` 之外析构（issue#90）：entry 持有最后一个
+/// 回调句柄时，`Rc` 归零会同步跑用户闭包与捕获对象的 `Drop`，而它们可能
+/// 重入本地订阅（注册/注销）——若此刻仍持 `RefCell` 的表借用，重入即炸
+/// `BorrowMutError`。
 fn local_sub_unregister(store_id: u64, sub_id: u64) {
-    LOCAL_SUBS.with(|table| {
-        table
-            .borrow_mut()
-            .retain(|e| !(e.store_id == store_id && e.sub_id == sub_id));
+    let retired = LOCAL_SUBS.with(|table| {
+        let mut table = table.borrow_mut();
+        let index = table
+            .iter()
+            .position(|e| e.store_id == store_id && e.sub_id == sub_id);
+        index.map(|index| table.remove(index))
     });
+    drop(retired);
 }
 
 /// 触发本线程登记的某 store 全部本地订阅；返回 (命中数, panic 摘除数,
@@ -134,11 +142,21 @@ pub(super) fn local_notify(store_id: u64, state: &dyn std::any::Any) -> (u64, u6
             }
         }
         let removed = dead.len() as u64;
+        // 毒回调整条移出表、在借用之外析构（issue#90）：句柄归零会跑用户
+        // 闭包的 `Drop`，其重入本地订阅不得撞上表借用。
+        let mut retired: Vec<LocalSubEntry> = Vec::new();
         if !dead.is_empty() {
-            table
-                .borrow_mut()
-                .retain(|e| e.store_id != store_id || !dead.contains(&e.sub_id));
+            let mut table = table.borrow_mut();
+            let mut index = 0;
+            while index < table.len() {
+                if table[index].store_id == store_id && dead.contains(&table[index].sub_id) {
+                    retired.push(table.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
         }
+        drop(retired);
         (matched, removed, last_cause)
     })
 }
@@ -171,5 +189,133 @@ impl Drop for LocalSubscription {
     fn drop(&mut self) {
         local_sub_unregister(self.store_id, self.sub_id);
         self.count.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// 析构时重入本地订阅注册/注销的捕获对象：issue#90 的可达路径就是用户
+    /// 闭包 `Drop` 在注销/摘除期间运行——那时若仍持 `LOCAL_SUBS` 的表借用，
+    /// 重入即抛 `BorrowMutError`。探针不吞 panic，让宿主析构路径原样传播。
+    struct DropProbe {
+        store_id: u64,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let sub_id = next_local_sub_id();
+            register::<u8>(self.store_id, sub_id, Box::new(|_state: &u8| {}));
+            local_sub_unregister(self.store_id, sub_id);
+        }
+    }
+
+    /// 登记一条捕获 [`DropProbe`] 的本地订阅：探针随回调句柄一起析构。
+    fn register_with_probe(store_id: u64, sub_id: u64) {
+        let probe = DropProbe {
+            store_id: store_id + 1,
+        };
+        register::<u8>(
+            store_id,
+            sub_id,
+            Box::new(move |_state: &u8| {
+                let _ = &probe;
+            }),
+        );
+    }
+
+    /// 普通退订（无通知快照持额外句柄）：整条登记移出表后才析构，探针能在自身
+    /// `Drop` 里成功注册并注销另一条本地订阅；注销即时可见、闸计数照旧回落。
+    #[test]
+    fn unregister_drops_callback_outside_table_borrow() {
+        const STORE: u64 = u64::MAX - 90;
+        let sub_id = next_local_sub_id();
+        register_with_probe(STORE, sub_id);
+        let count = Arc::new(AtomicUsize::new(1));
+        let ticket = LocalSubscription::new(STORE, sub_id, Arc::clone(&count));
+        let dropped = catch_unwind(AssertUnwindSafe(move || drop(ticket)));
+        assert!(
+            dropped.is_ok(),
+            "注销时用户闭包析构重入本地订阅不得炸 RefCell 借用"
+        );
+        assert_eq!(count.load(Ordering::Acquire), 0, "票据 Drop 的闸计数回落");
+        assert_eq!(local_notify(STORE, &0u8).0, 0, "注销后不再命中");
+    }
+
+    /// 通知中途退订后续订阅：快照强引用只保槽体活到调用收尾，最终析构不在表
+    /// 借用期；被注销的登记本轮跳过、下一轮不复活。
+    #[test]
+    fn notify_mid_flight_unregister_skips_later_sub() {
+        const STORE: u64 = u64::MAX - 91;
+        let first = next_local_sub_id();
+        let second = next_local_sub_id();
+        // 登记序即通知序：`first` 排在 `second` 之前，才能在后者被触达前注销它。
+        let first_hits = Rc::new(Cell::new(0));
+        register::<u8>(
+            STORE,
+            first,
+            Box::new({
+                let first_hits = Rc::clone(&first_hits);
+                move |_state: &u8| {
+                    first_hits.set(first_hits.get() + 1);
+                    local_sub_unregister(STORE, second);
+                }
+            }),
+        );
+        let second_hits = Rc::new(Cell::new(0));
+        register::<u8>(
+            STORE,
+            second,
+            Box::new({
+                let second_hits = Rc::clone(&second_hits);
+                let probe = DropProbe {
+                    store_id: STORE + 1,
+                };
+                move |_state: &u8| {
+                    let _ = &probe;
+                    second_hits.set(second_hits.get() + 1);
+                }
+            }),
+        );
+        let round = catch_unwind(AssertUnwindSafe(|| local_notify(STORE, &0u8)));
+        let (matched, removed, cause) = round.expect("中途退订的闭包析构重入不得炸 RefCell 借用");
+        assert_eq!(
+            (matched, removed),
+            (2, 0),
+            "本轮开始时两笔在册、无用户 panic"
+        );
+        assert!(cause.is_none(), "无用户 panic 即无成因摘要");
+        assert_eq!(
+            (first_hits.get(), second_hits.get()),
+            (1, 0),
+            "被注销的后续订阅本轮不再命中"
+        );
+        assert_eq!(local_notify(STORE, &0u8).0, 1, "下一轮只剩仍持有的登记");
+        assert_eq!(second_hits.get(), 0, "死订阅不复活");
+    }
+
+    /// 回调 panic 摘除路径：被摘除的登记同样整条移出、在表借用之外析构。
+    #[test]
+    fn notify_panic_removal_drops_callback_outside_table_borrow() {
+        const STORE: u64 = u64::MAX - 92;
+        let sub_id = next_local_sub_id();
+        let probe = DropProbe {
+            store_id: STORE + 1,
+        };
+        register::<u8>(
+            STORE,
+            sub_id,
+            Box::new(move |_state: &u8| {
+                let _ = &probe;
+                panic!("issue#90 探针：用户回调 panic 走 fail-closed 摘除");
+            }),
+        );
+        let round = catch_unwind(AssertUnwindSafe(|| local_notify(STORE, &0u8)));
+        let (matched, removed, cause) = round.expect("摘除路径的闭包析构重入不得炸 RefCell 借用");
+        assert_eq!((matched, removed), (1, 1), "毒回调按 fail-closed 摘除");
+        assert!(cause.is_some(), "摘除留痕成因摘要");
+        assert_eq!(local_notify(STORE, &0u8).0, 0, "摘除后不再触发");
     }
 }
