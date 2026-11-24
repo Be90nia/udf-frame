@@ -2,8 +2,8 @@
 //!
 //! 时间线全部经 [`MockClock`] 虚拟推进（Sleeper 注入，实现=advance）：
 //! 若阻塞版误走真实 `thread::sleep`，虚拟钟不前进，逐毫秒断言即红——
-//! 确定性不等式是 sleep 通路的证伪器。标「真睡」的两个测试用
-//! SystemClock 短时长（50ms 级），覆盖锁空闲面与并发活性。
+//! 确定性不等式是 sleep 通路的证伪器。锁空闲面使用 BlockingSleeper + MockClock
+//! 显式控制睡眠窗口；仅并发活性测试保留 SystemClock 短时长真实等待。
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -272,7 +272,7 @@ fn acquire_recheck_rounds_are_bounded() {
     );
 }
 
-// ---- 坑面「睡眠持锁」：acquire 睡眠期间锁必须空闲（真睡，短时长）----
+// ---- 坑面「睡眠持锁」：acquire 睡眠期间锁必须空闲（可控虚拟 sleep）----
 
 #[test]
 fn blocked_acquire_does_not_hold_lock() {
