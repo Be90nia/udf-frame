@@ -409,10 +409,10 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 | 4 | 审计环容量（权威历史） | `SyncStore::subscribe_events` / `PoolBase` | 视作 `1`（调用方给 `0` 时取 `max(1)`） | `SyncStore`：**调用方显式给**；池域：`AUDIT_RING_DEFAULT_CAP = 1024` | 溢出丢最旧（`seq` 空洞 = 显式证据；`take_events` 取走不留空洞） | 调大 `subscribe_events(cap, ..)` / 池域容量；完整性靠「权威历史」不靠实时回调 |
 | 5 | 审计待投递 FIFO | `SyncStore` / 池域（#65/#75） | —（固定） | `AUDIT_PENDING_CAP = 1024`（**无配置面**，两处同值） | 溢出丢最旧 + **独立投递丢弃计数**（`audit_delivery_drops()`，与环溢出分账） | 消费慢 ⇒ 改用 `take_events` 取权威历史 |
 | 6 | 回灌深度预算 | `runtime` 排空环 | —（固定） | `FEEDBACK_DEPTH_BUDGET = 64`（单次 dispatch 连续回灌链深度） | 停排 + `feedback_budget_exceeded` 计数；触发点 action **脱钩停放（deferred）**（保留来源身份，主队列继续；非 panic 非静默，**不是**退回队尾自动重放） | 显式 `resume_deferred(limit)`（#49）；`DispatchOutcome::Deferred{retained}` 上报 |
-| 7 | deferred 停放队列 | `runtime`（#49） | 不适用（容量独立配置） | `set_deferred_capacity(n)` + `deferred_capacity()` / `deferred_actions()`；默认 `DEFAULT_DEFERRED_CAPACITY = 64`（**已定**，见决定记录）；**独立于 ingress capacity** | 满 ⇒ 新续接拿**显式非成功终局**（`FinishRoot(Failed)`）+ 专用计数 `deferred_capacity_rejected()`，不入队、不消失、不误标成功 deferred | `resume_deferred(limit)`（FIFO、fresh epoch、独立续接收据）；`DispatchOutcome::CapacityRejected` 可观测 |
+| 7 | deferred 停放队列 | `runtime`（#49） | 不适用（容量独立配置） | `set_deferred_capacity(n)` + `deferred_capacity()` / `deferred_actions()`；默认 `DEFAULT_DEFERRED_CAPACITY = 64`（**已定**，见决定记录）；**独立于 ingress capacity**；**#95：与停放路径共锁线性化**——线性化点 = `inner.deferred_queue` 锁内发布（停放先得锁则按旧值留存、setter 返回后一律按新值；**缩容不丢既有 parked 记录**） | 满 ⇒ 新续接拿**显式非成功终局**（`FinishRoot(Failed)`）+ 专用计数 `deferred_capacity_rejected()`，不入队、不消失、不误标成功 deferred | `resume_deferred(limit)`（FIFO、fresh epoch、独立续接收据）；`DispatchOutcome::CapacityRejected` 可观测 |
 | 8 | FxScope 等待/跟踪条目 | `fx`（#13/#39） | 无界（`usize::MAX`，默认） | `with_max_pending(n)` / `with_max_tracked(n)`；默认**均无界** | 拒绝：`try_spawn_tracked` 返回 typed `AdmissionError::{PendingFull,TrackedFull}`（不阻塞不 panic） | 显式设界；`try_reap()` 收割后回落；`counts()` 读数 |
 | 9 | 对象池/线程池 idle 容量 | `pool` | 由 tuning 显式给 | `ObjectPoolTuning` / `ThreadPoolTuning` **显式必填，无默认**（`SizeClassPool` 逐档继承 tuning，无自有 cap） | 超 `idle_cap` ⇒ `dropped_overflow` 计数（有界降级） | 调 tuning；`shrink_to`/`prune_idle` 主动回收 |
-| 10 | 外部准入队列容量（ingress） | `runtime`（#38） | 无界（默认） | `SyncStore::set_capacity(n)`；默认 **0 = 不限**（等待被 reduce 的 action 数；正在执行的已出队，不计入） | 拒绝：`try_dispatch` ⇒ typed `AdmissionOutcome::Full`；`ActionSender::dispatch` ⇒ `false`；`SyncStore::dispatch`（无失败面）过载 panic fail-visible——均不阻塞、不部分插入；计数 `admission_full_count()` | 显式 `set_capacity(n)`（运行期调整与准入竞争 = 尽力而为）；`admission_full_count()` 读数 |
+| 10 | 外部准入队列容量（ingress） | `runtime`（#38） | 无界（默认） | `SyncStore::set_capacity(n)`；默认 **0 = 不限**（等待被 reduce 的 action 数；正在执行的已出队，不计入） | 拒绝：`try_dispatch` ⇒ typed `AdmissionOutcome::Full`；`ActionSender::dispatch` ⇒ `false`；`SyncStore::dispatch`（无失败面）过载 panic fail-visible——均不阻塞、不部分插入；计数 `admission_full_count()` | 显式 `set_capacity(n)`（**#95：与准入共锁线性化**——线性化点 = `inner.queue` 锁内发布；准入先得锁则按旧值完成、setter 返回后一律按新值；**缩容不回溯**既有记录，**扩容与 0 即时**生效）；`admission_full_count()` 读数 |
 
 **数值决定记录（2026-11-23 维护者拍板）**：本表全部默认值**保持现值（keep current）**——具体为：Run-ID `1024`、deferred `64`、审计环/待投递 `1024`、回灌深度 `64`、ingress 无界 **照旧**；scheduler 与 watchdog 的提案值（`1024` / `4096`）**不采纳，保持无界**（草案见 `reports/2026-11-23-resource-defaults-draft.md`，留痕备查）。依据：#56 Stage C 消费方验收结论「全默认开箱可用，未出现要求把默认值改小的证据」（`reports/2026-11-23-56-stage-c-consumer-validation.md`）；共同约定 2「默认=保守可用，禁为炫技设小界」。`AUDIT_PENDING_CAP` 无配置面、`FEEDBACK_DEPTH_BUDGET` 固定——均按现状记录，不新增配置面。
 
@@ -466,6 +466,9 @@ pub trait Notify<S> {
 | `resize(max, idle_cap)` | 参数合法性（`max == 0` / `idle_cap == 0` / `idle_cap > max`） | 非法 ⇒ `Err(PoolResizeError)`，状态零变更 + 审计 `ResizeRejected`；合法 ⇒ `Resized` | — | 错误是 `Copy` 值（拒绝路径零分配，`Display` 自带两参原值） | `pool.rs:45`、`pool.rs:261` |
 
 - **`note_borrow` / `metrics()` 是观测面，不是第三本准入账**（蓝图 §5）：`PoolBase` 不做 check-then-act；准入权在特化池——`MemoryPool` 在槽位锁内判 `created < max`（`memgov.rs:568`），`ObjectPool` 在片锁内判 `alive < share(max)`（`objpool.rs:1255`）。把 `metrics()` 当放行判据 = 无锁 check-then-act。
+- **归还两入口（#98）**：`note_return` = 裁决与真实槽位提交**分属两段临界区**（事件先于提交发射；适用于「槽位存储自有锁、事件重入看不到中间态」的实现方）；`note_return_with(commit)` = `pub(crate)` 协作入口，core 裁决 + 实现方槽位提交/配额回吐在**同一 `core` 临界区**内完成，事件恒描述**已提交**状态（`MemoryPool` 用它）。锁序 `core → 实现方槽位锁`；任何实现方**禁**持槽位锁再取 core；`resize` 被裁对象的析构在 `resizing` 闸**外**。
+- **池 metrics 的快照语义（#99）**：`MemoryPoolMetrics` / `ThreadPoolMetrics` 是**逐面非原子快照**（不取 `resizing`）——并发 `resize` 时各面可能来自相邻时刻；`ThreadPool` 的 actual-vs-target worker 差异属合法状态，不是混合窗口。要「同一已提交配置」请读 `resize`/审计回调内的状态（回调在全部内部锁释放后运行）。
+- **resize 审计事件的时序（#99）**：`Resized` / `ResizeRejected` 在实现方状态**全部提交且内部锁释放后**发射 ⇒ 回调可重入 `resize`/`acquire`/`metrics`；事件顺序 = 实际发射序（并发 resize 由各实现方串行闸定序），载荷不带目标值——读配置用 `metrics()`。`ThreadPool::resize` 的 epoch 在**任何用户回调之前**领取（「最后发起的目标生效」）。
 
 #### ThreadPool — 三参各管一件事
 
@@ -1201,7 +1204,7 @@ impl Scheduler {
         -> Result<TaskHandle, AdmissionError>;             // #58：触顶返回 Full（无部分插入）
     pub fn try_every(&self, period: Duration, task: impl Fn() + Send + Sync + 'static)
         -> Result<TaskHandle, AdmissionError>;             // #58：触顶返回 Full
-    pub fn set_capacity(&self, cap: usize);                 // #58：0=无界（默认）；置上限后 legacy after/every 触顶 panic
+    pub fn set_capacity(&self, cap: usize);                 // #58：0=无界（默认）；置上限后 legacy after/every 触顶 panic；#95：与 register 共锁线性化（state 锁内发布，缩容不驱逐、扩容与 0 即时）
     pub fn capacity(&self) -> usize;                        // #58
     pub fn live_registrations(&self) -> usize;              // #58：堆内待执行 + 执行中周期任务（≠ heap.len()）
     pub fn rejected_registrations(&self) -> u64;            // #58：闸关拒绝不计入（同 FxCounts::rejected）
@@ -1211,7 +1214,8 @@ impl Scheduler {
     pub fn is_closed(&self) -> bool;
     pub fn panic_count(&self) -> u64;                      // 点火 catch_unwind 命中计数
     pub fn worker_passes(&self) -> u64;                    // 驱动循环圈数（零自旋证据）
-    pub fn spawn_worker(self: &Arc<Self>) -> WorkerHandle;
+    pub fn spawn_worker(self: &Arc<Self>) -> WorkerHandle;   // fail-visible 旧口：OS 创建失败 ⇒ 带因 panic（#87）
+    pub fn try_spawn_worker(self: &Arc<Self>) -> std::io::Result<WorkerHandle>;  // #87：失败原样返回 io::Error、零残留；失败后注册照常、tick() 内核照常点火
 }
 
 pub struct TaskHandle { /* … */ }   // RAII（Drop 即 cancel）；非 Clone；Send + Sync
@@ -1434,12 +1438,13 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
 - TTL=逐条 expire-after-write（覆盖重置计时）；`now + ttl` 溢出 panic（fail-closed）。
 - 双界交互：满时**先清过期再逐 LRU 尾**（过期条目永不把活条目挤出去，当清得动时）。
 - 惰性过期：触碰即回收 + `expired` 计数（fail-visible，过期不是静默 None）；`len()`=物理条数（回收前僵尸占容，如实声明）。
-- 时钟只消费单调面；**并发面：单线程 `&mut self` 面 + `SyncLruCache`/`SyncTtlCache` 并发薄包装（`&self`+内部 Mutex，可观察语义与单线程版一致；共享面另有**锁内用户代码边界**，见下三条；分片留待命中率证据）**。
+- 时钟只消费单调面；**并发面：单线程 `&mut self` 面 + `SyncLruCache`/`SyncTtlCache` 并发薄包装（`&self`+内部 Mutex，可观察语义与单线程版一致；共享面另有**锁内用户代码边界**，见下四条；分片留待命中率证据）**。
 - **用户析构在锁外**（#71）：淘汰/过期/覆盖的 `V::drop`，以及 `remove`/`pop_lru`/`retain` 移除 map 条目或取走 arena 键时的 `K::drop`，**不在共享 mutex 内执行**——就**退休面**而言临界区内只做簿记与所有权转移（`HashMap::remove_entry` 取回 map 键，连同 arena 键/值装进退休批），解锁后按显式顺序（map 键 → arena 键 → 值）析构。退休批**零堆分配**（不破「覆盖插入不得分配」锚）。**本条只覆盖析构**——临界区内仍执行键的 `Hash`/`Eq` 与读侧 `V::clone`（见下两条）。
 - **poison 契约拆分**（#71）：**锁外**析构 panic **不投毒**缓存（析构发生在临界区之外，缓存状态未受损）；**临界区内** panic 仍投毒并 fail-fast 带因——**包括临界区内用户 trait 的 panic**（键 `Hash`/`Eq`、读侧 `V::clone`）⇒ 键/值实现须 panic-free。
 - **插入路径的 `K::clone` 在锁外**（#80）：`SyncLruCache::insert` / `SyncTtlCache::insert` 采**两阶段重验证插入**——先持锁查存在（存在则更新值与 recency，**不 clone**），不存在则**放锁**后 clone map 侧键副本（此刻无锁持有、未发生任何变更），再**重取锁重查**（第二次检查 = 线性化点），仍不存在才以已 clone 的键插入 ⇒ **锁内路径永不调 `K::clone`**。TTL 的第二次存在检查**早于**过期清扫/淘汰（panic 的 clone 不会造成部分变更）；「已有键重置过期且不 clone」保持；单线程 `LruCache` 路径不变。⚠️ 本条**只覆盖 `K::clone`**——锁内仍执行键的 `Hash`/`Eq` 与读路径的 `V::clone`。
 - **键 trait 在锁内**（#82，共享面的显式限制）：`K::Hash`、`K::Eq` 与借用键 `Q::Hash`/`Q::Eq` **可能在内部 mutex 下执行**——查表（`idx_of`→`HashMap::get`：`get`/`peek`/`contains`/`remove`/TTL 过期检查/插入存在性检查）、建表项（`map.get` + `map.insert`）、删除（`map.remove`）、以及 `HashMap` 扩容/rehash ⇒ 键实现须**快、不 panic、不得重入同一缓存**。这是「`HashMap` 作权威索引 + 单 mutex」的固有属性：真正的 lock-free 边界需要另一种索引协议（快照候选键 + 锁外哈希 + 槽位代次重验证），属架构重设计；**用指纹替代键身份被否决**（指纹不是等价关系，当身份会静默改 `Eq` 语义）。
 - **读路径 `V::clone` 在锁内**（#83，共享面的显式限制）：`get`/`peek` 返 owned ⇒ `V::clone` 在内部 mutex 下执行 ⇒ 值实现须**快、不 panic、不得重入同一缓存**。与 #71 的精确对照：**#71 移出锁的是退休值的析构；读侧 `Clone` 仍在锁内**。「锁外 clone + 重验证」不可安全实现（放锁后槽位可被替换/移除/淘汰/复用 ⇒ 锁外引用不安全），而 `Arc<V>` 存储会改所有权模型（`remove`/`pop_lru` 需新增 `V: Clone` 或改返回类型）⇒ 属公共兼容性决策，留待未来大版本。
+- **注入 `Clock` 在锁外**（#101）：`SyncTtlCache` 的全部 `now_instant` 取样都在 cache mutex **之外**——含满插清扫用的时间快照（第二阶段**取锁前**读取，锁内只消费该不可变值）⇒ 用户 `Clock` 实现可在 `now_instant` 内重入本缓存的读面（`len`/`contains`/`get`）而不自锁、panic 也不投毒。代价：取样与取锁之间刚过期的条目留到下次惰性访问/清扫（惰性 TTL 语义，不为更晚的纳秒快照把调用方注入依赖带进锁内）。⚠️ 本条与上三条**分开记**：Clock 在锁外；键 `Hash`/`Eq` 与读路径 `V::clone` **仍在锁内**。
 - **既有 API 属性未变**：`remove`/`pop_lru` 仍移动出 owned `V`、**不需要 `V: Clone`**。
 - **单线程面区分**：`LruCache`/`TtlCache` 无共享 mutex，但 `Hash`/`Eq` 仍在调用方栈上同步执行。
 - 构造签名类型强制「上限必填」（无默认无界构造，BoundedRegistry 同款）；满插入恒逐 LRU 尾（无 Reject 形）。
@@ -2117,7 +2122,7 @@ impl FieldBag {
 
 ## fx — 异步并发托管
 
-**feature**：`tokio`。**依赖面**：tokio（JoinSet/oneshot/watch/time::timeout/Semaphore）；CancellationToken 树/tokio-util 不引入。`tokio::spawn` 直调经 clippy `disallowed_methods` 闸封死——**效果只经 `FxScope` 命名口**（`spawn_tracked`/`spawn_detached`，后者为闸内唯一 allow 豁免）。
+**feature**：`tokio`。**依赖面**：tokio（JoinSet/oneshot/watch/time::timeout/Semaphore）；CancellationToken 树/tokio-util 不引入。`tokio::spawn` 直调经 clippy `disallowed_methods` 闸封死——**效果只经 `FxScope` 命名口**（`spawn_tracked`/`spawn_detached`）；issue#92 起脱管口改用 `Handle::spawn`、入集用 `JoinSet::spawn_on`，**本 crate 零 allow 豁免**（`Handle::spawn` 尚未入 lint 清单，缺口见 bd 待办）。
 
 ```rust
 pub struct FxScope { /* Mutex<JoinSet> + accepting 闸 + Semaphore + 取消源/令牌 */ }
@@ -2185,7 +2190,7 @@ impl CancelToken {
 }
 
 pub fn cancel_pair() -> (CancelSource, CancelToken);
-pub enum AdmissionError { Closed, PendingFull, TrackedFull }   // typed 过载/闸关（issue#39）
+pub enum AdmissionError { Closed, PendingFull, TrackedFull, NoRuntime }   // typed 过载/闸关/runtime 上下文缺失（issue#39/#92；**非** non_exhaustive ⇒ 跨 crate 穷尽 match 须列全）
 pub struct FxCounts { pub active: usize, pub waiting: usize, pub completed_unreaped: usize, pub rejected: usize }
 impl FxScope {
     pub fn with_max_pending(self, n: usize) -> Self;   // 等待许可的准入上限（默认无界，opt-in）
@@ -2198,6 +2203,7 @@ impl FxScope {
 ```
 
 - **三资源维度（issue#39）**：`with_concurrency` 只限**任务体并发**，**不是**内存/保留量上界；保留上界 = `with_max_tracked`（含已完成未收割条目），等待许可数 = `with_max_pending`，两者默认**无界**（opt-in 显式设）。有界准入走 `try_spawn_tracked` → `Result<_, AdmissionError>`（过载 typed 拒绝，不阻塞不 panic）；`spawn_tracked` 是**无界旧口**（保持兼容，不受上界约束）。`Spawned::join()` 只消费结果、**不**移除集合条目（收割口 = `try_reap`）。`counts()` 暴露 active/waiting/completed_unreaped/rejected。
+- **runtime 上下文前置条件（issue#92）**：`try_spawn_tracked` / `spawn_detached` 在**取任何内部锁之前**做 `Handle::try_current()` 预检——无当前 Tokio runtime ⇒ `AdmissionError::NoRuntime`：**不入容量账**（`admitted`/`tracked`/`active`/`waiting`/`rejected` 全不变）、**不消费宿主 Future**、不触闸。`spawn_tracked` 是 fail-visible 旧口（无 runtime 带因 panic，rustdoc `# Panics` 指向 typed 口）。`spawn_detached` 返回类型已统一为 `Result<JoinHandle<T>, AdmissionError>`（原 `ScopeClosed`），脱管语义（不进 JoinSet、不受 shutdown 等待、不计 tracked/in_flight）不变；入集用 `JoinSet::spawn_on(.., &handle)`、脱管用 `handle.spawn(..)`（不再隐式读当前位置）。timeout 面另需 runtime **启用 time driver**：`shutdown_timeout` / `join_timeout` 的 `# Panics` 已写明（`Builder::new_current_thread().build()` 未 `enable_time()` 即 panic），签名与返回面不变。
 - 任务结局归一：panic 经 catch_unwind 归一 `TaskError::Panicked(消息)`（payload downcast &str/String，否则哨兵文案）；发送端消亡=Cancelled；**join 超时=`TimedOut` = 截止已过 + 已请求 abort（`AbortHandle::abort()` 只是取消请求）——不表示任务体已终止、其守卫已运行或集合条目已被收割**（issue#67 契约冻结；超时后的证据是 scope 级 `in_flight` / `expect_body_idle` / `expect_fully_reaped_idle` / `counts()`；abort 仍是请求，任务守卫与 `in_flight` 跟踪在任务真正退出前具权威）。
 - `spawn_tracked` 线性化=锁内原子 RMW 过闸 + 插入与 shutdown 的 abort_all 串行——过闸任务必被 shutdown 覆及。
 - 条目滞留与收割（issue#13）：生命周期集条目不再静默丢弃——panic 载荷进集合（句柄被丢也不丢），**join 与 `try_reap`/停机排空双重可见**（同一 panic 两条路都可能报出，诊断面语义非 exactly-once）；完成条目滞留集合至 `try_reap`（增量收割口：锁内同步 `try_join_next` 扫已完成条目，空集零分配、幂等，不动在途任务、不改 in_flight）或停机排空显式消费。
