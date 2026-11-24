@@ -1852,4 +1852,175 @@ mod tests {
             "无订阅者时环历史必须为空（闸 = 槽，emit 快路径直接返回）"
         );
     }
+    /// 析构锁边界探针（issue#88 池域，形态同 `audit::tests::DropProbe`）：记录
+    /// 「用户回调闭包析构时订阅槽锁是否空闲」。`Drop` 里只做 `try_lock`（不阻塞、
+    /// 不 sleep）；持 `Weak` 而非 `Arc`，探针不得延长槽的寿命。
+    struct DropProbe {
+        audit: std::sync::Weak<Mutex<Option<AuditSlot>>>,
+        observed: Arc<Mutex<Option<LockBoundary>>>,
+        /// 析构次数（「恰好一次」断言：在途回调不得被新路径重复销毁）。
+        drops: Arc<AtomicUsize>,
+    }
+
+    /// 探针读数。
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum LockBoundary {
+        /// `try_lock` 成功：订阅槽锁空闲 ⇒ 回调闭包在锁外析构。
+        Free,
+        /// `try_lock` 失败：有线程持锁 ⇒ 回调闭包在锁内析构。
+        Held,
+    }
+
+    impl DropProbe {
+        fn new(audit: &Arc<Mutex<Option<AuditSlot>>>) -> Self {
+            Self {
+                audit: Arc::downgrade(audit),
+                observed: Arc::new(Mutex::new(None)),
+                drops: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            let boundary = match self.audit.upgrade() {
+                Some(audit) => match audit.try_lock() {
+                    Ok(_) => LockBoundary::Free,
+                    Err(_) => LockBoundary::Held,
+                },
+                // 槽本身已随 sink 析构：锁不复存在，谈不上「锁内析构」。
+                None => LockBoundary::Free,
+            };
+            *self.observed.lock().expect("探针结果槽中毒") = Some(boundary);
+        }
+    }
+
+    /// ⑥ issue#88 池域：现役票据 Drop 的整槽退役必须在 audit 锁**外**析构用户回调。
+    #[test]
+    fn pool_ticket_drop_retires_callback_outside_audit_lock() {
+        let sink = PoolAuditSink::new();
+        let probe = DropProbe::new(&sink.audit);
+        let observed = Arc::clone(&probe.observed);
+        let ticket = sink.subscribe_audit(16, move |_| {
+            let _ = &probe; // 闭包持有探针：闭包析构即观测点
+        });
+        assert_eq!(
+            *observed.lock().expect("探针结果槽中毒"),
+            None,
+            "订阅期的回调闭包不得被析构"
+        );
+
+        drop(ticket);
+        assert_eq!(
+            *observed.lock().expect("探针结果槽中毒"),
+            Some(LockBoundary::Free),
+            "池域票据 Drop 在 audit 锁内析构了用户回调闭包（#88 自锁形状）"
+        );
+    }
+
+    /// ⑦ issue#88 池域：新订阅覆盖旧订阅时，被覆盖整槽的析构同样必须在锁外。
+    #[test]
+    fn pool_resubscribe_retires_old_callback_outside_audit_lock() {
+        let sink = PoolAuditSink::new();
+        let probe = DropProbe::new(&sink.audit);
+        let observed = Arc::clone(&probe.observed);
+        let stale = sink.subscribe_audit(16, move |_| {
+            let _ = &probe;
+        });
+        let current = sink.subscribe_audit(16, |_| {});
+
+        assert_eq!(
+            *observed.lock().expect("探针结果槽中毒"),
+            Some(LockBoundary::Free),
+            "覆盖订阅在 audit 锁内析构了旧回调闭包（#88 自锁形状）"
+        );
+        drop(stale); // 代次失配：不碰新流
+        drop(current);
+    }
+
+    /// ⑧ 控制臂：同一探针在「锁被持有」时必须读到 `Held`——证明池域探针确有
+    /// 鉴别力（不是恒真断言）。持锁方是另一线程：std 未规定同线程对自己的锁
+    /// `try_lock` 的结果。
+    #[test]
+    fn pool_drop_probe_control_arm_reports_held_lock() {
+        let sink = PoolAuditSink::new();
+        let probe = DropProbe::new(&sink.audit);
+        let observed = Arc::clone(&probe.observed);
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = {
+            let audit = Arc::clone(&sink.audit);
+            thread::spawn(move || {
+                let _guard = lock(&audit);
+                locked_tx.send(()).expect("持锁信号通道");
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("持锁方未收到放行");
+            })
+        };
+        locked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("持锁线程未就绪");
+
+        drop(probe);
+        assert_eq!(
+            *observed.lock().expect("探针结果槽中毒"),
+            Some(LockBoundary::Held),
+            "控制臂失效：池域探针在锁被持有时仍报 Free"
+        );
+
+        release_tx.send(()).expect("放行持锁方");
+        holder.join().expect("持锁线程");
+    }
+    /// ⑨ issue#88 池域：替换/退订发生在**回调已被在途派发者取走**的窗口内
+    /// （槽内 `notify == None`）——旧回调只由在途派发者持有：锁外析构、恰好一次。
+    #[test]
+    fn pool_inflight_callback_is_destroyed_once_outside_lock_on_replace() {
+        let sink = Arc::new(PoolAuditSink::new());
+        let probe = DropProbe::new(&sink.audit);
+        let observed = Arc::clone(&probe.observed);
+        let drops = Arc::clone(&probe.drops);
+        let (in_cb_tx, in_cb_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let stale = sink.subscribe_audit(16, move |_| {
+            let _ = &probe; // 探针随闭包析构
+            in_cb_tx.send(()).expect("回调信号通道");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("回调未收到放行");
+        });
+
+        let emitter = {
+            let sink = Arc::clone(&sink);
+            thread::spawn(move || sink.emit(PoolAuditKind::Borrowed))
+        };
+        in_cb_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("回调未进入在途窗口（槽内 notify 未被取走）");
+
+        // 在途窗口内替换订阅 + 释放旧票据：两条路径都不得析构在途回调。
+        let current = sink.subscribe_audit(16, |_| {});
+        drop(stale);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "在途回调被替换/退订路径提前或重复析构"
+        );
+
+        release_tx.send(()).expect("放行回调");
+        emitter.join().expect("emit 线程");
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "在途回调必须恰好析构一次（重复销毁 = 双重释放）"
+        );
+        assert_eq!(
+            *observed.lock().expect("探针结果槽中毒"),
+            Some(LockBoundary::Free),
+            "在途回调在 audit 锁内析构（#88 自锁形状）"
+        );
+        drop(current);
+    }
 }

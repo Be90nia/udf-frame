@@ -2543,7 +2543,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ) -> AuditTicket {
         let gen = self.inner.audit_gen.fetch_add(1, Ordering::AcqRel) + 1;
         let cap = capacity.max(1);
-        {
+        let retired = {
             let mut guard = lock(&self.inner.audit);
             // 前订被覆盖留痕（读侧 audit_preempted）：单槽二次订阅会终止前订
             // 的事件流（典型：tracing 桥被自定义消费者顶掉），覆盖必须显形——
@@ -2551,7 +2551,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             if guard.is_some() {
                 self.inner.audit_preempted.fetch_add(1, Ordering::Relaxed);
             }
-            *guard = Some(AuditSink {
+            let retired = guard.replace(AuditSink {
                 ring: VecDeque::with_capacity(cap),
                 cap,
                 gen,
@@ -2566,7 +2566,12 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             // 不存在（该窗口内的发射会因闸 false 在环入账**之前**返回 = 静默丢
             // 取证）。热发射路径仍是一次 Acquire load。
             self.inner.audit_gate.store(true, Ordering::Release);
-        }
+            retired
+        };
+        // 被覆盖的整槽锁外析构（issue#88）：旧 sink 的 `notify` 可能仍持有用户
+        // 回调闭包，其捕获对象自带 `Drop`（宿主代码，可重入本 store 的
+        // `subscribe_events`/`take_events`）⇒ 锁内析构即自锁。
+        drop(retired);
         AuditTicket {
             gate: Arc::clone(&self.inner.audit_gate),
             audit: Arc::clone(&self.inner.audit),
