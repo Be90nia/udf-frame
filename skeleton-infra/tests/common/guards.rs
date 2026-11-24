@@ -4,12 +4,63 @@
 //!
 //! 为什么不 `tokio::time::timeout`：被测任务可能在 poll 内**无 await 忙等**
 //! （自旋段），它会饿死 tokio 的时间驱动 ⇒ 计时器护栏自身无界 ⇒ 测试挂死（CI 上
-//! 表现成 job 超时，比一条红更难诊断）。OS 时钟与时驱动解耦，护栏恒有界。
+//! 表现成 job 超时，比一条红更难诊断）。OS 时钟与 Tokio 时间驱动解耦；但若
+//! current_thread runtime 的整条执行线程被同步自旋占死，select 本身也无法运行，
+//! 此时由 CI job timeout 作为外层进程护栏。
 
 #![allow(dead_code)]
 
 use std::future::Future;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// 可取消的 OS 截止线程：目标 future 提前结束时立即唤醒线程，不让它白睡满 10s。
+struct DeadlineWake {
+    worker: Option<JoinHandle<()>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for DeadlineWake {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            // 线程只执行截止等待与 oneshot send；取消后立即退出，join 确保不遗留线程。
+            let _ = worker.join();
+        }
+    }
+}
+
+fn spawn_deadline(fire: tokio::sync::oneshot::Sender<()>) -> DeadlineWake {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let worker = thread::Builder::new()
+        .name("udf-test-deadline".into())
+        .spawn(move || {
+            let deadline = Instant::now() + CALL_LIMIT;
+            loop {
+                if worker_cancelled.load(Ordering::Acquire) {
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    let _ = fire.send(());
+                    break;
+                }
+                // park_timeout 允许虚假唤醒；用绝对截止时间循环，不能把虚假唤醒当超时。
+                thread::park_timeout(deadline.saturating_duration_since(now));
+            }
+        })
+        .expect("创建 OS 截止线程失败");
+    DeadlineWake {
+        worker: Some(worker),
+        cancelled,
+    }
+}
 
 /// 等待条件成立的上限（远小于 job 超时，远大于正常抖动）。
 const WAIT_LIMIT: Duration = Duration::from_secs(5);
@@ -28,22 +79,37 @@ pub async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
-/// 有界等待 future 完成：独立 OS 线程睡满期限后点火，`select!` 抢答。
+/// 有界等待 future 完成：独立 OS 线程按 OS 截止时间 park，`select!` 抢答。
 ///
-/// 代价：每次调用起一个 detached OS 线程，正常路径下它也白睡到期限才自退——
-/// 测试面可接受，换来的正是「护栏不依赖 tokio 时间驱动」。
+/// 代价：每次调用创建一个短生命周期 OS 线程；正常完成时 RAII guard 会取消、
+/// 唤醒并 join 它，不会留下睡满期限的后台线程。护栏不依赖 tokio 时间驱动。
 pub async fn bounded<F: Future>(what: &str, fut: F) -> F::Output {
     let (fire, fired) = tokio::sync::oneshot::channel::<()>();
-    std::thread::spawn(move || {
-        std::thread::sleep(CALL_LIMIT);
-        // 目标先完成时接收端已 drop ⇒ send 失败即正常收场。
-        let _ = fire.send(());
-    });
-    tokio::select! {
+    let deadline = spawn_deadline(fire);
+    let output = tokio::select! {
         biased;
         output = fut => output,
         _ = fired => panic!(
             "等待 {CALL_LIMIT:?} 仍未见「{what}」：不变量可能已被破坏，或运行时已被自旋饿死（有界等待，禁挂死）"
         ),
+    };
+    // 提前完成时取消 OS 截止线程；超时 panic 路径则由 Drop 同样清理。
+    drop(deadline);
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_worker_is_joined_when_guard_drops_early() {
+        let (fire, _fired) = tokio::sync::oneshot::channel::<()>();
+        let started = Instant::now();
+        drop(spawn_deadline(fire));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "提前完成后应取消并 join 截止线程，而不是等待完整 10s"
+        );
     }
 }

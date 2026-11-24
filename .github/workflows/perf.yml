@@ -1,22 +1,23 @@
 # udf-frame 跨平台性能 workflow（2026-10-28 新增）
 #
-# 与现有 ci.yml 的关系（为何不进 push / pull_request 闸）：
+# 与现有 ci.yml 的关系（性能结果不作为 push / PR 合并闸）：
 # - ci.yml 是**正确性闸**：fmt / test / bench 编译门 / clippy 三道，红即拦。
 #   性能数值是**环境相关量**（共享 runner 抖动、CPU 频率、邻居负载、
 #   macOS 定时任务、Windows Defender 扫描……），同一份代码在不同机器上
 #   波动 10%~30% 属常态。把它塞进 push/PR 闸 = 用不可靠信号判红绿，
 #   结果是开发者学会忽略红灯（告警疲劳），比没有闸更糟。
-# - 因此本 workflow **只在 workflow_dispatch（手动）与 schedule（每日一次，
-#   固定 04:23 UTC——避开整点/半点拥堵时段，CI 队列在高负载时段排队更久）**
-#   触发，产出**数据**（criterion 输出 + bench 摘要 artifact + 基线对比），
-#   不参与任何合并决策。
+# - 因此本 workflow 在 workflow_dispatch（手动）与 schedule（每日一次，
+#   固定 04:23 UTC）触发；另外仅当 PR 改动本工作流或 bench 定义时触发
+#   （路径过滤），用来验证 benchmark 清单/产物映射。所有触发都只产出**数据**
+#   （criterion 输出 + bench 摘要 artifact + 基线对比），不参与合并决策。
 # - Rust 版本 pin 1.96.0 与 ci.yml 一致（防工具链漂移让性能数不可比）；
 #   components 含 clippy/rustfmt 与 ci.yml 同款，便于本地复现同一环境。
 # - 矩阵仅 ubuntu-latest + macos-latest：Windows 性能数据本地已有
 #   （本仓库开发机为 Windows，性能基线以本地测量为准），CI 侧不重复消耗。
 #
 # 「性能失败不阻塞」语义（三重保险，任何一处生效即可）：
-# 1. 触发面：不在 push/PR 路径上 → 失败天然不拦合并。
+# 1. 触发面：无 push 触发；PR 仅在 perf workflow / bench 定义变更时路径过滤触发，
+#    且不应配置为 required check → 普通代码 PR 不跑，性能数据也不拦合并。
 # 2. bench 执行步 `continue-on-error: true` → bench 自身失败（runner 抖动、
 #    判据过严）只标红该步，不终止后续 artifact / 摘要产出。
 # 3. 基线对比只**告警**（>10% 回归写 warning + step summary），不改退出码。
@@ -38,6 +39,11 @@ name: udf-frame perf
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/perf.yml"
+      - "skeleton-infra/benches/**"
+      - "std-ext/benches/**"
   schedule:
     # 每日一次，04:23 UTC——避开整点（CI 调度高峰）。手动触发不受此限。
     - cron: "23 4 * * *"
@@ -49,6 +55,7 @@ jobs:
   bench:
     name: bench (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -247,18 +254,18 @@ jobs:
               "retry_async_first_attempt",
               "random_id_v4",
               "random_fill_8x8",
-              "scheduler/register/1000",
-              "scheduler/register/10000",
-              "scheduler/register/100000",
-              "scheduler/cancel/1000",
-              "scheduler/cancel/10000",
-              "scheduler/cancel/100000",
-              "scheduler/cancel_reclaim/1000",
-              "scheduler/cancel_reclaim/10000",
-              "scheduler/cancel_reclaim/100000",
-              "scheduler/pending_control/1000",
-              "scheduler/pending_control/10000",
-              "scheduler/pending_control/100000",
+              "scheduler/register_1000",
+              "scheduler/register_10000",
+              "scheduler/register_100000",
+              "scheduler/cancel_1000",
+              "scheduler/cancel_10000",
+              "scheduler/cancel_100000",
+              "scheduler/cancel_reclaim_1000",
+              "scheduler/cancel_reclaim_10000",
+              "scheduler/cancel_reclaim_100000",
+              "scheduler/pending_control_1000",
+              "scheduler/pending_control_10000",
+              "scheduler/pending_control_100000",
               # ── udf-skeleton-infra/benches/infra.rs 的每组代表 ID ──
               # 只为「该组整组消失/中途死掉」判缺；组内参数化叶子不逐条钉
               # （参数表是 bench 自己的调参面，改了不该红）。动态 ID
