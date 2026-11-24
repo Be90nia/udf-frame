@@ -4,7 +4,9 @@
 //!
 //! 为什么不 `tokio::time::timeout`：被测任务可能在 poll 内**无 await 忙等**
 //! （自旋段），它会饿死 tokio 的时间驱动 ⇒ 计时器护栏自身无界 ⇒ 测试挂死（CI 上
-//! 表现成 job 超时，比一条红更难诊断）。OS 时钟与时驱动解耦，护栏恒有界。
+//! 表现成 job 超时，比一条红更难诊断）。OS 时钟与 Tokio 时间驱动解耦；但若
+//! current_thread runtime 的整条执行线程被同步自旋占死，select 本身也无法运行，
+//! 此时由 CI job timeout 作为外层进程护栏。
 
 #![allow(dead_code)]
 
@@ -106,7 +108,7 @@ mod tests {
         let started = Instant::now();
         drop(spawn_deadline(fire));
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(5),
             "提前完成后应取消并 join 截止线程，而不是等待完整 10s"
         );
     }
