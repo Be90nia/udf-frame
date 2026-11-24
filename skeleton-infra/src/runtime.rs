@@ -463,6 +463,82 @@ impl RunIdDiag {
     }
 }
 
+/// 容量发布窗口停车闸（**仅 `cfg(test)` 构建存在**，issue#95）：把准入 / 停放
+/// 线程停在「已按旧 cap 裁决、尚未提交」的临界区里，供容量 setter 交错的
+/// 确定性测试。生产构建无本类型、热路径无任何检查。
+#[cfg(test)]
+struct CapacitySettle {
+    state: Mutex<SettleState>,
+    cv: Condvar,
+}
+
+#[cfg(test)]
+struct SettleState {
+    armed: bool,
+    entered: bool,
+}
+
+#[cfg(test)]
+impl CapacitySettle {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SettleState {
+                armed: false,
+                entered: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// 停靠点调用（**持对应 population 锁时进入**）：布防则置进入位并 park 到放行。
+    fn park(&self) {
+        let mut state = lock(&self.state);
+        if !state.armed {
+            return;
+        }
+        state.entered = true;
+        self.cv.notify_all();
+        while state.armed {
+            state = self
+                .cv
+                .wait(state)
+                .expect("capacity gate poisoned (prior holder panicked)");
+        }
+    }
+
+    /// 测试面：布防（清上一轮进入位）。
+    fn arm(&self) {
+        let mut state = lock(&self.state);
+        state.armed = true;
+        state.entered = false;
+    }
+
+    /// 测试面：有界等待停靠线程进入窗口（OS 时钟 Condvar 超时，非 sleep）。
+    fn wait_entered(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = lock(&self.state);
+        while !state.entered {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, _) = self
+                .cv
+                .wait_timeout(state, deadline - now)
+                .expect("capacity gate poisoned (prior holder panicked)");
+            state = next;
+        }
+        true
+    }
+
+    /// 测试面：放行并解除布防（后续准入 / 停放不再停靠）。
+    fn release(&self) {
+        let mut state = lock(&self.state);
+        state.armed = false;
+        self.cv.notify_all();
+    }
+}
+
 struct StoreInner<S, A, Op> {
     reducer: Arc<dyn Reducer<State = S, Action = A, Op = Op> + Send + Sync>,
     state: Mutex<Arc<S>>,
@@ -476,6 +552,14 @@ struct StoreInner<S, A, Op> {
     /// （默认）。正在执行的 action 已出队 → 不计入。容量满 = typed reject
     /// （[`SyncStore::try_dispatch`] 的 `Full`），绝不阻塞。
     capacity: AtomicUsize,
+    /// 准入停靠闸（**仅 `cfg(test)`**，issue#95）：`enqueue` 在「已按旧 cap
+    /// 裁决、尚未 push」的 queue 锁窗口停靠——容量 setter 此刻必被同一把锁挡住。
+    #[cfg(test)]
+    ingress_gate: CapacitySettle,
+    /// 停放停靠闸（**仅 `cfg(test)`**，issue#95）：停放路径在「已按旧 cap
+    /// 裁决、尚未 retain/reject」的 deferred_queue 锁窗口停靠。
+    #[cfg(test)]
+    deferred_gate: CapacitySettle,
     /// 容量满拒绝计数（fail-visible）：读侧 [`SyncStore::admission_full_count`]。
     admission_full: AtomicU64,
     /// 完成账本复用池（issue#40 性能协议：稳态零分配；issue#84 生命周期）：
@@ -1110,6 +1194,10 @@ fn enqueue<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'stat
             inner.admission_full.fetch_add(1, Ordering::SeqCst);
             return Enqueue::Full;
         }
+        // 测试停靠点（issue#95）：已按旧 cap 裁决、push 尚未提交——容量 setter
+        // 此刻只能被 queue 锁挡住（共锁线性化的可观测窗口）。
+        #[cfg(test)]
+        inner.ingress_gate.park();
     }
     // 序号 + 账本 + 因果计数：同一临界区内完成（入队即线性化点）。
     let seq = inner.next_seq.fetch_add(1, Ordering::SeqCst);
@@ -1620,6 +1708,10 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             queue: Mutex::new(VecDeque::new()),
             next_seq: AtomicU64::new(0),
             capacity: AtomicUsize::new(0),
+            #[cfg(test)]
+            ingress_gate: CapacitySettle::new(),
+            #[cfg(test)]
+            deferred_gate: CapacitySettle::new(),
             admission_full: AtomicU64::new(0),
             ledger_pool: Mutex::new(Vec::new()),
             deferred_queue: Mutex::new(VecDeque::new()),
@@ -2024,8 +2116,22 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 只约束**外部**准入（dispatch / try_dispatch / sender 的外部流量）；
     /// 同栈回灌不受约束（回灌是已接受 action 的内部延续，挡住它 = 排空环
     /// 自锁）。容量满 = typed reject（[`Self::try_dispatch`] 的 `Full`），
-    /// 绝不阻塞。调用于准入开始前（运行期调整与准入竞争 = 尽力而为）。
+    /// 绝不阻塞。
+    ///
+    /// # 与准入的线性化（issue#95）
+    ///
+    /// **线性化点 = `queue` 锁内的发布**：本方法先取 `queue` 锁再写新值，而每次
+    /// 外部准入在**同一把锁**内读 cap 并完成 push ⇒ 二者只有两种合法先后（不存在
+    /// 「准入读了旧 cap、setter 先返回、准入随后仍按旧 cap 入队」的交错）：
+    ///
+    /// - 准入先得锁：该条按**旧** cap 判定并入队，本方法随后返回——它线性化在
+    ///   本方法之前，**不被回溯删除/驱逐**（即使此刻 `pending_actions() > cap`）。
+    /// - 本方法先得锁：其后所有外部准入按**新** cap 判定。
+    ///
+    /// **扩容与 `0`（不限）对后续准入立即生效**；缩容只影响后续准入，已排队的
+    /// 工作照常被 reduce，另有独立计数记录拒绝。
     pub fn set_capacity(&self, cap: usize) {
+        let _queue = lock(&self.inner.queue);
         self.inner.capacity.store(cap, Ordering::Relaxed);
     }
 
@@ -2042,7 +2148,22 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 决定记录；只保证可配 + 可观测）。满 ⇒ 新续接拿显式非成功
     /// 终局（[`DispatchOutcome::CapacityRejected`]）并计入
     /// [`Self::deferred_capacity_rejected`]，绝不静默消失、绝不标成「已停放」。
+    ///
+    /// # 与停放写入的线性化（issue#95）
+    ///
+    /// **线性化点 = `deferred_queue` 锁内的发布**：本方法先取该锁再写新值，而
+    /// 停放路径在**同一把锁**内读 cap 并执行 retain / reject ⇒ 二者只有两种合法
+    /// 先后：
+    ///
+    /// - 停放先得锁：该条按**旧** cap 留存或拒收，本方法随后返回；已留存的停放
+    ///   记录**不被回溯删除**（即使此刻 `deferred_actions() > cap`）。
+    /// - 本方法先得锁：其后所有停放按**新** cap 判定。
+    ///
+    /// **扩容与 `0`（不限）对后续停放立即生效**。锁序不变：本方法只取
+    /// `deferred_queue`（与既有 `queue → deferred_queue` 单向序一致，不新增反向
+    /// 边，故与 `close` / `resume_deferred` 并发不产生死锁）。
     pub fn set_deferred_capacity(&self, cap: usize) {
+        let _parked = lock(&self.inner.deferred_queue);
         self.inner.deferred_capacity.store(cap, Ordering::Relaxed);
     }
 
@@ -2976,6 +3097,10 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
             let mut parked = lock(&inner.deferred_queue);
             let cap = inner.deferred_capacity.load(Ordering::Relaxed);
             let retained = cap == 0 || parked.len() < cap;
+            // 测试停靠点（issue#95）：停放已按旧 cap 裁决、留存/拒收尚未提交——
+            // 容量 setter 此刻只能被 deferred_queue 锁挡住。
+            #[cfg(test)]
+            inner.deferred_gate.park();
             let continuation = detach_deferred(record, retained);
             if retained {
                 parked.push_back(continuation);
@@ -4036,5 +4161,329 @@ mod tests {
             ledgers.iter().all(|l| l.terminal_published()),
             "展开路径不得把非终局账本放进复用池"
         );
+    }
+
+    // ── 容量 setter 与 population 的共锁线性化（issue#95）───────────────
+    //
+    // 三个 setter（ingress / deferred）与各自 population 共用一把锁；本区用
+    // `CapacitySettle` 把触发线程停靠在「已按旧 cap 裁决、尚未提交」的临界区里，
+    // 确定性构造「setter 想插在同一准入/停放的裁决与提交之间」的交错——
+    // 合法结果只有两种：触发方先得锁（setter 被挡住）或 setter 先得锁（触发方
+    // 按新 cap 判定）。禁 sleep 竞速。
+
+    /// setter 的反向有界等待上限：正确实现下 setter 必被锁挡住 ⇒ 必然超时。
+    const SETTER_BLOCK_LIMIT: Duration = Duration::from_millis(300);
+
+    enum CapAct {
+        /// 占住排空权（在 reduce 内阻塞）——使后续准入记录留在队列里。
+        Hold,
+        /// 普通外部准入。
+        Inc,
+        /// 无条件自指回灌：撞回灌预算即在 deferred 队列停一条。
+        Loop,
+    }
+
+    struct CapFixture {
+        hold: Arc<PoolGate>,
+    }
+
+    impl Reducer for CapFixture {
+        type State = u32;
+        type Action = CapAct;
+        type Op = Infallible;
+
+        fn initial(&self) -> u32 {
+            0
+        }
+
+        fn reduce(&self, s: &u32, a: CapAct, out: &mut EffectBuf<CapAct, Infallible>) -> u32 {
+            match a {
+                CapAct::Hold => {
+                    self.hold.mark_entered();
+                    self.hold.wait_release();
+                }
+                CapAct::Inc => {}
+                CapAct::Loop => out.push(Effect::Emit(CapAct::Loop)),
+            }
+            s + 1
+        }
+    }
+
+    /// ingress 容量 setter 与准入共锁（issue#95）：准入已按旧 cap 裁决（仍持
+    /// `queue` 锁）时 setter **不可能返回**；其后所有准入按新 cap 判定，且旧 cap
+    /// 接纳的记录不被回溯删除。
+    ///
+    /// 变异判别：若 setter 退回「锁外原子 store」，它会在准入停靠期间立即返回
+    /// ⇒ 本条红（本测试即该改动的变异锚）。
+    #[test]
+    fn ingress_capacity_setter_cannot_linearize_inside_admission() {
+        let hold = PoolGate::new();
+        let store = Arc::new(SyncStore::new(
+            CapFixture {
+                hold: Arc::clone(&hold),
+            },
+            skeleton::NoFx,
+        ));
+        // 占住排空权：让后续准入的记录留在队列里（容量闸才有可观测的队列深）。
+        let store_hold = Arc::clone(&store);
+        let holder = std::thread::spawn(move || store_hold.dispatch(CapAct::Hold));
+        hold.wait_entered();
+
+        store.inner.ingress_gate.arm();
+        let store_a = Arc::clone(&store);
+        let admission = std::thread::spawn(move || store_a.try_dispatch(CapAct::Inc));
+        assert!(
+            store
+                .inner
+                .ingress_gate
+                .wait_entered(Duration::from_secs(10)),
+            "准入必须停靠在「已读 cap、尚未 push」的 queue 锁窗口里"
+        );
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let store_b = Arc::clone(&store);
+        let setter = std::thread::spawn(move || {
+            store_b.set_capacity(1);
+            let _ = done_tx.send(());
+        });
+        // 负向断言（OS 时钟有界等待）：setter 不得在准入尚未提交时返回。
+        let setter_returned_early = done_rx.recv_timeout(SETTER_BLOCK_LIMIT).is_ok();
+        // 先放行再断言：断言失败时也不得把停靠线程留在锁里（否则是挂死而非失败）。
+        store.inner.ingress_gate.release();
+        assert_eq!(
+            admission.join().expect("准入线程不得 panic"),
+            AdmissionOutcome::Accepted,
+            "停靠中的准入按旧 cap（0 = 不限）接纳"
+        );
+        setter.join().expect("setter 线程不得 panic");
+        assert!(
+            !setter_returned_early,
+            "setter 在准入已按旧 cap 裁决、尚未 push 时返回 ⇒ 容量发布未与准入共锁（issue#95）"
+        );
+
+        assert_eq!(
+            store.pending_actions(),
+            1,
+            "旧 cap 接纳的那一条必须仍在队（缩容不回溯删除已接纳工作）"
+        );
+        assert_eq!(
+            store.try_dispatch(CapAct::Inc),
+            AdmissionOutcome::Full,
+            "setter 之后的新准入按新 cap=1 拒绝"
+        );
+        assert_eq!(store.admission_full_count(), 1, "拒绝必须留痕");
+        assert_eq!(store.pending_actions(), 1, "拒绝不得部分插入");
+
+        hold.open();
+        holder.join().expect("排空者不得 panic");
+        assert_eq!(*store.snapshot(), 2, "已接纳的 action 照常被 reduce");
+    }
+
+    /// ingress 容量：缩容只挡后续准入；扩容与 `0`（不限）对后续准入立即生效。
+    #[test]
+    fn ingress_capacity_expand_and_unbounded_apply_immediately() {
+        let hold = PoolGate::new();
+        let store = Arc::new(SyncStore::new(
+            CapFixture {
+                hold: Arc::clone(&hold),
+            },
+            skeleton::NoFx,
+        ));
+        let store_hold = Arc::clone(&store);
+        let holder = std::thread::spawn(move || store_hold.dispatch(CapAct::Hold));
+        hold.wait_entered();
+
+        store.set_capacity(1);
+        assert_eq!(
+            store.try_dispatch(CapAct::Inc),
+            AdmissionOutcome::Accepted,
+            "空队按 cap=1 接纳"
+        );
+        assert_eq!(
+            store.try_dispatch(CapAct::Inc),
+            AdmissionOutcome::Full,
+            "队列已到 cap=1 ⇒ 拒绝"
+        );
+
+        store.set_capacity(4);
+        assert_eq!(
+            store.try_dispatch(CapAct::Inc),
+            AdmissionOutcome::Accepted,
+            "扩容立即生效（不受此前拒绝影响）"
+        );
+        assert_eq!(
+            store.try_dispatch(CapAct::Inc),
+            AdmissionOutcome::Accepted,
+            "扩容后队列深 2 < 4"
+        );
+
+        store.set_capacity(0);
+        for _ in 0..3 {
+            assert_eq!(
+                store.try_dispatch(CapAct::Inc),
+                AdmissionOutcome::Accepted,
+                "0 = 不限：后续准入一律立即生效"
+            );
+        }
+        assert_eq!(store.admission_full_count(), 1, "只有 cap=1 那次被拒");
+        assert_eq!(store.pending_actions(), 6, "被拒记录不占位");
+
+        hold.open();
+        holder.join().expect("排空者不得 panic");
+        assert_eq!(*store.snapshot(), 7);
+    }
+
+    /// deferred 容量 setter 与停放写入共锁（issue#95）：停放已按旧 cap 裁决
+    /// （仍持 `deferred_queue` 锁）时 setter 不可能返回；其后停放按新 cap 判定，
+    /// 既有停放记录不被回溯删除，拒收计数准确。
+    #[test]
+    fn deferred_capacity_setter_cannot_linearize_inside_park() {
+        let store = Arc::new(SyncStore::new(
+            CapFixture {
+                hold: PoolGate::new(),
+            },
+            skeleton::NoFx,
+        ));
+        store.set_deferred_capacity(0); // 旧 cap = 不限
+
+        store.inner.deferred_gate.arm();
+        let store_a = Arc::clone(&store);
+        let parker = std::thread::spawn(move || store_a.try_dispatch(CapAct::Loop));
+        assert!(
+            store
+                .inner
+                .deferred_gate
+                .wait_entered(Duration::from_secs(10)),
+            "停放必须停靠在「已读 cap、尚未 retain/reject」的 deferred_queue 锁窗口里"
+        );
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let store_b = Arc::clone(&store);
+        let setter = std::thread::spawn(move || {
+            store_b.set_deferred_capacity(1);
+            let _ = done_tx.send(());
+        });
+        let setter_returned_early = done_rx.recv_timeout(SETTER_BLOCK_LIMIT).is_ok();
+        store.inner.deferred_gate.release();
+        assert_eq!(
+            parker.join().expect("停放线程不得 panic"),
+            AdmissionOutcome::Accepted,
+            "停放只是内部续接，准入面照常 Accepted"
+        );
+        setter.join().expect("setter 线程不得 panic");
+        assert!(
+            !setter_returned_early,
+            "setter 在停放已按旧 cap 裁决、尚未提交时返回 ⇒ 容量发布未与停放共锁（issue#95）"
+        );
+
+        assert_eq!(
+            store.deferred_actions(),
+            1,
+            "停放先得锁 ⇒ 按旧 cap（0 = 不限）留存，且不被回溯删除"
+        );
+        assert_eq!(store.deferred_capacity_rejected(), 0, "旧 cap 下无拒收");
+
+        assert_eq!(
+            store.try_dispatch(CapAct::Loop),
+            AdmissionOutcome::Accepted,
+            "外部准入容量不受影响"
+        );
+        assert_eq!(store.deferred_actions(), 1, "缩容不回溯删除既有停放记录");
+        assert_eq!(
+            store.deferred_capacity_rejected(),
+            1,
+            "新停放按新 cap=1 拒收且计数准确"
+        );
+    }
+
+    /// deferred 容量：扩容与 `0`（不限）对后续停放立即生效。
+    #[test]
+    fn deferred_capacity_expand_and_unbounded_apply_immediately() {
+        let store = SyncStore::new(
+            CapFixture {
+                hold: PoolGate::new(),
+            },
+            skeleton::NoFx,
+        );
+        store.set_deferred_capacity(1);
+        store.dispatch(CapAct::Loop);
+        assert_eq!(store.deferred_actions(), 1, "cap=1 接纳首条停放");
+        store.dispatch(CapAct::Loop);
+        assert_eq!(store.deferred_actions(), 1, "cap=1 拒绝第二条停放");
+        assert_eq!(store.deferred_capacity_rejected(), 1);
+
+        store.set_deferred_capacity(2);
+        store.dispatch(CapAct::Loop);
+        assert_eq!(store.deferred_actions(), 2, "扩容立即生效");
+        assert_eq!(store.deferred_capacity_rejected(), 1, "扩容后不再拒收");
+
+        store.set_deferred_capacity(0);
+        store.dispatch(CapAct::Loop);
+        assert_eq!(store.deferred_actions(), 3, "0 = 不限：立即生效");
+        assert_eq!(store.deferred_capacity_rejected(), 1);
+    }
+
+    /// 两个 setter 与 `close` / `resume_deferred` / 准入并发：锁序保持
+    /// （`queue → deferred_queue` 未被破坏）、无死锁、无丢无重。
+    ///
+    /// 计数口径：本次只跑 `Inc`（无停放记录）⇒ 每条 Accepted 恰好一次 reduce，
+    /// 终态 `snapshot == accepted` 即「无丢无重」。容量判定的精确交错已由上面
+    /// 三条确定性用例覆盖，本用例只咬锁序与存活。
+    #[test]
+    fn capacity_setters_concurrent_with_close_and_resume_preserve_records() {
+        let store = Arc::new(SyncStore::new(
+            CapFixture {
+                hold: PoolGate::new(),
+            },
+            skeleton::NoFx,
+        ));
+
+        let admit = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let mut accepted = 0u32;
+                for _ in 0..200 {
+                    if store.try_dispatch(CapAct::Inc) == AdmissionOutcome::Accepted {
+                        accepted += 1;
+                    }
+                }
+                accepted
+            })
+        };
+        let setter = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                for i in 0..200usize {
+                    store.set_capacity(i % 5);
+                    store.set_deferred_capacity(i % 3);
+                }
+            })
+        };
+        let resumer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let _ = store.resume_deferred(1).resumed;
+                }
+            })
+        };
+        let closer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.close())
+        };
+
+        let accepted = admit.join().expect("准入线程不得 panic");
+        setter.join().expect("setter 线程不得 panic");
+        resumer.join().expect("恢复线程不得 panic");
+        closer.join().expect("闭门线程不得 panic");
+
+        assert!(store.is_closed(), "close 必须生效");
+        assert_eq!(
+            *store.snapshot(),
+            accepted,
+            "每条 Accepted 恰好一次 reduce（无丢无重）"
+        );
+        assert_eq!(store.pending_actions(), 0, "闭门排空后主队列为空");
+        assert_eq!(store.deferred_actions(), 0, "本次无停放记录");
     }
 }

@@ -243,6 +243,79 @@ fn spawn_worker_thread(
     thread::Builder::new().name(name.to_owned()).spawn(body)
 }
 
+/// 容量发布窗口停车闸（**仅 `cfg(test)` 构建存在**，issue#95）：把 `register`
+/// 停在「已按旧 cap 裁决、尚未入堆」的状态锁内窗口里，供 `set_capacity` 交错的
+/// 确定性测试。生产构建无本类型、热路径无任何检查。
+#[cfg(test)]
+struct CapacitySettle {
+    state: Mutex<SettleState>,
+    cv: Condvar,
+}
+
+#[cfg(test)]
+struct SettleState {
+    armed: bool,
+    entered: bool,
+}
+
+#[cfg(test)]
+impl CapacitySettle {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SettleState {
+                armed: false,
+                entered: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// 停靠点调用（**持 `shared.state` 锁时进入**）：布防则置进入位并 park 到放行。
+    fn park(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if !state.armed {
+            return;
+        }
+        state.entered = true;
+        self.cv.notify_all();
+        while state.armed {
+            state = self.cv.wait(state).expect("capacity gate poisoned");
+        }
+    }
+
+    /// 测试面：布防（清上一轮进入位）。
+    fn arm(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.armed = true;
+        state.entered = false;
+    }
+
+    /// 测试面：有界等待停靠线程进入窗口（OS 时钟 Condvar 超时，非 sleep）。
+    fn wait_entered(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while !state.entered {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, _) = self
+                .cv
+                .wait_timeout(state, deadline - now)
+                .expect("capacity gate poisoned");
+            state = next;
+        }
+        true
+    }
+
+    /// 测试面：放行并解除布防（后续注册不再停靠）。
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.armed = false;
+        self.cv.notify_all();
+    }
+}
+
 struct Shared {
     clock: Arc<dyn Clock>,
     // ponytail: 单全局状态锁，注册竞争下吞吐负扩展（multidim ③ 实测
@@ -266,6 +339,10 @@ struct Shared {
     capacity: AtomicUsize,
     /// 因容量上界被拒的注册次数（#58；闸关拒发不计入，同 `FxCounts::rejected`）。
     rejected: AtomicU64,
+    /// 注册停靠闸（**仅 `cfg(test)`**，issue#95）：`register` 在「已按旧 cap
+    /// 裁决、尚未入堆」的状态锁窗口停靠——`set_capacity` 此刻必被同一把锁挡住。
+    #[cfg(test)]
+    register_gate: CapacitySettle,
     /// 已取消但可能仍在堆内的条目数（#52，近似计数）：取消 O(1) 递增，
     /// 清扫后归零——漂移至多「清扫期间落地的那次取消」，良性。
     tombstones: AtomicUsize,
@@ -358,6 +435,8 @@ impl Scheduler {
                 live: AtomicUsize::new(0),
                 capacity: AtomicUsize::new(0), // 0 = 无界（默认）
                 rejected: AtomicU64::new(0),
+                #[cfg(test)]
+                register_gate: CapacitySettle::new(),
                 tombstones: AtomicUsize::new(0),
                 spawn,
             }),
@@ -485,7 +564,22 @@ impl Scheduler {
     ///
     /// 与 `SyncStore::set_capacity` 同款口径（0 = 无界）；调低到当前活跃数
     /// 以下不驱逐既有注册，只让后续注册被拒。
+    ///
+    /// # 与注册的线性化（issue#95）
+    ///
+    /// **线性化点 = `state` 锁内的发布**：本方法先取状态锁再写新值，而
+    /// `Scheduler::register` 在**同一把锁**内读 cap 并完成检查 + 入堆 ⇒ 二者
+    /// 只有两种合法先后（不存在「注册读了旧 cap、本方法先返回、该注册随后仍按
+    /// 旧 cap 成功」的交错）：
+    ///
+    /// - 注册先得锁：该次按**旧** cap 判定并入堆，本方法随后返回——它线性化在
+    ///   本方法之前，**不被回溯取消/驱逐**（即使此刻 `live_registrations() > cap`）。
+    /// - 本方法先得锁：其后所有注册按**新** cap 判定。
+    ///
+    /// **扩容与 `0`（无界）对后续注册立即生效**。退役 / 取消路径仍经 `live` 的
+    /// 原子 CAS 释放额度、**不取状态锁**，故本方法不新增锁序边（状态锁零嵌套）。
     pub fn set_capacity(&self, cap: usize) {
+        let _state = lock(&self.shared.state);
         self.shared.capacity.store(cap, AtomicOrd::SeqCst);
     }
 
@@ -531,6 +625,10 @@ impl Scheduler {
             // 有界准入（#58）：活跃注册数达上界 ⇒ 显式拒绝，任务**不入堆**
             // （不部分插入）。检查与计数同在状态锁内 ⇒ 并发注册不越上界。
             let cap = self.shared.capacity.load(AtomicOrd::SeqCst);
+            // 测试停靠点（issue#95）：已按旧 cap 裁决、入堆尚未提交——
+            // `set_capacity` 此刻只能被状态锁挡住。
+            #[cfg(test)]
+            self.shared.register_gate.park();
             if cap > 0 && self.shared.live.load(AtomicOrd::SeqCst) >= cap {
                 drop(s);
                 self.shared.rejected.fetch_add(1, AtomicOrd::SeqCst);
@@ -1074,6 +1172,119 @@ mod tests {
     use skeleton::clock::MockClock;
 
     use super::*;
+
+    // ── 容量 setter 与注册共锁线性化（issue#95）──────────────────────────
+    //
+    // `set_capacity` 与 `register` 共用 `shared.state`；本区用 `CapacitySettle`
+    // 把注册线程停在「已按旧 cap 裁决、尚未入堆」的状态锁窗口里，确定性构造
+    // setter 想插在裁决与提交之间的交错。禁 sleep 竞速。
+
+    /// setter 的反向有界等待上限：正确实现下 setter 必被状态锁挡住 ⇒ 必然超时。
+    const SETTER_BLOCK_LIMIT: Duration = Duration::from_millis(300);
+
+    /// issue#95：注册已按旧 cap 裁决（仍持状态锁）时 setter **不可能返回**；
+    /// 其后所有注册按新 cap 判定，旧 cap 接纳的注册不被回溯驱逐。
+    ///
+    /// 变异判别：若 setter 退回「锁外原子 store」，它会在注册停靠期间立即返回
+    /// ⇒ 本条红（本测试即该改动的变异锚）。
+    #[test]
+    fn set_capacity_cannot_linearize_inside_register() {
+        let sched = Scheduler::new(Arc::new(MockClock::new()));
+        sched.shared.register_gate.arm();
+
+        let registering = {
+            let sched = sched.clone();
+            thread::spawn(move || sched.try_after(Duration::from_secs(60), || {}))
+        };
+        assert!(
+            sched
+                .shared
+                .register_gate
+                .wait_entered(Duration::from_secs(10)),
+            "注册必须停靠在「已读 cap、尚未入堆」的状态锁窗口里"
+        );
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let setting = {
+            let sched = sched.clone();
+            thread::spawn(move || {
+                sched.set_capacity(1);
+                let _ = done_tx.send(());
+            })
+        };
+        // 负向断言（OS 时钟有界等待）：setter 不得在注册尚未提交时返回。
+        let setter_returned_early = done_rx.recv_timeout(SETTER_BLOCK_LIMIT).is_ok();
+        // 先放行再断言：断言失败时也不得把停靠线程留在锁里（否则是挂死而非失败）。
+        sched.shared.register_gate.release();
+        let handle = registering
+            .join()
+            .expect("注册线程不得 panic")
+            .expect("停靠中的注册按旧 cap（0 = 无界）成功");
+        setting.join().expect("setter 线程不得 panic");
+        assert!(
+            !setter_returned_early,
+            "setter 在注册已按旧 cap 裁决、尚未入堆时返回 ⇒ 容量发布未与注册共锁（issue#95）"
+        );
+
+        assert_eq!(
+            sched.live_registrations(),
+            1,
+            "旧 cap 接纳的注册必须保留（缩容不回溯驱逐）"
+        );
+        assert_eq!(
+            sched.try_after(Duration::from_secs(60), || {}).err(),
+            Some(AdmissionError::Full),
+            "setter 之后的新注册按新 cap=1 拒绝"
+        );
+        assert_eq!(sched.live_registrations(), 1, "拒绝不占额度");
+        assert_eq!(sched.rejected_registrations(), 1, "拒绝必须留痕");
+
+        handle.detach();
+        sched.close();
+    }
+
+    /// issue#95：缩容只挡后续注册；扩容与 `0`（无界）对后续注册立即生效。
+    #[test]
+    fn set_capacity_shrink_and_expand_apply_to_later_registrations() {
+        let sched = Scheduler::new(Arc::new(MockClock::new()));
+        sched.set_capacity(1);
+        let first = sched
+            .try_after(Duration::from_secs(60), || {})
+            .expect("空位按 cap=1 接纳");
+        assert_eq!(
+            sched.try_after(Duration::from_secs(60), || {}).err(),
+            Some(AdmissionError::Full),
+            "活跃数达 cap=1 ⇒ 后续注册拒绝"
+        );
+
+        sched.set_capacity(2);
+        let second = sched
+            .try_after(Duration::from_secs(60), || {})
+            .expect("扩容立即生效");
+        sched.set_capacity(1);
+        assert_eq!(
+            sched.live_registrations(),
+            2,
+            "缩容到活跃数以下不驱逐既有注册"
+        );
+        assert_eq!(
+            sched.try_after(Duration::from_secs(60), || {}).err(),
+            Some(AdmissionError::Full),
+            "缩容后新注册按新 cap=1 拒绝"
+        );
+
+        sched.set_capacity(0);
+        let third = sched
+            .try_after(Duration::from_secs(60), || {})
+            .expect("0 = 无界：立即生效");
+        assert_eq!(sched.live_registrations(), 3);
+        assert_eq!(sched.rejected_registrations(), 2, "两次触顶各计一次");
+
+        first.detach();
+        second.detach();
+        third.detach();
+        sched.close();
+    }
 
     /// #55：detach 抑制 cancel 但**不得**泄漏 TaskCell 分配——句柄释放后
     /// 调度器清堆 ⇒ 弱引用升级失败（TaskCell 已回收）。
