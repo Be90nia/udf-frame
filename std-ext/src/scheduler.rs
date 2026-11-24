@@ -224,6 +224,25 @@ struct HeapState {
     next_seq: u64,
 }
 
+/// 驱动线程名（诊断面：线程列表可归因谁在跑；多 worker 共用同名——worker
+/// 数不计数，无编号可加，#87 明确不引入 worker 账本）。
+const WORKER_THREAD_NAME: &str = "scheduler-worker";
+
+/// OS 线程创建注入缝（issue#87，仅测试替换）：生产恒 [`spawn_worker_thread`]。
+///
+/// `fn` 指针而非 `dyn Fn`：开销只在起 worker 时一次间接调用（起 worker 是
+/// 冷路径；注册/点火热路径零成本）。
+type SpawnFn = fn(&str, Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>;
+
+/// 生产 spawner（issue#87）：`Builder::spawn` 把 OS 线程创建失败作为
+/// `io::Result` 返回（裸 `thread::spawn` 会 panic ⇒ 调用方无从恢复）。
+fn spawn_worker_thread(
+    name: &str,
+    body: Box<dyn FnOnce() + Send>,
+) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new().name(name.to_owned()).spawn(body)
+}
+
 struct Shared {
     clock: Arc<dyn Clock>,
     // ponytail: 单全局状态锁，注册竞争下吞吐负扩展（multidim ③ 实测
@@ -250,6 +269,10 @@ struct Shared {
     /// 已取消但可能仍在堆内的条目数（#52，近似计数）：取消 O(1) 递增，
     /// 清扫后归零——漂移至多「清扫期间落地的那次取消」，良性。
     tombstones: AtomicUsize,
+    /// OS 线程创建注入缝（issue#87）：生产恒 [`spawn_worker_thread`]，测试换
+    /// 成失败桩以确定性模拟创建失败。`fn` 指针 ⇒ 只在起 worker 时一次间接
+    /// 调用（热路径零成本）。
+    spawn: SpawnFn,
 }
 
 /// 埋点 kind 字段值（公开入口名：Once=after / Every=every）。log-embed 门内
@@ -287,6 +310,12 @@ impl Shared {
 /// 同步任务调度器（`Arc` 内脏，[`Clone`] 廉价共享；注册/点火/关闭线程安全）。
 ///
 /// 见[模块文档](self)双层形态与语义拍板。
+///
+/// **生产驱动启动失败可观察**（issue#87）：[`Scheduler::try_spawn_worker`]
+/// 把 OS 线程创建失败作为 `io::Error` 原样返回（失败零残留、调度器保持
+/// 开放）；[`Scheduler::spawn_worker`] 是 fail-visible 便利入口（失败带因
+/// panic）。启动失败后确定性内核不受影响——注册照常受理，显式
+/// [`Scheduler::tick`] 仍按 deadline 点火。
 #[derive(Clone)]
 pub struct Scheduler {
     shared: Arc<Shared>,
@@ -304,6 +333,17 @@ impl Scheduler {
     /// 新调度器：时间源注入（生产 [`SystemClock`](skeleton::clock::SystemClock)，
     /// 测试 [`MockClock`](skeleton::clock::MockClock) 确定性时间线）。
     pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self::build(clock, spawn_worker_thread)
+    }
+
+    /// 注入缝构造（issue#87，仅测试）：换掉 OS 线程创建实现，确定性模拟创建
+    /// 失败（不依赖真实 OS 线程资源耗尽）。
+    #[cfg(test)]
+    fn with_spawn(clock: Arc<dyn Clock>, spawn: SpawnFn) -> Self {
+        Self::build(clock, spawn)
+    }
+
+    fn build(clock: Arc<dyn Clock>, spawn: SpawnFn) -> Self {
         Self {
             shared: Arc::new(Shared {
                 clock,
@@ -319,6 +359,7 @@ impl Scheduler {
                 capacity: AtomicUsize::new(0), // 0 = 无界（默认）
                 rejected: AtomicU64::new(0),
                 tombstones: AtomicUsize::new(0),
+                spawn,
             }),
         }
     }
@@ -755,18 +796,48 @@ impl Scheduler {
     ///
     /// MockClock 时间不自动流动，驱动线程对其无意义——确定性测试走
     /// [`Scheduler::tick`]。
+    ///
+    /// # Panics
+    ///
+    /// OS 线程创建失败（PID/线程数限额、内存压力等）：**带因 panic**，消息含
+    /// 底层 `io::Error` 及其 `kind`。需要恢复面（失败后退回显式
+    /// [`Scheduler::tick`] 确定性内核，或把错误传播给宿主启动流程）的调用方走
+    /// [`Scheduler::try_spawn_worker`]。
     pub fn spawn_worker(self: &Arc<Self>) -> WorkerHandle {
+        self.try_spawn_worker().unwrap_or_else(|err| {
+            panic!(
+                "scheduler worker thread spawn failed (kind: {:?}): {err}——生产驱动未启动；\
+                 需要可恢复错误面请用 try_spawn_worker",
+                err.kind()
+            )
+        })
+    }
+
+    /// 起驱动线程（错误面可观察版，issue#87）：语义同
+    /// [`Scheduler::spawn_worker`]，但 OS 线程创建失败**原样返回**
+    /// `io::Error`（不改写 `kind`、不 panic）。
+    ///
+    /// 失败**零残留**：只有 OS 线程创建成功才构造 [`WorkerHandle`]——不遗留
+    /// 停信标、`JoinHandle` 或对 `Scheduler` 的额外所有权；调度器保持开放、
+    /// 注册照常受理、显式 [`Scheduler::tick`] 的确定性内核照常点火（启动失败
+    /// 不污染内核，也绝不假装「生产调度已启动」）。
+    ///
+    /// 典型处理：记录错误后退回 `tick()` 驱动，或向宿主启动流程传播。
+    pub fn try_spawn_worker(self: &Arc<Self>) -> std::io::Result<WorkerHandle> {
+        // 闭包只持 `Arc<Scheduler>` + 本 worker 停信标（#72）；spawn 失败时
+        // std 丢弃闭包 ⇒ 两个克隆随闭包消失（不留残余所有权）。
         let stop = Arc::new(AtomicBool::new(false));
-        let thread = thread::spawn({
+        let body = Box::new({
             let sched = Arc::clone(self);
             let stop = Arc::clone(&stop);
             move || worker_loop(sched, stop)
         });
-        WorkerHandle {
+        let thread = (self.shared.spawn)(WORKER_THREAD_NAME, body)?;
+        Ok(WorkerHandle {
             thread: Some(thread),
             sched: Arc::clone(self),
             stop,
-        }
+        })
     }
 }
 
@@ -1018,6 +1089,101 @@ mod tests {
         assert!(
             weak.upgrade().is_none(),
             "detach 后 TaskCell 必被回收（不泄漏分配）"
+        );
+    }
+
+    /// #87：注入的 OS 创建失败 ⇒ `try_spawn_worker` 原样返回 `io::Error` 的
+    /// kind，不 panic、不关闸、不留对 `Scheduler` 的残余所有权。
+    ///
+    /// 断言非恒真：注入桩必返回 `Err(WouldBlock)`——若实现改回裸
+    /// `thread::spawn`（panic）或吞掉错误，本测试红。
+    #[test]
+    fn try_spawn_worker_returns_original_io_error_without_residue() {
+        let sched = Arc::new(Scheduler::with_spawn(
+            Arc::new(MockClock::new()),
+            |_name, _body| Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        ));
+        let before = Arc::strong_count(&sched);
+        let err = sched
+            .try_spawn_worker()
+            .err()
+            .expect("注入 OS 创建失败必返回 Err（不得 panic）");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::WouldBlock,
+            "原样返回 OS 错误的 kind（不包装、不改写）"
+        );
+        assert_eq!(
+            Arc::strong_count(&sched),
+            before,
+            "失败零残留：闭包持有的 Arc<Scheduler> 克隆随闭包丢弃（无泄漏 owner）"
+        );
+        assert!(!sched.is_closed(), "启动失败不关闸（调度器仍开放）");
+        assert_eq!(sched.worker_passes(), 0, "无后台线程 ⇒ 驱动圈数恒 0");
+    }
+
+    /// #87：启动失败不污染确定性内核——注册照常受理，显式 `tick()` 仍按
+    /// deadline 点火。
+    #[test]
+    fn failed_spawn_leaves_tick_kernel_intact() {
+        let clock = Arc::new(MockClock::new());
+        let sched = Arc::new(Scheduler::with_spawn(clock.clone(), |_name, _body| {
+            Err(io::Error::from(io::ErrorKind::Other))
+        }));
+        assert!(sched.try_spawn_worker().is_err(), "注入创建失败必返回 Err");
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = Arc::clone(&hits);
+        sched
+            .after(Duration::from_millis(100), move || {
+                hits2.fetch_add(1, AtomicOrd::SeqCst);
+            })
+            .expect("启动失败不关闸：注册照常受理")
+            .detach();
+        assert_eq!(sched.live_registrations(), 1, "注册入堆（注册行为不变）");
+        assert_eq!(sched.tick(), 0, "未到期不点火");
+        clock.advance(Duration::from_millis(100));
+        assert_eq!(sched.tick(), 1, "失败后确定性内核照常按 deadline 点火");
+        assert_eq!(hits.load(AtomicOrd::SeqCst), 1);
+        assert_eq!(
+            sched.live_registrations(),
+            0,
+            "点火即退役（无虚构运行状态）"
+        );
+        assert_eq!(sched.worker_passes(), 0, "无后台线程：无人推进驱动圈数");
+        assert!(!sched.is_closed());
+    }
+
+    /// #87：兼容入口 `spawn_worker` 失败带因 panic（消息含 io::Error 的 kind
+    /// 并指向 `try_spawn_worker`），且失败路径同样零残留。
+    #[test]
+    fn spawn_worker_panics_with_io_error_cause_on_failed_os_spawn() {
+        let sched = Arc::new(Scheduler::with_spawn(
+            Arc::new(MockClock::new()),
+            |_name, _body| Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        ));
+        let before = Arc::strong_count(&sched);
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = sched.spawn_worker();
+        }))
+        .expect_err("fail-visible 便利入口：OS 创建失败必 panic");
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .expect("panic 载荷为格式化字符串");
+        assert!(
+            msg.contains("WouldBlock"),
+            "panic 带因：消息含 io::Error 的 kind（实际：{msg}）"
+        );
+        assert!(
+            msg.contains("try_spawn_worker"),
+            "panic 指向恢复面（实际：{msg}）"
+        );
+        assert_eq!(
+            Arc::strong_count(&sched),
+            before,
+            "panic 前的失败路径同样零残留"
         );
     }
 }
