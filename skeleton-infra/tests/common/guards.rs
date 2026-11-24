@@ -13,19 +13,23 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::thread::{self, Thread};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// 可取消的 OS 截止线程：目标 future 提前结束时立即唤醒线程，不让它白睡满 10s。
 struct DeadlineWake {
-    thread: Thread,
+    worker: Option<JoinHandle<()>>,
     cancelled: Arc<AtomicBool>,
 }
 
 impl Drop for DeadlineWake {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
-        self.thread.unpark();
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            // 线程只执行截止等待与 oneshot send；取消后立即退出，join 确保不遗留线程。
+            let _ = worker.join();
+        }
     }
 }
 
@@ -50,12 +54,10 @@ fn spawn_deadline(fire: tokio::sync::oneshot::Sender<()>) -> DeadlineWake {
             }
         })
         .expect("创建 OS 截止线程失败");
-    let guard = DeadlineWake {
-        thread: worker.thread().clone(),
+    DeadlineWake {
+        worker: Some(worker),
         cancelled,
-    };
-    drop(worker); // detached；由 guard 在 future 完成/超时时取消并唤醒
-    guard
+    }
 }
 
 /// 等待条件成立的上限（远小于 job 超时，远大于正常抖动）。
@@ -92,4 +94,20 @@ pub async fn bounded<F: Future>(what: &str, fut: F) -> F::Output {
     // 提前完成时取消 OS 截止线程；超时 panic 路径则由 Drop 同样清理。
     drop(deadline);
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_worker_is_joined_when_guard_drops_early() {
+        let (fire, _fired) = tokio::sync::oneshot::channel::<()>();
+        let started = Instant::now();
+        drop(spawn_deadline(fire));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "提前完成后应取消并 join 截止线程，而不是等待完整 10s"
+        );
+    }
 }
