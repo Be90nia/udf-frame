@@ -594,18 +594,21 @@ async fn current_thread_blocked_poll_cannot_observe_shutdown_deadline() {
     let (observe_tx, observe_rx) = std::sync::mpsc::channel::<()>();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel::<(bool, Instant)>();
     let observer = std::thread::spawn(move || {
+        // 握手/等待上限一律 30s（issue `udf-frame-so3`）：本证明的本质是「阻塞期
+        // timer/waiter 不前进」，不依赖紧上界；紧上界在共享机器上会假红。进程级
+        // `bounded` 护栏（10s）仍在 ⇒ 外部线程永不放行时仍具名失败而非挂死。
         observe_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("观察线程须收到开始观察指令");
         go.notify_one();
         entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("受控任务须进入同步段（不得静默跳过）");
         std::thread::sleep(Duration::from_millis(300));
         let progressed_during_block = waiter_returned.load(Ordering::Acquire);
         let release_at = Instant::now();
         release_tx.send(()).expect("受控任务须仍在等放行");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !waiter_returned.load(Ordering::Acquire) {
             if Instant::now() >= deadline {
                 break;
