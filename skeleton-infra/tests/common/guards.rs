@@ -35,11 +35,18 @@ fn spawn_deadline(fire: tokio::sync::oneshot::Sender<()>) -> DeadlineWake {
     let worker = thread::Builder::new()
         .name("udf-test-deadline".into())
         .spawn(move || {
-            if !worker_cancelled.load(Ordering::Acquire) {
-                thread::park_timeout(CALL_LIMIT);
-            }
-            if !worker_cancelled.load(Ordering::Acquire) {
-                let _ = fire.send(());
+            let deadline = Instant::now() + CALL_LIMIT;
+            loop {
+                if worker_cancelled.load(Ordering::Acquire) {
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    let _ = fire.send(());
+                    break;
+                }
+                // park_timeout 允许虚假唤醒；用绝对截止时间循环，不能把虚假唤醒当超时。
+                thread::park_timeout(deadline.saturating_duration_since(now));
             }
         })
         .expect("创建 OS 截止线程失败");
