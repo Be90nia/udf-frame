@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+### Fix(perf): 修正 Scheduler 基准清单误判 + PR 路径验证
+- Criterion 实际 Scheduler ID 使用 `scheduler/register_1000` 等下划线形式；旧期望清单误写斜杠，导致已跑出的 12 个基准被误判缺失，阻止完整性能基线提升。
+- 修正 12 个期望 ID；perf workflow 增加仅针对自身配置与 bench 定义变更的 PR 路径触发，仍只产出数据、不作为合并阻断闸。
+
+### Fix(tests): OS 截止线程可取消并确保回收
+- `bounded` 的独立 OS 截止线程由不可取消的 10s sleep 改为 OS 截止时间 + `park_timeout`；目标 future 提前完成时 RAII guard 设置取消信标、unpark 并 join，避免遗留睡眠线程。
+- 截止线程按绝对截止时间循环，容忍 `park_timeout` 虚假唤醒；新增回归测试验证提前 drop 能在远早于 10s 的时间内完成回收。
+- 明确边界：若同步自旋占死整个 current-thread runtime 线程，内部 select 仍无法运行，CI job timeout 继续作为外层进程护栏。
+
+
 ### Fix(tests): 有界等待护栏改用 OS 时钟——自旋任务会饿死 tokio 时间驱动,原护栏自身无界,2026-11-23;CI 两次挂死取证)
 - **现象**：CI 两次挂死（ubuntu 与 macOS 各一次，被新加的 job `timeout-minutes: 20` 掐断，否则默认 6h）；日志 `has been running for over 60 seconds` 指向 `timeout_reports_survivors_without_claiming_termination`。
 - **根因**：测试用「tokio 任务里无 await 的自旋循环」构造不可让渡段，而**护栏自己用 `tokio::time::timeout`** ——自旋占住 worker 后饿死 tokio 时间驱动 ⇒ 护栏永不触发 ⇒ 挂死。**用 tokio 计时器保护可能自旋的场景是自相矛盾**。
