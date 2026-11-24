@@ -77,10 +77,10 @@ pub async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
-/// 有界等待 future 完成：独立 OS 线程睡满期限后点火，`select!` 抢答。
+/// 有界等待 future 完成：独立 OS 线程按 OS 截止时间 park，`select!` 抢答。
 ///
-/// 代价：每次调用起一个 detached OS 线程，正常路径下它也白睡到期限才自退——
-/// 测试面可接受，换来的正是「护栏不依赖 tokio 时间驱动」。
+/// 代价：每次调用创建一个短生命周期 OS 线程；正常完成时 RAII guard 会取消、
+/// 唤醒并 join 它，不会留下睡满期限的后台线程。护栏不依赖 tokio 时间驱动。
 pub async fn bounded<F: Future>(what: &str, fut: F) -> F::Output {
     let (fire, fired) = tokio::sync::oneshot::channel::<()>();
     let deadline = spawn_deadline(fire);
