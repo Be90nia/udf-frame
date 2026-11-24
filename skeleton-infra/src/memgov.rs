@@ -542,8 +542,17 @@ mod memory_pool {
         /// 闲置对象栈（LIFO——热件常驻热缓存）；容量=历史闲槽高水位，缩容
         /// truncate 保容量（归还再留存零再分配）。
         idle: Vec<T>,
-        /// 池宇宙存活件数（= idle.len() + 借出在外）。缩容弃 idle/溢出丢弃/
-        /// 工厂 panic 回滚均递减——配额随件回吐。
+        /// 池宇宙**已占用席位**（admission population，issue#100）：
+        /// `= idle 真槽数 + 已借出在外 + 工厂创建中预留`。工厂**开始前**就在本锁
+        /// 临界区内占席（`created < max` check-and-act），成功后席位从「创建中」
+        /// 转为「已借出」（`PoolBase::borrowed` 此时才 +1），失败（工厂 panic）
+        /// 则释放席位并唤醒等待者。缩容弃 idle / 溢出丢弃 / 工厂 panic 回滚均
+        /// 递减——配额随件回吐。
+        ///
+        /// 故工厂在途窗口里 `metrics().core.idle + borrowed` **小于**本值，差值即
+        /// 「创建中预留」；`PoolMetrics` 是观测面，不是 admission 的完整预留账本
+        /// （本类型不为账面完美新增公共 `creating` 指标，测试经 `slot_snapshot`
+        /// 的 `created` 反推）。
         created: usize,
         /// 池深副本（只由 resize 经串行闸写；create 配额判定用）。
         max: usize,
@@ -637,6 +646,31 @@ mod memory_pool {
         /// 否则 condvar park 至期限（零自旋），期限到=显式 Err。resize 即时
         /// 生效：等待谓词每 wake 复判（调参 notify_all，扩容零阻塞等待者）。
         ///
+        /// # 创建预留与观测口径（issue#100）
+        ///
+        /// 配额判定与占席在**同一次槽位锁临界区**内完成（`created < max` ⇒
+        /// `created += 1`），之后才在锁外调工厂：**预留先于工厂**，所以工厂阻塞
+        /// 期间该席位已被占用，并发 `acquire` 不会超卖。
+        ///
+        /// - 工厂成功 → 席位由「创建中」转为「已借出」（`PoolBase::borrowed`
+        ///   此时才 +1）并交付给调用方；
+        /// - 工厂 panic → 席位释放（`created` 下降）+ 唤醒一个等待者，panic
+        ///   原样传播（见 `# Panics`）。
+        ///
+        /// 因此 `metrics().core.borrowed` 是**已交付借出读数**，不含创建中预留；
+        /// [`PoolMetrics`] 是观测面，**不是** admission 的完整预留账本——
+        /// `idle + borrowed == created` 只在无工厂在途时成立，工厂在途窗口的真实
+        /// 人口是 `idle + borrowed + creating`。本类型不为此新增公共 `creating`
+        /// 指标（不为了账面完美扩公开面）；测试面用 `slot_snapshot()` 的
+        /// `created` 减去 `idle` / `borrowed` 反推创建中数量。
+        ///
+        /// 缩容期间该预留不被撤销，见 [`Self::resize`] 的「缩容线性化边界」。
+        ///
+        /// # Panics
+        ///
+        /// 工厂闭包 panic 时原样传播：席位已先回滚（`created` 下降）并唤醒一个
+        /// 等待者，池不留半死态。
+        ///
         /// # Errors
         ///
         /// [`PoolAcquireTimeout`]：期限窗内无件可借。
@@ -683,6 +717,25 @@ mod memory_pool {
         /// 临界区内按**新**边界裁决并同区完成真实入槽（issue#98：归还若先赢
         /// core，它必在释放 core 前提交槽位，故本方法的 inner 裁剪必能看见它；
         /// 本方法先赢 core 则归还只能按新 cap/max 裁决）。
+        ///
+        /// # 缩容线性化边界（issue#100）
+        ///
+        /// 缩容只对**此后**的 admission 生效：本方法提交新 `max`/`idle_cap` 之后
+        /// 新发起的 [`Self::acquire`] 一律按新 `max` 判配额（`created < max`），
+        /// 不再按旧值预留。但缩容**前**已取得的席位不被撤销——与已借出句柄同等
+        /// 对待，本方法不取消任何正在执行的工厂调用：
+        ///
+        /// - 在途工厂（创建中预留）允许跑完并交付给调用方；
+        /// - 因此 `created` 允许**短时高于新 `max`**（最多多出「缩容前已准入的
+        ///   在途创建数」），随这些对象归还/丢弃自然收敛到新边界；
+        /// - 归还按**新**边界裁决（`idle < idle_cap && idle + borrowed < max`），
+        ///   超限对象析构 + 配额回吐（`created -= 1`）。
+        ///
+        /// 缩容不夺取调用方手中的对象：句柄照常 Deref/Drop。`created` 的真实含义
+        /// （含创建中预留）见 [`Self::acquire`] 的「创建预留与观测口径」。
+        ///
+        /// 工厂 panic 的**回滚纪律不受缩容影响**：回滚路径只看席位不看 `max`——
+        /// 席位照常释放、`created` 下降、一个等待者被唤醒。
         ///
         /// 事务边界（issue#99）：`resizing` 串行闸内只做纯状态提交——base 边界写
         /// （无事件原语）→ inner 边界与裁剪 → 账本 idle 回写；**闸释放后**才发
@@ -754,6 +807,11 @@ mod memory_pool {
         /// 各取一次，并发 `resize` 间隙里 `core.max` 与 `idle_cap` 可能来自相邻
         /// 时刻（各自都是已提交值，但不成对）。观测热路径不为低频 setter 加锁；
         /// 需成对读请在 resize 后静止点取，或由调用方外部串行化。
+        ///
+        /// **不是 admission 的完整预留账本**（issue#100）：`core.borrowed` 只含
+        /// 已交付句柄，工厂创建中预留既不在 `borrowed` 也不在 `idle`——工厂在途
+        /// 窗口里两者之和**可短时小于**真实人口 `idle + borrowed + creating`；
+        /// 差值只能经测试面 `slot_snapshot()` 的 `created` 反推。
         pub fn metrics(&self) -> MemoryPoolMetrics {
             let core = self.base.metrics();
             let idle_cap = lock(&self.inner).idle_cap;
@@ -780,8 +838,11 @@ mod memory_pool {
             &self.gate
         }
 
-        /// 测试面（`feature = "testing"`）：真实槽位数与存活件数（`metrics()`
-        /// 的 `idle` 是账本读数，本方法取槽位锁读真值——对账面断言用）。
+        /// 测试面（`feature = "testing"`）：真实槽位数与**已占用席位** `created`
+        /// （`metrics()` 的 `idle` 是账本读数，本方法取槽位锁读真值——对账面断言
+        /// 用）。`created` 含工厂创建中预留（issue#100），故工厂在途时
+        /// `created > slots + metrics().core.borrowed`，差值即构造中数量
+        /// （生产面不设该公共指标）。
         #[cfg(feature = "testing")]
         #[doc(hidden)]
         pub fn slot_snapshot(&self) -> (usize, usize) {

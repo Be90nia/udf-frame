@@ -1222,3 +1222,298 @@ mod resize_event_timing {
         );
     }
 }
+
+// ── issue#100：工厂在途预留（`created` 含创建中席位）跨越 resize 缩容 ──────
+//
+// 语义（issue#100 拍板，保留「预留先于工厂、工厂锁外运行、panic 回滚」）：工厂
+// 开始前就在槽位锁内 `created += 1` 占席，成功后席位转「已借出」，失败释放。
+// 缩容不撤销**已取得**的预留——在途工厂允许跑完并交付，`created` 因而可短时高于
+// 新 max；缩容后新 acquire 按新 max 判配额。
+//
+// 交错全用 mpsc 握手（禁 sleep）：工厂在通道上等主线程放行，`recv_timeout`
+// 把「该发生的没发生」记成具名红而不是挂死。
+
+#[cfg(feature = "testing")]
+mod factory_reservation {
+    use std::sync::Mutex;
+
+    use skeleton_infra::memgov::PoolAcquireTimeout;
+
+    use super::*;
+
+    /// 握手上限：远大于正常抖动，远小于挂死判据（通道超时 = 具名红）。
+    const HANDOFF: Duration = Duration::from_secs(5);
+
+    /// 放行闸的 RAII 兜底：断言 panic / 提前返回时也放行挂住的工厂线程。
+    /// 用 mpsc 而非 `Barrier`——`send` 不要求对端同时在等（先发后收也缓冲），
+    /// 故 Drop 顺序无关，展开路径上不会互等死锁。
+    struct Release(mpsc::Sender<()>);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(()); // 对端已弃置（线程结束）= 无需放行
+        }
+    }
+
+    /// 缩容不撤销在途工厂的预留：它必须跑完并交付（不触发第二次新建），
+    /// `created` 短时高于新 max 后收敛；缩容后新 acquire 按新 max 判配额。
+    #[test]
+    fn shrink_keeps_in_flight_factory_reservation_and_new_max_governs() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let make = {
+            let calls = Arc::clone(&calls);
+            let release_rx = Arc::clone(&release_rx);
+            move || {
+                // 第 2 次调用（在途工厂）挂住，等主线程缩容后放行。
+                if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    entered_tx.send(()).expect("factory entered signal");
+                    // 发送端弃置 = 同样放行（不让断言失败变成挂死）。
+                    let _ = release_rx.lock().expect("release rx").recv();
+                }
+                Vec::<u8>::new()
+            }
+        };
+        let p = Arc::new(MemoryPool::new(2, 2, make));
+        let mut first = p.acquire(Duration::from_millis(100)).expect("first seat");
+        first.push(7);
+        assert_eq!(p.slot_snapshot(), (0, 1), "第一件：已占一个席位、无闲槽");
+
+        let (delivered_tx, delivered_rx) = mpsc::channel();
+        let (hold_tx, hold_rx) = mpsc::channel::<()>();
+        let hold_rx = Arc::new(Mutex::new(hold_rx));
+        let worker = {
+            let p = Arc::clone(&p);
+            let hold_rx = Arc::clone(&hold_rx);
+            thread::spawn(move || {
+                let g = p.acquire(HANDOFF).expect("reserved factory must deliver");
+                assert_eq!(g.len(), 0);
+                delivered_tx.send(()).expect("delivered signal");
+                // 主线程核对期间持有（缩容不得夺取调用方对象）
+                let _ = hold_rx.lock().expect("hold rx").recv();
+                drop(g);
+            })
+        };
+        // 兜底：任一处断言 panic 也不会把 worker 留在放行通道上。
+        let release_factory = Release(release_tx);
+        let release_hold = Release(hold_tx);
+
+        entered_rx
+            .recv_timeout(HANDOFF)
+            .expect("worker 必须进入工厂（预留先于工厂）");
+        let (slots, created) = p.slot_snapshot();
+        let core = p.metrics().core;
+        assert_eq!((slots, created), (0, 2), "工厂开始前必须已占第二个席位");
+        assert_eq!(core.borrowed, 1, "创建中预留不得计入 borrowed");
+        assert_eq!(
+            created - slots - core.borrowed,
+            1,
+            "created = idle + borrowed + creating 对账（creating=1）"
+        );
+
+        // 缩容 2/2 → 1/1：在途预留不撤销，新边界即刻对后续 acquire 生效。
+        p.resize(MemoryTuning {
+            max: 1,
+            idle_cap: 1,
+        })
+        .expect("legal shrink");
+        let m = p.metrics();
+        assert_eq!((m.core.max, m.idle_cap), (1, 1));
+        assert_eq!(p.slot_snapshot().1, 2, "缩容不得撤销已取得的创建预留");
+        assert_eq!(&*first, &[7], "缩容不得夺取调用方手中的对象");
+
+        drop(release_factory); // 放行工厂
+        delivered_rx
+            .recv_timeout(HANDOFF)
+            .expect("已预留的工厂必须完成并交付");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "席位已在工厂前占好，缩容不得触发第二次新建"
+        );
+        let (slots, created) = p.slot_snapshot();
+        assert_eq!((slots, created), (0, 2), "缩容不写在途席位");
+        assert!(
+            created > p.metrics().core.max,
+            "created 允许短时高于新 max（缩容不撤销已准入的创建）"
+        );
+        assert_eq!(p.metrics().core.borrowed, 2, "两件都已交付在调用方手中");
+
+        // 新 acquire 按新 max 判配额（旧 max=2 已失效）：超时而不是再新建。
+        let blocked = p.acquire(Duration::from_millis(50));
+        assert_eq!(
+            blocked.err(),
+            Some(PoolAcquireTimeout),
+            "created=2 已越过新 max=1 ⇒ 必须超时"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "超时路径不得进工厂");
+
+        // 归还第一件：按新边界裁决（idle 0 + borrowed 1 不满足 < max 1）⇒ 丢弃回吐。
+        drop(first);
+        assert_eq!(p.metrics().core.borrowed, 1);
+        assert_eq!(p.slot_snapshot(), (0, 1), "越界归还回吐一个席位");
+
+        drop(release_hold); // 放行第二件的 Drop
+        worker.join().expect("factory worker");
+
+        // 收敛：归还后 created 落回新 max，全过程只两次工厂调用。
+        let m = p.metrics();
+        assert_eq!(m.core.borrowed, 0);
+        assert_eq!(p.slot_snapshot(), (1, 1), "闲置件入槽（idle=1, created=1）");
+        assert_eq!(p.slot_snapshot().1, m.core.max, "created 收敛到新 max");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "全程只两次工厂调用");
+    }
+
+    /// 工厂 panic（无 resize）：预留先占后还，`borrowed` 不被失败污染，
+    /// 池回滚后继续可用。
+    #[test]
+    fn factory_panic_rolls_back_reservation_without_borrowing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let make = {
+            let calls = Arc::clone(&calls);
+            let release_rx = Arc::clone(&release_rx);
+            move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered_tx.send(()).expect("factory entered signal");
+                    let _ = release_rx.lock().expect("release rx").recv();
+                    panic!("factory boom");
+                }
+                Vec::<u8>::new()
+            }
+        };
+        let p = Arc::new(MemoryPool::new(1, 1, make));
+        let worker = {
+            let p = Arc::clone(&p);
+            thread::spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = p.acquire(HANDOFF);
+                }))
+                .is_err()
+            })
+        };
+        let release_factory = Release(release_tx);
+
+        entered_rx
+            .recv_timeout(HANDOFF)
+            .expect("worker 必须进入工厂");
+        assert_eq!(p.slot_snapshot(), (0, 1), "工厂开始前必须已占席位");
+        assert_eq!(
+            p.metrics().core.borrowed,
+            0,
+            "创建中（未交付）不得计入 borrowed"
+        );
+
+        drop(release_factory); // 放行 → 工厂 panic
+        assert!(
+            worker.join().expect("worker"),
+            "工厂 panic 必须原样传播给调用方"
+        );
+        assert_eq!(p.slot_snapshot(), (0, 0), "panic 必须回滚创建预留");
+        assert_eq!(p.metrics().core.borrowed, 0, "失败路径不得增加 borrowed");
+
+        // 席位已回吐：这次借出必须成功（泄漏会让 max=1 永久耗尽 ⇒ 超时）。
+        let g = p
+            .acquire(Duration::from_millis(100))
+            .expect("回滚后池必须可用");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(g);
+    }
+
+    /// 工厂 panic 发生在缩容之后：回滚纪律不变（席位释放、`created` 下降、
+    /// 唤醒等待者），且不把失败算成借出。
+    #[test]
+    fn factory_panic_after_shrink_keeps_rollback_discipline_and_serves_waiter() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let make = {
+            let calls = Arc::clone(&calls);
+            let release_rx = Arc::clone(&release_rx);
+            move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    entered_tx.send(()).expect("factory entered signal");
+                    let _ = release_rx.lock().expect("release rx").recv();
+                    panic!("factory boom");
+                }
+                Vec::<u8>::new()
+            }
+        };
+        let p = Arc::new(MemoryPool::new(2, 2, make));
+        let mut first = p.acquire(Duration::from_millis(100)).expect("first seat");
+        first.push(7);
+
+        let worker = {
+            let p = Arc::clone(&p);
+            thread::spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = p.acquire(HANDOFF);
+                }))
+                .is_err()
+            })
+        };
+        let release_factory = Release(release_tx);
+        entered_rx
+            .recv_timeout(HANDOFF)
+            .expect("worker 必须进入工厂");
+        assert_eq!(p.slot_snapshot(), (0, 2));
+
+        // 缩容 2/2 → 1/1：在途预留不撤销。
+        p.resize(MemoryTuning {
+            max: 1,
+            idle_cap: 1,
+        })
+        .expect("legal shrink");
+        assert_eq!(p.slot_snapshot().1, 2, "缩容不得撤销在途预留");
+        assert_eq!(&*first, &[7], "缩容不得夺取调用方手中的对象");
+
+        // 等待者：缩容后按新 max 判配额（created=2 ≥ 1）⇒ 必然 park。
+        let (waiter_started_tx, waiter_started_rx) = mpsc::channel::<()>();
+        let (waiter_tx, waiter_rx) = mpsc::channel();
+        let waiter = {
+            let p = Arc::clone(&p);
+            thread::spawn(move || {
+                waiter_started_tx.send(()).expect("waiter start signal");
+                let got = p.acquire(HANDOFF).is_ok();
+                waiter_tx.send(got).expect("waiter result");
+            })
+        };
+        waiter_started_rx
+            .recv_timeout(HANDOFF)
+            .expect("waiter 必须先发起 acquire");
+
+        drop(release_factory); // 放行 → 工厂 panic
+        assert!(
+            worker.join().expect("worker"),
+            "工厂 panic 必须原样传播给调用方"
+        );
+        // 回滚：只剩 first 的席位；失败不计 borrowed，等待者不得凭空得件。
+        // 注：回滚的 notify 与随后归还的 notify 在外部不可区分（都表现为等待者
+        // 最终拿到件），本测试钉的是「回滚后等待者不永久挂住 / created 不泄漏 /
+        // 无新建」，notify 本身只由回滚分支代码形状保证。
+        assert_eq!(p.slot_snapshot(), (0, 1), "panic 必须回滚在途预留");
+        assert_eq!(p.metrics().core.borrowed, 1, "失败路径不得增加 borrowed");
+
+        // 归还 first 按新边界入槽（idle 0 + borrowed 0 < max 1）并唤醒等待者。
+        drop(first);
+        assert!(
+            waiter_rx
+                .recv_timeout(HANDOFF)
+                .expect("等待者必须被唤醒并拿到件"),
+            "回滚后归还的件必须交付给等待者"
+        );
+        waiter.join().expect("waiter");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "等待者复用归还件，不得新建"
+        );
+        assert_eq!(p.slot_snapshot(), (1, 1), "终态：一件闲着、席位收敛");
+        assert_eq!(p.metrics().core.borrowed, 0);
+    }
+}
