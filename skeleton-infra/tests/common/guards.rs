@@ -10,8 +10,8 @@
 
 use std::future::Future;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
