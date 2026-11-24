@@ -40,7 +40,7 @@ use std::borrow::Borrow;
 /// 告警基建）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PoolMetrics {
-    /// 池深：idle + borrowed 总量上限。
+    /// 池深上限：池宇宙已占席位（`created` = idle + 借出 + 工厂创建中预留，issue#100）的总量。
     pub max: usize,
     /// 空闲件数。
     pub idle: usize,
