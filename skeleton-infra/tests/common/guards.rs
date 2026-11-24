@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use std::future::Future;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 /// 等待条件成立的上限（远小于 job 超时，远大于正常抖动）。
@@ -28,17 +29,23 @@ pub async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
-/// 有界等待 future 完成：独立 OS 线程睡满期限后点火，`select!` 抢答。
+/// 有界等待 future 完成：独立 OS 线程用可取消的 OS 等待计时，`select!` 抢答。
 ///
-/// 代价：每次调用起一个 detached OS 线程，正常路径下它也白睡到期限才自退——
-/// 测试面可接受，换来的正是「护栏不依赖 tokio 时间驱动」。
+/// future 提前完成或调用方取消本护栏时，丢弃取消发送端会立即唤醒计时线程；
+/// 不再让每次正常测试都遗留一个最长睡眠 10s 的 detached 线程。
 pub async fn bounded<F: Future>(what: &str, fut: F) -> F::Output {
     let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+    let (cancel_timer, timer_cancelled) = mpsc::channel::<()>();
     std::thread::spawn(move || {
-        std::thread::sleep(CALL_LIMIT);
-        // 目标先完成时接收端已 drop ⇒ send 失败即正常收场。
-        let _ = fire.send(());
+        if matches!(
+            timer_cancelled.recv_timeout(CALL_LIMIT),
+            Err(RecvTimeoutError::Timeout)
+        ) {
+            let _ = fire.send(());
+        }
     });
+    // 保留发送端至目标 future 或超时分支结束；离开函数时 drop 会取消 OS 等待。
+    let _cancel_timer = cancel_timer;
     tokio::select! {
         biased;
         output = fut => output,
