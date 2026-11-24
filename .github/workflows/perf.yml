@@ -1,6 +1,6 @@
 # udf-frame 跨平台性能 workflow（2026-10-28 新增）
 #
-# 与现有 ci.yml 的关系（为何不进 push / pull_request 闸）：
+# 与现有 ci.yml 的关系（性能结果不作为 push / PR 合并闸）：
 # - ci.yml 是**正确性闸**：fmt / test / bench 编译门 / clippy 三道，红即拦。
 #   性能数值是**环境相关量**（共享 runner 抖动、CPU 频率、邻居负载、
 #   macOS 定时任务、Windows Defender 扫描……），同一份代码在不同机器上
@@ -16,7 +16,8 @@
 #   （本仓库开发机为 Windows，性能基线以本地测量为准），CI 侧不重复消耗。
 #
 # 「性能失败不阻塞」语义（三重保险，任何一处生效即可）：
-# 1. 触发面：不在 push/PR 路径上 → 失败天然不拦合并。
+# 1. 触发面：无 push 触发；PR 仅在 perf workflow / bench 定义变更时路径过滤触发，
+#    且不应配置为 required check → 普通代码 PR 不跑，性能数据也不拦合并。
 # 2. bench 执行步 `continue-on-error: true` → bench 自身失败（runner 抖动、
 #    判据过严）只标红该步，不终止后续 artifact / 摘要产出。
 # 3. 基线对比只**告警**（>10% 回归写 warning + step summary），不改退出码。
