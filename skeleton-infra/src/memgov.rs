@@ -380,11 +380,14 @@ pub fn expect_empty<K: Ord, V>(reg: &BoundedRegistry<K, V>) {
 // 组合件，本块只写槽位借还特化面。
 //
 // 并发形态（性能矩阵③④⑦的机制基础）：
-// - **锁不嵌套**：acquire 只取槽位锁；归还/读数=PoolBase 账本锁与槽位锁**顺序**
-//   各取（绝不同时持有）——零死锁面；
+// - **单一锁序 `core → inner`**（issue#98）：acquire/读数=槽位锁与账本锁**顺序**
+//   各取（不同时持有）；归还=账本锁内裁决 + **同区提交槽位/配额回吐**（持 core
+//   取 inner），这样「按旧边界批准、缩容后才入槽」的窗口不存在，审计事件也恒
+//   描述已提交状态。禁任何 inner → core 反向嵌套（含审计回调内的重入面：回调
+//   一律在所有内部锁之外发射）；
 // - **边界副本**：create 配额判定（`created < max`）必须与 `created` 变更原子，
 //   副本写只发生在 `resize`（`resizing` 串行闸保证与 PoolBase 账本同序成对写，
-//   并发 resize 不交错）；热路径零跨锁判定；
+//   含账本 idle 回写；并发 resize 不交错）；热路径零跨锁判定；
 // - **伪共享防（⑦）**：`#[repr(C)]` 定序 + align(64) 垫片，把账本锁/槽位锁/
 //   condvar 三条热词线分进独立 cache line。
 #[cfg(feature = "pool")]
@@ -676,9 +679,14 @@ mod memory_pool {
 
         /// 运行时调参：事前校验非法参数入口拒绝（不改任何状态）；生效后缩容
         /// 只弃 idle 槽（超限闲置件**锁外**析构，`created` 同步递减=配额回吐），
-        /// 借出句柄不受影响——归还时由 [`PoolBase::note_return`] 按新边界裁决
-        /// （槽满=丢弃+`dropped_overflow` 计数）。末尾 notify_all：扩容即时
-        /// 唤醒等待者（调参暂停窗零等待）。
+        /// 借出句柄不受影响——归还时由内部协作入口 `note_return_with` 在 core
+        /// 临界区内按**新**边界裁决并同区完成真实入槽（issue#98：归还若先赢
+        /// core，它必在释放 core 前提交槽位，故本方法的 inner 裁剪必能看见它；
+        /// 本方法先赢 core 则归还只能按新 cap/max 裁决）。`core` 边界写 →
+        /// inner 裁剪 → 账本 idle 回写整段都在 `resizing` 串行闸内（并发 resize
+        /// 不交错出 base/inner 边界不一致）；**弃置对象在闸外析构**（用户类型
+        /// `Drop` 可重入公开入口，闸内析构 ⇒ 重入 resize 自死锁）。末尾
+        /// notify_all：扩容即时唤醒等待者（调参暂停窗零等待）。
         ///
         /// # Errors
         ///
@@ -701,10 +709,15 @@ mod memory_pool {
                     None
                 }
             };
-            drop(_serial);
             if let Some(excess) = excess {
                 self.base.note_idle_delta(-(excess.len() as isize));
+                // 账本与槽位提交已完成：串行闸先放——`excess` 是用户类型，其
+                // `Drop` 可重入本池公开入口（重入 resize 会在同线程上等本闸，
+                // std Mutex 非重入 ⇒ 自死锁），故析构必须在闸外。
+                drop(_serial);
                 drop(excess);
+            } else {
+                drop(_serial);
             }
             self.cv.notify_all();
             Ok(())
@@ -818,20 +831,27 @@ mod memory_pool {
                 .slot
                 .take()
                 .expect("guard slot empty on drop (bookkeeping bug)");
-            if self.base.note_return() {
+            // 裁决 + 真实提交合成一个 core 临界区（锁序 core → inner，issue#98）：
+            // keep=入槽、丢弃=配额回吐都在事件发射之前完成，审计回调重入看到的
+            // 恒是已提交状态；对象析构与唤醒留在锁外。
+            let gone = self.base.note_return_with(|keep| {
                 #[cfg(feature = "testing")]
                 self.gate.park();
-                lock(self.inner).idle.push(obj);
-                self.cv.notify_one();
-            } else {
-                // 槽满：对象离开池宇宙——配额回吐（等待者可新建）+ 锁外析构
-                let mut inner = lock(self.inner);
-                inner.created = inner
-                    .created
-                    .checked_sub(1)
-                    .expect("created underflow on overflow drop (bookkeeping bug)");
-                drop(inner);
-                self.cv.notify_one();
+                if keep {
+                    lock(self.inner).idle.push(obj);
+                    None
+                } else {
+                    let mut inner = lock(self.inner);
+                    inner.created = inner
+                        .created
+                        .checked_sub(1)
+                        .expect("created underflow on overflow drop (bookkeeping bug)");
+                    Some(obj)
+                }
+            });
+            self.cv.notify_one();
+            if let Some(obj) = gone {
+                // 槽满：对象离开池宇宙——锁外析构
                 drop(obj);
             }
         }

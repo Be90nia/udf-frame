@@ -539,11 +539,14 @@ fn steady_state_borrow_return_is_zero_alloc() {
 
 #[cfg(feature = "testing")]
 mod return_atomicity {
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock, Weak};
 
     use skeleton_infra::memgov::ReturnGate;
 
     use super::*;
+
+    type PoolFn = fn() -> Vec<u8>;
+    type SharedPool = Arc<MemoryPool<Vec<u8>, PoolFn>>;
 
     /// 放行闸的 RAII 兜底：断言 panic 时不留 park 住的归还线程。
     struct ReleaseOnDrop<'a>(&'a ReturnGate);
@@ -563,13 +566,13 @@ mod return_atomicity {
         }
     }
 
-    fn shared_pool(max: usize, idle_cap: usize) -> Arc<MemoryPool<Vec<u8>, fn() -> Vec<u8>>> {
+    fn shared_pool(max: usize, idle_cap: usize) -> SharedPool {
         Arc::new(MemoryPool::new(max, idle_cap, Vec::new))
     }
 
     /// 静止点对账（resize 已返回、无在途借还）：账本读数 == 真实槽位、边界不破、
     /// 存活件数与 idle+borrowed 对得上。
-    fn assert_quiescent(p: &MemoryPool<Vec<u8>, fn() -> Vec<u8>>, what: &str) {
+    fn assert_quiescent<T, F: Fn() -> T>(p: &MemoryPool<T, F>, what: &str) {
         let m = p.metrics();
         let (slots, created) = p.slot_snapshot();
         assert_eq!(m.core.borrowed, 0, "{what}: 静止点不得有借出");
@@ -600,14 +603,13 @@ mod return_atomicity {
     /// 确定性交错：归还线程在「core 已裁决、槽位未提交」窗内 park，主线程发起
     /// shrink 并观察它能否在该窗内完成。`true` = resize 穿过了未提交的归还（旧
     /// 实现的竞态）；`false` = resize 被 core 挡住直到提交完成（新实现的原子性）。
-    fn resize_inside_return_window(
-        p: &Arc<MemoryPool<Vec<u8>, fn() -> Vec<u8>>>,
-        warm: usize,
-        tuning: MemoryTuning,
-    ) -> bool {
-        for _ in 0..warm {
-            drop(p.acquire(Duration::ZERO).expect("warm slot"));
-        }
+    fn resize_inside_return_window(p: &SharedPool, warm: usize, tuning: MemoryTuning) -> bool {
+        // 同时持有 warm 件再一并归还：造出 warm 个**不同**对象进闲槽（逐个借还
+        // 只会复用同一件，inner.idle 永远到不了新 cap，复现不出越界）。
+        let warm_guards: Vec<_> = (0..warm)
+            .map(|_| p.acquire(Duration::ZERO).expect("warm slot"))
+            .collect();
+        drop(warm_guards);
         p.return_gate().arm();
         let gate = ReleaseOnDrop(p.return_gate());
 
@@ -636,13 +638,21 @@ mod return_atomicity {
         started_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("resizer 必须起跑");
-        let finished_in_window = done_rx
-            .recv_timeout(Duration::from_millis(500))
-            .is_ok();
+        let finished_in_window = done_rx.recv_timeout(Duration::from_millis(500)).is_ok();
         gate.0.release();
         returner.join().expect("returner");
         resizer.join().expect("resizer");
         finished_in_window
+    }
+
+    /// 静止点读数一行（断言消息里带上具体越界数字）。
+    fn quiescent_report<T, F: Fn() -> T>(p: &MemoryPool<T, F>) -> String {
+        let m = p.metrics();
+        let (slots, created) = p.slot_snapshot();
+        format!(
+            "账本 idle {} / 真实闲槽 {slots} / idle_cap {} / created {created} / max {} / borrowed {}",
+            m.core.idle, m.idle_cap, m.core.max, m.core.borrowed
+        )
     }
 
     #[test]
@@ -658,7 +668,8 @@ mod return_atomicity {
         );
         assert!(
             !early,
-            "resize 在归还 pre-commit 窗内完成 ⇒ core 账本与 idle 槽位非原子（issue#98）"
+            "resize 在归还 pre-commit 窗内完成 ⇒ core 账本与 idle 槽位非原子（issue#98）；{}",
+            quiescent_report(&p)
         );
         assert_quiescent(&p, "只缩 idle_cap");
     }
@@ -676,7 +687,8 @@ mod return_atomicity {
         );
         assert!(
             !early,
-            "resize 在归还 pre-commit 窗内完成 ⇒ 旧边界下批准的留存越过新 max（issue#98）"
+            "resize 在归还 pre-commit 窗内完成 ⇒ 旧边界下批准的留存越过新 max（issue#98）；{}",
+            quiescent_report(&p)
         );
         assert_quiescent(&p, "同时缩 max 与 idle_cap");
     }
@@ -692,7 +704,11 @@ mod return_atomicity {
                 idle_cap: 1,
             },
         );
-        assert!(!early, "缩容必须等归还提交（issue#98）");
+        assert!(
+            !early,
+            "缩容必须等归还提交（issue#98）；{}",
+            quiescent_report(&p)
+        );
         assert_quiescent(&p, "缩容后静止点");
         p.resize(MemoryTuning {
             max: 8,
@@ -735,11 +751,7 @@ mod return_atomicity {
             1,
             "越界丢弃的对象必须在锁外恰好析构一次"
         );
-        assert_eq!(
-            p.metrics().core.dropped_overflow,
-            1,
-            "溢出计数恰好一次"
-        );
+        assert_eq!(p.metrics().core.dropped_overflow, 1, "溢出计数恰好一次");
         assert_eq!(p.slot_snapshot(), (0, 1), "丢弃必须回吐 create 配额一次");
 
         // 等待者此刻拿不到件（created == max 且 idle 空）：必须由留存件提交后的
@@ -747,9 +759,7 @@ mod return_atomicity {
         let (borrowed_tx, borrowed_rx) = mpsc::channel();
         thread::scope(|s| {
             let waiter = s.spawn(|| {
-                let g = p
-                    .acquire(Duration::from_secs(5))
-                    .expect("留存件唤醒等待者");
+                let g = p.acquire(Duration::from_secs(5)).expect("留存件唤醒等待者");
                 borrowed_tx.send(()).expect("borrowed signal");
                 drop(g); // 归还自留（新边界内）
             });
@@ -839,5 +849,113 @@ mod return_atomicity {
             violations.is_empty(),
             "审计回调看到未提交的中间态：{violations:#?}"
         );
+    }
+
+    // ── 用户对象析构不得落在内部闸内（Drop 可重入公开入口）──────────────────
+
+    trait ResizeProbe: Send + Sync {
+        fn probe(&self);
+    }
+
+    /// 缩容弃置的用户对象：`Drop` 里重入同一池的公开入口（本仓契约：用户类型的
+    /// `Drop` 可以回调池公开 API）。
+    struct ReentrantItem(Weak<dyn ResizeProbe>);
+
+    impl Drop for ReentrantItem {
+        fn drop(&mut self) {
+            if let Some(probe) = self.0.upgrade() {
+                probe.probe();
+            }
+        }
+    }
+
+    type ReentrantPool = MemoryPool<ReentrantItem, Box<dyn Fn() -> ReentrantItem + Send + Sync>>;
+
+    /// 布防时在 `Drop` 里对同一池发起一次 `resize`：若析构发生在 `resizing`
+    /// 闸内，该调用会在同线程上自等闸（std Mutex 非重入）而卡死。
+    struct RealProbe {
+        pool: OnceLock<Weak<ReentrantPool>>,
+        armed: AtomicBool,
+        completed: AtomicUsize,
+    }
+
+    impl ResizeProbe for RealProbe {
+        fn probe(&self) {
+            if !self.armed.load(Ordering::SeqCst) {
+                return;
+            }
+            let pool = self
+                .pool
+                .get()
+                .and_then(Weak::upgrade)
+                .expect("probe pool alive");
+            pool.resize(MemoryTuning {
+                max: 2,
+                idle_cap: 1,
+            })
+            .expect("reentrant resize is legal");
+            self.completed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 缩容弃置的对象必须在 `resizing` 串行闸**之外**析构：闸内析构 ⇒ 用户
+    /// `Drop` 重入 `resize` 自死锁（同线程等非重入锁）。用外层有界等待捕获，
+    /// 挂死记成红而不是真的挂死。
+    #[test]
+    fn shrink_drops_user_objects_outside_the_serial_gate() {
+        let probe = Arc::new(RealProbe {
+            pool: OnceLock::new(),
+            armed: AtomicBool::new(false),
+            completed: AtomicUsize::new(0),
+        });
+        let probe_handle: Arc<dyn ResizeProbe> = Arc::clone(&probe) as Arc<dyn ResizeProbe>;
+        let weak_probe: Weak<dyn ResizeProbe> = Arc::downgrade(&probe_handle);
+        let p: Arc<ReentrantPool> = {
+            let handle = weak_probe.clone();
+            Arc::new(MemoryPool::new(
+                2,
+                2,
+                Box::new(move || ReentrantItem(handle.clone()))
+                    as Box<dyn Fn() -> ReentrantItem + Send + Sync>,
+            ))
+        };
+        assert!(
+            probe.pool.set(Arc::downgrade(&p)).is_ok(),
+            "probe 只接线一次"
+        );
+
+        // 同时借出 2 件再归还（逐个借还只会复用同一件，闲槽到不了裁剪线）
+        let held: Vec<_> = (0..2)
+            .map(|_| p.acquire(Duration::ZERO).expect("slot"))
+            .collect();
+        drop(held);
+        assert_eq!(p.slot_snapshot(), (2, 2));
+
+        probe.armed.store(true, Ordering::SeqCst);
+        let (done_tx, done_rx) = mpsc::channel();
+        let resizer = {
+            let p = Arc::clone(&p);
+            thread::spawn(move || {
+                p.resize(MemoryTuning {
+                    max: 1,
+                    idle_cap: 1,
+                })
+                .expect("legal shrink");
+                done_tx.send(()).expect("done signal");
+            })
+        };
+        let outcome = done_rx.recv_timeout(Duration::from_secs(5));
+        probe.armed.store(false, Ordering::SeqCst);
+        assert!(
+            outcome.is_ok(),
+            "缩容弃置的用户对象在 resizing 闸内析构 ⇒ 其 Drop 重入 resize 自死锁（析构必须在闸外）"
+        );
+        resizer.join().expect("resizer");
+        assert_eq!(
+            probe.completed.load(Ordering::SeqCst),
+            1,
+            "用户对象 Drop 内的重入 resize 必须成功返回恰好一次"
+        );
+        assert_quiescent(&p, "缩容弃置");
     }
 }

@@ -332,8 +332,10 @@ thread_local! {
 /// （组合件不是池——槽位存储与对象生命周期归特化面）。
 ///
 /// 借出侧职责分工（RAII 语义，armor #26）：实现方的 guard `Drop` 路径调用
-/// [`Self::note_return`]，按返回值留存（放回闲槽）或丢弃——归还永不阻塞
-/// 永不报错，槽满 = 丢弃 + [`PoolMetrics::dropped_overflow`] 计数（fail-visible）。
+/// [`Self::note_return`]（裁决与提交分离）或内部入口 `note_return_with`（裁决
+/// 与真实槽位提交合成一个 core 临界区，issue#98），按裁决留存（放回闲槽）或
+/// 丢弃——归还永不阻塞永不报错，槽满 = 丢弃 + [`PoolMetrics::dropped_overflow`]
+/// 计数（fail-visible）。
 pub struct PoolBase {
     core: Mutex<PoolCore>,
     /// 审计环（[`PoolAuditSink`] 共用抽取件：gate/订阅槽/seq/代次/回调 panic
@@ -431,6 +433,11 @@ impl PoolBase {
     /// 把对象放回闲槽存储），`false` = 丢弃（槽满：缩容后超池深，或闲槽上限
     /// 已满——对象直接丢弃，`dropped_overflow` +1，发射 `OverflowDropped`）。
     ///
+    /// 本方法的裁决与实现方的槽位提交**不在同一临界区**（事件先于提交发射）：
+    /// 「槽位存储自有锁、事件重入看不到中间态」的实现方用它；`MemoryPool` 这类
+    /// 账本读数与槽位存储分锁的实现方必须用 `note_return_with`（内部协作入口，
+    /// 不对外公开；issue#98）。
+    ///
     /// RAII 语义唯一自洽：归还永不阻塞、永不报错；缩容窗内多余对象无处安放，
     /// 丢弃即计数（fail-visible），禁阻塞归还禁静默。
     ///
@@ -440,7 +447,28 @@ impl PoolBase {
     ///
     /// 借出数为 0 时调用 = 记账 bug（fail-fast，release 同判）。
     pub fn note_return(&self) -> bool {
-        let keep = {
+        self.decide_return(|_keep| ()).0
+    }
+
+    /// 归还裁决 + **同一 core 临界区内的槽位提交**（issue#98 协作入口）：持
+    /// `core` 完成 borrowed/idle/max/idle_cap 裁决后，在**释放 core 之前**调用
+    /// `commit(keep)`（实现方的真实入槽 / 配额回吐），随后释放所有内部锁再发射
+    /// `Returned` / `OverflowDropped`——事件恒描述**已提交状态**，回调重入实现方
+    /// 公开入口看不到「账本已改、槽位未提交」的中间态。
+    ///
+    /// 锁序：`core → 实现方槽位锁`（`commit` 在持 core 时取实现方锁）；实现方
+    /// 任何路径**禁**持槽位锁再取 core（反向嵌套即死锁）。`commit` 的返回值原样
+    /// 透出（实现方借它把丢弃分支的对象带到锁外析构）。
+    ///
+    /// 性能：与 [`Self::note_return`] 同款单次取锁；增量仅是实现方在 core
+    /// 临界区内多持一次自有槽位锁（不引入新锁、不碰归还热路径以外的东西）。
+    pub(crate) fn note_return_with<R>(&self, commit: impl FnOnce(bool) -> R) -> R {
+        self.decide_return(commit).1
+    }
+
+    /// 裁决内核：core 临界区内完成账本更新与 `commit`，锁外发射事件。
+    fn decide_return<R>(&self, commit: impl FnOnce(bool) -> R) -> (bool, R) {
+        let (keep, out) = {
             let mut core = lock(&self.core);
             assert!(
                 core.borrowed > 0,
@@ -453,14 +481,14 @@ impl PoolBase {
             } else {
                 core.dropped_overflow += 1;
             }
-            keep
+            (keep, commit(keep))
         };
         self.emit(if keep {
             PoolAuditKind::Returned
         } else {
             PoolAuditKind::OverflowDropped
         });
-        keep
+        (keep, out)
     }
 
     /// 开审计流：落闸 + 建槽（容量环 `cap` 钳到 ≥1——恒保最新一件）。再次订阅
