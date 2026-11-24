@@ -12,8 +12,8 @@
 
 use std::future::Future;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
