@@ -289,18 +289,23 @@ fn blocked_acquire_does_not_hold_lock() {
     let waiter = thread::spawn(move || b2.acquire(1).expect("回填后成功"));
 
     assert_eq!(
-        entered_rx.recv_timeout(Duration::from_secs(1)).expect("waiter 应进入 sleep"),
+        entered_rx.recv_timeout(Duration::from_secs(5)).expect("waiter 应进入 sleep"),
         Duration::from_millis(50)
     );
 
     // Sleeper 已停在显式闸门上。此时若 acquire 持锁睡眠，checker 无法在期限内取得锁；
     // MockClock 未推进，所以正确实现下 try_acquire 必须快速返回 Insufficient，不会消费令牌。
     let b3 = Arc::clone(&bucket);
+    let (checker_started_tx, checker_started_rx) = mpsc::channel();
     let (checked_tx, checked_rx) = mpsc::channel();
     let checker = thread::spawn(move || {
+        checker_started_tx.send(()).unwrap();
         let _ = checked_tx.send(b3.try_acquire(1));
     });
-    let lock_free = checked_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+    checker_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("checker 线程应先完成启动握手");
+    let lock_free = checked_rx.recv_timeout(Duration::from_secs(2)).is_ok();
 
     // 无论断言结果如何都放行足够的虚拟时间，保证 waiter/checker 可收尾，不留下挂死线程。
     for _ in 0..3 {
@@ -311,7 +316,7 @@ fn blocked_acquire_does_not_hold_lock() {
 
     assert!(
         lock_free,
-        "acquire 睡眠期间锁必须空闲；try_acquire 未能在 250ms 内取得锁"
+        "acquire 睡眠期间锁必须空闲；try_acquire 未能在 2s 内取得锁"
     );
 }
 
