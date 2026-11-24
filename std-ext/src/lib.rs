@@ -27,7 +27,7 @@
 //! | （常驻，零 feature） | `paths`：路径归一/相对化/containment（Windows verbatim 兼容）+ 家目录/XDG 用户基目录解析（env 面，零 IO 不创建） |
 //! | （常驻，零 feature） | `clock`：时长人读格式化 + RFC 3339 双向（时间源契约 `Clock`/`SystemClock`/`MockClock` 住 `skeleton::clock`，批 1 契约真下沉） |
 //! | （常驻，零 feature） | `retry`：同步 + 异步重试编排（政策显式/full-jitter 默认可注入/次数+预算双闸/fail-visible 耗尽回灌；`retry_async`+`AsyncSleeper` 注入式异步面零运行时依赖；退避计算用 `crate::backoff`） |
-//! | （常驻，零 feature） | `scheduler`：同步任务调度器（after/every；MockClock 确定性 tick 内核 + condvar park 驱动线程；锚定周期超载退化固定延迟，无补发） |
+//! | （常驻，零 feature） | `scheduler`：同步任务调度器（after/every；MockClock 确定性 tick 内核 + condvar park 驱动线程；锚定周期超载退化固定延迟，无补发；驱动启动失败可观察——`try_spawn_worker` → `io::Result`，失败零残留） |
 //! | （常驻，零 feature） | `ratelimit`：令牌桶限流（突发预算 + 恒速回填；满桶启动；MockClock 确定性令牌时间线 + Sleeper 锁外睡到再查，零自旋） |
 //! | （常驻，零 feature） | `cache`：LRU+TTL 缓存（O(1) get/insert 索引 arena 双向链零 unsafe；get=touch/peek 不 touch；TtlCache 逐条 expire-after-write + 惰性过期 fail-visible 计数；单线程 `&mut` 面 + `SyncLruCache`/`SyncTtlCache` 并发薄包装（`&self`+内部 Mutex，语义一致）） |
 //! | （常驻，零 feature） | `id`：UUIDv7 确定性变体时间有序 id（RFC 9562 §5.7 布局；指纹+挂钟毫秒→同指纹严格递增/跨毫秒时间序/回拨停走；同毫秒 4096 配额耗尽 fail-closed；指纹派生推荐 `crate::hash::stable64`）；凭据级 `RandomId`（UUIDv4，OS CSPRNG 直通 fail-closed 禁弱熵回退）在 `random` 门后 |

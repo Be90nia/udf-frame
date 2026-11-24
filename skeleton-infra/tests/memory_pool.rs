@@ -528,3 +528,316 @@ fn steady_state_borrow_return_is_zero_alloc() {
         "溢出路径确实走到了丢弃分支"
     );
 }
+
+// ── issue#98：归还裁决与槽位提交的跨锁原子性（core 临界区内挂住归还线程）───
+//
+// 旧实现把「core 账本裁决」与「inner.idle push / created 回吐」分成两个临界区：
+// 一次按旧边界批准的归还可以在缩容完成后才真正入槽（越过新 cap），Returned /
+// OverflowDropped 事件也早于槽位提交（回调重入看到中间态）。以下测试用
+// `feature = "testing"` 的归还窗闸把归还线程挂在 **core 临界区内的 pre-commit
+// 窗**，确定性复现/钉死该窗口（禁 sleep 控交错）。
+
+#[cfg(feature = "testing")]
+mod return_atomicity {
+    use std::sync::Mutex;
+
+    use skeleton_infra::memgov::ReturnGate;
+
+    use super::*;
+
+    /// 放行闸的 RAII 兜底：断言 panic 时不留 park 住的归还线程。
+    struct ReleaseOnDrop<'a>(&'a ReturnGate);
+
+    impl Drop for ReleaseOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// 越界丢弃的对象（析构次数可观测——「锁外析构恰好一次」的对账面）。
+    struct Tracked(Arc<AtomicUsize>);
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn shared_pool(max: usize, idle_cap: usize) -> Arc<MemoryPool<Vec<u8>, fn() -> Vec<u8>>> {
+        Arc::new(MemoryPool::new(max, idle_cap, Vec::new))
+    }
+
+    /// 静止点对账（resize 已返回、无在途借还）：账本读数 == 真实槽位、边界不破、
+    /// 存活件数与 idle+borrowed 对得上。
+    fn assert_quiescent(p: &MemoryPool<Vec<u8>, fn() -> Vec<u8>>, what: &str) {
+        let m = p.metrics();
+        let (slots, created) = p.slot_snapshot();
+        assert_eq!(m.core.borrowed, 0, "{what}: 静止点不得有借出");
+        assert_eq!(m.core.idle, slots, "{what}: 账本 idle 与真实槽数必须一致");
+        assert!(
+            slots <= m.idle_cap,
+            "{what}: 真实闲槽 {slots} 越过 idle_cap {}",
+            m.idle_cap
+        );
+        assert!(
+            m.core.idle <= m.idle_cap,
+            "{what}: 账本 idle {} 越过 idle_cap {}",
+            m.core.idle,
+            m.idle_cap
+        );
+        assert!(
+            created <= m.core.max,
+            "{what}: 存活件 {created} 越过 max {}",
+            m.core.max
+        );
+        assert_eq!(
+            created,
+            slots + m.core.borrowed,
+            "{what}: created 与 idle+borrowed 对账失配"
+        );
+    }
+
+    /// 确定性交错：归还线程在「core 已裁决、槽位未提交」窗内 park，主线程发起
+    /// shrink 并观察它能否在该窗内完成。`true` = resize 穿过了未提交的归还（旧
+    /// 实现的竞态）；`false` = resize 被 core 挡住直到提交完成（新实现的原子性）。
+    fn resize_inside_return_window(
+        p: &Arc<MemoryPool<Vec<u8>, fn() -> Vec<u8>>>,
+        warm: usize,
+        tuning: MemoryTuning,
+    ) -> bool {
+        for _ in 0..warm {
+            drop(p.acquire(Duration::ZERO).expect("warm slot"));
+        }
+        p.return_gate().arm();
+        let gate = ReleaseOnDrop(p.return_gate());
+
+        let returner = {
+            let p = Arc::clone(p);
+            thread::spawn(move || {
+                let g = p.acquire(Duration::ZERO).expect("borrow a prewarmed slot");
+                drop(g); // Drop ⇒ 归还路径：在 core 临界区内 park
+            })
+        };
+        assert!(
+            p.return_gate().wait_entered(Duration::from_secs(5)),
+            "归还线程必须进入 core 临界区内的 pre-commit 窗"
+        );
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let resizer = {
+            let p = Arc::clone(p);
+            thread::spawn(move || {
+                started_tx.send(()).expect("started signal");
+                p.resize(tuning).expect("legal tuning");
+                done_tx.send(()).expect("done signal");
+            })
+        };
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("resizer 必须起跑");
+        let finished_in_window = done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_ok();
+        gate.0.release();
+        returner.join().expect("returner");
+        resizer.join().expect("resizer");
+        finished_in_window
+    }
+
+    #[test]
+    fn shrink_idle_cap_waits_for_borrowed_return_commit() {
+        let p = shared_pool(4, 4);
+        let early = resize_inside_return_window(
+            &p,
+            2,
+            MemoryTuning {
+                max: 4,
+                idle_cap: 1,
+            },
+        );
+        assert!(
+            !early,
+            "resize 在归还 pre-commit 窗内完成 ⇒ core 账本与 idle 槽位非原子（issue#98）"
+        );
+        assert_quiescent(&p, "只缩 idle_cap");
+    }
+
+    #[test]
+    fn shrink_max_and_idle_cap_waits_for_borrowed_return_commit() {
+        let p = shared_pool(4, 4);
+        let early = resize_inside_return_window(
+            &p,
+            2,
+            MemoryTuning {
+                max: 1,
+                idle_cap: 1,
+            },
+        );
+        assert!(
+            !early,
+            "resize 在归还 pre-commit 窗内完成 ⇒ 旧边界下批准的留存越过新 max（issue#98）"
+        );
+        assert_quiescent(&p, "同时缩 max 与 idle_cap");
+    }
+
+    #[test]
+    fn expand_after_atomic_shrink_keeps_ledger_consistent() {
+        let p = shared_pool(4, 4);
+        let early = resize_inside_return_window(
+            &p,
+            2,
+            MemoryTuning {
+                max: 1,
+                idle_cap: 1,
+            },
+        );
+        assert!(!early, "缩容必须等归还提交（issue#98）");
+        assert_quiescent(&p, "缩容后静止点");
+        p.resize(MemoryTuning {
+            max: 8,
+            idle_cap: 8,
+        })
+        .expect("legal expand");
+        assert_quiescent(&p, "缩容后扩容静止点");
+    }
+
+    /// 借出件跨缩容存活：resize 先赢，归还按**新**边界裁决——越界丢弃恰好一次
+    /// （`dropped_overflow` + `created` 回吐 + 锁外析构），留存件在提交后唤醒
+    /// 等待者，等待者复用该件而不越过新池深新建。
+    #[test]
+    fn borrowed_return_after_shrink_decides_under_new_bounds() {
+        let created = Arc::new(AtomicUsize::new(0));
+        let destructed = Arc::new(AtomicUsize::new(0));
+        let p = {
+            let (created, destructed) = (Arc::clone(&created), Arc::clone(&destructed));
+            MemoryPool::new(2, 2, move || {
+                created.fetch_add(1, Ordering::SeqCst);
+                Tracked(Arc::clone(&destructed))
+            })
+        };
+
+        let a = p.acquire(Duration::ZERO).expect("slot a");
+        let b = p.acquire(Duration::ZERO).expect("slot b");
+        assert_eq!(created.load(Ordering::SeqCst), 2);
+        p.resize(MemoryTuning {
+            max: 1,
+            idle_cap: 1,
+        })
+        .expect("legal shrink");
+        // 缩容后借出件仍在外：合法中间态（borrowed 可 > 新 max）
+        assert_eq!(p.metrics().core.borrowed, 2);
+        assert_eq!(p.slot_snapshot(), (0, 2));
+
+        drop(a); // 新边界下 0+1<1 不成立 ⇒ 越界丢弃
+        assert_eq!(
+            destructed.load(Ordering::SeqCst),
+            1,
+            "越界丢弃的对象必须在锁外恰好析构一次"
+        );
+        assert_eq!(
+            p.metrics().core.dropped_overflow,
+            1,
+            "溢出计数恰好一次"
+        );
+        assert_eq!(p.slot_snapshot(), (0, 1), "丢弃必须回吐 create 配额一次");
+
+        // 等待者此刻拿不到件（created == max 且 idle 空）：必须由留存件提交后的
+        // 唤醒接手，而不是靠新建越过新池深。
+        let (borrowed_tx, borrowed_rx) = mpsc::channel();
+        thread::scope(|s| {
+            let waiter = s.spawn(|| {
+                let g = p
+                    .acquire(Duration::from_secs(5))
+                    .expect("留存件唤醒等待者");
+                borrowed_tx.send(()).expect("borrowed signal");
+                drop(g); // 归还自留（新边界内）
+            });
+            assert!(
+                borrowed_rx
+                    .recv_timeout(Duration::from_millis(200))
+                    .is_err(),
+                "缩容后无件可借，等待者不得提前完成"
+            );
+            drop(b); // 留存（新边界内）→ 提交后唤醒
+            borrowed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("等待者必须被留存件唤醒");
+            waiter.join().expect("waiter");
+        });
+
+        assert_eq!(
+            created.load(Ordering::SeqCst),
+            2,
+            "唤醒的等待者必须复用留存件，不得新建越过新池深"
+        );
+        let (slots, live) = p.slot_snapshot();
+        assert_eq!((slots, live), (1, 1));
+        let m = p.metrics();
+        assert_eq!(m.core.idle, slots);
+        assert_eq!(m.core.borrowed, 0);
+    }
+
+    /// 审计事件描述**已提交状态**：`Returned` / `OverflowDropped` 回调里重入
+    /// 公开入口必须看到「账本 idle == 真实槽位」「created == idle + borrowed」
+    /// 且能直接借到已提交的件（旧实现事件早于槽位提交/配额回吐）。
+    #[test]
+    fn audit_return_events_expose_committed_state() {
+        let p = shared_pool(2, 1);
+        let violations = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ticket = {
+            let inside = Arc::clone(&p);
+            let violations = Arc::clone(&violations);
+            PoolManaged::subscribe_audit(&*p, move |e| {
+                if !matches!(
+                    e.kind,
+                    PoolAuditKind::Returned | PoolAuditKind::OverflowDropped
+                ) {
+                    return;
+                }
+                let m = inside.metrics();
+                let (slots, created) = inside.slot_snapshot();
+                let push = |msg: String| violations.lock().expect("violations").push(msg);
+                if m.core.idle != slots {
+                    push(format!(
+                        "{:?}: 账本 idle {} != 真实槽位 {slots}",
+                        e.kind, m.core.idle
+                    ));
+                }
+                if created != slots + m.core.borrowed {
+                    push(format!(
+                        "{:?}: created {created} != idle {slots} + borrowed {}",
+                        e.kind, m.core.borrowed
+                    ));
+                }
+                if slots > m.idle_cap {
+                    push(format!(
+                        "{:?}: 真实槽位 {slots} 越过 idle_cap {}",
+                        e.kind, m.idle_cap
+                    ));
+                }
+                if inside.acquire(Duration::ZERO).is_err() {
+                    push(format!(
+                        "{:?}: 回调重入 acquire 看不到已提交的槽位/配额",
+                        e.kind
+                    ));
+                }
+            })
+        };
+
+        // Returned：借一件即还（提交后事件才发）
+        drop(p.acquire(Duration::from_millis(100)).expect("borrow"));
+        // OverflowDropped：借满两件后双还——第一件留存、第二件溢出丢弃
+        let a = p.acquire(Duration::from_millis(100)).expect("a");
+        let b = p.acquire(Duration::from_millis(100)).expect("b");
+        drop(a);
+        drop(b);
+        drop(ticket);
+
+        let violations = violations.lock().expect("violations");
+        assert!(
+            violations.is_empty(),
+            "审计回调看到未提交的中间态：{violations:#?}"
+        );
+    }
+}

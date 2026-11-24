@@ -457,6 +457,83 @@ mod memory_pool {
 
     impl std::error::Error for PoolAcquireTimeout {}
 
+    /// 归还窗口闸（**仅 `feature = "testing"` 构建存在**，issue#98）：把归还
+    /// 线程挂在该池「core 已裁决、槽位尚未提交/配额尚未回吐」的窗口里，供测试
+    /// 确定性复现跨锁提交竞态。生产构建无本类型、热路径无任何检查。
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub struct ReturnGate {
+        state: Mutex<GateState>,
+        cv: Condvar,
+    }
+
+    #[cfg(feature = "testing")]
+    struct GateState {
+        armed: bool,
+        entered: bool,
+    }
+
+    #[cfg(feature = "testing")]
+    impl ReturnGate {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(GateState {
+                    armed: false,
+                    entered: false,
+                }),
+                cv: Condvar::new(),
+            }
+        }
+
+        /// 归还线程调用（**持 core 锁时**进入）：布防时置进入位并 park 到放行。
+        fn park(&self) {
+            let mut state = lock(&self.state);
+            if !state.armed {
+                return;
+            }
+            state.entered = true;
+            self.cv.notify_all();
+            while state.armed {
+                state = self
+                    .cv
+                    .wait(state)
+                    .expect("return gate poisoned (prior holder panicked)");
+            }
+        }
+
+        /// 测试面：布防（清上一轮进入位）。
+        pub fn arm(&self) {
+            let mut state = lock(&self.state);
+            state.armed = true;
+            state.entered = false;
+        }
+
+        /// 测试面：有界等待归还线程进入窗口（OS 时钟 Condvar 超时，非 sleep）。
+        pub fn wait_entered(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            let mut state = lock(&self.state);
+            while !state.entered {
+                let now = Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let (next, _) = self
+                    .cv
+                    .wait_timeout(state, deadline - now)
+                    .expect("return gate poisoned (prior holder panicked)");
+                state = next;
+            }
+            true
+        }
+
+        /// 测试面：放行并解除布防（后续归还不 park）。
+        pub fn release(&self) {
+            let mut state = lock(&self.state);
+            state.armed = false;
+            self.cv.notify_all();
+        }
+    }
+
     /// 槽位账（槽位锁单权威内）：闲置对象栈 + 存活件数 + 边界副本。
     struct PoolInner<T> {
         /// 闲置对象栈（LIFO——热件常驻热缓存）；容量=历史闲槽高水位，缩容
@@ -519,6 +596,9 @@ mod memory_pool {
         /// 两把写会交错出 base/inner 边界不一致——闸保证「base 写→inner 写」
         /// 成对同序。热路径零触碰。
         resizing: Mutex<()>,
+        /// 归还窗口闸（仅 `feature = "testing"` 构建存在，issue#98 确定性复现用）。
+        #[cfg(feature = "testing")]
+        gate: ReturnGate,
         factory: F,
     }
 
@@ -543,6 +623,8 @@ mod memory_pool {
                 pad1: CachePad(()),
                 cv: Condvar::new(),
                 resizing: Mutex::new(()),
+                #[cfg(feature = "testing")]
+                gate: ReturnGate::new(),
                 factory,
             }
         }
@@ -636,6 +718,23 @@ mod memory_pool {
             MemoryPoolMetrics { core, idle_cap }
         }
 
+        /// 测试面（`feature = "testing"`）：归还窗口闸——把归还线程挂进
+        /// 「core 已裁决、槽位未提交」的 pre-commit 窗（issue#98）。
+        #[cfg(feature = "testing")]
+        #[doc(hidden)]
+        pub fn return_gate(&self) -> &ReturnGate {
+            &self.gate
+        }
+
+        /// 测试面（`feature = "testing"`）：真实槽位数与存活件数（`metrics()`
+        /// 的 `idle` 是账本读数，本方法取槽位锁读真值——对账面断言用）。
+        #[cfg(feature = "testing")]
+        #[doc(hidden)]
+        pub fn slot_snapshot(&self) -> (usize, usize) {
+            let inner = lock(&self.inner);
+            (inner.idle.len(), inner.created)
+        }
+
         /// 取走环内审计事件（事后取证对账面；环随取随清——委托
         /// [`PoolBase::take_audit_events`]，批量读侧非热路径）。
         pub fn take_audit_events(&self) -> Vec<PoolAuditEvent> {
@@ -648,6 +747,8 @@ mod memory_pool {
                 base: &self.base,
                 inner: &self.inner,
                 cv: &self.cv,
+                #[cfg(feature = "testing")]
+                gate: &self.gate,
                 slot: Some(obj),
             }
         }
@@ -681,6 +782,8 @@ mod memory_pool {
         base: &'p PoolBase,
         inner: &'p Mutex<PoolInner<T>>,
         cv: &'p Condvar,
+        #[cfg(feature = "testing")]
+        gate: &'p ReturnGate,
         slot: Option<T>,
     }
 
@@ -716,6 +819,8 @@ mod memory_pool {
                 .take()
                 .expect("guard slot empty on drop (bookkeeping bug)");
             if self.base.note_return() {
+                #[cfg(feature = "testing")]
+                self.gate.park();
                 lock(self.inner).idle.push(obj);
                 self.cv.notify_one();
             } else {
@@ -735,6 +840,9 @@ mod memory_pool {
 
 #[cfg(feature = "pool")]
 pub use memory_pool::{MemoryPool, MemoryPoolMetrics, MemoryTuning, PoolAcquireTimeout, PoolGuard};
+
+#[cfg(all(feature = "pool", feature = "testing"))]
+pub use memory_pool::ReturnGate;
 
 #[cfg(test)]
 mod tests {

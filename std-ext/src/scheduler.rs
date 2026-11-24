@@ -12,7 +12,9 @@
 //!   condvar park 到最近 deadline（零自旋），注册/关闭即时唤醒。驱动线程
 //!   属真实时钟面——MockClock 时间只在显式 `advance` 时流动，park 它无
 //!   意义（tokio auto-advance 陷阱的反向对表：零自动前进，确定性面走
-//!   tick）。
+//!   tick）。OS 线程创建失败可观察：走 [`Scheduler::try_spawn_worker`] 的
+//!   `io::Error`（失败零残留、调度器仍开放）；[`Scheduler::spawn_worker`]
+//!   是失败带因 panic 的便利入口（issue#87）。
 //!
 //! 姿态（骨架哲学：fail-visible/显式/禁静默；语义对标 JDK
 //! ScheduledThreadPoolExecutor 双形态、tokio `MissedTickBehavior`（gotchas
@@ -853,6 +855,9 @@ impl Drop for TaskHandle {
 /// 丢弃而调度器仍开着时，注册继续入堆但不再点火，直到再
 /// [`Scheduler::spawn_worker`] 或显式 [`Scheduler::close`]（显式状态，不是
 /// 泄漏）。
+///
+/// 句柄**只在 OS 线程创建成功时存在**（issue#87）：[`Scheduler::try_spawn_worker`]
+/// 失败原样返回 `io::Error`、不产出半构造句柄，故不存在「有句柄没线程」的态。
 pub struct WorkerHandle {
     /// Option 化：`join` 需把 JoinHandle 移出（类型有 Drop impl 时禁止
     /// 移出字段）；`None` = 已 join。
@@ -987,6 +992,10 @@ fn worker_loop(sched: Arc<Scheduler>, stop: Arc<AtomicBool>) {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
+    use skeleton::clock::MockClock;
+
     use super::*;
 
     /// #55：detach 抑制 cancel 但**不得**泄漏 TaskCell 分配——句柄释放后

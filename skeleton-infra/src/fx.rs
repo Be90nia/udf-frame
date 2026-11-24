@@ -25,6 +25,41 @@
 //! `with_concurrency` **不是**内存/保留量上界（保留上界是 `with_max_tracked`）；
 //! 有界准入口 `try_spawn_tracked` 过载时 typed 拒绝（`AdmissionError`），
 //! 不阻塞不 panic；计数面见 `FxScope::counts`。
+//!
+//! # 执行模型与阻塞边界（issue#94）
+//!
+//! 本域只托管**协作式** async：契约是被托管的 future 在有限时间内返回 poll，长工作段
+//! 定期让渡。三类「阻塞」必须分清，只有第一类属于本域能保证的范围：
+//!
+//! | 类别 | 形态 | 对 executor 的影响 |
+//! |---|---|---|
+//! | ① 协作式 async 等待 | `.await` 未就绪的 IO/timer/通道 | 返回 `Poll::Pending`，executor 照常 poll 其他任务与计时器 |
+//! | ② 同步阻塞 / 长时不 yield | poll 内忙等、同步锁等待、同步析构 | 占住 executor 线程；current-thread runtime 上 timer、取消观察、停机等待全部停摆 |
+//! | ③ 真正的 blocking work | 文件 IO、CPU 密集、阻塞系统调用 | 应移出 async executor（`tokio::task::spawn_blocking` 或消费方自备 `ThreadPool`），再 await / 收集结果 |
+//!
+//! 框架**不做** blocking adapter：不承诺能强制终止任意 Rust 代码，也不在 `FxScope`
+//! 内部再造 watchdog 线程伪装可抢占（#94 设计决策）——②③ 的适配责任在消费方。
+//!
+//! ## 截止不是硬墙钟上限
+//!
+//! [`FxScope::shutdown_timeout`] 与 [`Spawned::join_timeout`] 的 `d` 依赖 tokio timer：
+//! 只在 **executor 可继续调度**时才保证「到期触发并请求 abort」。某个 poll 卡在②的
+//! 同步段里时，截止即便已过，也只能等该段返回、executor 重新拿到执行权后才被观察到
+//! ⇒ `d` 不是对同步阻塞代码的硬上限。abort 是取消请求，任务在下一个让渡点才终止；
+//! 无 await 的同步段内 abort 排不上。故 [`TaskError::TimedOut`]、
+//! [`ShutdownReport::timed_out`]、[`ShutdownReport::still_running`] 的口径恒为
+//! 「截止已过 / 已请求 abort / 终止未观测」，**不是**「已终止」。
+//!
+//! ## runtime profile 选择
+//!
+//! 纯 async、无阻塞任务可用 current-thread runtime；含 blocking work 的应用必须
+//! multi-thread runtime（或独立 worker）。UDF 不替消费方创建/切换 runtime；
+//! current-thread 上**不要**用 `block_in_place`（该 API 不适用于 current-thread）。
+//! 也不要指望在被②占住的 worker 上推进 timer/截止。两侧由 `tests/fx_lifecycle.rs`
+//! 钉住：`current_thread_blocked_poll_cannot_observe_shutdown_deadline`（阻塞期间截止
+//! 无法被观察，放行后只能看到「已过期」）与
+//! `multi_worker_observes_shutdown_deadline_while_one_worker_is_blocked`（另一 worker
+//! 照常观察截止，且被阻塞任务不被标成已终止）。
 
 use std::any::Any;
 use std::fmt;
@@ -772,6 +807,15 @@ impl FxScope {
     /// （并发闸仍生效：许可取不到时任务在内部排队，不阻塞调用方）。需要保留量 /
     /// 准入上界保证的调用方必须走 [`Self::try_spawn_tracked`]。
     ///
+    /// # 阻塞边界（issue#94）
+    ///
+    /// 本口只承载**非阻塞 async orchestration**：被托管 future 必须在有限时间内返回
+    /// poll、长工作段定期让渡。CPU 密集 / 阻塞 IO / 阻塞系统调用**不得**放在 poll 内
+    /// ——同步段占住 executor 线程期间，timer、取消观察与停机等待全部停摆
+    /// （current-thread runtime 尤甚）。这类工作交给 `tokio::task::spawn_blocking` 或
+    /// 独立 `ThreadPool`，本任务只 await / 收集结果。三类阻塞的划分、`d` 的保证边界
+    /// 与 runtime profile 见模块文档「执行模型与阻塞边界」。
+    ///
     /// # 两套 drop 语义对照（选口先选语义）
     ///
     /// tokio 两套原生语义相反且类型上无区分：`JoinHandle` Drop = **detach**
@@ -837,7 +881,8 @@ impl FxScope {
     /// panic。
     ///
     /// 其余语义与 [`Self::spawn_tracked`] 一致（生命周期集托管、oneshot 旁路、
-    /// `Spawned::join()` 只消费结果、**不**移除集合条目）。
+    /// `Spawned::join()` 只消费结果、**不**移除集合条目）。阻塞边界同
+    /// [`Self::spawn_tracked`]：有界准入不改变「只承载非阻塞 async」的前提。
     pub fn try_spawn_tracked<T>(
         &self,
         fut: impl Future<Output = T> + Send + 'static,
@@ -1067,6 +1112,16 @@ impl FxScope {
     /// 判断「整 scope 已停机完成」请以共享排空已结算（再调用 `shutdown` 返回该次
     /// 排空的 canonical 报告副本）或 [`Self::in_flight`] 归零为准，勿把等待者的到期
     /// 报告当终局账。
+    ///
+    /// # 截止的保证边界（issue#94）
+    ///
+    /// `d` 依赖 tokio timer：只在 **executor 可继续调度**时才保证「到期触发并请求
+    /// abort」。若有任务卡在不返回 poll 的同步段（忙等 / 同步锁等待 / 同步析构），
+    /// 截止即使已过也要等该段返回、executor 重新拿到执行权后才被观察到 ⇒ `d`
+    /// **不是**对同步阻塞代码的硬墙钟上限，外层 CI job timeout 也不改变本域语义。
+    /// `timed_out` = 截止已过计数，`still_running` = 报告返回时终止仍未观测到——
+    /// 两者都**不**表示已终止。含 blocking work 的消费方须选 multi-thread runtime
+    /// 并把 blocking 工作移出 executor（见模块文档「执行模型与阻塞边界」）。
     pub async fn shutdown_timeout(&self, d: Duration) -> ShutdownReport {
         match self.begin_drain() {
             DrainSlot::Owner => {
@@ -1220,6 +1275,9 @@ impl<T: Send + 'static> Spawned<T> {
     /// `completed_unreaped` 不因 join 而减少。出集合只能靠 [`FxScope::try_reap`]
     /// 或停机排空（[`FxScope::shutdown`]）。保留量上界见
     /// [`FxScope::with_max_tracked`]。
+    ///
+    /// 本 await 同样是**协作式**的（issue#94）：对端任务停在同步段内不返回 poll 时，
+    /// `join` 也只能等它返回——`join` 不抢占、不推进也不终止对端。
     pub async fn join(self) -> Result<T, TaskError> {
         match self.rx.await {
             Ok(result) => result,
@@ -1241,6 +1299,14 @@ impl<T: Send + 'static> Spawned<T> {
     /// 任务体真正终止后才更新）；[`FxScope::expect_fully_reaped_idle`] 通过 ⇒ 集合
     /// 条目已收割（**终局 ≠ 已收割**，两层分开）。消费句柄**不**取消 scope 的生命
     /// 周期跟踪——任务仍归 scope 生命周期集托管。
+    ///
+    /// # 截止的保证边界（issue#94）
+    ///
+    /// `d` 依赖 tokio timer：executor 可继续调度时才保证「到期触发并请求 abort」。
+    /// 任务若停在不返回 poll 的同步段内，本方法也只能在该段返回、executor 恢复后
+    /// 才拿到 `TimedOut` ⇒ `d` **不是**硬墙钟上限。CPU / 阻塞 IO 应移出 executor
+    /// （`tokio::task::spawn_blocking` 或独立 `ThreadPool`），见模块文档「执行模型与
+    /// 阻塞边界」。
     pub async fn join_timeout(self, d: Duration) -> Result<T, TaskError> {
         match tokio::time::timeout(d, self.rx).await {
             Ok(Ok(result)) => result,

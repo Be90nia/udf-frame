@@ -57,6 +57,25 @@ udf-skeleton-infra = { path = "<UDF_ROOT>/skeleton-infra" }
 - demo 项目**建在 udf-frame 仓库外**——树内 `cargo new` 会被根 workspace 吸收损坏仓库；
 - `Scheduler::after/every` 注册仅入堆——生产面需 `spawn_worker()`（或确定性测试 `tick()`）才有点火驱动。
 
+### 异步效果里别做同步阻塞
+
+`FxScope` 托管的是**协作式** async：被托管的 future 必须在有限时间内返回 poll、长工作段定期让渡。poll 内忙等、同步锁等待或同步析构会占住 executor 线程——current-thread runtime 上期间 timer、取消观察与 `shutdown_timeout` 的期限全部停摆，`d` 因此**不是**硬墙钟上限（`TaskError::TimedOut` / `ShutdownReport::timed_out` 只表示「截止已过 + 已请求 abort」，不是「已终止」）。CPU 密集与阻塞 IO 交给 blocking pool 或自备 `ThreadPool`，任务内只 await / 收集结果：
+
+```rust
+let scope = skeleton_infra::fx::FxScope::new();
+let handle = scope
+    .spawn_tracked(async {
+        // 阻塞段在 blocking pool 上跑；本任务只 await 结果（不占 executor 线程）
+        tokio::task::spawn_blocking(|| (1..=1_000u64).map(|x| x * x).sum::<u64>())
+            .await
+            .expect("blocking closure panicked")
+    })
+    .unwrap();
+// let total = handle.join().await;   // 需在 tokio 运行时内 await
+```
+
+含 blocking work 的应用选 **multi-thread** runtime（或独立 worker）——纯 async 才可用 current-thread；**current-thread 上不要用 `block_in_place`**（该 API 不适用于该 runtime）。两侧边界由 `skeleton-infra/tests/fx_lifecycle.rs` 的两条测试钉住（`current_thread_blocked_poll_cannot_observe_shutdown_deadline` / `multi_worker_observes_shutdown_deadline_while_one_worker_is_blocked`），完整口径见 [docs/reference.md](docs/reference.md) 的 fx 章节与 `fx.rs` 模块文档。
+
 ## skeleton-infra 的 feature 门
 
 | feature | 域 |
