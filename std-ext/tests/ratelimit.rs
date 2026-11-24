@@ -6,8 +6,8 @@
 //! SystemClock 短时长（50ms 级），覆盖锁空闲面与并发活性。
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, mpsc};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -289,7 +289,9 @@ fn blocked_acquire_does_not_hold_lock() {
     let waiter = thread::spawn(move || b2.acquire(1).expect("回填后成功"));
 
     assert_eq!(
-        entered_rx.recv_timeout(Duration::from_secs(5)).expect("waiter 应进入 sleep"),
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiter 应进入 sleep"),
         Duration::from_millis(50)
     );
 
