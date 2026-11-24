@@ -1148,6 +1148,17 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
 /// panic 不投毒 cache）。**本条只覆盖析构**——锁内仍跑用户键 trait 与读侧
 /// `V::clone`（见下节「锁内用户代码契约」）。
 ///
+/// # 注入 Clock 在锁外（issue#101）
+///
+/// 全部 `Clock::now_instant` 调用都在 cache mutex **之外**取样——含满插清扫
+/// 所用的时间快照（第二阶段取锁**前**读取，锁内只消费该不可变值）。用户
+/// `Clock` 实现因此不会在这把锁下执行 ⇒ 其重入本缓存的读面（`len`/
+/// `contains`/`get`）不自锁、panic 不投毒。三类边界**分开记**，勿互相误读：
+///
+/// - **`Clock` 在锁外**（本条）：注入时钟实现无需了解本类型的私有锁序；
+/// - **键 `Hash`/`Eq` 仍在锁内**（issue#82）；
+/// - **读路径 `V::clone` 仍在锁内**（issue#83）。
+///
 /// # 锁内用户代码契约（issue#82/#83）
 ///
 /// 「析构在锁外」「`K::clone` 在锁外」**只覆盖那两条边界**——共享面仍有用户
@@ -1241,6 +1252,12 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
     /// ⚠️ 本条**只覆盖 `K::clone`**：锁内仍会执行键的 `Hash`/`Eq`（查表/建表
     /// 项/删除/rehash）与读路径的 `V::clone` ⇒ 见类型文档「锁内用户代码契约」
     /// （issue#82/#83）。
+    ///
+    /// **注入 `Clock` 在锁外**（issue#101）：两次取样都在 cache mutex 之外——
+    /// 第一次算 `expires`（阶段 1 取锁前），第二次是满插清扫用的不可变时间
+    /// 快照（阶段 2 取锁**前**读取，锁内不再调 `Clock`）。自定义 `Clock` 因此可
+    /// 在 `now_instant` 内重入本缓存而不自锁、panic 也不投毒；快照 = 阶段 2
+    /// 尝试开始的时刻，取样与拿锁之间刚过期的条目留到下次惰性访问/清扫。
     pub fn insert(&self, k: K, v: V, ttl: Duration) {
         assert!(
             !ttl.is_zero(),
@@ -1268,6 +1285,12 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         // 锁外 clone map 侧键副本：此刻**无 cache 锁持有、未发生任何变更**
         // ⇒ clone panic 在此展开（不投毒 cache，issue#80）。
         let map_key = k.clone();
+        // 阶段 2 的时间快照：注入 Clock 在**取锁前**取样（issue#101）——临界区
+        // 内只消费这个不可变值，用户 Clock 实现不得在 cache mutex 下执行（锁内
+        // 重入本缓存会自锁，panic 会投毒）。快照 = 第二阶段尝试开始的时刻：取样
+        // 与拿锁之间刚过期的条目留到下次惰性访问/清扫（惰性 TTL 语义，不为更晚
+        // 的纳秒快照把调用方注入依赖带进锁内）。
+        let purge_now = self.clock.now_instant();
         // 阶段 2：重取锁 + 重查（**第二次锁定检查 = 线性化点**；重查**早于**
         // 过期清扫/淘汰 ⇒ panic 的 clone 不会造成部分清扫/变更）。
         let (purge_retired, evict_retired, insert_retired) = {
@@ -1275,9 +1298,8 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
             let mut purge_retired = Vec::new();
             let mut evict_retired = Retired::empty();
             if g.idx_of(&k).is_none() && g.len() >= g.capacity() {
-                // 双界拍板：先过期先淘汰（单次 now 快照判定，确定性），仍满再逐 LRU 尾。
-                let now = self.clock.now_instant();
-                let (purged, retired) = g.retain(|_, e| e.expires > now);
+                // 双界拍板：先过期先淘汰（单次锁外 now 快照判定，确定性），仍满再逐 LRU 尾。
+                let (purged, retired) = g.retain(|_, e| e.expires > purge_now);
                 purge_retired = retired;
                 self.expired.fetch_add(purged as u64, Ordering::Relaxed);
                 // 埋点「TTL 过期驱逐（满插清扫）」：真回收才发（僵尸数+触发键指纹）。
@@ -1854,5 +1876,206 @@ mod lock_boundary_probe {
         let mut ttl: TtlCache<HashProbeKey, u32> = TtlCache::new(clock, 8);
         ttl.insert(HashProbeKey(1), 1, std::time::Duration::from_secs(60));
         assert_eq!(ttl.get(&HashProbeKey(1)), Some(&1));
+    }
+}
+
+/// 锁外 Clock 边界（issue#101）：注入时钟的 `now_instant` **不得**在 cache mutex
+/// 下执行。与 `lock_boundary_probe`（#82/#83：证明键 trait 与读侧 `V::clone`
+/// **确实**在锁内）互为反面——本组只钉死「Clock 不在锁内」。
+#[cfg(test)]
+mod clock_outside_lock {
+    use super::SyncTtlCache;
+    use skeleton::clock::Clock;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, TryLockError, Weak};
+    use std::time::{Duration, Instant, SystemTime};
+
+    /// 探针读数：`calls` = `now_instant` 调用次数；`under_lock` = 观察到 cache
+    /// mutex **已被持有**的次数（必须恒 0——那就是「Clock 在锁内」的回归信号）。
+    struct Probe {
+        calls: AtomicU64,
+        under_lock: AtomicU64,
+    }
+
+    impl Probe {
+        fn new() -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+                under_lock: AtomicU64::new(0),
+            }
+        }
+
+        /// 对目标缓存的内部 mutex 做 `try_lock`：`WouldBlock` = 本次 Clock 调用
+        /// 就发生在临界区里（同线程重入，非重入锁立即失败 ⇒ 不阻塞、不挂死）。
+        fn hit(&self, target: &Mutex<Weak<SyncTtlCache<u32, u32>>>) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let weak = target.lock().expect("probe 目标缓存锁").clone();
+            if let Some(cache) = weak.upgrade() {
+                match cache.core.try_lock() {
+                    Ok(_) | Err(TryLockError::Poisoned(_)) => {}
+                    Err(TryLockError::WouldBlock) => {
+                        self.under_lock.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 探针钟：每次 `now_instant` 观测 cache mutex 是否被持有（时间恒为 `base`）。
+    struct ProbeClock {
+        base: Instant,
+        target: Mutex<Weak<SyncTtlCache<u32, u32>>>,
+        probe: Probe,
+    }
+
+    impl Clock for ProbeClock {
+        fn now_instant(&self) -> Instant {
+            self.probe.hit(&self.target);
+            self.base
+        }
+
+        fn now_system(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+    }
+
+    fn probe_cache(cap: usize) -> (Arc<ProbeClock>, Arc<SyncTtlCache<u32, u32>>) {
+        let clock = Arc::new(ProbeClock {
+            base: Instant::now(),
+            target: Mutex::new(Weak::new()),
+            probe: Probe::new(),
+        });
+        let cache = Arc::new(SyncTtlCache::new(Arc::clone(&clock) as Arc<dyn Clock>, cap));
+        *clock.target.lock().expect("probe 目标缓存锁") = Arc::downgrade(&cache);
+        (clock, cache)
+    }
+
+    /// #101：满插路径（过期清扫 + 容量淘汰都走到）的每次 Clock 调用都在 cache
+    /// mutex 之外——两阶段共多次取样，但**一次都不在锁内**。
+    #[test]
+    fn insert_reads_clock_outside_cache_mutex() {
+        let (clock, cache) = probe_cache(2);
+        cache.insert(1, 1, Duration::from_secs(60));
+        cache.insert(2, 2, Duration::from_secs(60));
+        cache.insert(3, 3, Duration::from_secs(60)); // 满插：清扫 + 逐 LRU 尾
+        assert_eq!(cache.len(), 2);
+
+        let calls = clock.probe.calls.load(Ordering::SeqCst);
+        assert!(calls >= 4, "insert 两阶段都读到时钟（实际 {calls} 次）");
+        assert_eq!(
+            clock.probe.under_lock.load(Ordering::SeqCst),
+            0,
+            "insert 的 Clock 调用必须在 cache mutex 之外"
+        );
+    }
+
+    /// 探针鉴别力对照：**故意**在临界区内取样 ⇒ 探针必须记到 `WouldBlock`。
+    /// （证明上面那个「0 次」不是探针失效的空断言。）
+    #[test]
+    fn probe_detects_clock_read_inside_cache_mutex() {
+        let (clock, cache) = probe_cache(2);
+        let g = cache.lock_core();
+        let _ = clock.now_instant();
+        drop(g);
+
+        assert_eq!(clock.probe.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            clock.probe.under_lock.load(Ordering::SeqCst),
+            1,
+            "对照：锁内取样必须被探针抓到（否则上面的 0 次无意义）"
+        );
+    }
+
+    /// 可重入钟：`now_instant` 内调同一缓存的 `len`/`contains`——满插路径不得
+    /// 自锁。先 `try_lock` 判定锁可用：若实现把 Clock 读回锁内，这里在阻塞前
+    /// 就确定性失败（而非挂死测试进程）。
+    struct ReentrantClock {
+        base: Instant,
+        target: Mutex<Weak<SyncTtlCache<u32, u32>>>,
+        nested: AtomicBool,
+    }
+
+    impl Clock for ReentrantClock {
+        fn now_instant(&self) -> Instant {
+            if self.nested.swap(true, Ordering::SeqCst) {
+                // 内层（由 `contains`/`get` 自己的时钟读触发）：不再递归探测。
+                return self.base;
+            }
+            let weak = self.target.lock().expect("probe 目标缓存锁").clone();
+            if let Some(cache) = weak.upgrade() {
+                if let Err(TryLockError::WouldBlock) = cache.core.try_lock() {
+                    panic!("Clock 在 cache mutex 内执行（issue#101 回归：重入自锁面）");
+                }
+                let _ = cache.len();
+                let _ = cache.contains(&1);
+            }
+            self.nested.store(false, Ordering::SeqCst);
+            self.base
+        }
+
+        fn now_system(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+    }
+
+    #[test]
+    fn reentrant_clock_can_read_same_cache() {
+        let clock = Arc::new(ReentrantClock {
+            base: Instant::now(),
+            target: Mutex::new(Weak::new()),
+            nested: AtomicBool::new(false),
+        });
+        let cache = Arc::new(SyncTtlCache::new(Arc::clone(&clock) as Arc<dyn Clock>, 2));
+        *clock.target.lock().expect("probe 目标缓存锁") = Arc::downgrade(&cache);
+
+        cache.insert(1, 1, Duration::from_secs(60));
+        cache.insert(2, 2, Duration::from_secs(60));
+        cache.insert(3, 3, Duration::from_secs(60)); // 满插：清扫 + 驱逐
+        assert_eq!(cache.get(&3), Some(3));
+    }
+
+    /// panic 钟：在第 **2** 次读取（阶段 2 的清扫时间快照）展开——锁外 ⇒ 不投毒
+    /// （本类型 poison 策略是 fail-fast，炮在锁内会让后续访问全炸）。
+    struct PanicClock {
+        base: Instant,
+        /// 剩余放行次数：减到 0 的那次读取 panic（0 = 已解除）。
+        remaining: AtomicU64,
+    }
+
+    impl Clock for PanicClock {
+        fn now_instant(&self) -> Instant {
+            if self.remaining.load(Ordering::SeqCst) > 0
+                && self.remaining.fetch_sub(1, Ordering::SeqCst) == 1
+            {
+                panic!("clock boom（锁外展开）");
+            }
+            self.base
+        }
+
+        fn now_system(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+    }
+
+    #[test]
+    fn clock_panic_expands_outside_cache_mutex_and_cache_stays_usable() {
+        let clock = Arc::new(PanicClock {
+            base: Instant::now(),
+            remaining: AtomicU64::new(0),
+        });
+        let cache = SyncTtlCache::<u32, u32>::new(Arc::clone(&clock) as Arc<dyn Clock>, 2);
+        cache.insert(1, 1, Duration::from_secs(60));
+
+        // 阶段 1 的读取放行，阶段 2 的清扫快照 panic（旧实现此刻持锁 ⇒ 投毒）。
+        clock.remaining.store(2, Ordering::SeqCst);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.insert(2, 2, Duration::from_secs(60));
+        }));
+        assert!(caught.is_err(), "clock panic 原样传播给调用方");
+
+        // 锁未被毒：后续读写照常（poison 策略是 fail-fast ⇒ 毒了这里必炸）。
+        assert_eq!(cache.get(&1), Some(1));
+        cache.insert(3, 3, Duration::from_secs(60));
+        assert_eq!(cache.len(), 2);
     }
 }

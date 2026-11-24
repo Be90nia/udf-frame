@@ -295,19 +295,25 @@ impl TokenBucket {
         }
     }
 
-    /// 结算内核（try/acquire 共享，判定零漂移）：锁内惰性回填后判定，
-    /// 足额即扣减返回 `Ok(())`；不足额放锁并返回现有余数供上游报错。
+    /// 结算内核（try/acquire 共享，判定零漂移）：**锁外**取一次时间样本（注入
+    /// `Sleeper` 不得在 `state` mutex 下执行，issue#101）→ 取得状态锁后按该样本
+    /// 惰性回填 → 判定；足额即扣减返回 `Ok(())`，不足额放锁并返回现有余数供上游
+    /// 报错。
+    ///
+    /// 并发重排（合法竞争形态，非时钟回拨）：较早取样的线程可能晚于较新样本拿到
+    /// 锁 ⇒ `now < last` 时本轮 elapsed 记 0、**不推进 `last`**（下一次新样本从
+    /// `last` 起补齐完整区间）⇒ 任何一次结算都不倒退 `last`、不重复计算同一时间
+    /// 区间；竞争窗口内宁可保守少发，绝不多发。
     fn settle_and_take(&self, n: f64) -> Result<(), f64> {
-        let mut s = self.lock();
         let now = self.clock.now_instant();
-        // 回填 = 从上次结算点乘法重算（误差 ≤1ulp 不跨步积累），封顶吸收
-        // 任意大步。单调钟上 now >= last 恒成立（checked 显式化，clock armor）。
-        let elapsed = now
-            .checked_duration_since(s.last)
-            .expect("单调钟上 now >= last 恒成立（MockClock 后退类型层不可表达）");
-        if !elapsed.is_zero() {
-            s.tokens = (s.tokens + elapsed.as_secs_f64() * self.refill_rate).min(self.capacity);
-            s.last = now;
+        let mut s = self.lock();
+        // 回填 = 从上次结算点乘法重算（误差 ≤1ulp 不跨步积累），封顶吸收任意
+        // 大步；`now < last` = 旧样本晚提交 ⇒ elapsed 0（不 panic、不倒退 last）。
+        if let Some(elapsed) = now.checked_duration_since(s.last) {
+            if !elapsed.is_zero() {
+                s.tokens = (s.tokens + elapsed.as_secs_f64() * self.refill_rate).min(self.capacity);
+                s.last = now;
+            }
         }
         if s.tokens >= n {
             s.tokens -= n;
@@ -329,5 +335,340 @@ impl TokenBucket {
     /// into_inner 与 clock.rs/scheduler 先例同款。
     fn lock(&self) -> MutexGuard<'_, BucketState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// 锁外 Clock（issue#101）：`settle_and_take` 的时间样本在 `state` mutex **之外**
+/// 取得——注入 `Sleeper` 不得在锁下执行（重入自锁、panic 破坏面收敛到锁外），
+/// 且并发重排（旧样本晚提交）不改回填语义。
+#[cfg(test)]
+mod clock_outside_lock {
+    use super::{Sleeper, TokenBucket};
+    use skeleton::clock::Clock;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, TryLockError, Weak};
+    use std::time::{Duration, Instant, SystemTime};
+
+    fn bucket_with<S>(clock: &Arc<S>, capacity: f64, rate: f64) -> Arc<TokenBucket>
+    where
+        S: Sleeper + 'static,
+    {
+        let clock: Arc<dyn Sleeper> = Arc::<S>::clone(clock);
+        Arc::new(TokenBucket::new(clock, capacity, rate))
+    }
+
+    /// 探针钟：每次取样先对 bucket 的 `state` mutex 做 `try_lock`（`WouldBlock` =
+    /// 本次取样发生在临界区内 ⇒ 回归信号）；时间固定不动。
+    struct ProbeClock {
+        base: Instant,
+        target: Mutex<Weak<TokenBucket>>,
+        calls: AtomicU64,
+        under_lock: AtomicU64,
+    }
+
+    impl ProbeClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                base: Instant::now(),
+                target: Mutex::new(Weak::new()),
+                calls: AtomicU64::new(0),
+                under_lock: AtomicU64::new(0),
+            })
+        }
+
+        fn observe(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let weak = self.target.lock().expect("probe 目标桶锁").clone();
+            if let Some(bucket) = weak.upgrade() {
+                match bucket.state.try_lock() {
+                    Ok(_) | Err(TryLockError::Poisoned(_)) => {}
+                    Err(TryLockError::WouldBlock) => {
+                        self.under_lock.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+    }
+
+    impl Clock for ProbeClock {
+        fn now_instant(&self) -> Instant {
+            self.observe();
+            self.base
+        }
+
+        fn now_system(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+    }
+
+    impl Sleeper for ProbeClock {
+        fn sleep(&self, _d: Duration) {}
+    }
+
+    /// #101：`try_acquire` / `acquire` / 拒绝路径的每次取样都在 `state` mutex 之外。
+    #[test]
+    fn settle_reads_clock_outside_state_mutex() {
+        let clock = ProbeClock::new();
+        let bucket = bucket_with(&clock, 4.0, 1.0);
+        *clock.target.lock().expect("probe 目标桶锁") = Arc::downgrade(&bucket);
+        let before = clock.calls.load(Ordering::SeqCst); // 构造期锚点那次已计入
+
+        bucket.try_acquire(1).expect("首桶满");
+        bucket.acquire(1).expect("余量足够，无需睡眠");
+        assert!(bucket.try_acquire(9).is_err(), "超容量立即拒绝");
+
+        let calls = clock.calls.load(Ordering::SeqCst) - before;
+        assert_eq!(
+            calls, 2,
+            "两次结算各取一次样；拒绝路径不取样（实际 {calls} 次）"
+        );
+        assert_eq!(
+            clock.under_lock.load(Ordering::SeqCst),
+            0,
+            "结算的 Clock 取样必须在 state mutex 之外"
+        );
+    }
+
+    /// 探针鉴别力对照：**故意**持 state 锁取样 ⇒ 探针必须记到 `WouldBlock`
+    /// （证明上面那个「0 次」不是探针失效的空断言）。
+    #[test]
+    fn probe_detects_clock_read_inside_state_mutex() {
+        let clock = ProbeClock::new();
+        let bucket = bucket_with(&clock, 4.0, 1.0);
+        *clock.target.lock().expect("probe 目标桶锁") = Arc::downgrade(&bucket);
+        let before = clock.calls.load(Ordering::SeqCst); // 构造期锚点那次已计入
+
+        let g = bucket.state.lock().expect("bucket state");
+        let _ = clock.now_instant();
+        drop(g);
+
+        assert_eq!(clock.calls.load(Ordering::SeqCst) - before, 1);
+        assert_eq!(
+            clock.under_lock.load(Ordering::SeqCst),
+            1,
+            "对照：锁内取样必须被探针抓到（否则上面的 0 次无意义）"
+        );
+    }
+
+    /// 可重入钟：取样内调同一桶的 `try_acquire`（公开结算入口）——不得自锁。
+    /// 先 `try_lock` 判可用性（锁内取样在这里确定性失败，而非挂死测试进程）。
+    struct ReentrantClock {
+        base: Instant,
+        target: Mutex<Weak<TokenBucket>>,
+        nested: AtomicBool,
+    }
+
+    impl Clock for ReentrantClock {
+        fn now_instant(&self) -> Instant {
+            if self.nested.swap(true, Ordering::SeqCst) {
+                return self.base; // 内层（嵌套 try_acquire 自己的取样）
+            }
+            let weak = self.target.lock().expect("probe 目标桶锁").clone();
+            if let Some(bucket) = weak.upgrade() {
+                if let Err(TryLockError::WouldBlock) = bucket.state.try_lock() {
+                    panic!("Clock 在 bucket state mutex 内执行（issue#101 回归：重入自锁面）");
+                }
+                let _ = bucket.try_acquire(1);
+            }
+            self.nested.store(false, Ordering::SeqCst);
+            self.base
+        }
+
+        fn now_system(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+    }
+
+    impl Sleeper for ReentrantClock {
+        fn sleep(&self, _d: Duration) {}
+    }
+
+    #[test]
+    fn reentrant_clock_can_acquire_from_same_bucket() {
+        let clock = Arc::new(ReentrantClock {
+            base: Instant::now(),
+            target: Mutex::new(Weak::new()),
+            nested: AtomicBool::new(false),
+        });
+        let bucket = bucket_with(&clock, 4.0, 1.0);
+        *clock.target.lock().expect("probe 目标桶锁") = Arc::downgrade(&bucket);
+
+        bucket.try_acquire(1).expect("重入取样内扣 1、外层再扣 1");
+        bucket.try_acquire(1).expect("余量仍足");
+    }
+
+    /// panic 钟：取样处 panic——锁外展开 ⇒ 状态锁不投毒，桶照常可用。
+    struct PanicClock {
+        base: Instant,
+        target: Mutex<Weak<TokenBucket>>,
+        armed: AtomicBool,
+        panicked_under_lock: AtomicU64,
+    }
+
+    impl Clock for PanicClock {
+        fn now_instant(&self) -> Instant {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let weak = self.target.lock().expect("probe 目标桶锁").clone();
+                if let Some(bucket) = weak.upgrade() {
+                    if matches!(bucket.state.try_lock(), Err(TryLockError::WouldBlock)) {
+                        self.panicked_under_lock.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                panic!("clock boom（锁外展开）");
+            }
+            self.base
+        }
+
+        fn now_system(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+    }
+
+    impl Sleeper for PanicClock {
+        fn sleep(&self, _d: Duration) {}
+    }
+
+    #[test]
+    fn clock_panic_expands_outside_state_mutex_and_bucket_stays_usable() {
+        let clock = Arc::new(PanicClock {
+            base: Instant::now(),
+            target: Mutex::new(Weak::new()),
+            armed: AtomicBool::new(false),
+            panicked_under_lock: AtomicU64::new(0),
+        });
+        let bucket = bucket_with(&clock, 4.0, 1.0);
+        *clock.target.lock().expect("probe 目标桶锁") = Arc::downgrade(&bucket);
+
+        clock.armed.store(true, Ordering::SeqCst);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = bucket.try_acquire(1);
+        }));
+        assert!(caught.is_err(), "clock panic 原样传播给调用方");
+        assert_eq!(
+            clock.panicked_under_lock.load(Ordering::SeqCst),
+            0,
+            "clock panic 必须在 state mutex 之外展开"
+        );
+
+        // 锁未被毒：结算照常（panic 在取样阶段，状态未被触碰 ⇒ 仍是满桶）。
+        bucket.try_acquire(4).expect("panic 后桶仍可用");
+    }
+
+    /// 闸钟：取样值在**进入闸**前定好，放行后才返回——精确模拟「线程先取到 t1、
+    /// 被调度走、之后才提交」的窗口（不用 sleep 控交错）。
+    struct GateClock {
+        base: Instant,
+        offset_nanos: AtomicU64,
+        armed: AtomicBool,
+        at_gate: Arc<(Mutex<bool>, Condvar)>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl GateClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                base: Instant::now(),
+                offset_nanos: AtomicU64::new(0),
+                armed: AtomicBool::new(false),
+                at_gate: Arc::new((Mutex::new(false), Condvar::new())),
+                release: Arc::new((Mutex::new(false), Condvar::new())),
+            })
+        }
+
+        fn set_offset(&self, d: Duration) {
+            self.offset_nanos
+                .store(d.as_nanos() as u64, Ordering::SeqCst);
+        }
+
+        fn instant_at(&self, d: Duration) -> Instant {
+            self.base.checked_add(d).expect("测试时刻不溢出")
+        }
+
+        fn wait_at_gate(&self) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut at = self.at_gate.0.lock().expect("gate");
+            while !*at {
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(!left.is_zero(), "计时线程未进入闸（等超时）");
+                let (g, _) = self.at_gate.1.wait_timeout(at, left).expect("gate");
+                at = g;
+            }
+        }
+
+        fn release(&self) {
+            *self.release.0.lock().expect("gate") = true;
+            self.release.1.notify_all();
+        }
+    }
+
+    impl Clock for GateClock {
+        fn now_instant(&self) -> Instant {
+            let sample = self.instant_at(Duration::from_nanos(
+                self.offset_nanos.load(Ordering::SeqCst),
+            ));
+            if self.armed.swap(false, Ordering::SeqCst) {
+                *self.at_gate.0.lock().expect("gate") = true;
+                self.at_gate.1.notify_all();
+                let mut rel = self.release.0.lock().expect("gate");
+                while !*rel {
+                    rel = self.release.1.wait(rel).expect("gate");
+                }
+            }
+            sample
+        }
+
+        fn now_system(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH
+        }
+    }
+
+    impl Sleeper for GateClock {
+        fn sleep(&self, _d: Duration) {}
+    }
+
+    /// #101 并发重排：两个线程先后在锁外取到 t1 < t2，再反向取 state 锁（旧样本
+    /// 晚提交）⇒ 不得 panic、不得倒退 `last`、不得重复回填同一时间区间。
+    #[test]
+    fn stale_sample_committed_after_newer_sample_does_not_refund() {
+        let clock = GateClock::new();
+        let bucket = bucket_with(&clock, 2.0, 1.0);
+
+        // A：先取更早样本 t1 = base+1s，随即在闸处停住（尚未提交）。
+        clock.set_offset(Duration::from_secs(1));
+        clock.armed.store(true, Ordering::SeqCst);
+        let a = {
+            let bucket = Arc::clone(&bucket);
+            std::thread::spawn(move || bucket.try_acquire(1))
+        };
+        clock.wait_at_gate();
+
+        // B：取更晚样本 t2 = base+2s 并**先**提交。
+        clock.set_offset(Duration::from_secs(2));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let bucket = Arc::clone(&bucket);
+            move || {
+                let _ = tx.send(bucket.try_acquire(1));
+            }
+        });
+        let b_res = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("B 应在 2s 内提交（超时 = 结算路径把注入钟读进了锁内）");
+        assert!(b_res.is_ok(), "新样本先提交：余量足够");
+
+        clock.release();
+        let a_res = a.join().expect("旧样本晚提交不得 panic");
+        assert!(a_res.is_ok(), "按 B 推进后的余量判定（不重复回填）");
+
+        let (tokens, last) = {
+            let s = bucket.state.lock().expect("bucket state");
+            (s.tokens, s.last)
+        };
+        assert_eq!(
+            last,
+            clock.instant_at(Duration::from_secs(2)),
+            "不得倒退 last"
+        );
+        assert_eq!(tokens, 0.0, "不得重复回填同一时间区间（宁少发不多发）");
     }
 }

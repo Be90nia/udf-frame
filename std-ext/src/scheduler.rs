@@ -1018,6 +1018,11 @@ fn worker_loop(sched: Arc<Scheduler>, stop: Arc<AtomicBool>) {
                 // 重算。虚假唤醒醒来重算剩余时间继续 park——非自旋（每次醒
                 // 必 park）。信标判定在状态锁内：置位（Drop）同持此锁 ⇒
                 // 「判定后、wait 前」的窗口不会错过唤醒。
+                //
+                // 剩余时长用本轮**锁外**样本（上方 `now`，issue#101）：注入 Clock
+                // 不得在 state mutex 下执行 ⇒ 这里取锁只为「再检查 + 等」，
+                // 而检查在本样本之后、且在持锁内完成 ⇒ 取样窗口内入堆的更早
+                // deadline / 关闸 / 停信标都会被看见（丢唤醒防护）。
                 let s = lock(&sched.shared.state);
                 if stop.load(AtomicOrd::SeqCst) || s.closed {
                     return;
@@ -1029,15 +1034,16 @@ fn worker_loop(sched: Arc<Scheduler>, stop: Arc<AtomicBool>) {
                     drop(s);
                     continue;
                 }
-                let now = sched.shared.clock.now_instant();
-                if d > now {
-                    let guard = sched
-                        .shared
-                        .signal
-                        .wait_timeout(s, d - now)
-                        .unwrap_or_else(PoisonError::into_inner);
-                    drop(guard);
-                }
+                // 剩余时长来自本轮锁外样本 `now`（issue#101：注入 Clock 不在
+                // state mutex 下执行）；`d > now` 由外层匹配臂保证（`d <= now`
+                // 已走点火分支）。样本可能略旧 ⇒ 至多晚醒一次持锁等待的时长，
+                // 不会漏醒（复检均在此样本之后）。
+                let guard = sched
+                    .shared
+                    .signal
+                    .wait_timeout(s, d - now)
+                    .unwrap_or_else(PoisonError::into_inner);
+                drop(guard);
             }
             None => {
                 // 空堆：无限期 park，等 close/注册/停信标唤醒（零自旋的关键面）。
@@ -1185,5 +1191,366 @@ mod tests {
             before,
             "panic 前的失败路径同样零残留"
         );
+    }
+
+    /// 锁外 Clock（issue#101）：worker 的 park 路径不得在 `shared.state` mutex 下
+    /// 调注入时钟。三面各一测：try_lock 探针（每次取样都看到锁可用）、可重入钟
+    /// （取样内调 `is_closed`/`next_deadline` 不自锁）、取样窗口内插入更早
+    /// deadline（复检 ⇒ 不丢唤醒、不按旧样本长时间晚醒）。
+    mod clock_outside_state_lock {
+        use super::*;
+        use std::sync::TryLockError;
+        use std::time::SystemTime;
+
+        /// 轮询等条件（1ms 步进、2s 上限——驱动线程是真实时钟面，测试骨架）。
+        fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !ready() {
+                assert!(Instant::now() < deadline, "{what}：等超时（2s）");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// 探针钟：取值委托 `MockClock`；每次取样先对 scheduler 的 `state` mutex
+        /// 做 `try_lock`（`WouldBlock` = 本次取样在临界区内 ⇒ 回归信号）。
+        struct ProbeClock {
+            mock: Arc<MockClock>,
+            target: Mutex<Weak<Scheduler>>,
+            calls: AtomicU64,
+            under_lock: AtomicU64,
+        }
+
+        impl ProbeClock {
+            fn new(mock: Arc<MockClock>) -> Arc<Self> {
+                Arc::new(Self {
+                    mock,
+                    target: Mutex::new(Weak::new()),
+                    calls: AtomicU64::new(0),
+                    under_lock: AtomicU64::new(0),
+                })
+            }
+
+            fn observe(&self) {
+                self.calls.fetch_add(1, AtomicOrd::SeqCst);
+                let weak = self.target.lock().expect("probe 目标调度器锁").clone();
+                if let Some(sched) = weak.upgrade() {
+                    match sched.shared.state.try_lock() {
+                        Ok(_) | Err(TryLockError::Poisoned(_)) => {}
+                        Err(TryLockError::WouldBlock) => {
+                            self.under_lock.fetch_add(1, AtomicOrd::SeqCst);
+                        }
+                    }
+                }
+            }
+        }
+
+        impl Clock for ProbeClock {
+            fn now_instant(&self) -> Instant {
+                self.observe();
+                self.mock.now_instant()
+            }
+
+            fn now_system(&self) -> SystemTime {
+                self.mock.now_system()
+            }
+        }
+
+        /// #101：worker 的 park 路径（含注册/关闸唤醒后的重算）每次时钟取样都在
+        /// `state` mutex 之外。
+        #[test]
+        fn worker_park_reads_clock_outside_state_mutex() {
+            let mock = Arc::new(MockClock::new());
+            let clock = ProbeClock::new(Arc::clone(&mock));
+            let sched = Arc::new(Scheduler::new(Arc::clone(&clock) as Arc<dyn Clock>));
+            *clock.target.lock().expect("probe 目标调度器锁") = Arc::downgrade(&sched);
+
+            // 冻结仿钟上的 +1ms deadline：worker 反复 park（真实 1ms/圈）⇒
+            // park 分支的取样必然走过（mock 不推进，任务不点火）。
+            let handle = sched
+                .after(Duration::from_millis(1), || {})
+                .expect("未关闸注册必成");
+            let worker = sched.spawn_worker();
+            wait_until("worker 跑过三圈", || sched.worker_passes() >= 3);
+            let calls = clock.calls.load(AtomicOrd::SeqCst);
+            worker.join();
+            handle.detach();
+
+            assert!(calls >= 3, "park 路径确实取过样（实际 {calls} 次）");
+            assert_eq!(
+                clock.under_lock.load(AtomicOrd::SeqCst),
+                0,
+                "worker 的 Clock 取样不得在 state mutex 内"
+            );
+        }
+
+        /// 探针鉴别力对照：**故意**持 state 锁取样 ⇒ 探针必须记到 `WouldBlock`
+        /// （证明上面那个「0 次」不是探针失效的空断言）。
+        #[test]
+        fn probe_detects_clock_read_inside_state_mutex() {
+            let mock = Arc::new(MockClock::new());
+            let clock = ProbeClock::new(Arc::clone(&mock));
+            let sched = Arc::new(Scheduler::new(Arc::clone(&clock) as Arc<dyn Clock>));
+            *clock.target.lock().expect("probe 目标调度器锁") = Arc::downgrade(&sched);
+
+            let g = lock(&sched.shared.state);
+            let _ = clock.now_instant();
+            drop(g);
+
+            assert_eq!(clock.calls.load(AtomicOrd::SeqCst), 1);
+            assert_eq!(
+                clock.under_lock.load(AtomicOrd::SeqCst),
+                1,
+                "对照：锁内取样必须被探针抓到（否则上面的 0 次无意义）"
+            );
+        }
+
+        /// 可重入钟：取样内调同一调度器的 `is_closed`/`next_deadline`——park 路径
+        /// 不得自锁。先 `try_lock` 判可用性：锁内取样在这里确定性失败，而不是
+        /// 挂死测试进程。
+        struct ReentrantClock {
+            mock: Arc<MockClock>,
+            target: Mutex<Weak<Scheduler>>,
+        }
+
+        impl ReentrantClock {
+            fn new(mock: Arc<MockClock>) -> Arc<Self> {
+                Arc::new(Self {
+                    mock,
+                    target: Mutex::new(Weak::new()),
+                })
+            }
+        }
+
+        impl Clock for ReentrantClock {
+            fn now_instant(&self) -> Instant {
+                let weak = self.target.lock().expect("probe 目标调度器锁").clone();
+                if let Some(sched) = weak.upgrade() {
+                    if let Err(TryLockError::WouldBlock) = sched.shared.state.try_lock() {
+                        panic!(
+                            "Clock 在 scheduler state mutex 内执行（issue#101 回归：重入自锁面）"
+                        );
+                    }
+                    let _ = sched.is_closed();
+                    let _ = sched.next_deadline();
+                }
+                self.mock.now_instant()
+            }
+
+            fn now_system(&self) -> SystemTime {
+                self.mock.now_system()
+            }
+        }
+
+        #[test]
+        fn reentrant_clock_can_query_same_scheduler() {
+            let mock = Arc::new(MockClock::new());
+            let clock = ReentrantClock::new(Arc::clone(&mock));
+            let sched = Arc::new(Scheduler::new(Arc::clone(&clock) as Arc<dyn Clock>));
+            *clock.target.lock().expect("probe 目标调度器锁") = Arc::downgrade(&sched);
+
+            sched
+                .after(Duration::from_millis(1), || {})
+                .expect("注册必成")
+                .detach();
+            let worker = sched.spawn_worker();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while sched.worker_passes() < 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker.join(); // worker 侧 panic 原样重抛（fail-visible）
+            assert!(
+                sched.worker_passes() >= 2,
+                "worker 应在取样处不自锁地跑过两圈"
+            );
+        }
+
+        /// 闸钟：委托 `MockClock`；`armed` 时在取样处闸住 worker 并通知测试，由
+        /// 测试放行——精确构造「worker 已取到时间样本、尚未拿 state 锁」的窗口
+        /// （不用 sleep 控交错）。
+        struct GateClock {
+            mock: Arc<MockClock>,
+            armed: AtomicBool,
+            at_gate: Arc<(Mutex<bool>, Condvar)>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        }
+
+        impl GateClock {
+            fn new(mock: Arc<MockClock>) -> Arc<Self> {
+                Arc::new(Self {
+                    mock,
+                    armed: AtomicBool::new(false),
+                    at_gate: Arc::new((Mutex::new(false), Condvar::new())),
+                    release: Arc::new((Mutex::new(false), Condvar::new())),
+                })
+            }
+
+            fn arm(&self) {
+                self.armed.store(true, AtomicOrd::SeqCst);
+            }
+
+            fn wait_at_gate(&self) {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut at = self.at_gate.0.lock().expect("gate");
+                while !*at {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    assert!(!left.is_zero(), "worker 未在取样处闸住（等超时）");
+                    let (g, _) = self.at_gate.1.wait_timeout(at, left).expect("gate");
+                    at = g;
+                }
+            }
+
+            fn release(&self) {
+                *self.release.0.lock().expect("gate") = true;
+                self.release.1.notify_all();
+            }
+        }
+
+        impl Clock for GateClock {
+            fn now_instant(&self) -> Instant {
+                if self.armed.swap(false, AtomicOrd::SeqCst) {
+                    *self.at_gate.0.lock().expect("gate") = true;
+                    self.at_gate.1.notify_all();
+                    let mut rel = self.release.0.lock().expect("gate");
+                    while !*rel {
+                        rel = self.release.1.wait(rel).expect("gate");
+                    }
+                }
+                self.mock.now_instant()
+            }
+
+            fn now_system(&self) -> SystemTime {
+                self.mock.now_system()
+            }
+        }
+
+        /// #101 丢唤醒交错：worker 取到旧样本后、拿锁前插入更早 deadline ⇒ 复检
+        /// 必须看见并回主循环（否则按旧锚 park：既丢这次唤醒又长时间晚醒）。
+        /// 放行后**不再有任何 notify**——能按期点火只能靠复检。
+        #[test]
+        fn earlier_deadline_inserted_while_sampling_is_not_missed() {
+            let mock = Arc::new(MockClock::new());
+            let clock = GateClock::new(Arc::clone(&mock));
+            let sched = Arc::new(Scheduler::new(Arc::clone(&clock) as Arc<dyn Clock>));
+
+            sched
+                .after(Duration::from_secs(5), || {})
+                .expect("注册必成")
+                .detach();
+            let fired = Arc::new(AtomicU64::new(0));
+            let fired2 = Arc::clone(&fired);
+            clock.arm();
+            let worker = sched.spawn_worker();
+
+            clock.wait_at_gate(); // worker 已取到样本，尚未拿 state 锁
+            sched
+                .after(Duration::from_millis(1), move || {
+                    fired2.fetch_add(1, AtomicOrd::SeqCst);
+                })
+                .expect("注册必成")
+                .detach();
+            clock.release();
+            // 虚拟钟越过更早 deadline；此后**不 notify**（丢唤醒面全靠复检）。
+            mock.advance(Duration::from_millis(2));
+
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while fired.load(AtomicOrd::SeqCst) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker.join();
+            assert_eq!(
+                fired.load(AtomicOrd::SeqCst),
+                1,
+                "取样窗口内入堆的更早 deadline 必须被复检看见（缺复检 ⇒ 只能等满 5s 锚）"
+            );
+        }
+
+        /// panic 钟：在取样处 panic——锁外展开 ⇒ 不投毒状态锁；panic 原样传播
+        /// 出 worker（`join` 重抛），调度器仍可注册/点火（确定性内核不受影响）。
+        struct PanicClock {
+            mock: Arc<MockClock>,
+            target: Mutex<Weak<Scheduler>>,
+            armed: AtomicBool,
+            panicked: AtomicBool,
+            panicked_under_lock: AtomicU64,
+        }
+
+        impl PanicClock {
+            fn new(mock: Arc<MockClock>) -> Arc<Self> {
+                Arc::new(Self {
+                    mock,
+                    target: Mutex::new(Weak::new()),
+                    armed: AtomicBool::new(false),
+                    panicked: AtomicBool::new(false),
+                    panicked_under_lock: AtomicU64::new(0),
+                })
+            }
+        }
+
+        impl Clock for PanicClock {
+            fn now_instant(&self) -> Instant {
+                if self.armed.swap(false, AtomicOrd::SeqCst) {
+                    let weak = self.target.lock().expect("probe 目标调度器锁").clone();
+                    if let Some(sched) = weak.upgrade() {
+                        if matches!(sched.shared.state.try_lock(), Err(TryLockError::WouldBlock)) {
+                            self.panicked_under_lock.fetch_add(1, AtomicOrd::SeqCst);
+                        }
+                    }
+                    self.panicked.store(true, AtomicOrd::SeqCst);
+                    panic!("clock boom（锁外展开）");
+                }
+                self.mock.now_instant()
+            }
+
+            fn now_system(&self) -> SystemTime {
+                self.mock.now_system()
+            }
+        }
+
+        #[test]
+        fn clock_panic_expands_outside_state_mutex_and_scheduler_stays_usable() {
+            let mock = Arc::new(MockClock::new());
+            let clock = PanicClock::new(Arc::clone(&mock));
+            let sched = Arc::new(Scheduler::new(Arc::clone(&clock) as Arc<dyn Clock>));
+            *clock.target.lock().expect("probe 目标调度器锁") = Arc::downgrade(&sched);
+
+            sched
+                .after(Duration::from_secs(60), || {})
+                .expect("注册必成")
+                .detach();
+            clock.armed.store(true, AtomicOrd::SeqCst);
+            let worker = sched.spawn_worker();
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !clock.panicked.load(AtomicOrd::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                clock.panicked.load(AtomicOrd::SeqCst),
+                "worker 应在取样处 panic"
+            );
+            assert_eq!(
+                clock.panicked_under_lock.load(AtomicOrd::SeqCst),
+                0,
+                "clock panic 必须在 state mutex 之外展开"
+            );
+
+            // 调度器仍可用：注册 + 显式点火照常（panic 不破坏确定性内核）。
+            let fired = Arc::new(AtomicU64::new(0));
+            let fired2 = Arc::clone(&fired);
+            sched
+                .after(Duration::ZERO, move || {
+                    fired2.fetch_add(1, AtomicOrd::SeqCst);
+                })
+                .expect("panic 后调度器仍开放")
+                .detach();
+            assert_eq!(sched.tick(), 1, "panic 后显式点火照常");
+            assert_eq!(fired.load(AtomicOrd::SeqCst), 1);
+
+            let joined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.join()));
+            assert!(
+                joined.is_err(),
+                "worker 侧 clock panic 原样传播（join 重抛）"
+            );
+        }
     }
 }
