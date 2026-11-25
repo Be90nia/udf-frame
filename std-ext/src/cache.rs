@@ -1915,6 +1915,114 @@ mod lock_boundary_probe {
         ttl.insert(HashProbeKey(1), 1, std::time::Duration::from_secs(60));
         assert_eq!(ttl.get(&HashProbeKey(1)), Some(&1));
     }
+
+    #[cfg(feature = "log-embed")]
+    struct CallbackSubscriber(Box<dyn Fn() + Send + Sync>);
+
+    #[cfg(feature = "log-embed")]
+    impl tracing::Subscriber for CallbackSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {
+            (self.0)();
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn sync_lru_eviction_subscriber_runs_after_core_unlock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::subscriber::with_default;
+
+        let cache = Arc::new(SyncLruCache::new(1));
+        cache.insert("a".to_owned(), 1);
+        let violations = Arc::new(AtomicUsize::new(0));
+        let observed_cache = Arc::clone(&cache);
+        let observed_violations = Arc::clone(&violations);
+        let subscriber = CallbackSubscriber(Box::new(move || {
+            match observed_cache.core.try_lock() {
+                Ok(guard) => drop(guard),
+                Err(TryLockError::WouldBlock) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            }
+            let _ = observed_cache.len();
+        }));
+
+        with_default(subscriber, || cache.insert("b".to_owned(), 2));
+        assert_eq!(
+            violations.load(Ordering::SeqCst),
+            0,
+            "host subscriber must run after SyncLruCache releases its mutex"
+        );
+    }
+
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn sync_ttl_events_run_after_core_unlock() {
+        use skeleton::clock::MockClock;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tracing::subscriber::with_default;
+
+        let clock = Arc::new(MockClock::new());
+        let cache = Arc::new(SyncTtlCache::new(clock.clone(), 1));
+        let violations = Arc::new(AtomicUsize::new(0));
+        let observed_cache = Arc::clone(&cache);
+        let observed_violations = Arc::clone(&violations);
+        let subscriber = CallbackSubscriber(Box::new(move || {
+            match observed_cache.core.try_lock() {
+                Ok(guard) => drop(guard),
+                Err(TryLockError::WouldBlock) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            }
+            let _ = observed_cache.len();
+        }));
+
+        with_default(subscriber, || {
+            cache.insert("a".to_owned(), 1, Duration::from_secs(1));
+            clock.advance(Duration::from_secs(1));
+            assert_eq!(cache.get(&"a".to_owned()), None); // lazy TTL event
+
+            cache.insert("b".to_owned(), 2, Duration::from_secs(1));
+            clock.advance(Duration::from_secs(1));
+            cache.insert("c".to_owned(), 3, Duration::from_secs(1)); // TTL sweep event
+            cache.insert("d".to_owned(), 4, Duration::from_secs(1)); // capacity event
+            clock.advance(Duration::from_secs(1));
+            assert_eq!(cache.purge_expired(), 1); // explicit purge event
+        });
+
+        assert_eq!(
+            violations.load(Ordering::SeqCst),
+            0,
+            "all SyncTtlCache subscribers must run after the core mutex is released"
+        );
+    }
 }
 
 /// 锁外 Clock 边界（issue#101）：注入时钟的 `now_instant` **不得**在 cache mutex
