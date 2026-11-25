@@ -34,7 +34,7 @@
 //! | 谁异步收变更信号 | [`notify::NotifySink`] 投递口收单调版本号水位（[`notify::Notify`] 登记面；见版本拉取现态，合并合法、丢拍可检出） |
 //! | 谁呈现给 UI | [`view::ViewMap`] 投影 + [`view::IntentMap`] 意图翻译（语言无关出站/入站；参考实现 `skeleton_infra::view::ViewBridge`） |
 //! | 效果从哪出 | [`Effect::Run`] 描述值 → [`EffectRuntime::run`] 解释，经 [`ActionSender`] 回灌闭环 |
-//! | 谁持久化 | [`JournalPort`] 端口（后端自换；参考实现 `skeleton_infra::journal::JsonlJournal`） |
+//! | 谁持久化 | [`JournalPort`] 端口（`append`=缓冲接受、[`JournalPort::flush`]=持久点；后端自换；参考实现 `skeleton_infra::journal::JsonlJournal`） |
 //!
 //! # 契约即可实现（toy 最小环）
 //!
@@ -860,44 +860,71 @@ pub trait Store {
     fn is_closed(&self) -> bool;
 }
 
-/// 状态持久化端口（框架留口、后端自换）：快照持久化 + 动作追加 + 恢复的
-/// 最小面。真相源「在后端怎么存」完全委托给实现方——JSONL/SQLite/网络皆可，
-/// 序列化词表由实现自选，本 crate 不绑格式（零依赖纪律）。参考实现：
+/// 「后端没有持久化位」的 typed 错误（[`JournalPort::flush`] 不支持面）。
+///
+/// 没有持久化边界、无法承诺任何跨崩溃可见性的实现把它内嵌进自己的
+/// [`JournalPort::Err`]，从 `flush` 显式返回——typed 拒绝优于返回 `Ok`
+/// 静默谎报持久（`flush` 刻意没有默认实现）。进程内后端若把「已接受即可见」
+/// 当作自己的边界，也可以合法返回 `Ok`，但必须在实现文档里如实声明该边界。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushUnsupported;
+
+impl std::fmt::Display for FlushUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("journal backend has no flush/durability boundary")
+    }
+}
+
+impl std::error::Error for FlushUnsupported {}
+
+/// 状态持久化端口（框架留口、后端自换）：动作追加 + 显式持久化位 + 快照 +
+/// 恢复的最小面。真相源「在后端怎么存」完全委托给实现方——JSONL/SQLite/网络
+/// 皆可，序列化词表由实现自选，本 crate 不绑格式（零依赖纪律）。参考实现：
 /// `skeleton_infra::journal::JsonlJournal`（`journal` feature）。
 ///
 /// 参考实现的行格式约束（细节归实现方）：action/state 须可序列化为
 /// **JSON 对象**（行 tag 与载荷平铺同层）——非对象载荷（如 `A = u64` 序列化
-/// 为裸数字）首条 [`Self::append`] 即 `Err`；先落盘后 apply ⇒ 零副作用，
-/// 换对象形状重试即可。
+/// 为裸数字）首条 [`Self::append`] 即 `Err`；`Err` 发生在任何字节进入持久化
+/// 管线之前 ⇒ 零副作用，换对象形状重试即可。
 ///
 /// # 语义契约（实现必须兑现）
 ///
-/// 1. **先落盘后 apply**：[`Self::append`] 返回 `Err` ⇒ 调用方禁 apply 该
-///    action——内存态永不领先已持久前缀。
-/// 2. **恢复完备**：[`Self::restore`] 返回三态 [`Restore`]，调用方按其语义
+/// 1. **`append` = 缓冲接受，不是已持久**：[`Self::append`] 的 `Ok` 只表示整条
+///    记录已被本实现接受（参考实现=写进 64 KiB `BufWriter`），**不承诺**崩溃后
+///    仍可恢复；`Err` ⇒ 调用方禁 apply 该 action。
+/// 2. **持久化边界显式**：[`Self::flush`] 把此前 append 的全部记录推过实现的
+///    持久化边界（参考实现=`BufWriter` flush + `sync_all`，掉电真持久）。
+///    「apply 后崩溃不丢史」的调用方必须在 apply 前调 `flush` 并见 `Ok`——本端口
+///    **不**逐条 fsync，批次/窗口由调用方决定（#106：缓冲接受不得描述成已持久
+///    的 write-ahead 日志）。
+/// 3. **恢复完备**：[`Self::restore`] 返回三态 [`Restore`]，调用方按其语义
 ///    重建当前态——`Empty` 取 [`Reducer::initial`] 零 apply；`FromInitial`
 ///    自 initial 起按序 apply 全量动作；`FromSnapshot` 自快照态起按序
 ///    apply 增量动作。重放协议：动作流**经同一装配的 store 逐条
 ///    [`Store::dispatch`]**（效果环照常运转）——[`Effect::Emit`] 回灌等派生
 ///    动作由排空环再生，终态与 live 收敛；裸 reduce 逐条套用会丢派生链
 ///    （挂点矩阵与收敛回归见实现方 `skeleton_infra::journal`）。
-/// 3. **fail-visible**：持久化失败如实 `Err`，禁静默丢弃——静默丢 action =
+/// 4. **fail-visible**：持久化失败如实 `Err`，禁静默丢弃——静默丢 action =
 ///    真相源丢史。
-/// 4. **单写者**：本端口不设跨进程锁；多进程挂载同一账本的编排归上层。
+/// 5. **单写者**：本端口不设跨进程锁；多进程挂载同一账本的编排归上层。
 ///
 /// # 与实现层 `Journal` trait 的分工
 ///
-/// 实现层全功能面 trait `skeleton_infra::journal::Journal` 的同名方法已改名
-/// （`append_action`/`restore_stream`/`append_snapshot`；`replay` 为实现层
-/// 独有），本端口独占契约词表（`append`/`restore`/`persist_snapshot`）——两
-/// trait 同屏 import 直呼无歧义（旧三同名双候选拒编译已结构性消灭，批 2A）。
+/// 实现层全功能面 trait `skeleton_infra::journal::Journal` 的方法名带实现层
+/// 词形（`append_action`/`restore_stream`/`append_snapshot`；`replay` 为实现层
+/// 独有），本端口独占契约词表（`append`/`flush`/`restore`/`persist_snapshot`）
+/// ——两 trait 同屏 import 直呼无歧义（旧三同名双候选拒编译已结构性消灭，批
+/// 2A）。唯一同名项 `flush` 是参考实现的**固有方法**（非 trait 方法）：方法
+/// 调用语法下固有方法优先且语义相同（端口实现直接转调），UFCS
+/// `JournalPort::flush(&mut j)` 亦无第二候选。
 /// 状态面同款关联类型化（批 6A，与实现层同步）：[`JournalPort::State`] 被
 /// `Self` 钉死，端口方法直呼零 turbofish 零绑定标注（`j.append(&a)` /
 /// `let r = j.restore()`）。
 ///
 /// # Examples
 ///
-/// 后端自换即实现本 trait——一个内存账本（无任何序列化依赖）同样合法：
+/// 后端自换即实现本 trait——一个内存账本（无任何序列化依赖）同样合法；它的
+/// `flush` 只能声明**进程内**语义（崩溃即全丢），不得声称 OS 持久：
 ///
 /// ```
 /// use skeleton::{JournalPort, Restore};
@@ -913,6 +940,9 @@ pub trait Store {
 ///         self.applied.push(action.clone());
 ///         Ok(())
 ///     }
+///     fn flush(&mut self) -> Result<(), Self::Err> {
+///         Ok(()) // 进程内账本：记录已在 Vec 里可见，没有更外层的持久位
+///     }
 ///     fn persist_snapshot(&mut self, _state: &u64) -> Result<(), Self::Err> {
 ///         Ok(()) // 快照可选：真相源恒为动作流
 ///     }
@@ -923,19 +953,35 @@ pub trait Store {
 ///
 /// let mut j = MemJournal { applied: Vec::new() };
 /// j.append(&"inc".to_string()).unwrap(); // 直呼：写面零标注
+/// j.flush().unwrap(); // 持久化位：进程内语义=已接受即可见
 /// assert_eq!(j.restore().unwrap(), Restore::FromInitial(vec!["inc".to_string()]));
 /// ```
 pub trait JournalPort<A> {
-    /// 持久化失败类型（实现方定义；`Err` ⇒ 契约①「先落盘后 apply」生效）。
+    /// 持久化失败类型（实现方定义；`Err` ⇒ 契约①生效：调用方禁 apply 该 action）。
+    ///
+    /// 没有持久化位的后端把 [`FlushUnsupported`] 内嵌进本类型，从
+    /// [`Self::flush`] 显式返回它。
     type Err;
     /// 账本状态面（快照与恢复语义的载荷类型；实现方定义）。
     type State;
-    /// 动作追加（真相源的增量单位）。
+    /// 动作追加（真相源的增量单位）。`Ok` = 记录已被本实现接受（参考实现=
+    /// 进入写缓冲），**不是**已持久（契约①）。
     ///
     /// payload 契约：`A` 序列化结果**必须是 JSON object**（实现层按
     /// `#[serde(tag)]` 事件行校验）——unit variant 序列化为裸字符串，
     /// 运行时 `Err`（fail-visible）；给 enum 挂 `#[serde(tag = "t")]` 即免。
     fn append(&mut self, action: &A) -> Result<(), Self::Err>;
+    /// 持久化位：把此前 [`Self::append`] 已接受的记录推过实现的持久化边界
+    /// （参考实现=`BufWriter` flush + `sync_all`，掉电真持久）。
+    ///
+    /// `Ok` ⇒ 这些记录已到达实现的持久化边界（参考实现=崩溃后重开仍可读到；
+    /// 边界由实现方文档声明：进程内后端只有进程内语义，**不得**声称 OS 持久）。
+    /// `Err` ⇒ fail-visible，调用方不得把依赖该批次的动作当作已持久。
+    ///
+    /// **刻意没有默认实现**：默认 `Ok(())` 会让没有持久化位的后端静默谎报持久
+    /// （#106）。每个实现必须显式表态——真持久、进程内语义，或返回内嵌
+    /// [`FlushUnsupported`] 的 typed 错误。
+    fn flush(&mut self) -> Result<(), Self::Err>;
     /// 快照持久化（加速恢复的可选位；真相源恒为动作流）。动名
     /// `persist_snapshot` 与 [`Store::snapshot`] 的读侧快照跨层同名反向消歧
     /// （接口维 R1：账本侧=持久化写入，store 侧=拉取读取）。
@@ -1029,6 +1075,44 @@ mod tests {
         assert_eq!(
             tail_before, tail_after,
             "pop_front 只摘队首（其余效果原地不动）——否则排空退化为 O(k²) 元素搬移"
+        );
+    }
+
+    /// #106 finding 1：没有持久化位的后端必须从 `flush` 返回 typed
+    /// [`FlushUnsupported`]，而不是靠默认实现返回 `Ok` 静默谎报持久——
+    /// `JournalPort::flush` 无默认实现正是为此（删掉 trait 里的方法声明本测
+    /// 即编译失败，不再有「不实现也能编译且说谎」的形状）。
+    #[test]
+    fn journal_port_without_durability_flushes_via_typed_unsupported() {
+        struct NoDurability;
+
+        impl JournalPort<u8> for NoDurability {
+            type State = u8;
+            type Err = FlushUnsupported;
+
+            fn append(&mut self, _action: &u8) -> Result<(), Self::Err> {
+                Ok(())
+            }
+
+            fn flush(&mut self) -> Result<(), Self::Err> {
+                Err(FlushUnsupported)
+            }
+
+            fn persist_snapshot(&mut self, _state: &u8) -> Result<(), Self::Err> {
+                Ok(())
+            }
+
+            fn restore(&self) -> Result<Restore<u8, u8>, Self::Err> {
+                Ok(Restore::Empty)
+            }
+        }
+
+        let mut j = NoDurability;
+        assert_eq!(j.append(&1), Ok(()), "append 仍可缓冲接受");
+        assert_eq!(j.flush(), Err(FlushUnsupported), "无持久位=typed 拒绝");
+        assert_eq!(
+            FlushUnsupported.to_string(),
+            "journal backend has no flush/durability boundary"
         );
     }
 }

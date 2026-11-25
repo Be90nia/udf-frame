@@ -1,9 +1,14 @@
-//! 追加式真相源端口 + JSONL 默认实现（先落盘后 apply；schema 只加字段+default）。
+//! 追加式真相源端口 + JSONL 默认实现（append=缓冲接受、flush=持久点；schema 只加字段+default）。
 //!
 //! feature 门 `journal`（绑 serde+serde_json+契约 crate skeleton——JournalPort 兑现面）。契约要点：
-//! - **先落盘后 apply**：`append` 契约 Err ⇒ 调用方禁 apply 该 Action；
+//! - **append=缓冲接受，非已持久**（#106 ①）：`append_action`/端口 `append` 的
+//!   `Ok` 只表示整条记录已进入 64 KiB `BufWriter`——**不**代表崩溃后可恢复；
+//!   `Err` ⇒ 调用方禁 apply 该 Action。本件不是「append 即已持久」的 write-ahead。
+//! - **flush 点=持久点**：`flush()`=BufWriter flush + `sync_all`（掉电真持久）；
+//!   需要「apply 后崩溃不丢史」的调用方在 apply 前调它（**不**逐条 fsync，窗口由
+//!   调用方定）。读侧可见性=已 flush 前缀；干净 drop 会把缓冲写进 OS（重开可见），
+//!   进程崩溃/`mem::forget` 才是丢数据的分界。
 //! - **单写者**：本件无跨进程锁，双进程挂载同一账本=交错损坏——多进程场景上层编排；
-//! - **flush 点=持久点**：BufWriter 缓冲非逐行 flush；读侧可见性=已 flush 前缀；
 //! - 行格式：版本头 `{"v":1}`（`deny_unknown_fields`——未知字段=协议不兼容 fail-closed
 //!   拒挂载；`"seed"` 落点须同步扩 Header 字段集）；action 行/snapshot 行
 //!   均为 `{"t":"a"|"s", ...payload}` 平铺——**`"t"` 为顶层保留键**（payload 携带顶层
@@ -267,7 +272,11 @@ where
     /// 账本状态面（快照行与恢复语义的载荷类型）。
     type State: Serialize + DeserializeOwned;
 
-    /// 追加一行 action。**契约：Err ⇒ 调用方禁 apply 该 Action**（先落盘后 apply 的另一半）。
+    /// 追加一行 action。**契约：`Ok` = 记录已进写缓冲（非持久），`Err` ⇒ 调用方
+    /// 禁 apply 该 Action**（#106 ①：缓冲接受不得当成已持久的 write-ahead）。
+    ///
+    /// 崩溃恢复语义要另一刀：需要「apply 后崩溃不丢史」的调用方在 apply 前调
+    /// [`JsonlJournal::flush`]（flush + `sync_all`）并见 `Ok`；本件不逐条 fsync。
     ///
     /// 行格式约束：action/state 必须序列化为 **JSON 对象**（tag `"t"` 与载荷
     /// 平铺同层）——非对象载荷（如 `A = u64` 序列化为裸数字）首条
@@ -277,14 +286,15 @@ where
     /// 挂点矩阵：外部动作=组合根包装层 append→dispatch；`Run`/`Cancel` 效果的
     /// 回灌动作=解释器标准形模板强制 append-before-send（成功才 back.send）；
     /// **Emit 回灌不入账**——派生动作由 store 核心直接入队（不经解释器，无挂点
-    /// 可设），它是已落盘 action 经纯 reducer 的确定性派生（同 (state, action)
-    /// 恒同输出）：重放=Restore 动作流经同一装配的 store 逐条 dispatch，派生链
-    /// 由排空环再生、终态收敛（回归锚：`tests/journal_port.rs`
-    /// emit_feedback_replay_converges_with_live——live==重放==审计深度链三方可
-    /// 查）。需逐动作账本的宿主须在自设派生挂点上 append。核心不设钩子=有意
-    /// （零依赖）。
+    /// 可设），它是已接受（append 成功）的 action 经纯 reducer 的确定性派生
+    /// （同 (state, action) 恒同输出）：重放=Restore 动作流经同一装配的 store
+    /// 逐条 dispatch，派生链由排空环再生、终态收敛（回归锚：
+    /// `tests/journal_port.rs` emit_feedback_replay_converges_with_live——live==
+    /// 重放==审计深度链三方可查）。需逐动作账本的宿主须在自设派生挂点上 append。
+    /// 核心不设钩子=有意（零依赖）。
     ///
-    /// BufWriter 缓冲，非逐行 flush；`snapshot_every` 命中时自动 flush（见模块注）。
+    /// BufWriter 缓冲（64 KiB），非逐行 flush；`snapshot_every` 命中时自动 flush
+    /// （含 `sync_all`，见模块注）。
     ///
     /// 失败面（#217/#106③）：载荷编码越过实例记录上限 ⇒ `Err(RecordTooLarge)`；
     /// 前一次 write/flush/sync 失败 ⇒ `Err(Poisoned)`。两者都**不写字节**，但
@@ -355,7 +365,7 @@ pub type SnapshotStream<'j, A, S> = Option<(S, Replay<'j, A>)>;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// // (A, S) 在构造期钉死（一次 turbofish，税落最冷点）；此后方法调用全直呼：
 /// let mut j = JsonlJournal::<Action, State>::create("journal.jsonl")?;
-/// j.append_action(&Action { id: 1 })?; // 先落盘：Err ⇒ 禁 apply（A 从参数推断）
+/// j.append_action(&Action { id: 1 })?; // 缓冲接受（非持久）：Err ⇒ 禁 apply（A 从参数推断）
 /// let _restored = j.restore_stream()?; // 全推断：Some((快照态, 增量回放)) 或 None
 /// j.append_snapshot(&State { count: 1 })?; // 周期位：flush+写快照行（S 由 Self 归一）
 /// j.flush()?; // 宿主停机序的 flush 位：解释器 close → 排空 idle → flush → drop
@@ -565,6 +575,8 @@ impl<A, S> JsonlJournal<A, S> {
 
     /// 显式冲刷（宿主停机序的 flush 位：解释器 close → 排空 idle → **flush** →
     /// drop——shutdown 前把 BufWriter 尾部落盘，读侧可见性=已 flush 前缀）。
+    /// 本方法即契约端口 [`skeleton::JournalPort::flush`] 的持久点语义（该实现
+    /// 直接转调本方法）。
     ///
     /// flush 末尾 `sync_all`（杠精盲审 2026-10-17）：裸 flush 只到 OS 页缓存，
     /// 掉电面「flush 点=持久点」不成立——同 crate atomic_write 有完整 fsync
@@ -970,7 +982,7 @@ where
         self.reject_if_poisoned()?;
         // 序列化先于任何字节落盘（#217 R2 有界 sink）：超限=快照未落盘、writer 健康。
         let line = tagged_line("s", state, self.max_record_bytes)?;
-        // flush 先行：快照行必须落在全部已 append action 之后（先落盘后 apply 的持久点纪律）。
+        // flush 先行：快照行必须落在全部已接受 action 的可见前缀之后（持久点纪律）。
         self.flush()?;
         let written = self.writer.write_all(&line);
         self.guard_io(written)?;
@@ -1021,12 +1033,17 @@ where
 
 /// 契约端口兑现：`skeleton::JournalPort`（零依赖端口，后端自换的稳定面）。
 ///
-/// 后端自换路径：宿主面向 `skeleton::JournalPort` 三方法编程，换后端=另实现
+/// 后端自换路径：宿主面向 `skeleton::JournalPort` 四方法编程，换后端=另实现
 /// 该端口（内存账本/SQLite/网络皆可，序列化词表自选）；本件为 JSONL 参考实现。
 /// 本 crate 的 [`Journal`] trait 是全功能面（[`Replay`] 懒回放逐行解析，
 /// 不物化 Vec）——宿主要增量流式恢复用 [`Journal`]，要端口可换性用
 /// `JournalPort`。端口同款关联类型化（批 6A）：`State` 被 `Self` 钉死，
 /// 端口方法直呼零标注。
+///
+/// **持久化边界**（#106 ①）：端口 [`skeleton::JournalPort::append`] 走缓冲接受
+/// （= [`Journal::append_action`]，`Ok` 不代表已持久）；端口
+/// [`skeleton::JournalPort::flush`] 转调固有 [`JsonlJournal::flush`]（BufWriter
+/// flush + `sync_all`）——调用方在 apply 前调它决定持久窗口（不逐条 fsync）。
 impl<A, S> skeleton::JournalPort<A> for JsonlJournal<A, S>
 where
     A: Serialize + DeserializeOwned,
@@ -1036,7 +1053,13 @@ where
     type State = S;
 
     fn append(&mut self, action: &A) -> Result<(), JournalError> {
+        // 缓冲接受（非持久）：端口 flush 才是持久点。
         self.append_action(action)
+    }
+
+    fn flush(&mut self) -> Result<(), JournalError> {
+        // 固有 `flush`：BufWriter flush + `sync_all`——端口持久点=同一语义。
+        JsonlJournal::flush(self)
     }
 
     fn persist_snapshot(&mut self, state: &S) -> Result<(), JournalError> {
@@ -1577,7 +1600,7 @@ mod tests {
 
     /// 顶层 `"t"` 为行 tag
     /// 保留键——payload 携带同层 `"t"` 时平铺成重复键，serde_json 后键覆盖前键，
-    /// replay 整行被当未知 tag 静默跳过（先落盘后 apply 契约下=真相源丢史）。
+    /// replay 整行被当未知 tag 静默跳过（账本契约下=真相源丢史）。
     /// fail-closed：append 即 Err(Serialize)，字节零落盘。触发形态常见：
     /// `#[serde(tag = "t")]` internally-tagged enum 或任意含顶层 t 字段的类型。
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1725,7 +1748,7 @@ mod tests {
     }
 
     /// 零覆盖 #11：snapshot() 序列化失败 → Err(Serialize) 且零字节落盘。
-    /// 契约：flush 先行已把存量 action 落盘（先落盘后 apply 的持久点纪律），
+    /// 契约：flush 先行已把存量 action 推过持久点（持久点纪律），
     /// 失败只发生在快照行写出前——账本保持一致前缀（版本头 + action 流），
     /// 无半行残迹。变异检出：先写后序列化的形态在此留残行，立即红。
     #[test]

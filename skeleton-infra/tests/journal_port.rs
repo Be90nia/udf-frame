@@ -73,6 +73,44 @@ fn journal_port_restore_three_shapes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #106 finding 1：端口 `append` = 缓冲接受（不是已持久）。未 `flush` 的记录
+/// 对同一文件的另一个读句柄不可见——不谎报已持久；端口 `flush` 后重开可读
+/// （进程级可见；`JsonlJournal` 的 flush 还含 `sync_all`）。
+#[test]
+fn port_append_is_buffered_until_flush() {
+    type Port = dyn JournalPort<Act, State = St, Err = skeleton_infra::journal::JournalError>;
+
+    let dir = case_dir("flush-boundary");
+    let path = dir.join("j.jsonl");
+    let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
+
+    Port::append(&mut j, &Act { id: 1 }).unwrap();
+    Port::append(&mut j, &Act { id: 2 }).unwrap();
+
+    // 未 flush：两条只在 64 KiB 写缓冲里——重开不得看见（append 不是已持久）。
+    let reader = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
+    assert_eq!(
+        reader.restore().unwrap(),
+        Restore::Empty,
+        "未 flush 的 append 对重开不可见（append=缓冲接受，非已持久）"
+    );
+    drop(reader);
+
+    Port::flush(&mut j).unwrap();
+
+    // flush 后：重开读到完整前缀——端口 flush 就是持久点。
+    let reopened = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
+    assert_eq!(
+        reopened.restore().unwrap(),
+        Restore::FromInitial(vec![Act { id: 1 }, Act { id: 2 }]),
+        "端口 flush 后重开可读"
+    );
+
+    drop(reopened);
+    drop(j);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// E0283/E0034 治理证明：两侧 trait 同屏 import，直呼（方法语法，零
 /// turbofish/零 UFCS/零 DynJournal 别名）编译通过——旧世界（实现层与端口
 /// 三同名方法）本用例在 `j.restore()` 处双候选拒编译；改名消重后每名唯一
