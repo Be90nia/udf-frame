@@ -218,6 +218,7 @@ impl Drop for PoolAuditTicket {
 mod pool_audit_ticket_drop_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn drop_contains_callback_panic_and_records_it_once() {
