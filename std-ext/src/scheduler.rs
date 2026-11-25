@@ -1716,6 +1716,10 @@ mod tests {
         struct ReentrantClock {
             mock: Arc<MockClock>,
             target: Mutex<Weak<Scheduler>>,
+            /// 锁内取样计数。**禁直接 panic**：判定窗口必须排除测试自身的持锁
+            /// 动作（`worker.join()` 会 `Scheduler::close()`，同持 state）——否则
+            /// worker 退出那一圈的锁外取样会被误判成回归（CI 实测红）。
+            under_lock: AtomicU64,
         }
 
         impl ReentrantClock {
@@ -1723,6 +1727,7 @@ mod tests {
                 Arc::new(Self {
                     mock,
                     target: Mutex::new(Weak::new()),
+                    under_lock: AtomicU64::new(0),
                 })
             }
         }
@@ -1732,9 +1737,7 @@ mod tests {
                 let weak = self.target.lock().expect("probe 目标调度器锁").clone();
                 if let Some(sched) = weak.upgrade() {
                     if let Err(TryLockError::WouldBlock) = sched.shared.state.try_lock() {
-                        panic!(
-                            "Clock 在 scheduler state mutex 内执行（issue#101 回归：重入自锁面）"
-                        );
+                        self.under_lock.fetch_add(1, AtomicOrd::SeqCst);
                     }
                     let _ = sched.is_closed();
                     let _ = sched.next_deadline();
@@ -1763,10 +1766,17 @@ mod tests {
             while sched.worker_passes() < 2 && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            // 判定窗口在此封口：join = close（测试线程持 state），其后的退出圈
+            // 取样不属被测的 park 路径。
+            let under_lock = clock.under_lock.load(AtomicOrd::SeqCst);
             worker.join(); // worker 侧 panic 原样重抛（fail-visible）
             assert!(
                 sched.worker_passes() >= 2,
                 "worker 应在取样处不自锁地跑过两圈"
+            );
+            assert_eq!(
+                under_lock, 0,
+                "Clock 在 scheduler state mutex 内执行（issue#101 回归）"
             );
         }
 
