@@ -24,7 +24,8 @@
 //! ```
 //!
 //! EnvFilter 解析失败 fail-visible：stderr 报非法语法与回退结果（配置错误
-//! 必须可见，禁静默降级成另一档级别）。
+//! 必须可见，禁静默降级成另一档级别；经同一 best-effort reporter，stderr
+//! 不可写时告警丢失但不 panic、不回退成另一档级别）。
 //!
 //! 零依赖纪律（同 text.rs/journal.rs/memgov.rs 先例）：thiserror 不入 manifest，
 //! 本件手写同形 `Display`/`Error` impl（文案与 thiserror 派生形态逐字一致），
@@ -43,9 +44,12 @@
 //! `skeleton::logpath` trait 文档示例），release 构建=
 //! `home_dir()/.<project_name>/log/`，home 不可解析=构造期显式 Err（禁静默
 //! 落 cwd）。[`FileSink`] 按日滚动 `log-YYYY-MM-DD.log` 纯追加（跨进程按行
-//! 交错安全，永不改名/截断），每行 flush；写失败=计数+stderr 一次告警+继续
-//!（禁 panic 拖垮业务、禁纯吞）。时间戳与文件名恒 UTC（std 无本地时区 API，
-//! chrono 依赖判否）。
+//! 交错安全，永不改名/截断），每行 flush；写失败=计数+一次告警+继续（禁
+//! panic 拖垮业务、禁纯吞）。告警走 [`SoftFailureReporter`]（默认
+//! [`StderrReporter`]，best-effort、禁 `eprintln!`——stderr 不可写时它会
+//! panic 或阻塞）；写/刷失败后当日落点按 [`FileSink`] 失败面阶梯降级
+//! （主文件 → 恢复文件 → 当日停写）。时间戳与文件名恒 UTC（std 无本地时区
+//! API，chrono 依赖判否）。
 //!
 //! 多通道扇出面（P1-10-a 前置件，拍板 2026-10-23；`log` feature）：固定三
 //! 通道 `Channel`（general/access/dns，封闭枚举=非法通道名在类型层不可
@@ -123,11 +127,13 @@ fn env_filter_or(default_level: log::LevelFilter) -> tracing_subscriber::EnvFilt
             Ok(filter) => filter,
             Err(err) => {
                 // fail-visible：RUST_LOG 写错不允许静默降级成另一档级别
-                eprintln!(
+                //（#143：告警走 best-effort reporter——stderr 坏掉时 eprintln!
+                // 会 panic，把「告警后回退」变成崩溃）。
+                StderrReporter.report(&format!(
                     "skeleton-infra::logx: RUST_LOG={spec:?} 语法非法（{err}）；\
                      回退默认过滤 `{}`+skeleton=off（框架域静默）",
                     default_level,
-                );
+                ));
                 fallback()
             }
         },
@@ -135,11 +141,11 @@ fn env_filter_or(default_level: log::LevelFilter) -> tracing_subscriber::EnvFilt
         Err(err) => {
             // fail-visible 对齐（审计吹毛）：非 Unicode 值同属「已设但不可
             // 解析」面，禁静默降级
-            eprintln!(
+            StderrReporter.report(&format!(
                 "skeleton-infra::logx: RUST_LOG 不可解析（{err}）；\
                  回退默认过滤 `{}`+skeleton=off（框架域静默）",
                 default_level,
-            );
+            ));
             fallback()
         }
     }
@@ -318,6 +324,47 @@ impl std::error::Error for LogInitError {
     }
 }
 
+/// 软失败诊断出口（#184/#143）：软路径上的告警是 **best-effort**——实现既不得
+/// panic，也不得无限期阻塞调用线程。`eprintln!`/`print!` 系列在 stderr 不可写
+/// 时 panic、在管道满时阻塞，软失败路径用它们等于把日志故障升级成业务故障。
+/// 实现方契约：
+///
+/// - **不 panic**：任何 IO 错误吞掉即可；
+/// - **有界**：单次尝试，不重试、不循环、不排队等待（实现方还应尽量不引入可
+///   无限期阻塞的操作；默认 [`StderrReporter`] 的残留见其文档）；
+/// - 报告可以丢失——[`FileSink::dropped_lines`] 才是权威计数面。
+///
+/// 注入入口 [`FileSink::with_reporter`]：测试用它模拟坏 stderr（断言软失败
+/// 路径不依赖 stderr 可写），宿主用它把诊断改道到自己的汇。
+pub trait SoftFailureReporter: std::fmt::Debug + Send + Sync {
+    /// 报告一条软失败诊断（不可失败、不可重试、不可上抛）。
+    fn report(&self, message: &str);
+}
+
+/// 默认出口：best-effort 写 stderr，一切错误忽略（#184 Round 2：最终错误路径
+/// 不得用 `eprintln!`——它自己会 panic）。
+///
+/// 有界性（诚实声明）：每次报告 = 单次持锁 + 单次写入的**常量工作量**——不重试、
+/// 不循环、不追加（`eprintln!` 的失败会 panic，且没有放弃点）。两点残留：
+///
+/// - stderr 锁不可非阻塞获取：本仓固定的 1.96.0 工具链上 `Stderr::try_lock`
+///   尚不可用（实测 E0599），故锁竞争时会等锁（std 的 stderr 锁只被别的
+///   stderr 写者短暂持有）；
+/// - stderr 管道满/下游停止读取时同步 `write` 仍可能阻塞——彻底非阻塞需后台写
+///   线程或改 fd 标志，两者都在本件非目标内。
+///
+/// 需要硬保证的宿主注入自己的 [`SoftFailureReporter`]（如只计数、把诊断交给
+/// 独立的可丢弃队列）。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StderrReporter;
+
+impl SoftFailureReporter for StderrReporter {
+    fn report(&self, message: &str) {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), "{message}");
+    }
+}
+
 /// 按日滚动的追加式文件日志汇（诊断面）。
 ///
 /// 跨进程并发安全（armor，std 文档逐条对表）：纯追加**永不改名/截断**——
@@ -326,9 +373,27 @@ impl std::error::Error for LogInitError {
 /// std 默认以 FILE_SHARE_READ|WRITE|DELETE 打开，不挡并发打开者。每次
 /// `write` 调用=一个落盘单元（fmt 层经 `format_line` 保证整行单调用）。
 ///
-/// 失败面（拍板）：写失败**不 panic、不上抛**——计数 + stderr 一次告警 +
-/// 继续（日志失败拖垮业务是反模式；纯吞禁——[`FileSink::dropped_lines`]
-/// 可观测）。恢复自然发生：下一行重走打开路径。
+/// 失败面（拍板 2026-10-17；#112/#184/#198 收紧）：写失败**不 panic、不上抛**
+/// ——计数 + 首行一次告警 + 继续（日志失败拖垮业务是反模式；纯吞禁——
+/// [`FileSink::dropped_lines`] 可观测）。两类失败分开处理：
+///
+/// - **打开失败**（目录缺失/权限/落点被占）：落点不变、`writer` 保持未打开，
+///   下一行重走打开路径——只重试新行，不追认上一行；
+/// - **写/刷失败**：该文件的记录边界已不可信（可能已落半行前缀）——句柄在
+///   锁内摘除、锁外析构（`BufWriter` 析构自带的 flush 属 std 行为，错误忽略）；
+///   退役即**放弃**该句柄：不补偿 flush、不重试上一行。当日主文件
+///   **poisoned 不再续写**，后续行改落 `log-YYYY-MM-DD.recovery.log`；恢复
+///   文件再写/刷失败则当日 fail-stop（后续行只计数，不再开新文件）。
+///
+/// 告警一律走 [`SoftFailureReporter`]（默认 [`StderrReporter`]）：best-effort、
+/// 单次尝试、不 panic（`eprintln!` 在 stderr 不可写时会 panic）。失败告警
+/// 仍只报首次；落点升级各有一次独立诊断（每日至多 2 条，非逐行），二者都不
+/// 计入 [`FileSink::dropped_lines`]。
+///
+/// **恢复 ≠ 记录原子性**：poison 后的文件尾部可能留半行前缀，本件**不截断**
+/// （日志文件跨进程共享，回截会删掉别的进程已追加的行）；恢复只保证「新行不
+/// 再接在半行后面」，不自动修复已有半行，也不保证跨进程记录原子性——需要逐
+/// 记录修复请按文件自建 framing/校验。
 ///
 /// 边缘语义（固有 fd 行为，非缺陷）：日志根被外部删除后，长命句柄的续行
 /// 写入已解除链接的文件（Windows share-delete/POSIX unlink 同构）——行入
@@ -358,29 +423,89 @@ pub struct FileSink {
     state: std::sync::Mutex<SinkState>,
     dropped: std::sync::atomic::AtomicU64,
     warned: std::sync::atomic::AtomicBool,
+    reporter: std::sync::Arc<dyn SoftFailureReporter>,
 }
 
-#[derive(Debug)]
+/// 当日落点的降级阶梯（#198：写/刷失败后禁用当前文件，禁原地续写）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// `log-YYYY-MM-DD.log`：正常态。
+    Main,
+    /// `log-YYYY-MM-DD.recovery.log`：主文件写/刷失败后的接管文件（append）。
+    Recovery,
+    /// 恢复文件也写/刷失败：当日 fail-stop，后续行只计数不落盘——禁续写边界
+    /// 不明的文件，禁每失败一次再造一个新文件。
+    Stopped,
+}
+
+impl Target {
+    /// 失败一次后的下一落点。
+    fn after_failure(self) -> Self {
+        match self {
+            Self::Main => Self::Recovery,
+            Self::Recovery | Self::Stopped => Self::Stopped,
+        }
+    }
+
+    /// 落点文件名（[`Target::Stopped`] 无落点）。
+    fn file_name(self, day: i64) -> Option<String> {
+        match self {
+            Self::Main => Some(day_file_name(day)),
+            Self::Recovery => Some(recovery_file_name(day)),
+            Self::Stopped => None,
+        }
+    }
+}
+
 struct SinkState {
-    /// 当前文件对应的 UTC 纪元日（换日即换文件）。
+    /// 当前落点对应的 UTC 纪元日（换日即重开主文件）。
     day: i64,
-    writer: Option<std::io::BufWriter<std::fs::File>>,
+    /// 当日落点阶梯。
+    target: Target,
+    /// 落点文件句柄；`None` = 待打开（首行/换日/上次打开失败）。
+    ///
+    /// 动态 `Write` 是 #198 要求的注入点：生产恒 `BufWriter<File>`，测试塞入
+    /// 半写/刷失败替身以钉死恢复行为。
+    writer: Option<Box<dyn std::io::Write + Send>>,
+}
+
+impl std::fmt::Debug for SinkState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 句柄不透明（dyn Write 无 Debug）：只报是否已打开。
+        f.debug_struct("SinkState")
+            .field("day", &self.day)
+            .field("target", &self.target)
+            .field("writer_open", &self.writer.is_some())
+            .finish()
+    }
 }
 
 impl FileSink {
     /// 建汇：立即递归创建根目录（配置错误在此显式失败，禁等到首行才爆）；
-    /// 文件按日懒开（无事件不落空文件）。
+    /// 文件按日懒开（无事件不落空文件）。诊断走默认 [`StderrReporter`]。
     pub fn new(root: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
+        Self::with_reporter(root, std::sync::Arc::new(StderrReporter))
+    }
+
+    /// 同 [`FileSink::new`]，诊断出口可注入：测试用它模拟坏 stderr（断言软失败
+    /// 路径不依赖 stderr 可写），宿主用它把软失败诊断改道到自己的汇。`reporter`
+    /// 须自守 [`SoftFailureReporter`] 的 no-panic/不阻塞契约（本件不替它兜底）。
+    pub fn with_reporter(
+        root: impl Into<std::path::PathBuf>,
+        reporter: std::sync::Arc<dyn SoftFailureReporter>,
+    ) -> std::io::Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         Ok(Self {
             root,
             state: std::sync::Mutex::new(SinkState {
                 day: i64::MIN,
+                target: Target::Main,
                 writer: None,
             }),
             dropped: std::sync::atomic::AtomicU64::new(0),
             warned: std::sync::atomic::AtomicBool::new(false),
+            reporter,
         })
     }
 
@@ -399,21 +524,22 @@ impl FileSink {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     + 1;
                 if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!(
+                    self.reporter.report(&format!(
                         "skeleton-infra::logx: log file write failed (root={}, \
                          error={err}); dropped lines so far: {dropped} — \
                          application keeps running",
                         self.root.display(),
-                    );
+                    ));
                 }
                 buf.len()
             }
         }
     }
 
-    /// 单次落盘：换日（或首行）→ 递归建根 + 打开 `log-YYYY-MM-DD.log`
-    /// （追加）；整行一次 write_all + flush（每行 flush 拍板）。锁内串行
-    /// =单进程行完整。
+    /// 单次落盘：换日（或首行/上次打开失败）→ 递归建根 + 打开当前落点文件
+    /// （追加）；整行一次 write_all + flush（每行 flush 拍板）。锁内串行=进程
+    /// 内行完整；锁外只做两件慢事——析构退役句柄（`BufWriter::drop` 会 flush）
+    /// 与报告诊断（可能写 stderr），故告警/析构阻塞都不占状态锁。
     fn try_write_line(&self, now: std::time::SystemTime, buf: &[u8]) -> std::io::Result<()> {
         let day = utc_epoch_days(now);
         let mut state = self
@@ -422,27 +548,49 @@ impl FileSink {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.writer.is_none() || state.day != day {
             std::fs::create_dir_all(&self.root)?;
-            let path = self.root.join(day_file_name(day));
             let file = std::fs::OpenOptions::new()
                 .append(true)
                 .create(true)
                 .open(&path)?;
-            state.writer = Some(std::io::BufWriter::new(file));
-            state.day = day;
+            state.writer = Some(Box::new(std::io::BufWriter::new(file)));
         }
         // ponytail: 极端跨进程竞争下行仍可能按 write() 边界交错（常规文件
         // 单次几 KiB 写实际恒整写）；进程内由 Mutex 保证行完整。若未来出现
         // 真实交错现场，升级=绕过 BufWriter 每行单 write 系统调用直写。
-        let writer = state.writer.as_mut().expect("writer opened above");
-        std::io::Write::write_all(writer, buf)?;
-        std::io::Write::flush(writer)
+        let write_result = {
+            let writer = state.writer.as_mut().expect("writer opened above");
+            std::io::Write::write_all(writer, buf).and_then(|()| std::io::Write::flush(writer))
+        };
+        match write_result {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // 记录边界已不可信：句柄退役、当日落点降级，绝不原地续写。
+                retired.extend(state.writer.take());
+                let poisoned = self
+                    .root
+                    .join(state.target.file_name(day).expect("not Stopped"))
+                    .display()
+                    .to_string();
+                let next = state.target.after_failure();
+                let destination = match next.file_name(day) {
+                    Some(name) => self.root.join(name).display().to_string(),
+                    None => "no file (UTC day fail-stopped)".to_string(),
+                };
+                *notice = Some(format!(
+                    "skeleton-infra::logx: retiring log file {poisoned} after write/flush \
+                     error ({err}); subsequent lines for UTC day {day} go to {destination}"
+                ));
+                state.target = next;
+                Err(err)
+            }
+        }
     }
 }
 
 impl std::io::Write for FileSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // 软失败面：恒 Ok（丢弃走计数+stderr；io 层 Err 会被 fmt 层吞掉，
-        // 在这里截住才有可观测计数）。
+        // 软失败面：恒 Ok（丢弃走计数 + reporter 告警；io 层 Err 会被 fmt 层
+        // 吞掉，在这里截住才有可观测计数）。
         Ok(self.write_line_soft(buf))
     }
 
@@ -901,6 +1049,13 @@ fn day_file_name(day: i64) -> String {
     format!("log-{y:04}-{m:02}-{d:02}.log")
 }
 
+/// 恢复文件名：主文件写/刷失败后接管的同日文件（#198）。新文件而非续写主
+/// 文件——主文件尾部可能留半行前缀，续写会把新行接在半行后面。
+fn recovery_file_name(day: i64) -> String {
+    let (y, m, d) = civil_from_days(day);
+    format!("log-{y:04}-{m:02}-{d:02}.recovery.log")
+}
+
 /// 默认行格式（拍板）：`[UTC 时间 LEVEL target] message key=value ...`。
 /// 整行先合成单 String 再一次写出——fmt 层的多段写会被 FileSink 视作多个
 /// 落盘单元（行破碎），单写是行完整性的实现侧前提。以本地单元结构实现
@@ -1161,6 +1316,104 @@ mod file_sink_tests {
         temp_dir_in(&base, &format!("logx-{tag}-")).expect("scratch under target/")
     }
 
+    /// 记录型 reporter：断言「首行一次告警」与落点降级诊断的可达性（#184）。
+    #[derive(Debug, Default)]
+    struct RecordingReporter(std::sync::Mutex<Vec<String>>);
+
+    impl RecordingReporter {
+        fn messages(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl SoftFailureReporter for RecordingReporter {
+        fn report(&self, message: &str) {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(message.to_string());
+        }
+    }
+
+    /// 静默 reporter：模拟坏 stderr（诊断全丢）——软失败契约不得依赖它成功。
+    #[derive(Debug, Default)]
+    struct SilentReporter;
+
+    impl SoftFailureReporter for SilentReporter {
+        fn report(&self, _message: &str) {}
+    }
+
+    /// 注入替身故障面（#198 要求可模拟「半写后报错」与「flush 报错」）。
+    #[derive(Clone, Copy)]
+    enum Fault {
+        /// 写入半行即报错：记录边界不确定。
+        PartialWrite,
+        /// 整行写入成功、flush 报错。
+        Flush,
+        /// 恢复文件也立即写失败：当日应落 fail-stop。
+        AlwaysWrite,
+    }
+
+    struct FaultyWriter {
+        file: std::fs::File,
+        fault: Fault,
+    }
+
+    impl std::io::Write for FaultyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self.fault {
+                Fault::Flush => self.file.write(buf),
+                Fault::PartialWrite => {
+                    let half = buf.len() / 2;
+                    self.file.write_all(&buf[..half])?;
+                    Err(std::io::Error::other("injected partial write failure"))
+                }
+                Fault::AlwaysWrite => Err(std::io::Error::other("injected write failure")),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            match self.fault {
+                Fault::Flush => Err(std::io::Error::other("injected flush failure")),
+                Fault::PartialWrite | Fault::AlwaysWrite => self.file.flush(),
+            }
+        }
+    }
+
+    /// 装作「当日落点句柄已打开、下一次写失败」：把替身塞进锁内状态。
+    fn install_writer(
+        sink: &FileSink,
+        day: i64,
+        target: Target,
+        path: &std::path::Path,
+        fault: Fault,
+    ) {
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .expect("faulty writer backing file");
+        let mut state = sink
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.day = day;
+        state.target = target;
+        state.writer = Some(Box::new(FaultyWriter { file, fault }));
+    }
+
+    /// 当日 scratch 根下的文件数（断言 fail-stop 不造新文件）。
+    fn file_count(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root)
+            .expect("log root readable")
+            .map(|e| e.expect("dir entry"))
+            .filter(|e| e.path().is_file())
+            .count()
+    }
+
     // 民用日期转换：纪元锚+闰年（手工计数交叉验证——2000 世纪闰走算法的
     // /36_524 修正臂，必须钉死）。
     #[test]
@@ -1190,6 +1443,8 @@ mod file_sink_tests {
     fn day_file_name_matches_utc_date() {
         assert_eq!(day_file_name(0), "log-1970-01-01.log");
         assert_eq!(day_file_name(20_743), "log-2026-10-17.log");
+        assert_eq!(recovery_file_name(0), "log-1970-01-01.recovery.log");
+        assert_eq!(recovery_file_name(20_743), "log-2026-10-17.recovery.log");
     }
 
     // release 布局纯函数（env 无关面；env 粘合面在 tests/log_file.rs --release）。
@@ -1234,8 +1489,8 @@ mod file_sink_tests {
         assert_eq!(sink.dropped_lines(), 0);
     }
 
-    // 软失败面：落点被文件占住 → 丢弃计数增长且不 panic（stderr 一次告警为
-    // 进程副作用，以计数器为断言面）；落点恢复 → 后续行自然落盘，计数停涨。
+    // 软失败面：落点被文件占住 → 丢弃计数增长且不 panic（告警走注入 reporter，
+    // 以计数器与 reporter 记录为断言面）；落点恢复 → 后续行自然落盘，计数停涨。
     #[test]
     fn write_failure_counts_warns_once_and_recovers() {
         use std::io::Write as _;
@@ -1243,26 +1498,36 @@ mod file_sink_tests {
         let root = scratch.path().join("blocked");
         std::fs::write(&root, b"x").expect("placeholder file at root path");
 
-        // 绕过 new()（其对被占根显式失败）直接构造，模拟「建汇成功后落点被占」。
+        // 绕过 with_reporter()（其对被占根显式失败）直接构造，模拟「建汇成功后
+        // 落点被占」。
+        let reporter = std::sync::Arc::new(RecordingReporter::default());
         let mut sink = FileSink {
             root: root.clone(),
             state: std::sync::Mutex::new(SinkState {
                 day: i64::MIN,
+                target: Target::Main,
                 writer: None,
             }),
             dropped: std::sync::atomic::AtomicU64::new(0),
             warned: std::sync::atomic::AtomicBool::new(false),
+            reporter: reporter.clone(),
         };
 
         sink.write_all(b"lost-1\n").expect("soft path never errs");
         sink.write_all(b"lost-2\n").expect("soft path never errs");
         assert_eq!(sink.dropped_lines(), 2);
+        assert_eq!(
+            reporter.messages().len(),
+            1,
+            "首行一次告警（one-warning 策略不变）"
+        );
 
         // 落点恢复（文件→目录）→ 第三行自然落盘，计数停涨。
         std::fs::remove_file(&root).expect("unblock");
         std::fs::create_dir_all(&root).expect("restore dir");
         sink.write_all(b"ok\n").expect("soft path never errs");
         assert_eq!(sink.dropped_lines(), 2);
+        assert_eq!(reporter.messages().len(), 1, "恢复后不再告警");
         let today = day_file_name(utc_epoch_days(SystemTime::now()));
         assert_eq!(
             std::fs::read_to_string(root.join(today)).expect("file"),
