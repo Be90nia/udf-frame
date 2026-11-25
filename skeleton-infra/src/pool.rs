@@ -1076,7 +1076,10 @@ struct ReservationGuard {
 
 impl ReservationGuard {
     fn new(shared: Arc<Shared>) -> Self {
-        Self { shared, armed: true }
+        Self {
+            shared,
+            armed: true,
+        }
     }
 
     fn disarm(&mut self) {
@@ -1385,9 +1388,8 @@ impl<G: SpawnGate> ThreadPool<G> {
             }
             // ② 锁外：OS 线程创建 + 创建闸裁决（禁持调度锁跨创建/跨用户闸门）。
             for (index, worker_id) in ids.iter().enumerate() {
-                let attempt = catch_unwind(AssertUnwindSafe(|| {
-                    self.create_worker(None, *worker_id)
-                }));
+                let attempt =
+                    catch_unwind(AssertUnwindSafe(|| self.create_worker(None, *worker_id)));
                 let failure = match attempt {
                     Ok(Ok(())) => None,
                     Ok(Err(failure)) => Some(failure.error),
@@ -1609,9 +1611,8 @@ impl<G: SpawnGate> ThreadPool<G> {
                 if start_tx.send(()).is_err() {
                     // Defensive path: the receiver should still be waiting. If it has
                     // disappeared, undo the now-live worker count and return its task.
-                    let mut task_guard = slot
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut task_guard =
+                        slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let task = task_guard.take();
                     drop(task_guard);
                     {
@@ -2163,7 +2164,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod reservation_handoff_regressions {
     use super::*;
@@ -2258,7 +2258,10 @@ mod reservation_handoff_regressions {
         let pool = Arc::new(ThreadPool::new(ThreadPoolTuning::new(1, 2, 8)));
         let deadline = std::time::Instant::now() + HANDOFF;
         while pool.shared.worker_loop_entries.load(Ordering::SeqCst) != 1 {
-            assert!(std::time::Instant::now() < deadline, "initial worker did not start");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "initial worker did not start"
+            );
             thread::yield_now();
         }
 
@@ -2270,11 +2273,11 @@ mod reservation_handoff_regressions {
         });
 
         let resize_pool = Arc::clone(&pool);
-        let resize = thread::spawn(move || {
-            resize_pool.resize(ThreadPoolTuning::new(2, 2, 8))
-        });
+        let resize = thread::spawn(move || resize_pool.resize(ThreadPoolTuning::new(2, 2, 8)));
         assert_eq!(
-            entered_rx.recv_timeout(HANDOFF).expect("spawn reached handoff"),
+            entered_rx
+                .recv_timeout(HANDOFF)
+                .expect("spawn reached handoff"),
             1
         );
         assert_eq!(
@@ -2292,7 +2295,10 @@ mod reservation_handoff_regressions {
         });
 
         release_tx.send(()).expect("release startup handoff");
-        resize.join().expect("resize thread").expect("resize succeeds");
+        resize
+            .join()
+            .expect("resize thread")
+            .expect("resize succeeds");
         joined_rx
             .recv_timeout(HANDOFF)
             .expect("join waits for committed worker to observe shutdown and retire");
