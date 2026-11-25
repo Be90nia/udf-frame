@@ -4,6 +4,32 @@
 
 ## [Unreleased]
 
+### Fix(telemetry): backoff 纯性与各域事件后置、fx 成因/自停机、测试看门狗 abort（#200/#201/#202/#204/#205/#206/#133）
+- `backoff_delay` 不再发事件（纯算术、零时钟零随机零回调）；观测上移到 `retry` 的 verdict/backoff 事件（仍含 attempt/base_ms/max_ms/backoff_ms）。
+- retry / ratelimit / process_results / fx 的事件全部后置到动作、结果或睡眠之后：订阅者 panic 不再改变尝试次数、typed 错误、睡眠量与限流结果。**剩余限制**：阻塞型订阅者仍可推迟该事件点之后的时间线（已写进各模块文档）。
+- `FxScope`：`shutdown`/`shutdown_timeout` 在**本 scope 的托管任务**内调用 ⇒ 在 `begin_drain` 之前 fail-fast panic（不再自作 owner 后被自己的 abort 取消）；托管任务 panic 的 warn 诊断在结果成形之后发，不再顶替 `Panicked` 成因。
+- 测试看门狗 `DeadlineGuard`：诊断写出改可失败 `writeln!` + `catch_unwind`，随后**无条件** `abort()`（stderr 坏掉不再绕过进程级终止）。
+
+### Fix(fsx): TempDir 私有目录/前缀校验、atomic_write 显式策略与临时件所有权、copy_tree 拒绝链接根（#215/#216/#120/#134/#182/#207）
+- `temp_dir_in` 返回 `Result<TempDir, TempDirError>`（`From<TempDirError> for io::Error` 使既有 `?` 调用点零改动）；Unix 新建 0700；`prefix` 必须是单个普通路径组件（空串合法，`/`、`\`、`.`、`..`、绝对/盘符/UNC 前缀 ⇒ `InvalidPrefix`，拒绝后零残留）。
+- `atomic_write_with(path, bytes, AtomicWritePolicy::{Inherit,Private,PreserveExisting})`；`atomic_write` 保持 `Inherit`（既有行为零改动）；`Private` 在写首字节前建 0600（Windows 仅父目录 ACL，不宣称私有）。
+- 临时件只在 `create_new` 成功后承认所有权：撞名/失败不删预置路径，错误路径只清本次创建的那一条。
+- `copy_tree` 源根为符号链接 ⇒ `Prepare(InvalidInput)`（两策略同面，`dst` 不创建）；Windows 只读树清理改显式工作栈迭代（不再递归）。
+- `ConfigFile::save`/`save_toml` 默认走 `AtomicWritePolicy::Private`（Unix 落盘 0600）。
+
+### Fix(paths/logx): 家锚绝对性、project_name 校验、原生大小写折叠、日志私有权限与 init 清理归属（#179/#175/#113/#111/#180/#130）
+- `paths::home_dir()` 结果恒绝对或 `None`；`resolve_xdg_dir` 自身再校验 home 绝对性（相对锚 fail closed）。
+- `DefaultPathResolver::new` 返回 `Result<Self, LogPathError>`（`HomeUnresolvable` / `InvalidProjectName`）；`project_name` 必须是单个 `Normal` 组件（debug/release 同判）。
+- 大小写不敏感 containment 改原生单元折叠（Unix 字节 / Windows UTF-16 码元），不再经 `to_string_lossy`（不同非法编码不再因 U+FFFD 判等）。
+- `FileSink`：Unix 新建根 0700、日文件 0600；既有非私有根/文件拒绝（不静默 chmod）；`init_with_file` 失败只回收本次新建的空根。
+
+### Fix(scheduler/shutdown): 取消代数扫描纪元、fire 事件时序、停机诊断顺序、有限超时饱和、Subscription teardown 契约（#109/#123/#194/#121/#193/#122/#137）
+- 调度器墓碑记账改「单调取消代数 + 扫描纪元」：取消仍 O(1)，压缩按代数差触发锁内扫堆数真实 cancelled 条目，扫描纪元锁内发布（不再清零、自然弹出不递减）；容量上限仍由 CAS 闸门精确管理。
+- `fire` 的 debug 事件移到回调执行/终态裁决之后（不再插在出堆与回调之间）；补 panic-subscriber 回归测试。
+- `ShutdownCoordinator`：注册事件与整体报告事件都在提交/唤醒/放锁之后发（订阅器 panic 不再滞留终态或阻塞并发叫者）。
+- `close_wait_timeout` 的 deadline 溢出饱和到可表示最远点（`WaitDeadline::{Forever,Until}` 类型区分，有限超时恒有限）。
+- `Subscription`：Drop 面 `catch_unwind` contain + `subscription_teardown_panic_count()`；新增显式 `unsubscribe() -> Result<(), Box<dyn Any + Send>>`（原始 panic 载荷交调用方）；契约文档写明 Drop 回调必须不 panic、不阻塞、不等待在途工作。
+
 ### Fix(drop): LeakGuard::drop 与 TaskHandle::drop 不再触发宿主回调（issue#183/#143 残留）
 - `LeakGuard::drop` 不再 `eprintln!`（stderr 不可写会 panic）：改 best-effort 可失败写入并忽略错误；类型文档删掉「panic-in-drop 会被吞」的错误声明。
 - `TaskHandle::drop` 改为静默取消：取消语义（CAS/墓碑/notify）不变，但析构路径不再同步调用宿主 tracing subscriber（#221 §2.5）；显式 `cancel()` 仍发 `skeleton::scheduler::cancel` 事件。

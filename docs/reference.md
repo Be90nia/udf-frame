@@ -28,7 +28,7 @@
 | `log-fs` | 零依赖 | — | `logx` 文件落盘面：密钥掩码/路径解析（契约 `LogPathResolver` 住 `skeleton::logpath`）/`FileSink` 按日滚动——单开即可用文件日志 |
 | `log` | `log-fs` + log, tracing, tracing-subscriber, tracing-log | — | `logx` 门面绑定层：init 系（EnvFilter/双 sink）+ `FileSinkWriter` |
 | `tracing` | `runtime` + tracing, tracing-subscriber | — | `tracingx`：审计事件流 → tracing 桥 |
-| `log-embed` | tracing | — | 埋点：skeleton-infra=shutdown 一域 6 + fx 一域 1 = 7 点；std-ext 自有同款 feature=七域 48 点（合计九域 55；计数口径见 [log-embed 段](#log-embed--埋点规范)；默认关=宏消除零依赖零开销） |
+| `log-embed` | tracing | — | 埋点：skeleton-infra=shutdown 一域 6 + fx 一域 1 = 7 点；std-ext 自有同款 feature=七域 47 点（合计九域 54；计数口径见 [log-embed 段](#log-embed--埋点规范)；默认关=宏消除零依赖零开销） |
 | `compose` | `runtime` | — | `combine`/`combine!` 父子分片组合器（`compose = ["runtime"]`：单开连带 runtime，零三方成本） |
 | `config-json` | serde, serde_json | — | `ConfigFile` 分层装配 + 原子保存（serde_json::Value 统一值面） |
 | `config-toml` | `config-json` + toml | — | `load_toml`/`save_toml` + `file_layer_toml`（TOML↔值面翻译） |
@@ -61,7 +61,7 @@
 | shutdown | 常驻 | 跨组件优雅停机编排器 | [`shutdown`](#shutdown--停机编排) |
 | ratelimit | 常驻 | 令牌桶限流（突发+恒速回填） | [`ratelimit`](#ratelimit--令牌桶) |
 | cache | 常驻 | LRU+TTL 缓存（O(1) arena 双向链） | [`cache`](#cache--lruttl-缓存) |
-| fsx | 常驻 | 文件系统受控子集（walk/copy/rm/tempdir/atomic_write） | [`fsx`](#fsx--文件系统受控子集) |
+| fsx | 常驻 | 文件系统受控子集（walk/copy/rm/tempdir/atomic_write/atomic_write_with） | [`fsx`](#fsx--文件系统受控子集) |
 | encode | 常驻 | hex/base64/BOM/UTF-16 编解码 | [`encode`](#encode--编解码) |
 | id | 常驻 | UUIDv7 确定性变体时间有序 id | [`id`](#id--时间有序-id) |
 | iter | 常驻 | 迭代器扩展精选（itertools 语义子集 5 件） | [`iter`](#iter--迭代器扩展) |
@@ -180,7 +180,7 @@ pub enum AdmissionOutcome {
 | `ActionSender::dispatch` | 返回 `false`（`#[must_use]` 兜底） | 同一计数 |
 | `subscribe` / `subscribe_local` | 照常登记、票据照常注销，但永无触发——通知静默（已知取舍；需要显式拒绝面时用 `try_subscribe`，闭门后返回 `Err(StoreClosed)`） | 计入 `subscriptions_after_close`；`subscriber_count` 可交叉查证 |
 
-**停机等待（#64）**：`close()` 是 **best-effort**——静默态（本调用夺得排空租约）同步排至 idle；**竞争态**（他线程已持租约）只完成交接即返，返回时排空可能仍在进行。要「等静止」用 `close_wait()` / `close_wait_timeout(d)`，结果 `Drained` / `TimedOutStillRunning` / `Reentrant`（同栈重入不自等）。谓词 = 租约释放 + 活跃队列空，**不计 deferred 停放记录**（#49 口径）；timeout 只界等待、不取消同步 reducer。宿主要真屏障（flush/drop 依赖前）用此等待面，勿依赖 `close()` 的返回时机。
+**停机等待（#64）**：`close()` 是 **best-effort**——静默态（本调用夺得排空租约）同步排至 idle；**竞争态**（他线程已持租约）只完成交接即返，返回时排空可能仍在进行。要「等静止」用 `close_wait()` / `close_wait_timeout(d)`，结果 `Drained` / `TimedOutStillRunning` / `Reentrant`（同栈重入不自等）。谓词 = 租约释放 + 活跃队列空，**不计 deferred 停放记录**（#49 口径）；timeout 只界等待、不取消同步 reducer。**有限超时恒有限**（#122）：deadline 算术溢出时饱和到可表示的最远截止，不退化成无界等待。宿主要真屏障（flush/drop 依赖前）用此等待面，勿依赖 `close()` 的返回时机。
 
 **完成账本的复用边界（#84）**：账本进复用池**只在终局发布（`root_done && outstanding == 0`）且指定 owner 让渡之后**——非等待型根（`try_dispatch` / `ActionSender::dispatch`）的 owner 是它的**因果链**：`finish_root` / 最后一个 `descendant_done` / `detach_deferred` 三个转移点各尝试一次 claim（恰好一次入池）；等待型根的 owner 是**外部等待者**，它在 `wait()` 克隆并返回 `Outcome` 之后才归还。`Arc<Ledger>` 克隆可随在途后代存活到全部结算；`reset` 只在「终局 + `outstanding == 0` + 已 claim 归还」三不变式下执行（debug 构建断言兜底）。⇒ **不同根的收据记账永不交叉**（此前可提前入池并被 `reset` 擦掉在途后代计数）。
 
@@ -1085,7 +1085,7 @@ pub struct NotInside { pub base: PathBuf, pub path: PathBuf }
 ### 家目录与 XDG（env 解析面，零 IO——不创建目录）
 
 ```rust
-pub fn home_dir() -> Option<PathBuf>;    // std::env::home_dir 直包
+pub fn home_dir() -> Option<PathBuf>;    // 结果恒绝对或 None（相对锚 fail closed，#179）
 pub fn config_dir() -> Option<PathBuf>;  // $XDG_CONFIG_HOME（绝对）→ $HOME/.config
 pub fn cache_dir() -> Option<PathBuf>;   // $XDG_CACHE_HOME（绝对）→ $HOME/.cache
 pub fn data_dir() -> Option<PathBuf>;    // $XDG_DATA_HOME（绝对）→ $HOME/.local/share
@@ -1246,7 +1246,8 @@ pub enum AdmissionError { Closed, Full }   // #58：拒绝原因（Full = 容量
 - **丢弃 WorkerHandle = 只停该 worker**（#72，维护者 03:59 定稿；旧「关闸不 join」形态已废止）：句柄持 `Arc<AtomicBool>` 停信标，Drop 在状态锁内置位 + `notify_all`（置位持锁、判定持锁 ⇒ 无丢唤醒）；**调度器不关闸**，其他 worker 与既有登记照常。`join` 仍是显式 scheduler-wide 停机。drop **不 join**（句柄可能在 worker 自身回调内被 drop ⇒ 自等死锁）⇒ 不确认线程终止、不传播 worker panic。**无 worker 态**：全部句柄丢弃而调度器仍开 ⇒ 注册继续入堆但不点火，直到再起 worker 或 `close()`。
 - **惰性墓碑**：cancel 不摘堆（O(1)），死亡条目到点弹出时摘除——远期取消的墓碑多醒一拍（语义正确，代价一次空醒）。
 - **有界准入**（#58）：`capacity` 默认 **0 = 无界**⇒ 既有行为零变化；**不预设**有界默认值（#56 第二消费方验证前不盲设）。触顶时 legacy `after`/`every` **panic**（fail-visible；返回 `Err(Closed)` 会撒谎），typed 面用 `try_after`/`try_every` 返回 `AdmissionError::Full` 且**无部分插入**。活跃注册数口径 = 堆内待执行条目 **+ 执行中周期任务**（后者仍可能重臂）——**不等同 `heap.len()`**（墓碑不计入）。额度**恰好一次**释放：一次性点火终态、周期任务取消·关闸·panic 四条退役路径共用单一 CAS 闸门（赢家释放）。取消仍 **O(1)**（零锁零扫堆）；容量检查与计数同在状态锁内 ⇒ 并发注册不越上界；被拒回调**不入堆**，其捕获在堆锁外析构。
-- **远期取消条目提前回收**（#52）：取消路径仍 O(1)（弱引用记账 + 墓碑计数）；**清扫独立触发**（不在 cancel 路径），按绝对下限 16 / 比例阈值 4 在状态锁内重建堆只留 PENDING 条目，被摘条目**移出锁外**析构。取消 earliest-deadline 时通知驱动并**重算 park 锚**——驱动不再为堆顶墓碑空醒一拍。**执行语义零变化**：已出堆检查-执行窗口内落地的取消仍不可撤、仍照跑。墓碑计数为近似量（清扫期间落地的取消会漂移，良性——额度上限由 CAS 闸门精确管理）。
+- **远期取消条目提前回收**（#52；#109/#123 改为扫描纪元）：取消路径仍 O(1)——**成功取消只递增单调取消代数**（不取堆锁、不扫堆、无计数递减）；**清扫仍独立触发**（不在 cancel 路径），触发面 = 代数差达下限 ⇒ 在状态锁内**扫堆数真实 cancelled 条目**，同时满足绝对下限 16 与比例阈值 4 才重建（只留 PENDING 条目），被摘条目**移出锁外**析构；扫描到的代数**锁内发布**（落后的取消必然促成下一次扫描，不会被「清零」抹掉；自然弹出也不递减）。取消 earliest-deadline 时通知驱动并**重算 park 锚**——驱动不再为堆顶墓碑空醒一拍。**执行语义零变化**：已出堆检查-执行窗口内落地的取消仍不可撤、仍照跑。额度上限仍由 CAS 闸门精确管理——代数只作扫描触发，**不再声称是精确居留墓碑数**。
+- **fire 事件时序（#194）**：`fire` 的 debug 事件在回调执行/终态裁决之后发（不再插在「出堆 → 回调」之间），语义是「已执行」而非「开始执行」。
 - 溢出 fail-closed：注册/重臂恒 `checked_add`；重入安全：点火在堆锁外——回调内 after/every/cancel/close 合法。
 
 ```rust
@@ -1532,21 +1533,31 @@ pub enum CopyError {
 pub fn rm_all(path: impl AsRef<Path>) -> Result<(), RmError>;
 pub struct RmError { pub path: PathBuf, pub err: io::Error }
 
-pub fn temp_dir_in(root: impl AsRef<Path>, prefix: &str) -> io::Result<TempDir>;
+pub fn temp_dir_in(root: impl AsRef<Path>, prefix: &str) -> Result<TempDir, TempDirError>;
+
+/// 临时目录创建失败（#182）：前缀非法与 IO 失败显式分立
+pub enum TempDirError {
+    InvalidPrefix { prefix: String, reason: &'static str },
+    Io(io::Error),
+}
+// impl From<TempDirError> for io::Error ⇒ 既有 io::Result 调用点 `?` 零改动
+
 pub struct TempDir { /* … */ }
 impl TempDir {
     pub fn path(&self) -> &Path;
-    pub fn close(self) -> io::Result<()>;   // 显式清理（Drop 为兜底，错误只记录）
+    pub fn close(self) -> io::Result<()>;   // 显式清理（Drop 为兜底，best-effort stderr 报告）
 }
-impl Drop for TempDir { /* rm_all；失败 fail-visible 记 stderr */ }
+impl Drop for TempDir { /* rm_all；失败只走 best-effort stderr，不发事件（#221 §6） */ }
 
-pub fn atomic_write(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()>;  // fsx::atomic
+pub fn atomic_write(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()>;  // fsx::atomic = Inherit
+pub enum AtomicWritePolicy { Inherit, Private, PreserveExisting }
+pub fn atomic_write_with(path: impl AsRef<Path>, bytes: &[u8], policy: AtomicWritePolicy) -> io::Result<()>;
 ```
 
-- `copy_tree`：`dst` 必须不存在（create_dir 独占语义）；首错即停，已处理量以计数显式申报（禁静默半途）；遍历按文件名排序——报错点确定可复现；文件复制=`fs::copy` 本体语义（权限保留，时间戳不承诺）。
+- `copy_tree`：`dst` 必须不存在（create_dir 独占语义）；首错即停，已处理量以计数显式申报（禁静默半途）；遍历按文件名排序——报错点确定可复现；文件复制=`fs::copy` 本体语义（权限保留，时间戳不承诺）。**源根是符号链接 ⇒ `Prepare(InvalidInput)`**（`Follow`/`Preserve` 同面，#120；`dst` 不创建，不再出现「链接根被当目录、返回 `Ok(dirs:1,files:0)`」的假成功）。
 - `rm_all`：引擎=std 硬化原语（CVE-2022-21658 防护+Windows DELETE_PENDING 等待）；加 Windows 只读属性装甲（首次 `PermissionDenied` 清只读后重试恰一轮，仍败原错误上浮）。Unix 只读目录 EACCES 属 OS 语义如实上浮（不自动 chmod）。
-- `temp_dir_in`：命名=前缀+pid+进程内原子序号+挂钟纳秒（同进程不撞/跨进程 pid 隔离/pid 回收由纳秒兜底）；创建走 `create_dir` 独占语义。落点由调用方给定（禁系统 TEMP，工作区内自选根）。`prefix` 按 `Path::join` 语义拼接，含 `..` 可越出 root（与 tempfile 同行为，调用方自负）。
-- `atomic_write`：同目录临时件（write+`sync_all`）→ rename 原子替换——读者恒见旧内容或新内容，恒无半写中间态。armor：**不先删旧**（删旧引入目标缺失窗口毁掉原子性）；`to` 为已存在目录恒败；同目录临时件从根上排除跨分区 rename；错误路径自清临时件后以原错误上浮；父目录必须已存在（不隐式 mkdir）；新文件=umask 新建语义**不继承**原 mode/ACE；并发写同目标=最后赢（rename 原子线性化）。崩溃在 rename 前留 `atomic-{pid}-{seq}{nanos}` 临时件（可识别，手扫/启动扫）。
+- `temp_dir_in`：命名=前缀+pid+进程内原子序号+挂钟纳秒；创建走 `create_dir` 独占语义；**Unix 新建 0700**（umask 只能收窄），Windows 权限继承父目录 ACL（不宣称私有）。落点由调用方给定（禁系统 TEMP）。`prefix` 必须是**单个普通路径组件**：空串合法，含 `/`、`\`、`.`、`..`、绝对/盘符/UNC 前缀 ⇒ `TempDirError::InvalidPrefix`（拒绝后零残留，#182）。
+- `atomic_write` / `atomic_write_with`：同目录临时件（write+`sync_all`）→ rename 原子替换——读者恒见旧内容或新内容，恒无半写中间态。`atomic_write` = `Inherit`（umask 新建语义，**既有行为零改动**）；`atomic_write_with` 显式策略（#215）：`Private`（Unix 临时件建时即 0600、写首字节前生效；Windows 仅父目录 ACL 继承，**不宣称私有**）、`PreserveExisting`（Unix 以目标现有 mode 建临时件，`symlink_metadata` 不穿链接；目标缺失回落 `Inherit`；目标非普通文件 ⇒ `InvalidInput`；Windows ⇒ `Unsupported`）。**临时件所有权**（#216）：只在 `create_new` 成功后承认所有权，失败/撞名**不删**预置路径；错误路径只清本调用创建的那一条，清理失败不掩盖原错误。其余 armor 不变：**不先删旧**（删旧引入目标缺失窗口毁掉原子性）；`to` 为已存在目录恒败；同目录临时件从根上排除跨分区 rename；父目录必须已存在（不隐式 mkdir）；并发写同目标=最后赢（rename 原子线性化）。崩溃在 rename 前留 `atomic-{pid}-{seq}{nanos}` 临时件（可识别，手扫/启动扫）。
 
 ```rust
 use std_ext::fsx::{walk, Sort};
@@ -1936,7 +1947,7 @@ impl<C> Default for ConfigFile<C> { /* new() */ }
 
 **读入上限（#197/#127）**：`file_layer`/`file_layer_toml`/`load_toml` 三入口的读入受 `DEFAULT_MAX_FILE_BYTES`（8 MiB）约束，`ConfigFile::max_file_bytes` 逐实例覆盖（`load_toml` 是单文件自由函数，恒默认）；实现按「最多读 limit+1 字节」强制（metadata 只作提前拒绝优化），超限报 `ConfigError::File`（`source` 为 `ConfigFileTooLarge { limit, observed }`，路径在 `path`），**不截断、不部分接受**；上限只管读入字节，不约束解析后的值树规模与 `.layer()` 合并深度。
 
-`save` = Pretty 序列化 + [`fsx::atomic_write`](#fsx--文件系统受控子集)（崩溃安全）。**保存=全量重序列化**：注释与键序不保留（前置声明）；并发保存最后赢。serde_json 序列化语义如实声明：整数键映射被静默字符串化、非有限浮点被静默写 null——需挡这两类值的采用方自理。
+`save` / `save_toml` = Pretty 序列化 + [`fsx::atomic_write_with`](#fsx--文件系统受控子集)`(.., AtomicWritePolicy::Private)`（崩溃安全 + **Unix 落盘文件 0600**；Windows 仅父目录 ACL 继承，不宣称私有；#215）。**保存=全量重序列化**：注释与键序不保留（前置声明）；并发保存最后赢。serde_json 序列化语义如实声明：整数键映射被静默字符串化、非有限浮点被静默写 null——需挡这两类值的采用方自理。
 
 ### TOML 面（`config-toml`，叠在 config-json 上）
 
@@ -2433,7 +2444,11 @@ pub fn mask_secrets(input: &str, secrets: &[&str]) -> String;
 
 pub struct DefaultPathResolver { /* … */ }
 impl DefaultPathResolver {
-    pub fn new(project_name: impl Into<String>) -> Result<Self, HomeDirUnresolvable>;
+    pub fn new(project_name: impl Into<String>) -> Result<Self, LogPathError>;
+}
+pub enum LogPathError {
+    HomeUnresolvable(HomeDirUnresolvable),
+    InvalidProjectName { name: String, reason: &'static str },
 }
 impl skeleton::logpath::LogPathResolver for DefaultPathResolver { /* … */ }
 pub struct HomeDirUnresolvable;
@@ -2479,8 +2494,9 @@ pub struct AlreadyInit;
 - **EnvFilter 语义**：`init_tracing_from_env` 在 RUST_LOG 未设/非法时兜底恒为 `<default_level>,skeleton=off`（框架自身埋点默认静默，宿主日志零打扰）；RUST_LOG 已设且合法时逐字生效。解析失败 fail-visible：stderr 报非法语法与回退结果（禁静默降级成另一档级别）。三种开启姿势：`RUST_LOG=debug`（全开）/ `RUST_LOG=warn,skeleton::ratelimit=debug`（单域）/ `RUST_LOG=skeleton::scheduler=trace`（单流程）。
 - **桥接语义知情声明**：log 门面经 tracing-log 桥后事件 target="log"、原 target 降为 `log.target` 字段——`RUST_LOG=skeleton=debug` 不路由 log 门面行。初始化组合注记：只调 `try_init()`（其内部已含桥初始化），不得再显式 `LogTracer::init`（撞 log 单例恒 Err）。
 - `mask_secrets`：命中子串→`"***"`；按长度降序替换（最长优先防半掩）；空串项跳过；恒分配一次新 String。
-- **`DefaultPathResolver` 双构建默认根**：debug=编译期 `CARGO_MANIFEST_DIR`/log（框架自身开发态，零运行时猜测；采方开发态请注入自有 resolver）；release=`home_dir()/.<project_name>/log/`——release 恒不引用 CARGO_MANIFEST_DIR（开发者机器路径烧进发布物=隐私面）。home 构造期一次性解析，失败显式 Err（禁静默落 cwd）。
-- **`FileSink`**：按日滚动 `log-YYYY-MM-DD.log` 纯追加（跨进程按行交错安全，永不改名/截断），每行 flush。失败面（#112/#184/#198）：**打开失败**=落点不变、下一行重试（只重试新行，不追认上一行）；**写/刷失败**=句柄在锁内摘除、锁外析构，当日落点降级 `主文件 → log-YYYY-MM-DD.recovery.log → 当日停写（fail-stop）`，绝不原地续写可能带半行前缀的文件；`dropped_lines` 是权威计数面，告警走可注入的 `SoftFailureReporter`（默认 `StderrReporter`，best-effort、禁 `eprintln!`、首次一条）。**恢复 ≠ 记录原子性**：不截断、不自动修复半行（日志跨进程共享，回截会删掉别的进程已追加的行）。时间戳与文件名恒 UTC（std 无本地时区 API，chrono 判否）。`new` 立即递归创建根目录（配置错误显式失败，禁等到首行才爆）；文件按日懒开（无事件不落空文件）。默认行格式：`[UTC 时间 LEVEL target] message key=value ...`（整行先合成单 String 再一次写出=行完整性前提）。
+- **`DefaultPathResolver` 双构建默认根**：debug=编译期 `CARGO_MANIFEST_DIR`/log（框架自身开发态，零运行时猜测；采方开发态请注入自有 resolver）；release=`home_dir()/.<project_name>/log/`——release 恒不引用 CARGO_MANIFEST_DIR（开发者机器路径烧进发布物=隐私面）。home 构造期一次性解析，失败或**非绝对**显式 Err（`LogPathError::HomeUnresolvable`，禁静默落 cwd；#179）。
+- **`project_name` 语法（#175/#113）**：单个 `Normal` 路径组件（一个目录名，**不是**相对路径表达式）——非空、不含 `/` 与 `\`、不含 NUL/控制字符、不是 `.`/`..`、不是盘符/UNC 前缀；debug/release 同判，非法 ⇒ `Err(LogPathError::InvalidProjectName { name, reason })`（不静默清洗——清洗会把不同输入折叠到同一目录）。
+- **`FileSink`**：按日滚动 `log-YYYY-MM-DD.log` 纯追加（跨进程按行交错安全，永不改名/截断），每行 flush。失败面（#112/#184/#198）：**打开失败**=落点不变、下一行重试（只重试新行，不追认上一行）；**写/刷失败**=句柄在锁内摘除、锁外析构，当日落点降级 `主文件 → log-YYYY-MM-DD.recovery.log → 当日停写（fail-stop）`，绝不原地续写可能带半行前缀的文件；`dropped_lines` 是权威计数面，告警走可注入的 `SoftFailureReporter`（默认 `StderrReporter`，best-effort、禁 `eprintln!`、首次一条）。**恢复 ≠ 记录原子性**：不截断、不自动修复半行（日志跨进程共享，回截会删掉别的进程已追加的行）。时间戳与文件名恒 UTC（std 无本地时区 API，chrono 判否）。`new` 立即递归创建根目录（配置错误显式失败，禁等到首行才爆）；文件按日懒开（无事件不落空文件）。默认行格式：`[UTC 时间 LEVEL target] message key=value ...`（整行先合成单 String 再一次写出=行完整性前提）。**权限（#180）**：Unix 新建根 0700、日文件 0600（`mode` 独立于 umask）；**既有**根/文件带 group/other 位 ⇒ `PermissionDenied`（不静默 chmod 调用方路径）；Windows 无 POSIX 位，靠父目录 ACL 继承，**不宣称私有**。**init 失败收尾（#130）**：只回收**本次调用新建**的空根（归属由非递归 `create` 的 `AlreadyExists` 原子判定），既有根即使为空也保留。
 - **`init_with_file(resolver, default_level)`**：console+file 双 sink（同一默认行格式）；过滤语义同 `init_tracing_from_env`（恒含 `skeleton=off` 兜底）；本地资源（日志根目录）先建，任何配置错误在任何全局被触碰之前显式失败（`LogInitError::RootCreate`）。签名：
 
 ```rust
@@ -2642,9 +2658,9 @@ impl ViewBridge<S, A, M, I, J, R> {
 
 **feature**：`log-embed`（绑 tracing；**默认不开启**——埋点宏展开为空、tracing 依赖不进树，cargo tree 零 tracing 证明；`tracingx`/`logx` 桥不受本 feature 影响）。
 
-九域 55 调用点（`std-ext` 七域 48：scheduler 14 / retry 12 / cache 9 / fsx 6 / ratelimit 4 / iter 2 / backoff 1；本 crate 七点：shutdown 6 + fx 1），覆盖 scheduler/ratelimit/retry/backoff/fsx/cache/shutdown/iter/fx。**计数口径**：「调用点」= `embed_event!` 宏调用——排除宏定义行、`//` 文档/注释行与 `#[cfg(test)]` 之后的内容，多行调用按首行计一次；改埋点后按此口径重数，同步两 crate 的 `lib.rs`/`Cargo.toml` 注与本段。纪律（lib.rs `embed_event!` 注）：
+九域 54 调用点（`std-ext` 七域 47：scheduler 14 / retry 12 / cache 9 / fsx 6 / ratelimit 4 / iter 2；本 crate 七点：shutdown 6 + fx 1），覆盖 scheduler/ratelimit/retry/fsx/cache/shutdown/iter/fx。**计数口径**：「调用点」= `embed_event!` 宏调用——排除宏定义行、`//` 文档/注释行与 `#[cfg(test)]` 之后的内容，多行调用按首行计一次；改埋点后按此口径重数，同步两 crate 的 `lib.rs`/`Cargo.toml` 注与本段。纪律（lib.rs `embed_event!` 注）：
 
-- **只埋行为决策点**（register/cancel/fire/裁决/拒绝/等待分段），禁埋纯计算路径（`backoff_delay` 的 debug 入参事件是派单契约显式点）。
+- **只埋行为决策点**（register/cancel/fire/裁决/拒绝/等待分段），禁埋纯计算路径（`backoff_delay` 现零事件——#202：观测上移到 `retry` 的 verdict/backoff 事件）。
 - **字段化禁格式化**：字段只收数值/布尔/静态串，禁 format!/Display。
 - **关联序号进字段**：seq（scheduler 堆条目）/attempt（retry 轮次）/round（ratelimit 阻塞重查轮）承载跨事件关联，不起 span。
 - 级别规范：正常流转=debug / 异常路径=warn / 终态=info。事件全部在状态锁外发射（订阅方 IO 不持锁）。
@@ -2671,7 +2687,7 @@ target 规范：域=`skeleton::<domain>`，子流程=`skeleton::<domain>::<phase
 
 | 组合 | 形态 | 说明 |
 |---|---|---|
-| `full` | 一键全开 | 本 crate 14 消费面叶子并集（不含 `unsafe-evidence` 证据开关；`--all-features` = full + unsafe-evidence）；采用方默认心智入口——「不懂就 full」，子开关=进阶裁剪。std-ext 七域 48 埋点由其自有 `log-embed` 承载（ADR 0005 否决跨 crate 强制耦合）；workspace 全量=两 crate 各自 `--all-features` |
+| `full` | 一键全开 | 本 crate 14 消费面叶子并集（不含 `unsafe-evidence` 证据开关；`--all-features` = full + unsafe-evidence）；采用方默认心智入口——「不懂就 full」，子开关=进阶裁剪。std-ext 七域 47 埋点由其自有 `log-embed` 承载（ADR 0005 否决跨 crate 强制耦合）；workspace 全量=两 crate 各自 `--all-features` |
 | `--no-default-features` | 纯生态件面 | 常驻 14 域（行为件面；十三域零门常驻、本体纯 std；`json` 域与凭据级 `RandomId`（`random` 门）按需显式开）+ memgov 可独立（`--features memgov`） |
 | 默认 | runtime + pool | pool 连带 memgov；SyncStore/PoolBase/ThreadPool 可用 |
 | `log-fs` 单开 | log-fs 面零三方 | 文件日志可用（mask_secrets/DefaultPathResolver/FileSink），不拉 tracing 四件套；std-ext 常驻依赖仍在树内（**不含** `serde_json`：`json` 域经 `json` feature 才进树，`log-fs` 不点亮它） |
