@@ -112,6 +112,10 @@ type AuditCallback = Box<dyn FnMut(&PoolAuditEvent) + Send>;
 #[cfg(feature = "testing")]
 type ResizeEpochHook = Box<dyn FnMut(u64) + Send>;
 
+/// Worker startup handoff hook (unit-test-only deterministic interleaving seam).
+#[cfg(test)]
+type WorkerStartHook = Box<dyn FnMut(u64) + Send>;
+
 /// 审计槽（订阅态的单槽内容）：容量环 + 实时回调 + 订阅代次（形态同
 /// `audit::AuditSink`）+ **在途派发状态 + 待投递 FIFO**（issue#75）。
 struct AuditSlot {
@@ -730,6 +734,13 @@ pub enum RejectCause {
 ///
 /// 闸门语义：**创建前**裁决。`Ok(())` = 允许本次创建；`Err(e)` = 本次创建
 /// 失败（池据此回滚 worker 席位并把失败上抛给调用方——禁静默降级）。
+///
+/// # Panics
+///
+/// A panic from this user callback propagates unchanged. The pool first rolls back the
+/// current reservation; when called from a multi-worker resize, all not-yet-attempted
+/// reservations in that batch are also rolled back before the panic resumes. The
+/// submitted task is consumed by the panicking call and is dropped during unwinding.
 pub trait SpawnGate: Send + Sync + 'static {
     /// 裁决一次 worker 创建（`worker_id` = 本次创建的 worker 序号，单调）。
     fn check_spawn(&self, worker_id: u64) -> Result<(), ThreadSpawnError>;
@@ -913,6 +924,11 @@ struct Shared {
     /// 确定性交错测试暂停在「领号 → 目标提交」窗（issue#99）。
     #[cfg(feature = "testing")]
     resize_epoch_hook: Mutex<Option<ResizeEpochHook>>,
+    /// Test-only pause after OS spawn but before reservation commit.
+    #[cfg(test)]
+    worker_start_hook: Mutex<Option<WorkerStartHook>>,
+    #[cfg(test)]
+    worker_loop_entries: AtomicU64,
 }
 
 struct Inner {
@@ -965,7 +981,9 @@ fn reserve_worker(g: &mut Inner) -> u64 {
 /// 误发令牌会把 core worker 退役），但席位**兑现后**须再对账（issue#69：
 /// 并发 resize 下按最新目标收敛，不留陈旧令牌）。
 fn reconcile_shrink(g: &mut Inner) {
-    let live = g.workers - g.reservations;
+    // Keep unwind cleanup non-panicking even if a prior invariant violation poisoned
+    // the bookkeeping path. In valid states this is identical to ordinary subtraction.
+    let live = g.workers.saturating_sub(g.reservations);
     g.shrinking = live.saturating_sub(g.core);
     debug_assert!(
         g.shrinking <= g.workers,
@@ -1047,6 +1065,53 @@ pub struct ThreadPool<G: SpawnGate = AllowAllSpawns> {
 struct SpawnFailure {
     error: ThreadSpawnError,
     task: Option<Task>,
+}
+
+/// Owns one already-published worker reservation until it is committed as a live
+/// worker. Drop rolls the reservation back if user code unwinds during creation.
+struct ReservationGuard {
+    shared: Arc<Shared>,
+    armed: bool,
+}
+
+impl ReservationGuard {
+    fn new(shared: Arc<Shared>) -> Self {
+        Self {
+            shared,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn rollback(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // This runs during unwinding from a user-supplied SpawnGate. Recover the
+        // poisoned mutex rather than causing a second panic from Drop.
+        let mut g = self
+            .shared
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        g.workers = g.workers.saturating_sub(1);
+        g.reservations = g.reservations.saturating_sub(1);
+        g.spawn_failures += 1;
+        reconcile_shrink(&mut g);
+        self.armed = false;
+        drop(g);
+        self.shared.retired.notify_all();
+        self.shared.work.notify_all();
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        self.rollback();
+    }
 }
 
 impl ThreadPool<AllowAllSpawns> {
@@ -1142,6 +1207,10 @@ impl<G: SpawnGate> ThreadPool<G> {
             next_epoch: AtomicU64::new(0),
             #[cfg(feature = "testing")]
             resize_epoch_hook: Mutex::new(None),
+            #[cfg(test)]
+            worker_start_hook: Mutex::new(None),
+            #[cfg(test)]
+            worker_loop_entries: AtomicU64::new(0),
         });
         let pool = Self {
             base,
@@ -1245,6 +1314,11 @@ impl<G: SpawnGate> ThreadPool<G> {
     /// 自带「部分生效」状态（目标 core / 实际存活 worker 数），调用方不必回查
     /// 指标即可判断池处于什么状态（已建 worker 继续服务，可重试 resize 补齐）。
     /// 失败另经 [`ThreadPoolMetrics::spawn_failures`] 计数留痕（fail-visible）。
+    ///
+    /// **与 shutdown 并发**：已经进入 OS 创建阶段的单个 reservation 可以完成
+    /// reservation→live 交接，随后 worker 观察 shutdown 并退役；尚未尝试的批次
+    /// reservation 会回滚，后续增长轮次停止。shutdown 后调用 resize 只提交配置
+    /// 边界，不会重新启动 worker。
     pub fn resize(&self, t: ThreadPoolTuning) -> Result<(), PoolResizeError> {
         // ① 纯校验（零锁、零状态变更）：此刻没有任何内部锁在持，拒绝事件可就地
         //    发射（issue#99：拒绝事件也必须在锁外）。
@@ -1289,26 +1363,30 @@ impl<G: SpawnGate> ThreadPool<G> {
             }
         };
         let mut spawn_failure = None;
+        let mut spawn_panic = None;
         loop {
             // ① 锁内：缺口席位预留 + 缩容令牌对账（目标已在上面提交；OS 线程
             //    创建在锁外，见下）。
             let (ids, shrink_pending) = {
                 let mut g = lock(&self.shared.inner);
-                // 缩容令牌：只从**可退休的真实 worker** 计（issue#34：在途席位
-                // 不是可退役 worker），按**最新 core** 对账（issue#69：陈旧令牌
-                // 禁留——并发 resize 后按最新目标收敛）。
                 reconcile_shrink(&mut g);
-                // 增长缺口：按**已承诺总量**（真实 + 在途席位）计（issue#69：
-                // 在途预留已占席位，禁重复预留同一缺口 ⇒ workers ≤ max 恒成立）。
-                let before = g.workers;
-                let deficit = g.core.saturating_sub(g.workers);
-                let ids: Vec<u64> = (0..deficit).map(|_| reserve_worker(&mut g)).collect();
-                debug_assert!(
-                    g.workers <= before.max(g.core),
-                    "growth must not push committed population above max"
-                );
-                debug_assert!(g.reservations <= g.workers, "reservations ⊆ committed");
-                (ids, g.shrinking > 0)
+                if g.shutdown {
+                    // Shutdown is terminal: do not start replacement workers while an
+                    // earlier in-flight reservation is being committed/retired.
+                    (Vec::new(), false)
+                } else {
+                    // Growth counts committed workers + in-flight reservations, so
+                    // concurrent resizes cannot reserve the same missing seats.
+                    let before = g.workers;
+                    let deficit = g.core.saturating_sub(g.workers);
+                    let ids: Vec<u64> = (0..deficit).map(|_| reserve_worker(&mut g)).collect();
+                    debug_assert!(
+                        g.workers <= before.max(g.core),
+                        "growth must not push committed population above max"
+                    );
+                    debug_assert!(g.reservations <= g.workers, "reservations ⊆ committed");
+                    (ids, g.shrinking > 0)
+                }
             };
             if shrink_pending {
                 // 唤醒空闲 worker 认领退出令牌（缩容生效点）。
@@ -1319,23 +1397,39 @@ impl<G: SpawnGate> ThreadPool<G> {
             }
             // ② 锁外：OS 线程创建 + 创建闸裁决（禁持调度锁跨创建/跨用户闸门）。
             for (index, worker_id) in ids.iter().enumerate() {
-                if let Err(failure) = self.create_worker(None, *worker_id) {
-                    // 补建在失败处停止；未尝试的预留一并回滚（幻影 worker 消除，
-                    // join 不会等一个不存在的 worker）。
-                    self.rollback_reservations(ids.len() - index - 1);
-                    spawn_failure = Some(failure.error);
+                let shutting_down = { lock(&self.shared.inner).shutdown };
+                if shutting_down {
+                    self.rollback_reservations(ids.len() - index);
                     break;
                 }
-                // 席位兑现 ⇒ 真实存活数 +1 ⇒ 待退令牌按**最新 core** 重算
-                // （issue#69：旧目标预留的席位兑现后若超出最新目标 ⇒ 标记退役，
-                // 不得静默满足新目标两次；陈旧令牌禁留）。
+                let attempt =
+                    catch_unwind(AssertUnwindSafe(|| self.create_worker(None, *worker_id)));
+                let failure = match attempt {
+                    Ok(Ok(())) => None,
+                    Ok(Err(failure)) => Some(failure.error),
+                    Err(payload) => {
+                        // Current slot was rolled back by ReservationGuard::drop.
+                        // Release the rest of this batch, then defer rethrow until the
+                        // already-committed resize event has been emitted outside locks.
+                        self.rollback_reservations(ids.len() - index - 1);
+                        spawn_panic = Some(payload);
+                        break;
+                    }
+                };
+                if let Some(error) = failure {
+                    self.rollback_reservations(ids.len() - index - 1);
+                    spawn_failure = Some(error);
+                    break;
+                }
+
+                // Reconcile against the latest target after every successful handoff.
                 {
                     let mut g = lock(&self.shared.inner);
                     reconcile_shrink(&mut g);
                 }
                 self.notify_retire_tokens();
             }
-            if spawn_failure.is_some() {
+            if spawn_failure.is_some() || spawn_panic.is_some() {
                 break;
             }
             // ③ 下一轮：对账最新目标（并发 resize 期间目标可能已变）——补足到
@@ -1360,6 +1454,9 @@ impl<G: SpawnGate> ThreadPool<G> {
         //    resize/execute/metrics。目标被更晚发起的调用覆盖时不发（那次调用负责）。
         if committed {
             self.base.emit_resize(ResizeOutcome::Resized);
+        }
+        if let Some(payload) = spawn_panic {
+            std::panic::resume_unwind(payload);
         }
         match spawn_failure {
             None => Ok(()),
@@ -1405,6 +1502,15 @@ impl<G: SpawnGate> ThreadPool<G> {
     #[doc(hidden)]
     pub fn set_resize_epoch_hook(&self, hook: impl FnMut(u64) + Send + 'static) {
         *lock(&self.shared.resize_epoch_hook) = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_worker_start_hook(&self, hook: impl FnMut(u64) + Send + 'static) {
+        *self
+            .shared
+            .worker_start_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
     }
 
     /// 测试面（`feature = "testing"`）：调度锁与 base 账本锁当前是否空闲——供
@@ -1464,53 +1570,104 @@ impl<G: SpawnGate> ThreadPool<G> {
     /// 失败路径三件事同做：回滚席位（计数回到实际存活数）+ 失败计数
     /// （`spawn_failures`）+ 唤醒 join（否则 join 会等一个不存在的 worker）。
     fn create_worker(&self, first: Option<Task>, worker_id: u64) -> Result<(), SpawnFailure> {
-        // ① 闸门裁决（生产恒放行；单态化后本分支被编译器删掉）。
+        // The reservation is already visible in Inner before user code runs. The guard
+        // rolls it back if SpawnGate panics, including during a multi-worker resize.
+        let mut reservation = ReservationGuard::new(Arc::clone(&self.shared));
+
+        // User-injectable gate runs outside the scheduler lock. Panics propagate only
+        // after ReservationGuard::drop restores the accounting.
         if let Err(error) = self.gate.check_spawn(worker_id) {
-            return Err(self.rollback_spawn(error, first));
+            return Err(self.rollback_spawn(&mut reservation, error, first));
         }
-        // ② OS 创建。任务经一次性槽交接：创建失败时原样取回交还调用方
-        //    （失败路径禁吞任务——任务归属调用方）。
+
+        // A newly spawned OS thread is held behind this one-shot handoff. It cannot
+        // observe shutdown/shrink or decrement workers before reservation commit.
         let slot = Arc::new(Mutex::new(first));
         let worker_slot = Arc::clone(&slot);
         let worker_shared = Arc::clone(&self.shared);
+        let (start_tx, start_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let spawned = thread::Builder::new()
             .name(format!("pool-worker-{worker_id}"))
             .spawn(move || {
+                if start_rx.recv().is_err() {
+                    // Creator unwound before commit; the reservation guard owns rollback.
+                    return;
+                }
                 let mut guard = lock(&worker_slot);
                 let first = guard.take();
                 drop(guard);
                 worker_loop(worker_shared, first);
             });
+
         match spawned {
             Ok(_handle) => {
-                // 席位兑现：真实线程已建成，从在途册转出（真实存活自此含它）。
-                lock(&self.shared.inner).reservations -= 1;
+                // Deterministic test seam: pause after OS spawn, before accounting commit.
+                #[cfg(test)]
+                {
+                    let hook = self
+                        .shared
+                        .worker_start_hook
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(mut hook) = hook {
+                        hook(worker_id);
+                    }
+                }
+
+                // Commit reservation -> live under the state lock before starting worker.
+                let shrink_pending = {
+                    let mut g = lock(&self.shared.inner);
+                    g.reservations -= 1;
+                    reconcile_shrink(&mut g);
+                    reservation.disarm();
+                    g.shrinking > 0
+                };
+                if shrink_pending {
+                    self.shared.work.notify_all();
+                }
+
+                if start_tx.send(()).is_err() {
+                    // Defensive path: the receiver should still be waiting. If it has
+                    // disappeared, undo the now-live worker count and return its task.
+                    let mut task_guard =
+                        slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let task = task_guard.take();
+                    drop(task_guard);
+                    {
+                        let mut g = lock(&self.shared.inner);
+                        g.workers = g.workers.saturating_sub(1);
+                        g.spawn_failures += 1;
+                        reconcile_shrink(&mut g);
+                    }
+                    self.shared.retired.notify_all();
+                    self.shared.work.notify_all();
+                    return Err(SpawnFailure {
+                        error: ThreadSpawnError::from(std::io::Error::other(
+                            "worker startup handoff receiver disappeared",
+                        )),
+                        task,
+                    });
+                }
                 Ok(())
             }
             Err(e) => {
-                let mut guard = lock(&slot);
+                let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let task = guard.take();
                 drop(guard);
-                Err(self.rollback_spawn(ThreadSpawnError::from(e), task))
+                Err(self.rollback_spawn(&mut reservation, ThreadSpawnError::from(e), task))
             }
         }
     }
 
-    /// 创建失败回滚：撤销预留席位（幻影 worker 消除）+ 失败计数 + 唤醒 join。
-    fn rollback_spawn(&self, error: ThreadSpawnError, task: Option<Task>) -> SpawnFailure {
-        {
-            let mut g = lock(&self.shared.inner);
-            g.workers -= 1;
-            g.reservations -= 1;
-            g.spawn_failures += 1;
-            debug_assert!(
-                g.reservations <= g.workers,
-                "reservations ⊆ committed population after rollback"
-            );
-        }
-        // join 在 `retired` 上等 worker 退役：回滚后必须唤醒，否则 join 会
-        // 永远等一个不存在的 worker。
-        self.shared.retired.notify_all();
+    /// Roll back a returned creation error. The same guard also handles panic unwinds.
+    fn rollback_spawn(
+        &self,
+        reservation: &mut ReservationGuard,
+        error: ThreadSpawnError,
+        task: Option<Task>,
+    ) -> SpawnFailure {
+        reservation.rollback();
         SpawnFailure { error, task }
     }
 
@@ -1538,6 +1695,7 @@ impl<G: SpawnGate> ThreadPool<G> {
             reconcile_shrink(&mut g);
         }
         self.shared.retired.notify_all();
+        self.shared.work.notify_all();
     }
 }
 
@@ -1574,6 +1732,8 @@ impl<G: SpawnGate> Drop for ThreadPool<G> {
 /// 处理完当前任务即退；真实存活跌破 core 前禁认领令牌——issue#34）；
 /// first-task 交接先跑再入环。
 fn worker_loop(shared: Arc<Shared>, mut first: Option<Task>) {
+    #[cfg(test)]
+    shared.worker_loop_entries.fetch_add(1, Ordering::SeqCst);
     let mut g = lock(&shared.inner);
     loop {
         let next = if let Some(task) = first.take() {
@@ -2022,5 +2182,199 @@ mod tests {
             "在途回调在 audit 锁内析构（#88 自锁形状）"
         );
         drop(current);
+    }
+}
+
+#[cfg(test)]
+mod reservation_handoff_regressions {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const HANDOFF: Duration = Duration::from_secs(5);
+
+    struct PanicOnceGate {
+        armed: AtomicBool,
+    }
+
+    impl SpawnGate for PanicOnceGate {
+        fn check_spawn(&self, worker_id: u64) -> Result<(), ThreadSpawnError> {
+            if worker_id > 0 && self.armed.swap(false, Ordering::SeqCst) {
+                panic!("injected SpawnGate panic for worker {worker_id}");
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spawn_gate_panic_rolls_back_current_and_unattempted_resize_reservations() {
+        let pool = ThreadPool::try_with_gate(
+            ThreadPoolTuning::new(1, 4, 8),
+            Arc::new(AbortPolicy),
+            PanicOnceGate {
+                armed: AtomicBool::new(true),
+            },
+        )
+        .expect("initial worker");
+        let _audit = pool.subscribe_audit(|_| {});
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            pool.resize(ThreadPoolTuning::new(4, 4, 8))
+        }));
+        assert!(panic.is_err(), "original SpawnGate panic must propagate");
+        {
+            let g = lock(&pool.shared.inner);
+            assert_eq!(g.workers, 1, "only the original worker remains");
+            assert_eq!(g.reservations, 0, "all batch reservations are rolled back");
+            assert_eq!(g.spawn_failures, 1, "gate panic is observable");
+        }
+        assert!(
+            pool.take_audit_events()
+                .iter()
+                .any(|event| event.kind == PoolAuditKind::Resized),
+            "the committed target resize is audited before the original panic resumes"
+        );
+
+        pool.resize(ThreadPoolTuning::new(4, 4, 8))
+            .expect("later resize can fill the target");
+        assert_eq!(pool.metrics().workers, 4);
+        pool.shutdown();
+        pool.join();
+    }
+
+    #[test]
+    fn spawn_gate_panic_during_submit_rolls_back_single_reservation() {
+        let pool = ThreadPool::try_with_gate(
+            ThreadPoolTuning::new(1, 2, 1),
+            Arc::new(AbortPolicy),
+            PanicOnceGate {
+                armed: AtomicBool::new(true),
+            },
+        )
+        .expect("initial worker");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        pool.execute(move || {
+            started_tx.send(()).expect("test receiver alive");
+            release_rx.recv().expect("release busy task");
+        })
+        .expect("first task");
+        started_rx
+            .recv_timeout(HANDOFF)
+            .expect("initial worker executing blocker");
+        pool.execute(|| {}).expect("fill the only queue slot");
+
+        let panic = catch_unwind(AssertUnwindSafe(|| pool.execute(|| {})));
+        assert!(panic.is_err(), "original SpawnGate panic must propagate");
+        {
+            let g = lock(&pool.shared.inner);
+            assert_eq!(g.workers, 1);
+            assert_eq!(g.reservations, 0);
+            assert_eq!(g.spawn_failures, 1);
+            assert_eq!(g.queue.len(), 1, "accepted queued work remains owned");
+        }
+
+        release_tx.send(()).expect("worker still alive");
+        pool.shutdown();
+        pool.join();
+        assert_eq!(pool.metrics().completed, 2);
+    }
+
+    #[test]
+    fn resize_after_shutdown_does_not_restart_workers() {
+        let pool = ThreadPool::new(ThreadPoolTuning::new(1, 2, 8));
+        pool.shutdown();
+        pool.join();
+        let entries = pool.shared.worker_loop_entries.load(Ordering::SeqCst);
+
+        // The target boundary may be updated, but shutdown is terminal and growth
+        // must not create workers that can only start and immediately exit.
+        pool.resize(ThreadPoolTuning::new(2, 2, 8))
+            .expect("resize target update after shutdown");
+        assert_eq!(pool.metrics().workers, 0);
+        assert_eq!(
+            pool.shared.worker_loop_entries.load(Ordering::SeqCst),
+            entries,
+            "resize after shutdown must not start another worker"
+        );
+    }
+
+    #[test]
+    fn worker_waits_for_reservation_commit_before_shutdown_can_retire_it() {
+        let pool = Arc::new(ThreadPool::new(ThreadPoolTuning::new(1, 2, 8)));
+        let deadline = std::time::Instant::now() + HANDOFF;
+        while pool.shared.worker_loop_entries.load(Ordering::SeqCst) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "initial worker did not start"
+            );
+            thread::yield_now();
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        pool.set_worker_start_hook(move |worker_id| {
+            entered_tx.send(worker_id).expect("test receiver alive");
+            release_rx.recv().expect("release reservation commit");
+        });
+
+        let resize_pool = Arc::clone(&pool);
+        let resize = thread::spawn(move || resize_pool.resize(ThreadPoolTuning::new(2, 2, 8)));
+        assert_eq!(
+            entered_rx
+                .recv_timeout(HANDOFF)
+                .expect("spawn reached handoff"),
+            1
+        );
+        assert_eq!(
+            pool.shared.worker_loop_entries.load(Ordering::SeqCst),
+            1,
+            "new worker must not enter worker_loop before reservation commit"
+        );
+
+        pool.shutdown();
+        let (joined_tx, joined_rx) = mpsc::channel();
+        let join_pool = Arc::clone(&pool);
+        let joiner = thread::spawn(move || {
+            join_pool.join();
+            joined_tx.send(()).expect("join result receiver alive");
+        });
+
+        // Wait until the pre-existing worker has retired. The outstanding reservation
+        // must still keep join blocked and preserve workers >= reservations.
+        let deadline = std::time::Instant::now() + HANDOFF;
+        loop {
+            let g = lock(&pool.shared.inner);
+            if g.workers == 1 && g.reservations == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown did not retire the original worker while preserving reservation"
+            );
+            drop(g);
+            thread::yield_now();
+        }
+        assert!(
+            joined_rx.try_recv().is_err(),
+            "join must not return while the reservation is still outstanding"
+        );
+
+        release_tx.send(()).expect("release startup handoff");
+        resize
+            .join()
+            .expect("resize thread")
+            .expect("resize succeeds");
+        joined_rx
+            .recv_timeout(HANDOFF)
+            .expect("join waits for committed worker to observe shutdown and retire");
+        joiner.join().expect("joiner thread");
+        assert_eq!(pool.metrics().workers, 0);
+        assert_eq!(
+            pool.shared.worker_loop_entries.load(Ordering::SeqCst),
+            2,
+            "new worker enters only after commit"
+        );
     }
 }
