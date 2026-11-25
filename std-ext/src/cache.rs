@@ -1314,49 +1314,59 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         let purge_now = self.clock.now_instant();
         // 阶段 2：重取锁 + 重查（**第二次锁定检查 = 线性化点**；重查**早于**
         // 过期清扫/淘汰 ⇒ panic 的 clone 不会造成部分清扫/变更）。
-        let (purge_retired, evict_retired, insert_retired) = {
+        let (purge_retired, evict_retired, insert_retired, purged, evicted, len_at_evict) = {
             let mut g = self.lock_core();
             let mut purge_retired = Vec::new();
             let mut evict_retired = Retired::empty();
+            let mut purged = 0usize;
+            let mut evicted = false;
+            let mut len_at_evict = 0usize;
             if g.idx_of(&k).is_none() && g.len() >= g.capacity() {
                 // 双界拍板：先过期先淘汰（单次锁外 now 快照判定，确定性），仍满再逐 LRU 尾。
-                let (purged, retired) = g.retain(|_, e| e.expires > purge_now);
+                let (count, retired) = g.retain(|_, e| e.expires > purge_now);
+                purged = count;
                 purge_retired = retired;
                 self.expired.fetch_add(purged as u64, Ordering::Relaxed);
-                // 埋点「TTL 过期驱逐（满插清扫）」：真回收才发（僵尸数+触发键指纹）。
-                #[cfg(feature = "log-embed")]
-                if purged > 0 {
-                    embed_event!(
-                        debug,
-                        target: "skeleton::cache::evict",
-                        kind = "ttl_sweep",
-                        key_hash = key_fingerprint(&k),
-                        zombies = purged as u64
-                    );
-                }
                 if g.len() >= g.capacity() {
-                    // 埋点「容量淘汰」（TtlCache 站点）：被逐者恒 LRU 尾。
-                    let retired = g.evict_tail();
-                    evict_retired = retired;
+                    // 容量淘汰只记录决策；subscriber 在解锁与退休析构后调用。
+                    evict_retired = g.evict_tail();
+                    evicted = true;
                     self.evictions.fetch_add(1, Ordering::Relaxed);
-                    embed_event!(
-                        debug,
-                        target: "skeleton::cache::evict",
-                        kind = "capacity",
-                        key_hash = evict_retired.slot_key.as_ref().map(|k| key_fingerprint(k)),
-                        order = "lru_tail",
-                        len_at_evict = g.len() as u64
-                    );
+                    len_at_evict = g.len();
                 }
             }
             // 锁内不调 `K::clone`（备好的键副本直接用）；竞态落败（键已被他人
             // 插入）⇒ 走普通覆盖路径，未被采用的候选键**解锁后**才析构。
             let (_, retired) = g.insert_with_map_key(k, map_key, entry);
-            (purge_retired, evict_retired, retired)
+            (
+                purge_retired,
+                evict_retired,
+                retired,
+                purged,
+                evicted,
+                len_at_evict,
+            )
         };
         drop(purge_retired);
         evict_retired.retire();
         insert_retired.retire();
+        if purged > 0 {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "ttl_sweep",
+                zombies = purged as u64
+            );
+        }
+        if evicted {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "capacity",
+                order = "lru_tail",
+                len_at_evict = len_at_evict as u64
+            );
+        }
     }
 
     /// 读（touch + 惰性过期 + 命中计数）。过期条目按 miss（不计命中）。
