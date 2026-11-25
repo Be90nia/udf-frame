@@ -254,6 +254,63 @@ fn insufficient_reports_available_and_wait() {
     }
 }
 
+// ---- 坑面「等待时长换算 panic」（issue#115/#148）：极端但合法的参数面 ----
+
+// 构造函数只要求正有限；缺口 1 个 ÷ 1e-30 个/秒 = 1e30 秒，远超 Duration
+// 表示范围 —— 旧实现的 from_secs_f64 在「令牌不足」这条 fail-visible 结果
+// 路径上 panic，把「暂不足」变成崩溃。
+#[test]
+fn try_acquire_saturates_unrepresentable_wait() {
+    let clock = Arc::new(MockClock::new());
+    let bucket = TokenBucket::new(clock, 1.0, 1e-30);
+    bucket.try_acquire(1).expect("构造即满桶");
+    let err = bucket.try_acquire(1).expect_err("空桶必拒，且不得 panic");
+    assert_eq!(
+        err.wait(),
+        Duration::MAX,
+        "超出 Duration 表示范围 ⇒ 饱和，不 panic 不回绕"
+    );
+    assert!(
+        matches!(err, TryAcquireError::Insufficient { available, .. } if available == 0.0),
+        "仍是 Insufficient 载荷（available 原样），实得 {err:?}"
+    );
+}
+
+// 阻塞版同一换算：饱和等待下不可能在可测时间内醒来 ⇒ 只验第一轮请求的步长。
+// 探针把 sleep 入参照样作 panic 载荷抛出（旧实现在 wait_for 里就 panic，载荷
+// 是字符串 ⇒ downcast 失败即红）。
+#[test]
+fn acquire_asks_for_saturated_wait_without_panicking() {
+    struct SaturatingProbe(Instant);
+
+    impl Clock for SaturatingProbe {
+        fn now_instant(&self) -> Instant {
+            self.0
+        }
+        fn now_system(&self) -> SystemTime {
+            SystemTime::now()
+        }
+    }
+
+    impl Sleeper for SaturatingProbe {
+        fn sleep(&self, d: Duration) {
+            std::panic::panic_any(d)
+        }
+    }
+
+    let bucket = TokenBucket::new(Arc::new(SaturatingProbe(Instant::now())), 1.0, 1e-30);
+    bucket.try_acquire(1).expect("清空满桶");
+    let payload = catch_unwind(AssertUnwindSafe(|| bucket.acquire(1))).unwrap_err();
+    let slept = *payload
+        .downcast_ref::<Duration>()
+        .expect("acquire 必须走到 sleep（旧实现更早 panic，载荷为字符串）");
+    assert_eq!(
+        slept,
+        Duration::MAX,
+        "acquire 每轮步长 = 饱和后的实际缺口时长（不虚报更短）"
+    );
+}
+
 // ---- 坑面「醒后忙转」：轮次有界——睡满缺口一次到位，零自旋 ----
 
 #[test]

@@ -44,6 +44,7 @@
 //! | 巨步回填溢出 | clock.rs armor：Instant+巨大 Duration 平台 panic | 回填走差值 `elapsed`，从不对时刻做加法；封顶 `min` 吸收任意大步 | `huge_advance_saturates_at_capacity` |
 //! | 睡眠持锁 | 并发常识（阻塞他人 try_acquire） | 缺口时长锁内算完即 drop guard，sleep 在锁外 | `blocked_acquire_does_not_hold_lock` |
 //! | 醒后忙转（wait 下溢 0 → sleep(0) 自旋） | std `from_secs_f64` 小值截断 | 睡粒度下限 1ns（`wait.max(1ns)`） | `acquire_recheck_rounds_are_bounded` |
+//! | 等待时长换算 panic（极小速率/极大缺口） | `from_secs_f64` 对 inf/超范围 panic | `try_from_secs_f64` + 饱和 `Duration::MAX`（issue#115/#148），`wait_ns` 遥测同步饱和 | `try_acquire_saturates_unrepresentable_wait` |
 //! | acquire(n>cap) 无限等 | Guava permits 无上限面 | 立即 `Err(ExceedsCapacity)` | `acquire_above_capacity_rejects_immediately` |
 //! | acquire(0) 阻塞 | Guava `acquire(0)` 文档 | 恒 Ok no-op | `acquire_zero_is_noop` |
 //! | 非法构造参数 | fail-closed 纪律（RetryPolicy 同款） | capacity/rate ≤0、NaN、inf 构造期 panic | `invalid_constructor_args_panic` |
@@ -105,7 +106,8 @@ pub enum TryAcquireError {
     Insufficient {
         /// 判定时刻的现有令牌数（回填后、扣减前口径）。
         available: f64,
-        /// 令牌足额的可满足时刻（按恒速回填估算；≥1ns）。
+        /// 令牌足额的可满足时刻（按恒速回填估算；下限 1ns，超出 `Duration`
+        /// 表示范围时饱和到 `Duration::MAX`——极低回填速率/极大缺口面）。
         wait: Duration,
     },
 }
@@ -195,6 +197,11 @@ impl TokenBucket {
     ///   = 死桶；
     /// - `refill_rate <= 0`、NaN、inf：零速率=永不回填的死桶；无穷速率
     ///   =「无限流」，不该经限流器表达。
+    ///
+    /// 数值域（issue#148）：`capacity`/`refill_rate` 接受任意**正有限** `f64`
+    /// （含 1e300 与次正规数 `5e-324`），不另设最小速率/最大容量门槛——代价
+    /// 是极端组合的缺口等待可能超出 `Duration` 表示范围，此时等待值饱和到
+    /// `Duration::MAX`（不 panic，见 [`TryAcquireError::Insufficient`]）。
     #[must_use]
     pub fn new(clock: Arc<dyn Sleeper>, capacity: f64, refill_rate: f64) -> Self {
         assert!(
@@ -257,7 +264,7 @@ impl TokenBucket {
                     available: tokens,
                     wait,
                 };
-                embed_event!(warn, target: "skeleton::ratelimit::try_acquire", permits = permits, available = tokens, wait_ns = wait.as_nanos() as u64, reason = "insufficient");
+                embed_event!(warn, target: "skeleton::ratelimit::try_acquire", permits = permits, available = tokens, wait_ns = crate::retry::telemetry_ns(wait), reason = "insufficient");
                 Err(err)
             }
         }
@@ -303,7 +310,7 @@ impl TokenBucket {
             #[cfg(feature = "log-embed")]
             {
                 round += 1;
-                embed_event!(debug, target: "skeleton::ratelimit::acquire", permits = permits, round = round, deficit = deficit, wait_ns = wait.as_nanos() as u64);
+                embed_event!(debug, target: "skeleton::ratelimit::acquire", permits = permits, round = round, deficit = deficit, wait_ns = crate::retry::telemetry_ns(wait));
             }
         }
     }
@@ -336,11 +343,20 @@ impl TokenBucket {
         }
     }
 
-    /// 缺口时长：`deficit / rate` 秒，下限 1ns（`from_secs_f64` 小值截断为
-    /// 0 → sleep(0) 忙转；下限保底真实 park，SystemClock 面平台粒度过睡
-    /// 无害——重查时余量只多不少）。
+    /// 缺口时长：`deficit / rate` 秒，下限 1ns、上限饱和到 `Duration::MAX`。
+    ///
+    /// - 下界：`from_secs_f64` 把极小值截断为 0 → `sleep(0)` 忙转；1ns 保底
+    ///   真实 park（SystemClock 面平台粒度过睡无害——重查时余量只多不少）。
+    /// - 上界（issue#115/#148）：构造函数接受任意正有限 `capacity`/`refill_rate`，
+    ///   但 `deficit / rate` 可溢出为 inf 或超出 `Duration` 表示范围；直接喂
+    ///   `Duration::from_secs_f64` 会 panic，把「令牌不足」这条 fail-visible
+    ///   结果变成崩溃。改为 `try_from_secs_f64` + 饱和到 `Duration::MAX`
+    ///   ——`try_acquire` 恒是不 panic 的查询，`acquire` 的每轮步长仍是有限的
+    ///   实际回填时长（不虚报比真实缺口更短的时间）。
     fn wait_for(deficit: f64, refill_rate: f64) -> Duration {
-        Duration::from_secs_f64(deficit / refill_rate).max(Duration::from_nanos(1))
+        Duration::try_from_secs_f64(deficit / refill_rate)
+            .unwrap_or(Duration::MAX)
+            .max(Duration::from_nanos(1))
     }
 
     /// 毒锁恢复：状态胞在持锁内无 panic 面（回填纯算术、扣减无越界），

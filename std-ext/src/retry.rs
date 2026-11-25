@@ -9,7 +9,8 @@
 //! 姿态（骨架哲学 fail-visible/显式策略/禁静默）：
 //!
 //! - **政策显式**：次数/退避/预算在 [`RetryPolicy`] 构造期一次定死，非法值
-//!   构造期 fail-closed panic（测试写错了就炸，不静默）——零退避=忙等风暴，
+//!   构造期 fail-closed panic（测试写错了就炸，不静默）——零退避=忙等风暴
+//!   （`base` 与 `max_delay` 两个参数都拒零：上限为零同样把每次退避压成零），
 //!   零次数=静默不执行，都不放行；
 //! - **可重试判定显式可选**：[`retry`] 默认全可重试；按错误类分流走
 //!   [`retry_if`]（判定器独立参数，不藏进政策对象——政策保持 `Copy`、
@@ -36,7 +37,7 @@
 //! | 无限重试 | 次数闸构造期必填 ≥1，先于睡眠裁决 |
 //! | 预算漏计 | 预算测量与退避睡眠同钟（[`Sleeper`] 超 trait 绑 [`Clock`]，错配在类型层不可表达）；异步面预算口径差异见 [`retry_async`] 文档 |
 //! | 不可重试错误重试 | 判定器先于睡眠，拒绝即停 |
-//! | 退避为零风暴 | base=0 构造期拒绝 |
+//! | 退避为零风暴 | base=0 与 max_delay=0 均构造期拒绝（上限为零把退避压成零，issue#114/#147） |
 //! | 只配次数不配预算=风暴面 | 文档红线（[`RetryPolicy::with_budget`]）；双闸先到先停（`deadline_and_attempts_both_bound_retries`） |
 //! | 无 jitter 同步节拍→重试风暴 | full jitter 内建禁关、源=RandomState 派生（`full_jitter_within_half_open_range` + `retry_delays_are_jittered`） |
 //! | 取消后仍重试 | sleep 内联 await，外层 future drop 即全停（`dropped_retry_stops_entirely`）；sync 循环被次数/预算双闸强制有界 |
@@ -112,8 +113,12 @@ pub type JitterFn = fn(Duration) -> Duration;
 /// Backoff and Jitter" 公式的 `sleep = random(0, d)` 形）。
 ///
 /// 熵源 = std `RandomState`（每实例随机种子，零三方）；**非密码学熵面**，
-/// 勿用于任何安全用途。`d` 为零返回零；纳秒收窄按 Duration 不变量恒无损
-/// （内部即 u64 纳秒存储，`try_from` 失败分支不可达）。
+/// 勿用于任何安全用途。`d` 为零返回零。
+///
+/// **值域 = 整个 `Duration` 域**（issue#156）：采样在 `d.as_nanos()`（`u128`）
+/// 上做模归约，`d` 超过 `u64::MAX` 纳秒（约 584 年）时照原样覆盖，不静默
+/// 截到 `u64::MAX` 纳秒。归约偏差上界 `d / 2^128`（每值概率偏移，远低于
+/// 非密码学抖动的可达分辨率——显式采纳模归约，不做拒绝采样）。
 ///
 /// ```
 /// use std::time::Duration;
@@ -126,12 +131,40 @@ pub type JitterFn = fn(Duration) -> Duration;
 /// ```
 #[must_use]
 pub fn full_jitter(d: Duration) -> Duration {
-    let nanos = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+    let nanos = d.as_nanos();
     if nanos == 0 {
         return Duration::ZERO;
     }
-    let r = RandomState::new().build_hasher().finish();
-    Duration::from_nanos(r % nanos)
+    // 128 位随机面：两个独立种子 hasher 拼成 u128，覆盖 nanos 的完整值域。
+    let hi = u128::from(RandomState::new().build_hasher().finish());
+    let lo = u128::from(RandomState::new().build_hasher().finish());
+    duration_from_nanos(((hi << 64) | lo) % nanos)
+}
+
+/// `u128` 纳秒 → `Duration`（[`full_jitter`] 采样落地）：秒/纳秒两段拆分。
+/// 秒段饱和不可达——入参恒 `< d.as_nanos()` 且 `d` 是 `Duration`，秒数必在 `u64` 内。
+fn duration_from_nanos(n: u128) -> Duration {
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    Duration::new(
+        u64::try_from(n / NANOS_PER_SEC).unwrap_or(u64::MAX),
+        (n % NANOS_PER_SEC) as u32, // < 1e9，u32 恒不截断
+    )
+}
+
+// ── 遥测数值转换（issue#149）──
+//
+// `Duration::as_millis`/`as_nanos` 是 `u128`：直接 `as u64` 对 `Duration::MAX`
+// 量级会回绕成小值（遥测里看起来像「零延迟」）。统一经 `try_from` 饱和到
+// `u64::MAX`——不回绕、不改单位；单位由函数名钉死。
+#[cfg(feature = "log-embed")]
+pub(crate) fn telemetry_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// 同上，单位纳秒。
+#[cfg(feature = "log-embed")]
+pub(crate) fn telemetry_ns(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// 重试政策：次数/退避/预算三闸，构造期定死、运行期只读（`Copy`）。
@@ -156,9 +189,13 @@ impl RetryPolicy {
     /// # Panics
     ///
     /// - `max_attempts == 0`：零次执行不是重试语义，静默通过=调用方以为试过；
-    /// - `base` 为零：零退避=忙等风暴。
+    /// - `base` 为零：零退避=忙等风暴；
+    /// - `max_delay` 为零：上限为零会把每次退避（含 `base` 非零时）压成零
+    ///   ——与零 `base` 同一种忙等风暴，仅换了个参数名表达（issue#114/#147）。
     ///
-    /// 构造期 fail-closed（测试写错了就炸，不静默）。
+    /// 构造期 fail-closed（测试写错了就炸，不静默）。`base > max_delay` 仍
+    /// 合法（非零上限下饱和截平，见 `backoff_delay`）；要「立即重试」请显式
+    /// 不睡眠（不配预算、调用方自己的循环），不要用零上限冒充政策。
     #[must_use]
     pub fn new(max_attempts: u32, base: Duration, max_delay: Duration) -> Self {
         assert!(
@@ -168,6 +205,10 @@ impl RetryPolicy {
         assert!(
             !base.is_zero(),
             "退避 base 必须非零（零退避=忙等风暴，fail-closed 拒绝）"
+        );
+        assert!(
+            !max_delay.is_zero(),
+            "退避 max_delay 必须非零（零上限把每次重试延迟压成 0=忙等风暴，fail-closed 拒绝）"
         );
         Self {
             max_attempts,
@@ -370,7 +411,7 @@ where
                             last: e,
                             elapsed,
                         };
-                        embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_out_of_budget", elapsed_ms = elapsed.as_millis() as u64);
+                        embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_out_of_budget", elapsed_ms = telemetry_ms(elapsed));
                         return Err(err);
                     }
                 }
@@ -380,12 +421,12 @@ where
                 sleeper.sleep((policy.jitter)(delay));
                 // 原 `skeleton::backoff` 的计算入参事件在这里补齐（issue#202：纯算术件不发事件，
                 // 观测面移到调用点；base/max/backoff 三者同处一条事件）。
-                embed_event!(warn, target: "skeleton::retry::verdict", attempt = attempts, decision = "retry", base_ms = policy.base.as_millis() as u64, max_ms = policy.max_delay.as_millis() as u64, backoff_ms = delay.as_millis() as u64);
+                embed_event!(warn, target: "skeleton::retry::verdict", attempt = attempts, decision = "retry", base_ms = telemetry_ms(policy.base), max_ms = telemetry_ms(policy.max_delay), backoff_ms = telemetry_ms(delay));
                 // 截平（base 线性值 > max）才发：saturating 语义下的静默截平
                 // 是异常路径留痕点（契约「base>cap 截平发生」）。
                 #[cfg(feature = "log-embed")]
                 if policy.base.saturating_mul(attempts) > delay {
-                    embed_event!(warn, target: "skeleton::retry::backoff", attempt = attempts, linear_ms = policy.base.saturating_mul(attempts).as_millis() as u64, capped_ms = delay.as_millis() as u64);
+                    embed_event!(warn, target: "skeleton::retry::backoff", attempt = attempts, linear_ms = telemetry_ms(policy.base.saturating_mul(attempts)), capped_ms = telemetry_ms(delay));
                 }
             }
         }
@@ -530,7 +571,7 @@ where
                             last: e,
                             elapsed,
                         };
-                        embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_out_of_budget", elapsed_ms = elapsed.as_millis() as u64);
+                        embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_out_of_budget", elapsed_ms = telemetry_ms(elapsed));
                         return Err(err);
                     }
                 }
@@ -541,11 +582,11 @@ where
                 sleep.sleep((policy.jitter)(delay)).await;
                 // 原 `skeleton::backoff` 的计算入参事件在这里补齐（issue#202：纯算术件不发事件，
                 // 观测面移到调用点；base/max/backoff 三者同处一条事件）。
-                embed_event!(warn, target: "skeleton::retry::verdict", attempt = attempts, decision = "retry", base_ms = policy.base.as_millis() as u64, max_ms = policy.max_delay.as_millis() as u64, backoff_ms = delay.as_millis() as u64);
+                embed_event!(warn, target: "skeleton::retry::verdict", attempt = attempts, decision = "retry", base_ms = telemetry_ms(policy.base), max_ms = telemetry_ms(policy.max_delay), backoff_ms = telemetry_ms(delay));
                 // 截平（base 线性值 > max）才发：与同步面同口径（抖动前值）。
                 #[cfg(feature = "log-embed")]
                 if policy.base.saturating_mul(attempts) > delay {
-                    embed_event!(warn, target: "skeleton::retry::backoff", attempt = attempts, linear_ms = policy.base.saturating_mul(attempts).as_millis() as u64, capped_ms = delay.as_millis() as u64);
+                    embed_event!(warn, target: "skeleton::retry::backoff", attempt = attempts, linear_ms = telemetry_ms(policy.base.saturating_mul(attempts)), capped_ms = telemetry_ms(delay));
                 }
             }
         }

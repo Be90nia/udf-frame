@@ -486,11 +486,21 @@ where
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // lower：非空才承诺 1（重复面不可预知；itertools CoalesceBy 公式），
-        // upper 同底源
-        let (low, hi) = self.iter.size_hint();
-        let low = low + usize::from(matches!(self.last, Some(Some(_))));
-        (usize::from(low > 0), hi)
+        // 三态各一支（issue#151）：held/fused 两支必须把 `last` 自身算进去，
+        // 否则「底源已空但手里还握着 1 个」会给出 (1, Some(0)) 这种非法对。
+        match self.last {
+            // 未开始：输出数 ≤ 底源（相邻重复会合并 ⇒ 下界只在非空时承诺 1，
+            // 不能说成底源 lower，[1, 1] 只出 1 个）。
+            None => {
+                let (low, hi) = self.iter.size_hint();
+                (usize::from(low > 0), hi)
+            }
+            // 持有一个待续元素：至少再产 1 个（held 必出），至多 held + 底源
+            // 每项各 1 个；上界加法 checked（溢出即未知，不撒谎也不 panic）。
+            Some(Some(_)) => (1, self.iter.size_hint().1.and_then(|hi| hi.checked_add(1))),
+            // 墓碑：已 fused，底源复活也不改本适配器输出（与 next()/fold() 同口径）。
+            Some(None) => (0, Some(0)),
+        }
     }
 
     fn fold<Acc, G>(self, mut init: Acc, mut g: G) -> Acc
@@ -628,6 +638,11 @@ where
             mut iter,
             pos,
         } = self;
+        // 首 Err 已置位（可能来自更早的 next()）：与 next() 同口径短路，
+        // 不再拉底层（issue#150——processor 可先 next() 撞错再 fold）。
+        if error.is_err() {
+            return init;
+        }
         // try_fold 短路：遇 Err 记错误位并以 Err(acc) 中断（itertools 同构）。
         // 分支内不发事件：累加器与错误位先在迭代器内定型，诊断在
         // process_results 边界发（issue#206——订阅者不得顶替 Err(acc)）。
@@ -998,6 +1013,59 @@ mod tests {
     }
 
     #[test]
+    fn dedup_size_hint_counts_held_item() {
+        // issue#151：底源空但手里握着 1 个——旧式「只读底源上界」会给出非法对
+        // (1, Some(0))。
+        let mut d = dedup([1, 2]);
+        assert_eq!(d.next(), Some(1));
+        assert_eq!(d.size_hint(), (1, Some(1)), "held 必须计入 upper");
+        assert_eq!(d.collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn dedup_size_hint_fused_tombstone_is_exact_empty() {
+        // issue#151：墓碑态恒 (0, Some(0))，底源复活型也改不了（与 next/fold 同口径）。
+        let mut d = dedup(CountingIter::resurrecting(vec![1, 1], 1));
+        assert_eq!(d.next(), Some(1));
+        assert_eq!(d.next(), None);
+        assert_eq!(d.size_hint(), (0, Some(0)), "fused 后上界不得开放");
+
+        let mut fused = dedup(CountingIter::resurrecting(vec![1, 1], 1));
+        while fused.next().is_some() {}
+        assert_eq!(fused.size_hint(), (0, Some(0)));
+        assert_eq!(
+            fused.fold(Vec::new(), |mut acc, x| {
+                acc.push(x);
+                acc
+            }),
+            Vec::<i32>::new(),
+            "fold 与 size_hint 同口径"
+        );
+    }
+
+    #[test]
+    fn dedup_size_hint_upper_is_checked_add() {
+        // 上界 usize::MAX 时 +1 不可表示 ⇒ None（未知），不 panic 也不撒谎。
+        struct OverstatedUpper {
+            pos: usize,
+        }
+        impl Iterator for OverstatedUpper {
+            type Item = i32;
+            fn next(&mut self) -> Option<i32> {
+                let out = [1, 2].get(self.pos).copied();
+                self.pos += 1;
+                out
+            }
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (0, Some(usize::MAX))
+            }
+        }
+        let mut d = dedup(OverstatedUpper { pos: 0 });
+        assert_eq!(d.next(), Some(1)); // held = 2
+        assert_eq!(d.size_hint(), (1, None));
+    }
+
+    #[test]
     fn dedup_fold_equals_collect() {
         let via_fold = dedup([1, 1, 2, 2, 3]).fold(Vec::new(), |mut acc, x| {
             acc.push(x);
@@ -1042,6 +1110,26 @@ mod tests {
             2,
             "首 Err 后（含 Err 那次共 2 次拉取）不得继续拉取"
         );
+    }
+
+    #[test]
+    fn process_results_fold_after_next_error_pulls_nothing() {
+        // issue#150：processor 可先 next() 撞错再 fold()——fold 必须与 next() 同口径
+        // 短路，否则已终态适配器继续消费底源并跑折叠闭包（副作用外溢）。
+        let data = [Ok::<i32, &str>(1), Err("e1"), Ok(3)];
+        let pulls = std::cell::Cell::new(0usize);
+        let it = data.into_iter().inspect(|_| pulls.set(pulls.get() + 1));
+        let folded = process_results(it, |mut inner| {
+            assert_eq!(inner.next(), Some(1));
+            assert_eq!(inner.next(), None, "首 Err 置位并短路");
+            assert_eq!(pulls.get(), 2);
+            inner.fold(Vec::new(), |mut acc, x| {
+                acc.push(x);
+                acc
+            })
+        });
+        assert_eq!(folded, Err("e1"));
+        assert_eq!(pulls.get(), 2, "fold 不得在已置 Err 后继续拉底层");
     }
 
     #[test]

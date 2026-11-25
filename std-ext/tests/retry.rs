@@ -288,6 +288,14 @@ fn zero_attempts_rejected_at_construction() {
     let _ = RetryPolicy::new(0, Duration::from_millis(1), Duration::from_secs(1));
 }
 
+// 坑面「退避为零风暴」第二条通道（issue#114/#147）：零上限把 base 非零的
+// 退避也压成 0（backoff_delay 的 .min(max)），与零 base 同一种忙等风暴。
+#[test]
+#[should_panic(expected = "退避 max_delay 必须非零")]
+fn zero_max_delay_rejected_at_construction() {
+    let _ = RetryPolicy::new(5, Duration::from_secs(1), Duration::ZERO);
+}
+
 // 坑面「panic 当错误重试污染语义」：panic 原样传播，不转 Err、不计数、不重试。
 #[test]
 fn panic_propagates_untouched() {
@@ -337,6 +345,41 @@ fn full_jitter_within_half_open_range() {
         Duration::ZERO,
         "值域 [0, 1ns) 仅含零"
     );
+}
+
+// issue#156：full_jitter 的值域覆盖**整个** Duration 域——旧实现把
+// `as_nanos()` 截到 u64::MAX 纳秒（约 584 年），更大的 d 只从 [0, u64::MAX ns)
+// 采样，实测值永远不会到阈值之上。
+#[test]
+fn full_jitter_covers_full_duration_range() {
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    let from_nanos =
+        |n: u128| Duration::new((n / NANOS_PER_SEC) as u64, (n % NANOS_PER_SEC) as u32);
+    let u64_nanos = u128::from(u64::MAX);
+    let cases = [
+        (from_nanos(u64_nanos - 1), "略低于 u64::MAX 纳秒"),
+        (from_nanos(u64_nanos), "恰在 u64::MAX 纳秒"),
+        (from_nanos(u64_nanos * 4), "高于 u64::MAX 纳秒 4 倍"),
+        (Duration::MAX, "Duration::MAX"),
+    ];
+    for (d, label) in cases {
+        let mut above_threshold = false;
+        for _ in 0..64 {
+            let j = full_jitter(d);
+            assert!(j < d, "{label}: 抖动值 {j:?} 越出 [0, {d:?}) 半开区间");
+            if j >= Duration::from_nanos(u64::MAX) {
+                above_threshold = true;
+            }
+        }
+        if d > Duration::from_nanos(u64::MAX) {
+            // 值域过半在阈值之上：64 次全落在下方的概率 = 2^-128（旧实现恒下方）。
+            assert!(
+                above_threshold,
+                "{label}: 采样从未越过 u64::MAX 纳秒——值域被静默截断"
+            );
+        }
+    }
+    assert_eq!(full_jitter(Duration::ZERO), Duration::ZERO);
 }
 
 // armor「无 jitter 同步节拍→重试风暴」行为面：默认政策（full jitter 禁关）
