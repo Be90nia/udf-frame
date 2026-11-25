@@ -74,15 +74,51 @@
 //   按域开；级别规范（正常流转=debug / 异常路径=warn / 终态=info）文档化在
 //   各模块头注。
 #[cfg(feature = "log-embed")]
+static EMBEDDED_EVENT_PANIC_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of embedded tracing events whose host subscriber panicked.
+///
+/// This counter saturates at `u64::MAX`. It is available only when the
+/// `log-embed` feature is enabled. The counter is diagnostic; it never changes
+/// the result of the operation that emitted the event.
+#[cfg(feature = "log-embed")]
+pub fn embedded_event_panic_count() -> u64 {
+    EMBEDDED_EVENT_PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run one embedded event behind a panic boundary. This is panic containment only:
+/// tracing subscribers still run synchronously on the emitting thread and must be
+/// fast/non-blocking. It does not make emission under a library lock safe, and
+/// `panic=abort` cannot be contained.
+#[cfg(feature = "log-embed")]
+#[inline]
+fn emit_embedded_event(emit: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(emit)).is_err() {
+        let _ = EMBEDDED_EVENT_PANIC_COUNT.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |count| Some(count.saturating_add(1)),
+        );
+    }
+}
+
+#[cfg(feature = "log-embed")]
 macro_rules! embed_event {
     (debug, target: $target:expr, $($rest:tt)*) => {
-        ::tracing::event!(target: $target, ::tracing::Level::DEBUG, $($rest)*)
+        $crate::emit_embedded_event(|| {
+            ::tracing::event!(target: $target, ::tracing::Level::DEBUG, $($rest)*)
+        })
     };
     (info, target: $target:expr, $($rest:tt)*) => {
-        ::tracing::event!(target: $target, ::tracing::Level::INFO, $($rest)*)
+        $crate::emit_embedded_event(|| {
+            ::tracing::event!(target: $target, ::tracing::Level::INFO, $($rest)*)
+        })
     };
     (warn, target: $target:expr, $($rest:tt)*) => {
-        ::tracing::event!(target: $target, ::tracing::Level::WARN, $($rest)*)
+        $crate::emit_embedded_event(|| {
+            ::tracing::event!(target: $target, ::tracing::Level::WARN, $($rest)*)
+        })
     };
 }
 #[cfg(not(feature = "log-embed"))]
@@ -105,3 +141,47 @@ pub mod ratelimit;
 pub mod retry;
 pub mod scheduler;
 pub mod text;
+
+#[cfg(all(test, feature = "log-embed"))]
+mod embedded_event_panic_tests {
+    use super::*;
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata};
+
+    struct PanicSubscriber;
+
+    impl tracing::Subscriber for PanicSubscriber {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, _: &Event<'_>) {
+            panic!("injected host tracing subscriber panic");
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test]
+    fn embedded_event_contains_subscriber_panic_and_counts_it() {
+        let before = embedded_event_panic_count();
+        tracing::subscriber::with_default(PanicSubscriber, || {
+            embed_event!(debug, target: "skeleton::telemetry_test", marker = 1);
+        });
+        assert_eq!(
+            embedded_event_panic_count(),
+            before.saturating_add(1),
+            "subscriber panic is counted without escaping the emitting call"
+        );
+    }
+}

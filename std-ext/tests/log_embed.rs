@@ -465,17 +465,18 @@ fn scheduler_close_is_info_with_cleared_count() {
 }
 
 #[test]
-fn worker_exit_event_captured_across_thread() {
+fn worker_teardown_does_not_emit_synchronous_host_event() {
     let cap = capture();
-    // 本测试二进制唯一全局挂载点：worker 线程无线程局部订阅器，事件落全局。
+    // 本测试二进制唯一全局挂载点：close 的调用方事件落全局。
     tracing::subscriber::set_global_default(cap.clone()).expect("全局订阅器只设一次");
     let sched = Arc::new(Scheduler::new(Arc::new(SystemClock)));
     let worker = sched.spawn_worker();
-    worker.join(); // close + join：worker 在退出前发终态事件，join 建立先行关系
-    cap.assert_event(
-        "skeleton::scheduler::worker",
-        Level::INFO,
-        &["reason=closed"],
+    worker.join();
+    cap.assert_event("skeleton::scheduler::close", Level::INFO, &["cleared=0"]);
+    assert_eq!(
+        cap.len(),
+        1,
+        "worker teardown must not synchronously invoke the host subscriber"
     );
 }
 
