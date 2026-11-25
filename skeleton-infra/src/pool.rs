@@ -730,6 +730,13 @@ pub enum RejectCause {
 ///
 /// 闸门语义：**创建前**裁决。`Ok(())` = 允许本次创建；`Err(e)` = 本次创建
 /// 失败（池据此回滚 worker 席位并把失败上抛给调用方——禁静默降级）。
+///
+/// # Panics
+///
+/// A panic from this user callback propagates unchanged. The pool first rolls back the
+/// current reservation; when called from a multi-worker resize, all not-yet-attempted
+/// reservations in that batch are also rolled back before the panic resumes. The
+/// submitted task is consumed by the panicking call and is dropped during unwinding.
 pub trait SpawnGate: Send + Sync + 'static {
     /// 裁决一次 worker 创建（`worker_id` = 本次创建的 worker 序号，单调）。
     fn check_spawn(&self, worker_id: u64) -> Result<(), ThreadSpawnError>;
