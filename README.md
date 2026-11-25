@@ -143,7 +143,7 @@ cargo run -p udf-skeleton-infra --example pooled_thread_pool
 | 缝 | 端口 | 随附实现（skeleton-infra） | 用途 |
 |---|---|---|---|
 | 效果托管 | `EffectRuntime`（skeleton） | `NoFx` 缺省件 / `fx::FxScope`（tokio feature） | 副作用以描述值在边缘解释，经 `ActionSender` 回灌闭环 |
-| 状态持久化 | `JournalPort`（skeleton，零依赖） | `journal::JsonlJournal`（journal feature） | 先落盘后 apply；后端自换 = 另实现端口（SQLite/网络皆可） |
+| 状态持久化 | `JournalPort`（skeleton，零依赖） | `journal::JsonlJournal`（journal feature） | append=缓冲接受、`flush`=持久点（append Err ⇒ 禁 apply）；后端自换 = 另实现端口（SQLite/网络皆可） |
 | 观测 | 审计事件值面（runtime） | `audit::AuditEvent` + `tracingx`（tracing feature） | 事件流桥入 tracing，观测栈由宿主自选 |
 | 测试替身 | `Reducer` 契约直测 | `testing::{TestStore, ScriptedRuntime}`（testing feature） | 逐动作断言 + 脚本化解释器 |
 | 解析面 | `JsonPort`/`SqlDialectPort`/`MarkdownPort`（skeleton，零依赖） | `parse_mock` 三脚本化 mock（testing feature）；真实实现=宿主 optional dep（serde_json 等）或采用方自供 | 框架定义形状，生态提供实现（journal 先例推广） |

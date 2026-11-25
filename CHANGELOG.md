@@ -4,6 +4,35 @@
 
 ## [Unreleased]
 
+### Fix(runtime): Notified 只在回调真被调用时发 + 状态落位不克隆 + 退役 sink 槽位回收 + 本地闸计数一致（#145/#160/#161/#162）
+- `Notified` 语义收紧：本地/跨线程都在**最后一次在册检查之后、进回调之前**计 `invoked`，只有 `invoked > 0` 才记一条通知；`local_missed_notifications` 与 panic 计数保持独立。
+- 状态落位不再调用 `S::clone`（#160）：唯一持有走 `Arc::get_mut` + `mem::replace`（锁内只剩 memcpy），共享态 `Arc::new(next_val)` 换一次分配——分配 profile 与旧 CoW 实现逐情形相同，重入/阻塞/panic 三类风险消失；`S::Clone` 退出框架调用面（契约改写）。
+- 每轮投递末尾清空退役 sink 缓冲（`Vec::clear` 保容量）：最后一份 `Arc` 的析构不在表锁内、不打断迭代。
+- 本地闸改共享在册令牌：panic 摘除 `swap(false)` 胜者回落闸、票据 Drop 走同一令牌且幂等，计数恰好一次。
+
+### Fix(logx): FileSink 新增 opt-in 保留策略（#128）
+- `RetentionPolicy`（`max_age` / `max_total_bytes`，默认零窗口 = 不删任何文件）+ `FileSink::with_retention` / `prune` / `pruned_files`。
+- 触发 = 换日/首次开文件或显式 `prune()`；顺序先 age 后 byte，**当日文件永不淘汰**；删除在状态锁外、同一 sink 以独立闸串行化，失败只聚合告警不 panic；`init_with_file` 装配的 sink 不带策略（文档写明）。
+- 平台事实入文档：Windows 目录枚举元数据是枚举时快照（按大小判定须按路径重查 `metadata`）；NTFS 上并发删同一路径可都返回 `Ok`（清理轮次串行化 + 按路径去重）。
+
+### Fix(view): 装配生命周期化（mount→bind→seal）+ RFC 6901 路径编译 + 初始区域全量（#104/#146/#155/#173/#190）
+- `mount` 变 fallible：`bindings()` 恰调一次并编译全量声明（前导 `/`、`~0`/`~1`、拒根指针/重复解码路径/前缀冲突），编码器 `covers()` 装配期求值并缓存（热路径零 `covers()`）。
+- `bind` 的 ID = 显式登记序；未覆盖绑定全构建 `BindError::UncoveredBinding`（不再 `debug_assert`；失败不占 ID、不改登记态）。
+- `seal` 新阶段：捕获一次稳定 Store 快照并投影，发布**初始区域全量**（初始 even 水位 2；Region-only 封板即可用）；封板前通知只计数。
+- `snapshot_doc` 返回 `Result<Snapshot, SnapshotError>`：已提交投影值 + 同一临界区水位；缺值即 `Incomplete`，修复重试耗尽 `Raced`。
+- 投影槽按绑定位置保留（`Vec<Option<V>>`），panic 不挤位；非对象挡路只丢该叶（不再返回空 doc）。
+
+### Fix(compose/id/fsx): combine! 省略 lift 的编译期闸、IdRegistry 有界注册表、copy_tree 包含关系拒绝（#124/#199/#126/#108）
+- `combine!` 省略 `lift` 只在子件 `Op = Infallible` 时编译通过（`assert_effect_free` 恒等闸，E0271 带因）；新增 `discard_effects` 显式 opt-in；`Combine` 类型面与运行期零改动（零 dyn/零装箱/零分叉）。
+- `id`：新增显式 `IdRegistry`（`new`/`bounded`/`open`；超限 `RegistryFull` 拒新**不淘汰**）+ `IdRegistry::{len,is_empty}` 与 `process_registry()` population 读数；`IdGen::new` 仍走进程级默认注册表。
+- `fsx::copy_tree`：落点解析后等于/位于源根内 ⇒ `Prepare(InvalidInput)`（canonicalize 源根 + 目标父 + 叶子，`..`/符号链接父一视同仁；判定早于建目标，TOCTOU 已文档化）。**实测修正**：#108 的「无界目录增长」被 `Sort::ByName` 的目录项快照压成静默半截/错位复制——危害是坏结果而非磁盘爆掉。
+
+### Fix(journal): append=缓冲接受、端口新增 flush 持久点（#106 finding 1）
+- `JournalPort` 新增**必需方法** `flush(&mut self) -> Result<(), Self::Err>`：`Ok` 只保证到达实现方文档声明的持久化边界；**刻意无默认实现**（默认 `Ok(())` 会让无持久位的后端静默谎报持久），不支持持久化的后端返回 `skeleton::FlushUnsupported`。
+- `append` 契约收窄为「缓冲接受，**不是**已持久」；`Err ⇒ 禁 apply` 保持不变；参考 JSONL 实现的端口 `flush` 转调固有 `flush`（BufWriter flush + `sync_all`），不逐条 fsync（窗口归调用方）。
+- **破坏性**：`JournalPort` 新增必需方法（0.1.0 未发布；仓内实现者已全部更新）。
+- 测试：`port_append_is_buffered_until_flush`（未 flush 时另一句柄不可见、flush 后可见）、`journal_port_without_durability_flushes_via_typed_unsupported`。
+
 ### Fix(view): v1 线格式原子迁移——32B Header + 对齐 odd/even seqlock + 两读入口 + 读写加固（#171 #187 #107 #165 #186 #154 #153 #141 #142 #172 #168 #185 #188 #211）
 - Header 按 #222 §B 冻结（32B；publication sequence 在 `8..16`、8 字节对齐，原子读写）；`RegionBacking` 新增对齐原子 publish-sequence 能力（默认 `Unsupported`、装配期拒绝 SAB 模式；**禁字节拷贝降级**）。写事务 `odd → payload → index/header → even`；even 序列为唯一水位（封板 2、每拍 +2）。
 - 读侧两个独立入口：`read_snapshot`（不可变快照，普通 load）与 `read_lock_free`（SAB，前后 acquire-load 相等且 even，odd/变化先拒后有界重试，耗尽 typed `RetryExhausted`）；不支持的 protocol major 在读任何 v1 偏移之前拒绝。

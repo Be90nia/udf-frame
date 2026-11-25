@@ -767,7 +767,7 @@ impl Reducer for DoneFeature {
 }
 
 /// 一行装配：镜头 Workspace.done + 路由 Act::Done。unwrap 自动自 &Act 克隆上浮
-///（要求 DoneAct: Clone）；lift 省略 = 零效果上提（子 Op 是 Infallible，正好）。
+///（要求 DoneAct: Clone）；lift 省略 = 零效果上提（子 Op 是 Infallible，正好 —— 省略有编译期闸：带效应子件省不掉；丢弃须写 discard_effects）。
 /// 产物实现 `Fragment` 不实现 `Reducer`（分片无 `initial`）：根状态由 WorkspaceFeature
 /// 显式构造；分片作根 = E0277 编译期拒绝。
 fn done_fragment() -> impl Fragment<State = Workspace, Action = Act, Op = Infallible> {

@@ -207,7 +207,7 @@ pub enum AdmissionOutcome {
 
 ### Panic 契约
 
-- `S::Clone` 必须 panic-free：外部持有快照时状态落位走 `Arc::make_mut` 克隆分支，clone 在 state 锁内 panic 即毒锁——**实例整体报废且状态不可取出**（文档化显式契约）。
+- `S::Clone` **不在框架调用面上**（#160）：状态落位发布的是 `next_val` 本身——唯一持有走原地写（`Arc::get_mut` + `mem::replace`），共享态换一次分配（`Arc::new(next_val)`）。框架任何路径都不克隆旧状态 ⇒「用户在 state 锁内 clone」的重入/阻塞/panic 三类风险**不存在**；分配 profile 与旧 CoW 实现逐情形一致。
 - reducer panic 不报废实例：计数（`reducer_panic_count`）+审计现场（`AuditEventKind::ReducerInterrupted`）后原样重抛；action 已出队随栈展开丢失，状态不前进。
 - 解释器 panic 不报废实例：panic 原样从 `dispatch` 上浮（fail-visible），毒锁在下一次效果转发时恢复 + 计数（`runtime_panic_count`）——读数口径与首轮 panic 的细节见下文「effect 执行两档」节。
 - 订阅回调 panic：fail-closed 摘除 + `subscriber_panics` 计数 + `subscriber_panic_last_cause` 成因摘要。
@@ -354,20 +354,20 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 - dispatch 热路径锚：`examples/dispatch_profile.rs`（end_to_end_dispatch ≤100ns 契约）；订阅态 dispatch 全含 ~142ns / 无订阅 ~77ns（2026-10-16 批 C）。
 - `subscribe_events` 未订阅 emit 面：一次 Acquire load，零分配零锁（机制断言，audit 域 doc）。
 
-**锚口径（诚实化）**：上述 ns 级 dispatch 锚**仅在小 State 下成立**——锚的测量对象是状态迁移本身的固定开销，不含状态体量的复制成本。`Arc<State>` 是 CoW 快照：外部持有快照时（强计数 ≥2），状态落位走 `Arc::make_mut` 克隆分支，每次 dispatch 额外付一次 `S::clone`（在 state 锁内执行）。审计实测（架构审计（本地留存，未入库）F-05）：
+**锚口径（诚实化）**：上述 ns 级 dispatch 锚**仅在小 State 下成立**——锚的测量对象是状态迁移本身的固定开销，不含状态体量的复制成本。`Arc<State>` 是 CoW 快照：外部持有快照时（强计数 ≥2），状态落位在**共享态**分支换一次分配（`Arc::new(next_val)`）——**不克隆旧值**（#160：`S::clone` 不在框架调用面上），分配次数与旧 `Arc::make_mut` 实现逐情形相同。审计实测（架构审计（本地留存，未入库）F-05，**旧 CoW 实现的克隆成本口径**）：
 
 | 口径 | 实测 |
 |---|---|
-| 克隆计数 | 每 100 次「读快照 + dispatch」= 200 次 State 克隆；每 100 次纯 dispatch = 100 次 |
+| 克隆计数（旧实现） | 每 100 次「读快照 + dispatch」= 200 次 State 克隆；每 100 次纯 dispatch = 100 次 |
 | 深克隆代价 | 1 MiB State（`Vec<[u64;32]>` × 4096）约 210µs/dispatch（release）——与 ~80ns 锚差约 2600 倍 |
 | `Arc` 包裹 State 是否解题 | **不解题**：Arc 包裹与深克隆 State 均为 ~205-210µs/dispatch（比率 1.0x）——reducer 内部照样克隆整个载荷 |
 
 采用方指引：
 
 1. **State 体量**：建议控制在数 KiB 级；大状态用分片 + 自选持久化结构（`compose` 域的父子分片即此路径）。
-2. **持有快照的代价**：长期持有 `snapshot()` 会让后续每次 dispatch 都付一次 State 深克隆（成本随 State 体量线性增长）——快照是「一致性视图」，不是「廉价引用」。
+2. **持有快照的代价**：长期持有 `snapshot()` 不再让后续 dispatch 付整态深克隆（#160），但共享态分支每次仍换一次分配并构造新值——成本是「分配 + 新值」，不再是「整态克隆」（旧实现见上表 F-05 口径）。
 3. **`Arc<Inner>` 模式**：把大载荷放进 `Arc<Inner>`、State 只持 Arc 句柄——`S::clone` 退化为 Arc 计数克隆。但**仅此不够**：审计实测「Arc 包裹 State」与深克隆 State 比率 1.0x，因为 reducer 内部仍整体克隆载荷；此模式要真正省下深拷贝，reducer 侧须经 `Arc::make_mut` 之类 CoW 路径只克隆被改动的部分（**该用法本仓未实测**，属采用方侧选择，框架不代为保证）。
-4. **`S::clone` 必须 panic-free**：clone 在 state 锁内执行，panic 即毒锁——实例整体报废且状态不可取出（见上文「Panic 契约」）。
+4. **`S::clone` 不再被框架调用**（#160）：无需再为框架保证 Clone panic-free；大载荷的优化落在 reducer 侧 CoW（见上一条），框架不给保证。
 
 #### 状态布局建议（issue#53 证据，bench 可复现）
 
@@ -1564,7 +1564,7 @@ pub enum AtomicWritePolicy { Inherit, Private, PreserveExisting }
 pub fn atomic_write_with(path: impl AsRef<Path>, bytes: &[u8], policy: AtomicWritePolicy) -> io::Result<()>;
 ```
 
-- `copy_tree`：`dst` 必须不存在（create_dir 独占语义）；首错即停，已处理量以计数显式申报（禁静默半途）；遍历按文件名排序——报错点确定可复现；文件复制=`fs::copy` 本体语义（权限保留，时间戳不承诺）。**源根是符号链接 ⇒ `Prepare(InvalidInput)`**（`Follow`/`Preserve` 同面，#120；`dst` 不创建，不再出现「链接根被当目录、返回 `Ok(dirs:1,files:0)`」的假成功）。
+- `copy_tree`：`dst` 必须不存在（create_dir 独占语义）；首错即停，已处理量以计数显式申报（禁静默半途）；遍历按文件名排序——报错点确定可复现；文件复制=`fs::copy` 本体语义（权限保留，时间戳不承诺）。**源根是符号链接 ⇒ `Prepare(InvalidInput)`**（`Follow`/`Preserve` 同面，#120；`dst` 不创建，不再出现「链接根被当目录、返回 `Ok(dirs:1,files:0)`」的假成功）。**落点解析后等于/位于源根内 ⇒ `Prepare(InvalidInput)`**（#108：`canonicalize` 源根 + 解析目标父 + 叶子，`..`/符号链接父一视同仁；判定在**建目标之前**，`dst` 不创建；与 `create_dir` 之间仍有 TOCTOU 窗口，已文档化，不是 OS 沙箱）。**实测修正**：`Sort::ByName` 的逐目录条目快照会把自我嵌套压成「返回 `Ok` 的半截/错位复制」——危害是**静默坏结果**而非磁盘爆掉；包含关系闸就是为此设。
 - `rm_all`：引擎=std 硬化原语（CVE-2022-21658 防护+Windows DELETE_PENDING 等待）；加 Windows 只读属性装甲（首次 `PermissionDenied` 清只读后重试恰一轮，仍败原错误上浮）。Unix 只读目录 EACCES 属 OS 语义如实上浮（不自动 chmod）。
 - `temp_dir_in`：命名=前缀+pid+进程内原子序号+挂钟纳秒；创建走 `create_dir` 独占语义；**Unix 新建 0700**（umask 只能收窄），Windows 权限继承父目录 ACL（不宣称私有）。落点由调用方给定（禁系统 TEMP）。`prefix` 必须是**单个普通路径组件**：空串合法，含 `/`、`\`、`.`、`..`、绝对/盘符/UNC 前缀 ⇒ `TempDirError::InvalidPrefix`（拒绝后零残留，#182）。
 - `atomic_write` / `atomic_write_with`：同目录临时件（write+`sync_all`）→ rename 原子替换——读者恒见旧内容或新内容，恒无半写中间态。`atomic_write` = `Inherit`（umask 新建语义，**既有行为零改动**）；`atomic_write_with` 显式策略（#215）：`Private`（Unix 临时件建时即 0600、写首字节前生效；Windows 仅父目录 ACL 继承，**不宣称私有**）、`PreserveExisting`（Unix 以目标现有 mode 建临时件，`symlink_metadata` 不穿链接；目标缺失回落 `Inherit`；目标非普通文件 ⇒ `InvalidInput`；Windows ⇒ `Unsupported`）。**临时件所有权**（#216）：只在 `create_new` 成功后承认所有权，失败/撞名**不删**预置路径；错误路径只清本调用创建的那一条，清理失败不掩盖原错误。其余 armor 不变：**不先删旧**（删旧引入目标缺失窗口毁掉原子性）；`to` 为已存在目录恒败；同目录临时件从根上排除跨分区 rename；父目录必须已存在（不隐式 mkdir）；并发写同目标=最后赢（rename 原子线性化）。崩溃在 rename 前留 `atomic-{pid}-{seq}{nanos}` 临时件（可识别，手扫/启动扫）。
@@ -1711,7 +1711,7 @@ impl std::str::FromStr for Id {       // 连字形解析（hex 位大小写不�
 
 - **同毫秒配额（4096−基址）耗尽 = fail-closed panic**（拒绝静默借位与等待活锁；等待与 MockClock 冻结语义/零自旋纪律冲突；持续率超 4M id/s 应分片指纹）。
 - **counter 基址=指纹固定派生**（回放可复现优先于不可预测性）。
-- **同指纹单权威注册表**（进程级 `OnceLock<Mutex<HashMap>>`）：同指纹 `IdGen::new` 复用同一权威——跨句柄严格递增、零撞 id（生态多生成器同域撞 id 的失败类结构性消灭）。句柄不可手搓，只能经注册表获得。
+- **同指纹单权威注册表**：`IdGen::new` 走进程级默认 `IdRegistry`（跨句柄严格递增、零撞 id）；也可自建显式注册表——`IdRegistry::new()`（无界）/`bounded(max)`（超限返回 `RegistryFull` 拒新，**绝不淘汰**已有指纹——淘汰等于重发 id）/`open()`（从注册表恢复句柄），`IdRegistry::{len,is_empty}` 只读 population，`process_registry()` 暴露默认注册表的同一读数。指纹域集必须**有界可信**，禁逐请求/租户派生（模块文档写明）。句柄不可手搓，只能经注册表获得。
 - 48bit 时间戳越界 / epoch 前挂钟：fail-closed panic。
 
 ```rust
@@ -2260,7 +2260,7 @@ scope.expect_body_idle();   // 任务体结束；集合是否已收割用 expect
 
 **feature**：`journal`（绑 serde + serde_json + 契约 crate）。**依赖面**：serde/serde_json 仅此 feature 可达。
 
-契约要点：**先落盘后 apply**（`append` Err ⇒ 调用方禁 apply 该 Action）；**单写者**（双进程挂载同一账本=交错损坏，多进程场景上层编排）；**flush 点=持久点**（BufWriter 缓冲非逐行 flush，读侧可见性=已 flush 前缀）；行格式=版本头 `{"v":1}`（`deny_unknown_fields`——未知字段 fail-closed 拒挂载）+ action/snapshot 行 `{"t":"a"|"s", ...payload}` 平铺（**`"t"` 为顶层保留键**，payload 携带顶层 `"t"`=append 显式拒绝；payload 须序列化为 JSON 对象）。
+契约要点：**append=缓冲接受 / flush=持久点**（`append` Ok 只表示已被实现接受、**不代表已持久**；`append` Err ⇒ 调用方禁 apply 该 Action；持久化走端口 `flush`，不逐条 fsync，窗口归调用方）；**单写者**（双进程挂载同一账本=交错损坏，多进程场景上层编排）；**flush 点=持久点**（BufWriter 缓冲非逐行 flush，读侧可见性=已 flush 前缀）；行格式=版本头 `{"v":1}`（`deny_unknown_fields`——未知字段 fail-closed 拒挂载）+ action/snapshot 行 `{"t":"a"|"s", ...payload}` 平铺（**`"t"` 为顶层保留键**，payload 携带顶层 `"t"`=append 显式拒绝；payload 须序列化为 JSON 对象）。
 
 ```rust
 pub trait Journal<A>
@@ -2310,7 +2310,7 @@ pub enum ReplayError {
 }
 ```
 
-- 实现层 `Journal` 与契约 `skeleton::JournalPort` 分工：实现层方法名带实现层词形（`append_action`/`restore_stream`/`append_snapshot`，`replay` 独有），端口独占契约词表（`append`/`restore`/`persist_snapshot`，返回三态 `Restore<A, S>` 物化）——两 trait 同屏 import 直呼无歧义（旧三同名双候选拒编译已结构性消灭，批 2A）。状态面为关联类型 `State`（批 6A）：被 `Self` 钉死，构造一次定型（`JsonlJournal::<A, S>::create(..)`）后方法调用零 turbofish 零绑定标注；dyn 焊接面走 [`DynJournal`] 别名（`State =` 短形）。宿主要增量流式恢复用实现层 `Journal`，要端口可换性面向 `skeleton::JournalPort` 编程。
+- 实现层 `Journal` 与契约 `skeleton::JournalPort` 分工：实现层方法名带实现层词形（`append_action`/`restore_stream`/`append_snapshot`，`replay` 独有），端口独占契约词表（`append`/`flush`/`restore`/`persist_snapshot`，返回三态 `Restore<A, S>` 物化）——两 trait 同屏 import 直呼无歧义（旧三同名双候选拒编译已结构性消灭，批 2A）。**端口 `flush` 是必需方法**（无默认实现：默认 `Ok(())` 会让无持久位的后端静默谎报持久），`Ok` 只保证到达实现方文档声明的持久化边界；不支持持久化的后端返回 `skeleton::FlushUnsupported`。状态面为关联类型 `State`（批 6A）：被 `Self` 钉死，构造一次定型（`JsonlJournal::<A, S>::create(..)`）后方法调用零 turbofish 零绑定标注；dyn 焊接面走 [`DynJournal`] 别名（`State =` 短形）。宿主要增量流式恢复用实现层 `Journal`，要端口可换性面向 `skeleton::JournalPort` 编程。
 - `open`：末行无 `\n` 结尾=崩溃残行 → 截断到上一完整行边界并计数留痕（残行必未越过 flush 点=非持久，截断不丢任何已持久 action）。头行必须带终止换行（否则 `HeaderUnterminated`）；`create` 经同目录独占临时文件 + `hard_link` 原子发布（目标已存在=EEXIST，绝不覆盖），失败只清本次临时文件——`shortcut:` 依赖文件系统支持硬链接（FAT/exFAT 不支持时报底层 IO 错误）。
 - **记录上限（#217）**：`DEFAULT_MAX_RECORD_BYTES`=16 MiB（含终止换行），`create_with_limit`/`open_with_limit` 覆盖；写侧经有界 sink 序列化（超限零落盘、writer 保持健康），读侧（头行/回放/快照扫描）读满 `limit` 未见换行即报 `RecordTooLarge`（带物理行号）并吞掉该行余量；超大行处理完回收行缓冲容量。
 - **权限（#181）**：Unix 新建 0600（独立于 umask）；`open` 校验已有文件，含 group/other 位报 `InsecurePermissions`（**不隐式 chmod**）；Windows 隐私靠父目录 ACL 继承（不声称自动加固）。
@@ -2476,7 +2476,17 @@ impl FileSink {
         root: impl Into<std::path::PathBuf>,
         reporter: std::sync::Arc<dyn SoftFailureReporter>,
     ) -> std::io::Result<Self>;
+    pub fn with_retention(self, policy: RetentionPolicy) -> Self;   // opt-in；默认零窗口=不删
+    pub fn prune(&self);                                            // 同步一轮（age→byte）
+    pub fn pruned_files(&self) -> u64;                              // 权威删除计数（与 dropped_lines 互不混算）
     pub fn dropped_lines(&self) -> u64;
+}
+/// 有界保留（#128）：两轴独立，任一为 `None` 即该轴不生效
+pub struct RetentionPolicy { /* … */ }
+impl RetentionPolicy {
+    pub fn new() -> Self;                                     // 零窗口 = 不删任何文件
+    pub fn max_age(self, age: std::time::Duration) -> Self;   // 按文件名 UTC 日截断
+    pub fn max_total_bytes(self, bytes: u64) -> Self;
 }
 impl std::io::Write for FileSink { /* 软失败面：恒 Ok，丢弃走计数 */ }
 
@@ -2513,6 +2523,7 @@ pub struct AlreadyInit;
 - **`DefaultPathResolver` 双构建默认根**：debug=编译期 `CARGO_MANIFEST_DIR`/log（框架自身开发态，零运行时猜测；采方开发态请注入自有 resolver）；release=`home_dir()/.<project_name>/log/`——release 恒不引用 CARGO_MANIFEST_DIR（开发者机器路径烧进发布物=隐私面）。home 构造期一次性解析，失败或**非绝对**显式 Err（`LogPathError::HomeUnresolvable`，禁静默落 cwd；#179）。
 - **`project_name` 语法（#175/#113）**：单个 `Normal` 路径组件（一个目录名，**不是**相对路径表达式）——非空、不含 `/` 与 `\`、不含 NUL/控制字符、不是 `.`/`..`、不是盘符/UNC 前缀；debug/release 同判，非法 ⇒ `Err(LogPathError::InvalidProjectName { name, reason })`（不静默清洗——清洗会把不同输入折叠到同一目录）。
 - **`FileSink`**：按日滚动 `log-YYYY-MM-DD.log` 纯追加（跨进程按行交错安全，永不改名/截断），每行 flush。失败面（#112/#184/#198）：**打开失败**=落点不变、下一行重试（只重试新行，不追认上一行）；**写/刷失败**=句柄在锁内摘除、锁外析构，当日落点降级 `主文件 → log-YYYY-MM-DD.recovery.log → 当日停写（fail-stop）`，绝不原地续写可能带半行前缀的文件；`dropped_lines` 是权威计数面，告警走可注入的 `SoftFailureReporter`（默认 `StderrReporter`，best-effort、禁 `eprintln!`、首次一条）。**恢复 ≠ 记录原子性**：不截断、不自动修复半行（日志跨进程共享，回截会删掉别的进程已追加的行）。时间戳与文件名恒 UTC（std 无本地时区 API，chrono 判否）。`new` 立即递归创建根目录（配置错误显式失败，禁等到首行才爆）；文件按日懒开（无事件不落空文件）。默认行格式：`[UTC 时间 LEVEL target] message key=value ...`（整行先合成单 String 再一次写出=行完整性前提）。**权限（#180）**：Unix 新建根 0700、日文件 0600（`mode` 独立于 umask）；**既有**根/文件带 group/other 位 ⇒ `PermissionDenied`（不静默 chmod 调用方路径）；Windows 无 POSIX 位，靠父目录 ACL 继承，**不宣称私有**。**init 失败收尾（#130）**：只回收**本次调用新建**的空根（归属由非递归 `create` 的 `AlreadyExists` 原子判定），既有根即使为空也保留。
+- **保留策略（#128，opt-in）**：`RetentionPolicy` 两轴（`max_age` / `max_total_bytes`），**默认零窗口 = 不删任何文件**（既有行为零改动）。触发 = 换日/首次开文件，或显式 `prune()`（同步执行，宿主可自行后台化）。顺序 = 先 age 再 byte；**当日文件永不淘汰**（age 用 `date < cutoff`、byte 遇 `date >= today` 即停）。删除在**状态锁外**、同一 sink 的一轮清理以独立闸串行化；单条失败只聚合一条 `SoftFailureReporter` 通告 + 计数（`NotFound` 视为并发良性竞态不计），**绝不 panic、不影响后续写入**；权威删除计数 `pruned_files()`（与 `dropped_lines` 互不混算）。只管本件命名的文件（`log-YYYY-MM-DD*.log`），**跨进程保留无协调**。经 `init_with_file` 装配的 sink **不带**保留策略（宿主需保留时自行构造 `FileSink`）。
 - **`init_with_file(resolver, default_level)`**：console+file 双 sink（同一默认行格式）；过滤语义同 `init_tracing_from_env`（恒含 `skeleton=off` 兜底）；本地资源（日志根目录）先建，任何配置错误在任何全局被触碰之前显式失败（`LogInitError::RootCreate`）。签名：
 
 ```rust
@@ -2594,7 +2605,7 @@ pub struct Combine<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L> { /* … */ }
 
 - 六参语义：`get`/`set`=父状态内子切片的读写镜头；`wrap`/`unwrap`=子 action 上浮 / 父 action 下沉路由（`unwrap` 返回 None=本层不路由，状态克隆原样返回零效果）；`lift_fx`=子效果词表到父词表的显式上提。子效果里的 `Emit(CA)` 由核心经 `wrap` 自动上浮——`lift_fx` 只收 `Run`/`Cancel` 两形。
 - **产物实现 `Fragment` 不实现 `Reducer`**：分片没有 `initial`——根状态由父 Feature 的 `initial` 显式构造（含子初值），分片只承载 reduce 委托；用作根 = **E0277 编译期拒绝**（`#[diagnostic::on_unimplemented]` 错误信息自带修复指引；禁静默空状态）。子件 bound 相应放宽为 `Fragment`：完整 Feature 经 blanket impl 仍可作子件，分片可嵌分片。
-- `combine!` 两形态：**变体短形态** `combine!(Child, Parent.field, Enum::Variant)` 一体生成 wrap/unwrap（unwrap 自 `&PA` 克隆上浮，要求子 action `Clone`）；`lift` 省略=零效果上提。**显式形态** `wrap:`/`unwrap:`/`lift:` 逐项给（非 Clone 词表与复杂路由的逃生口）。切片表达式限 `状态类型.字段名` 裸段（泛型/路径状态退回 `combine` 显式形态）。
+- `combine!` 三档效果面：**省略 `lift`** ⇒ 编译期闸（`assert_effect_free`）——只有子件 `Op = Infallible` 才可省（带效应子件省略 ⇒ E0271，不再静默丢效果）；**`lift:`** ⇒ 显式上提；**`discard_effects`** ⇒ 显式 opt-in 丢弃（关键字在调用点让「丢数据」显形）。**变体短形态** `combine!(Child, Parent.field, Enum::Variant)` 一体生成 wrap/unwrap（unwrap 自 `&PA` 克隆上浮，要求子 action `Clone`）；**显式形态** `wrap:`/`unwrap:`/`lift:` 逐项给（非 Clone 词表与复杂路由的逃生口）。切片表达式限 `状态类型.字段名` 裸段（泛型/路径状态退回 `combine` 显式形态）。
 - 零 dyn 零装箱；采用方可用 `Combine<_, _, …>` 注解持有产物（匿名 `impl Fragment` 形态做不到）。
 
 ```rust
@@ -2652,23 +2663,26 @@ store.close();
 ```rust
 pub struct ViewBridge<S, A, M, I, J, R> { /* 订阅票据 + 单锁折叠态 + eager 区域通道 */ }
 impl ViewBridge<S, A, M, I, J, R> {
-    pub fn mount<T: Store<State = S, Action = A>>(store: T, map: M, intents: I, encoders: Encoders<J, R>) -> Self;
-    pub fn bind(&self, path: &str) -> Result<BindingId, BindError>;      // 装配期；首通知封板
+    pub fn mount<T: Store<State = S, Action = A>>(store: T, map: M, intents: I, encoders: Encoders<J, R>)
+        -> Result<Self, MountError>;   // 装配期：bindings() 恰调一次 + 路径编译/重复/前缀/覆盖校验（全构建 typed）
+    pub fn bind(&self, path: &str) -> Result<BindingId, BindError>;  // ID=登记序；未覆盖绑定 typed 拒；失败不占 ID
+    pub fn seal(&self) -> Result<(), SealError>;  // 捕获一次稳定 Store 快照投影 + 初始区域全量（水位 2）；幂等
     pub fn send_intent(&self, intent: Value) -> Result<bool, IntentError>; // Ok(false) = 闭门
     pub fn take_patches(&self) -> PatchBatch;   // 水位 (from/to/protocol_version) + resync 位
-    pub fn snapshot_doc(&self) -> Snapshot;     // 现态全量重投影 + 同源版本（快照即交付）
+    pub fn snapshot_doc(&self) -> Result<Snapshot, SnapshotError>;  // 已提交投影值 + 同源水位；不完整即 Err
     pub fn region_version(&self) -> u64;        // 区域头版本（与 to_version 同源）
     pub fn projection_panics(&self) -> u64;     // 降级显形计数（对齐 subscriber_panics 先例）
+    pub fn pre_seal_notifications(&self) -> u64; // 封板前到达的通知累计（装配纪律违约的可见面）
 }
 ```
 
-要点：桥 = 纯订阅者（票据归桥，Drop = 注销；store 所有权随桥）；**版本 = 已提交的 even 发布序列**（封板 2、每条通知 +2；odd 只在发布进行中可见，永不外露为已提交版本；JSON `to_version`/`Snapshot.version`/区域头共用同一 even 水位）；投影 panic = 毒化残因（catch + 计数 + `resync` 位 ⇒ `snapshot_doc` 收口）；未知标签跳过（读侧 `view::read` 实现一次，TS/Py/C 镜像复刻，禁整区失败）；正典验收环 `examples/view_bridge_demo.rs`，行为面 `tests/view_bridge_test.rs` 与 `tests/view_region_wire.rs`。
+要点：桥 = 纯订阅者（票据归桥，Drop = 注销；store 所有权随桥）；**装配是检查型生命周期**：`mount`（声明捕获/编译/校验，fallible）→ `bind`（登记序 ID，未覆盖 typed 拒）→ `seal`（一次稳定 Store 快照投影 + 初始区域全量，初始 even 水位=2）→ 之后才允许 dispatch；封板前到达的通知只计数（`pre_seal_notifications`），不投影不发布；**版本 = 已提交的 even 发布序列**（封板 2、每条通知 +2；odd 只在发布进行中可见，永不外露为已提交版本；JSON `to_version`/`Snapshot.version`/区域头共用同一 even 水位）；`snapshot_doc` 只吃**已提交投影值 + 同一临界区的水位**，任何绑定缺已知良好值 ⇒ `SnapshotError::Incomplete`（禁把部分树当完整快照）；投影 panic = 计数 + resync + 有界修复重投影（耗尽 ⇒ `Raced`）；错误面 = `MountError` / `SealError` / `SnapshotError` / `BindError::UncoveredBinding`；未知标签跳过（读侧 `view::read` 实现一次，TS/Py/C 镜像复刻，禁整区失败）；正典验收环 `examples/view_bridge_demo.rs`，行为面 `tests/view_bridge_test.rs` 与 `tests/view_region_wire.rs`。
 
 **v1 线格式与区域发布（#171/#187/#222 §B）**：Header 32B 冻结——`0..4` magic `UVBR`、`4..6` protocol major、`6..8` flags、`8..16` **8 字节对齐的 publication sequence**（原子读写）、`16..20` region_id、`20..24` binding_count、`24..32` index_offset(=32)。写事务：`odd → payload → index/header（跳过 seq 字节）→ even`；读事务是**两个独立入口**——`read_snapshot(&[u8], decls)` 用于不可变快照，`read_lock_free(..)` 用于 SAB（前后 acquire-load 必须相等且 even；odd/变化先拒后有界重试，耗尽报 `RetryExhausted`）。`RegionBacking` 必须提供对齐原子 publish-sequence 能力（默认 `Unsupported`，装配期拒绝 SAB 模式，**禁字节拷贝降级**）；backing/encoder 的 panic 在桥边界 contain 成 typed 失败；事务中途失败 ⇒ 区域 unavailable，唯一恢复口 `reseed_region()`。不支持 major 在读任何 v1 偏移之前拒绝；结构损坏 typed `Err`，逐条目畸形计入跳过 + resync。常量与命名工件见 `docs/view-bridge-constants/`（`--check` 在 CI 断言与 manifest 一致）。
 
 **边界：同一进程内 vs 跨进程/跨重启**。桥保证的是**同一进程内**的自洽与重同步——票据、补丁水位、快照与区域版本都活在同一个桥实例里，`snapshot_doc()` 是进程内重同步原语、**不是持久化**。进程死亡后 UI 侧无从复现：**视图复现由 store/持久化层负责**（journal 回放或采用方自有存储），桥不缓存状态、不作此承诺（Android 分层对照：ViewModel 保进程内，SavedStateHandle 保进程死亡——后者不属渲染层职责）。
 
-**纪律指向**：①视图词表用 enum 表达互斥状态、禁布尔旗子（正反例见 `skeleton::view::ViewMap` 文档与 `bindings()` 语义）；②「派生 input 覆盖 compute 实读」红线的最小可执行反例 = `tests/view_bridge_test.rs::narrow_input_leaks_stale_and_is_detectable`——漏报的三处签名：`projection_runs` 停滞、水位推进而补丁为空、快照真值与最后交付的补丁值不等。
+**纪律指向**：①视图词表用 enum 表达互斥状态、禁布尔旗子（正反例见 `skeleton::view::ViewMap` 文档与 `bindings()` 语义）；②「派生 input 覆盖 compute 实读」红线的最小可执行反例 = `tests/view_bridge_test.rs::narrow_input_leaks_stale_and_is_detectable`——漏报的**两处**签名：`projection_runs` 停滞、水位推进而补丁为空（第三处「快照真值与补丁值不等」不再适用：快照只吃已提交投影值，#104/§6，陈旧值体现在快照内容本身）。
 
 ---
 

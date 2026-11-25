@@ -10,7 +10,7 @@
 
 | | `skeleton::JournalPort<A>`（`State` 关联类型） | `skeleton_infra::journal::Journal<A>`（`State` 关联类型） |
 |---|---|---|
-| 词表 | `append` / `restore` / `persist_snapshot` | `append_action` / `restore_stream` / `append_snapshot` + `replay` |
+| 词表 | `append` / `flush` / `restore` / `persist_snapshot` | `append_action` / `restore_stream` / `append_snapshot` + `replay` |
 | 恢复形态 | 物化三态 `Restore<A, Self::State>`（`Empty` / `FromInitial` / `FromSnapshot`） | 流式：`Some((快照态, Replay<'_, A>))` 或 `None` |
 
 - **场景：换后端（SQLite/网络账本）或业务逻辑依赖注入** → 面向 `JournalPort` 写 → 为什么：端口独占契约词表，后端可整体替换；两 trait 同屏 import 直呼无歧义（方法名刻意分叉）。
@@ -48,7 +48,7 @@
 | 一行装配 | ✅ 镜头/路由/克隆上提一体生成 | ❌ 六参逐项手写 |
 | `wrap` 收什么 | 变体构造器（tuple variant 天然是 `Fn(CA) -> PA`） | 任意闭包/`Fn(CA) -> PA` |
 | 子动作 `Clone` 要求 | unwrap 自动克隆上浮 → 要求 `Clone` | 不要求（unwrap 自己写） |
-| 效果上提 | `lift:` 省略 = 零效果上提 | `lift_fx` 必给（显式 `|_, _| {}` 同义） |
+| 效果上提 | `lift:` 省略 = 零效果上提（**仅 `Op = Infallible` 可省**；丢弃须写 `discard_effects`） | `lift_fx` 必给（显式 `|_, _| {}` 同义） |
 | 状态切片 | 限 `状态.字段` 裸段 | 任意（泛型/路径状态走这里） |
 
 - **场景：子域有真动作类型、父路由是 tuple variant（`Act::Done(DoneAct)`）** → 宏短形态 → 为什么：一行装配，零样板，组合税个位数 ns。
