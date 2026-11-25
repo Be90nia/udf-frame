@@ -28,8 +28,10 @@
 //! serde_json journal 先例形态，toml 仅 config-toml 可达）。形状拍板点：
 //! 配置端口面与配置文件面（本地留存，未入库）。
 
-#[cfg(feature = "config-toml")]
+#[cfg(feature = "config-json")]
 use std::fmt;
+#[cfg(feature = "config-json")]
+use std::io::Read;
 #[cfg(feature = "config-json")]
 use std::marker::PhantomData;
 #[cfg(feature = "config-json")]
@@ -72,6 +74,19 @@ use skeleton::config::ConfigError;
 /// - 高层非对象（标量/数组/null）：整体替换——数组不按下标合并、null 是
 ///   显式值（config-rs 式 null 吞并/下标合并魔法判否，fail-visible）。
 ///
+/// # 读入上限（#197/#127）
+///
+/// `file_layer`/`file_layer_toml`/`load_toml` 三处的文件读入都受
+/// [`DEFAULT_MAX_FILE_BYTES`]（8 MiB）约束，超限报 `ConfigError::File`（`source`
+/// 为 [`ConfigFileTooLarge`]：路径 + 上限 + 观测大小），**绝不截断成功、绝不部分
+/// 接受**。逐实例覆盖用 [`ConfigFile::max_file_bytes`]；`load_toml` 是单文件自由
+/// 函数、无实例承载覆盖，恒走默认值。
+///
+/// 实现口径：metadata 只作提前拒绝的优化（文件大小可能在 metadata 与读之间变化），
+/// 上限由**读入**强制——最多读 `limit + 1` 字节即停（`std::io::Read::take`，
+/// 无新依赖）。上限只管读入字节数，**不**约束解析后的值树规模，也不约束
+/// `.layer()` 的程序化合并深度（后者见上节）。
+///
 /// # 保存面
 ///
 /// [`ConfigFile::save`] = Pretty 序列化 + [`fsx::atomic_write`](std_ext::fsx)
@@ -107,17 +122,28 @@ use skeleton::config::ConfigError;
 pub struct ConfigFile<C> {
     /// 层叠原始值（低→高；load 时依次折叠）。
     layers: Vec<serde_json::Value>,
+    /// 文件层读入上限（字节；默认 [`DEFAULT_MAX_FILE_BYTES`]，构造器可覆盖）。
+    max_file_bytes: usize,
     _marker: PhantomData<fn() -> C>,
 }
 
 #[cfg(feature = "config-json")]
 impl<C> ConfigFile<C> {
-    /// 空分层链。
+    /// 空分层链（文件层读入上限取 [`DEFAULT_MAX_FILE_BYTES`]）。
     pub fn new() -> Self {
         Self {
             layers: Vec::new(),
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             _marker: PhantomData,
         }
+    }
+
+    /// 覆盖文件层读入上限（字节）。只影响本实例后续的 `file_layer`/
+    /// `file_layer_toml`；超限报 `ConfigError::File`（`source` 为
+    /// [`ConfigFileTooLarge`]，含上限与观测大小）。
+    pub fn max_file_bytes(mut self, limit: usize) -> Self {
+        self.max_file_bytes = limit;
+        self
     }
 
     /// 显式原始值层（链图 explicit 层/外部覆盖/中间任意层皆可叠）。
@@ -154,6 +180,7 @@ impl<C> std::fmt::Debug for ConfigFile<C> {
         // 手写防 derive 的 `C: Debug` 假界：PhantomData<fn() -> C> 恒 Debug
         f.debug_struct("ConfigFile")
             .field("layers", &self.layers)
+            .field("max_file_bytes", &self.max_file_bytes)
             .finish()
     }
 }
@@ -178,12 +205,12 @@ impl<C> ConfigFile<C> {
         Ok(self.layer(v))
     }
 
+    /// 文件层（链图第 2 层）：读入上限为本实例 [`Self::max_file_bytes`]（默认
+    /// [`DEFAULT_MAX_FILE_BYTES`]）；超限报 `ConfigError::File`（`source` 为
+    /// [`ConfigFileTooLarge`]），绝不部分接受。
     pub fn file_layer(self, path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let bytes = std::fs::read(path).map_err(|source| ConfigError::File {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let bytes = read_file_bounded(path, self.max_file_bytes)?;
         let v: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|source| ConfigError::Parse {
                 key: path.display().to_string(),
@@ -214,12 +241,11 @@ impl<C> ConfigFile<C> {
 /// 降级）；需要 Datetime 全保真走 [`load_toml`] 类型化直读。
 #[cfg(feature = "config-toml")]
 impl<C> ConfigFile<C> {
+    /// TOML 文件层：读入上限同 [`ConfigFile::file_layer`]（本实例的
+    /// [`ConfigFile::max_file_bytes`]）。
     pub fn file_layer_toml(self, path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let bytes = std::fs::read(path).map_err(|source| ConfigError::File {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let bytes = read_file_bounded(path, self.max_file_bytes)?;
         let v: toml::Value = toml::from_slice(&bytes).map_err(|source| ConfigError::Parse {
             key: path.display().to_string(),
             source: Box::new(source),
@@ -231,15 +257,15 @@ impl<C> ConfigFile<C> {
 
 /// 类型化直读 TOML 配置文件（单文件面，无分层；Datetime 全保真）。
 ///
-/// IO 失败报 [`ConfigError::File`]；TOML 词法/反序列化失败报
-/// [`ConfigError::Parse`]（key=文件路径）。
+/// IO 失败报 `ConfigError::File`；读入超 [`DEFAULT_MAX_FILE_BYTES`] 亦报
+/// `ConfigError::File`（`source` 为 [`ConfigFileTooLarge`]；单文件面无实例承载
+/// 上限覆盖，需要更大上限走 [`ConfigFile::file_layer_toml`] +
+/// [`ConfigFile::max_file_bytes`]）；TOML 词法/反序列化失败报
+/// `ConfigError::Parse`（key=文件路径）。
 #[cfg(feature = "config-toml")]
 pub fn load_toml<C: serde::de::DeserializeOwned>(path: impl AsRef<Path>) -> Result<C, ConfigError> {
     let path = path.as_ref();
-    let bytes = std::fs::read(path).map_err(|source| ConfigError::File {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let bytes = read_file_bounded(path, DEFAULT_MAX_FILE_BYTES)?;
     toml::from_slice(&bytes).map_err(|source| ConfigError::Parse {
         key: path.display().to_string(),
         source: Box::new(source),
@@ -458,6 +484,49 @@ mod tests {
             }
             assert!(err.to_string().starts_with("serialize config: "));
             assert!(std::error::Error::source(&err).is_some());
+        }
+    }
+
+    // ── 读入上限的「读入侧」闸（config-json：Cursor 直连，不经 metadata）──
+
+    #[cfg(feature = "config-json")]
+    mod cfgbound {
+        use super::*;
+        use std::io::Cursor;
+
+        fn payload(err: &ConfigError) -> ConfigFileTooLarge {
+            match err {
+                ConfigError::File { source, .. } => {
+                    assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                    *source
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<ConfigFileTooLarge>())
+                        .expect("source 必须是 ConfigFileTooLarge")
+                }
+                other => panic!("期望 File，得 {other:?}"),
+            }
+        }
+
+        #[test]
+        fn read_side_gate_accepts_exactly_limit() {
+            let path = Path::new("in-memory.json");
+            let bytes = read_bounded(Cursor::new(vec![b' '; 8]), path, 8).unwrap();
+            assert_eq!(bytes.len(), 8, "恰等于上限必须放行");
+        }
+
+        #[test]
+        fn read_side_gate_rejects_one_byte_over_without_metadata() {
+            // Cursor 没有 metadata 面：上限全靠读入闸，多一字节即报
+            let path = Path::new("in-memory.json");
+            let err = read_bounded(Cursor::new(vec![b' '; 9]), path, 8).unwrap_err();
+            assert_eq!(
+                payload(&err),
+                ConfigFileTooLarge {
+                    limit: 8,
+                    observed: 9
+                }
+            );
+            assert!(err.to_string().contains("in-memory.json"), "{err}");
         }
     }
 

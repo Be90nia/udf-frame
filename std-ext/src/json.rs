@@ -4,10 +4,13 @@
 //! JSON 解码标准件：RFC 8259 严格 / 注释容忍双模 + 输入上限 + 行列位置错误。
 //!
 //! - [`JsonMode::Strict`]：serde_json 原生严格解析（对应 Go `platform.UseStrictJSON` 面）；
-//! - [`JsonMode::Tolerant`]：先剥离 `//` 行注释与 `/* */` 块注释再解析（字符串字面量内不动）；
+//! - [`JsonMode::Tolerant`]：先剥离 `//` 行注释与 `/* */` 块注释再解析（字符串字面量内不动；
+//!   注释按词法空白处理——块注释内换行保留、其余内容换成一个空白，未闭合块注释
+//!   报错并带开注行列）；
 //! - 输入上限 [`MAX_INPUT_BYTES`]（64 MiB）：读满即停、超限报错（fail-visible，绝不无限读、
 //!   绝不截断成功）；
-//! - 解析错误带 1 起行列位置（提取自 serde_json，无需手写 offset 换算）。
+//! - 解析错误带 1 起行列位置（serde_json 错误原样提取；未闭合块注释的位置由本域按
+//!   原始输入自算。行号与原始输入一致，列号按变换后文本计——见 `strip_json_comments`）。
 
 use std::io::Read;
 
@@ -82,7 +85,8 @@ pub fn decode_str(s: &str, mode: JsonMode) -> Result<serde_json::Value, JsonPars
     match mode {
         JsonMode::Strict => serde_json::from_str(s).map_err(JsonParseError::from_serde),
         JsonMode::Tolerant => {
-            serde_json::from_str(&strip_json_comments(s)).map_err(JsonParseError::from_serde)
+            let stripped = strip_json_comments(s)?;
+            serde_json::from_str(&stripped).map_err(JsonParseError::from_serde)
         }
     }
 }
@@ -94,60 +98,103 @@ pub fn decode_slice(s: &[u8], mode: JsonMode) -> Result<serde_json::Value, JsonP
     decode_str(s, mode)
 }
 
-/// 剥离 `//` 行注释和 `/* */` 块注释。
+/// 剥离 `//` 行注释和 `/* */` 块注释（注释=词法空白，不是删除）。
 ///
-/// 字符串字面量内的注释标记被保留（对应 Go `infra/conf/json_reader.go`）。
-fn strip_json_comments(input: &str) -> String {
+/// 字符串字面量内的注释标记与转义逐字节原样保留（对应 Go
+/// `infra/conf/json_reader.go`）。块注释内的换行（`\n`/`\r`）原样保留、其余
+/// 内容移除；无换行的注释替换为一个空格——两侧 token 绝不相接（`1/*c*/2` 是
+/// 两个 token，不会变成 `12`）。未闭合块注释报错并带开注位置（原始输入 1 起
+/// 行列）。
+///
+/// 位置约定：换行全保留 ⇒ 行号与原始输入一致；列号按变换后文本计（同一行内
+/// 移除注释后列会左移）。唯一按原始输入计位置的是未闭合注释错误。
+///
+/// 输出容量取输入长度上界：每段注释最多补一个空白字节（`/*` + `*/` 至少 4
+/// 字节），注释只减不增，故不会产生超出输入上限的第二块大缓冲。
+fn strip_json_comments(input: &str) -> Result<String, JsonParseError> {
+    let src = input.as_bytes();
     let mut out = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
+    // 尚未拷贝的原文起点：只在剥离注释处切段，字符串与普通字节随整段带出
+    let mut copied_from = 0;
     let mut i = 0;
-    let mut in_string = false;
-    while i < chars.len() {
-        let c = chars[i];
-        if in_string {
-            out.push(c);
-            if c == '\\' && i + 1 < chars.len() {
-                // 转义字符：保留下一字符
-                out.push(chars[i + 1]);
+    while i < src.len() {
+        match src[i] {
+            // 字符串字面量：整段原文保留（注释标记不动，转义按两字节跳过）
+            b'"' => {
+                i += 1;
+                while i < src.len() {
+                    match src[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                i = i.min(src.len());
+            }
+            b'/' if src.get(i + 1) == Some(&b'/') => {
+                out.push_str(&input[copied_from..i]);
                 i += 2;
-                continue;
+                while i < src.len() && src[i] != b'\n' {
+                    i += 1;
+                }
+                // 行尾 `\n`（若有）留作分隔符，由后续整段拷贝带出
+                copied_from = i;
             }
-            if c == '"' {
-                in_string = false;
+            b'/' if src.get(i + 1) == Some(&b'*') => {
+                let body_start = i + 2;
+                let mut close = body_start;
+                while close < src.len() {
+                    if src[close] == b'*' && src.get(close + 1) == Some(&b'/') {
+                        break;
+                    }
+                    close += 1;
+                }
+                if close >= src.len() {
+                    let (line, column) = position_at(src, i);
+                    return Err(JsonParseError {
+                        line,
+                        column,
+                        message: format!(
+                            "unterminated block comment starting at line {line}, column {column}"
+                        ),
+                    });
+                }
+                out.push_str(&input[copied_from..i]);
+                let mut kept_newline = false;
+                for &b in &src[body_start..close] {
+                    if b == b'\n' || b == b'\r' {
+                        out.push(b as char);
+                        kept_newline = true;
+                    }
+                }
+                if !kept_newline {
+                    out.push(' ');
+                }
+                i = close + 2;
+                copied_from = i;
             }
-            i += 1;
-            continue;
+            // 普通字节（含多字节 UTF-8 的全部字节）随整段拷贝带出
+            _ => i += 1,
         }
-        // 不在字符串中
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        // 行注释 //
-        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
-            // 跳到行尾
-            i += 2;
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // 块注释 /* */
-        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            i += 2; // skip */
-            if i > chars.len() {
-                i = chars.len();
-            }
-            continue;
-        }
-        out.push(c);
-        i += 1;
     }
-    out
+    out.push_str(&input[copied_from..]);
+    Ok(out)
+}
+
+/// 原始输入中 `offset` 处的 1 起行列（列按字符计、续字节不占列；`\n` 换行）。
+fn position_at(src: &[u8], offset: usize) -> (u32, u32) {
+    let mut line = 1u32;
+    let mut column = 1u32;
+    for &b in &src[..offset] {
+        if b == b'\n' {
+            line += 1;
+            column = 1;
+        } else if b & 0xC0 != 0x80 {
+            column += 1;
+        }
+    }
+    (line, column)
 }
