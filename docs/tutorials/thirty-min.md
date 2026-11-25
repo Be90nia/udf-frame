@@ -157,8 +157,9 @@ Board { next_id: 1, tasks: [Task { id: 0, title: "写周报", col: Doing }] }
 ```
 
 **这步教你什么契约**：`Op = Infallible` 让 `Effect::Run` 在类型层不可构造——零效果程序配
-`NoFx` 缺省解释器，副作用的缺席是编译期事实，不是纪律约定。reducer 是纯函数：状态进
-出、效果写 `out`，禁 IO 由「本 crate 零 IO 依赖」结构性保证。
+`NoFx` 缺省解释器，**框架托管效果**的缺席是编译期事实（`Op = Infallible` 的签名保证）。reducer 是纯函数：状态进
+出、效果写 `out`；「禁 IO」由框架不向 reducer 暴露 IO 能力 + 实现纪律保证，**不是编译期强制**
+（下游仍可直接调用 std/OS，issue#136）。
 
 ## 第 2 步（7 分钟）：journal 持久化——挂载、flush、重放恢复
 

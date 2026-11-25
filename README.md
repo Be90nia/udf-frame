@@ -16,7 +16,7 @@ action ──▶ Store ──▶ Reducer（纯函数）──▶ 新状态 + 效
 | [`std-ext`](std-ext) | 散件层 | 十四域（`text`/`encode`/`hash`/`iter`/`backoff`/`fsx`/`paths`/`clock`/`retry`/`scheduler`/`ratelimit`/`cache`/`id`/`json`；十三域零门常驻、本体纯 std；`json` 域门控 `json` feature，`random` 门控凭据级 CSPRNG `RandomId`）+ `log-embed` 埋点（七域 48 调用点） | 默认树：仅 `skeleton`（workspace 路径依赖）——零三方（开 `json` 门时 `serde_json` 子树按需进树） |
 | [`skeleton-infra`](skeleton-infra) | 实现层 | `runtime::SyncStore`（契约参考实现：同步排空环 + 快照广播）+ `audit` 审计事件流 + `pool` 池化管理组合件 + `compose` 组合器 + `view` 语言无关视图桥（ADR 0006）+ `testing` 测试替身（含 `parse_mock` 解析面 mock）+ `shutdown` 停机编排 + 生态绑定（tokio fx / journal / memgov / logx / tracingx / config） | 默认树：仅 `skeleton` + `std-ext`（均 workspace 路径依赖）——零三方 |
 
-契约（约束后面代码长法的形状）与实现（机器）分家：`skeleton` 十分钟读完，`skeleton-infra` 按域查典。核心无 IO 依赖 → reducer「禁 IO」是编译期事实，不是评审约定；副作用只能以 `Effect::Run { op }` 描述值离场，由宿主提供的解释器执行。
+契约（约束后面代码长法的形状）与实现（机器）分家：`skeleton` 十分钟读完，`skeleton-infra` 按域查典。核心无 IO 依赖，且框架不向 reducer 参数暴露 IO 能力 → 副作用只能以 `Effect::Run { op }` 描述值离场，由宿主提供的解释器执行；但「reducer 禁 IO」是**实现/架构不变式，不是编译期保证**（下游实现仍可直接调用 std/OS，见 issue#136）。
 
 ## 快起
 

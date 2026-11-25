@@ -4,8 +4,9 @@
 //! 谁呈现 / 谁持久化 / 谁发异步变更信号 / 什么算一个 store）、数据词汇
 //! （Effect/EffectBuf/EffectId/ActionSender/Subscription/NoFx）与语义契约文本
 //! （各 trait 文档中的承诺）。零
-//! `[dependencies]`——核心无 IO/运行时依赖，reducer「禁 IO」从评审约束升级为
-//! 编译期不可能。
+//! `[dependencies]`——核心无 IO/运行时依赖，且框架不向 reducer 参数暴露 IO/运行时
+//! 能力；但「reducer 禁 IO」是**实现/架构不变式，不是 Rust 编译期保证**——下游实现
+//! 仍可直接调用 `std::fs`/时钟/全局状态或自加依赖（issue#136）。
 //!
 //! 基础端口域（契约+参考实现+测试替身同模块，`skeleton_infra` 承载行为件）：
 //! [`clock`]（时间源双口分流）、[`config`]（env 覆盖→校验）、[`logpath`]
@@ -97,8 +98,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 非法状态进类型（互斥态用嵌套 enum，禁 bool 旗子）。
 ///
 /// **根契约**：[`Reducer`] 是一个 Feature 的唯一状态迁移函数——`initial` 给出
-/// 根状态、`reduce` 同 `(state, action)` 恒产同输出（确定性）；IO 在结构上
-/// 不可触——本 crate 无 IO 依赖。子件（`combine` 产物）只需 [`Fragment`]：
+/// 根状态、`reduce` 同 `(state, action)` 恒产同输出（确定性）。**纯度边界**：
+/// 框架不通过 reducer 参数暴露 IO/运行时能力（trait 签名即边界，`Op = Infallible`
+/// 阻止用框架效果词汇描述效果）；但「禁 IO/时钟/随机」与状态不可变是**实现/架构
+/// 不变式，不是编译期保证**——下游实现仍可直接调用 std/OS，`Clone + Send + Sync`
+/// 也不排除内部可变性（issue#136）。子件（`combine` 产物）只需 [`Fragment`]：
 /// 每个 `Reducer` 都是合法子件（blanket impl），反之不成立——分片无根状态
 /// 工厂，作根 = E0277 编译期拒绝。
 #[diagnostic::on_unimplemented(
@@ -118,7 +122,7 @@ pub trait Reducer {
     /// 状态分片没有本方法（[`Fragment`] 是 reduce-only 契约）——根状态由父
     /// Feature 的 `initial` 显式构造（含子切片初值），分片只承载 reduce 委托。
     fn initial(&self) -> Self::State;
-    /// 纯函数：禁 IO/时钟/随机/写共享态（结构性：本 crate 无此依赖）。
+    /// 纯函数：禁 IO/时钟/随机/写共享态（实现纪律——本 crate 无此依赖，但编译器不强制下游实现）。
     /// 效果写入 `out`（写入序 = 转发序），状态经返回值给出（效果出参化）。
     fn reduce(
         &self,
@@ -145,7 +149,7 @@ pub trait Fragment {
     type Action: Send;
     /// 同 [`Reducer::Op`]
     type Op;
-    /// 纯函数：禁 IO/时钟/随机/写共享态（结构性：本 crate 无此依赖）。
+    /// 纯函数：禁 IO/时钟/随机/写共享态（实现纪律——本 crate 无此依赖，但编译器不强制下游实现）。
     /// 效果写入 `out`（写入序 = 转发序），状态经返回值给出（效果出参化）。
     fn reduce(
         &self,

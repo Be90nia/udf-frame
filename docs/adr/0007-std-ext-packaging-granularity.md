@@ -101,7 +101,7 @@ F-15 的**原始措辞经实测不成立**——本 ADR 的第一件事是把它
 | B 保持常开 + 文档诚实化 | 承认 `serde_json` 常开 | 零三方的承诺**永久作废**（两个 crate 同时），且变成散文约定而非可验事实；与仓库自身成例相悖：`serde_json` 在 `skeleton-infra` 的 `journal`/`config-json` 门后、`tracing` 在 `std-ext` 的 `log-embed` 门后——**仓库既有纪律就是「三方依赖走 feature 门」** | 否决 |
 | C `json` 域迁出 `std-ext` | 回 `skeleton-infra` | 破坏 ADR 0004 的分层（`json` 是叶子行为件不是胶水件）；「只要散件」路线（`std-ext` 单依赖即取即用）的用户为一份 JSON 解码器拖进整个 infra 实现层；`infra` 侧已有 `config-json` 绑 serde_json（配置读写值面），再放一份解码器语义相邻 | 否决 |
 
-**决策的理论依据与仓库自身哲学同构**：README 明写「核心无 IO 依赖 → reducer「禁 IO」是**编译期事实，不是评审约定**」。
+**决策的理论依据与仓库自身哲学同构**：README 明写「核心无 IO 依赖 → 副作用只能以 `Effect::Run` 描述值离场」，并明确「reducer 禁 IO」是实现/架构不变式而非编译期保证（issue#136）。
 「零三方」同理应当是 `cargo tree` 可一行复核的**事实**，而不是需要散文加注的承诺。
 
 ### 2.3 外部证据
