@@ -806,7 +806,8 @@ mod log_embed {
         );
     }
 
-    // 埋点「容量淘汰（LRU 尾）」：LruCache 满插 → debug（被逐者指纹/LRU 序/残留）。
+    // 埋点「容量淘汰（LRU 尾）」：LruCache 满插 → debug（策略/LRU 序/残留）。
+    // 不计算被逐键指纹：诊断不能为已提交变更额外调用用户 Hash。
     #[test]
     fn lru_capacity_evict_emits_debug_event() {
         let mut c = LruCache::new(2);
@@ -821,12 +822,6 @@ mod log_embed {
         assert_eq!(e.level, Level::DEBUG);
         assert_eq!(e.field("kind"), Some("capacity"));
         assert_eq!(e.field("order"), Some("lru_tail"), "LRU 序选择策略入字段");
-        let expected = fingerprint("x");
-        assert_eq!(
-            e.field("key_hash"),
-            Some(expected.as_str()),
-            "被逐者=x（LRU 尾）"
-        );
         assert_eq!(
             e.field("len_at_evict"),
             Some("1"),
