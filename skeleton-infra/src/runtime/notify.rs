@@ -131,5 +131,11 @@ pub(super) fn notify_async<S, A, Op>(inner: &StoreInner<S, A, Op>) {
                 }
             }
         }
+        // 每轮投递末尾释放强引用（issue#161）：票据 Drop 后本缓冲是最后一个
+        // 强持有者——不在此清空，被退订/被 panic 摘除的 sink 及其捕获图会滞留
+        // 到下一次 dispatch（长闲 store 可无限期不清）。`clear` 保容量（稳态
+        // 零分配不变）；此刻不持 `notify_sinks` 表锁 ⇒ 最后一个 Arc 的析构
+        // 不在表锁内，也不触碰本轮已完成的投递。
+        slots.clear();
     });
 }

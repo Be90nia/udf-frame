@@ -50,7 +50,7 @@ use receipt::{Ledger, Outcome};
 /// panic，禁静默吞掉毒锁继续跑。（crate 内共享：testing 域 TestStore 同纪律取锁。）
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect(
-        "skeleton Store state lock poisoned（S::Clone/守卫 panic 违约——实例整体报废且状态不可取出，见 Store 文档「Panic 契约」节）: prior panic while holding the lock",
+        "skeleton Store state lock poisoned（锁内守卫 panic 违约——实例整体报废且状态不可取出，见 Store 文档「Panic 契约」节）: prior panic while holding the lock",
     )
 }
 
@@ -609,6 +609,8 @@ struct StoreInner<S, A, Op> {
     subs_version: Arc<AtomicUsize>,
     /// 本地订阅闸（[`SyncStore::subscribe_local`]）：零本地订阅时通知路径一次
     /// relaxed 读即短路，不触达任何线程本地表。只作闸，不作精确计数读侧。
+    /// issue#162：panic 摘除与票据 Drop 共享在册令牌 ⇒ 恰好回落一次，毒回调
+    /// 摘除后闸不再虚高（虚高会让后续每拍都误记跨线程 miss）。
     local_subs: Arc<AtomicUsize>,
     /// 本地订阅跨线程 miss 计数（读侧 [`SyncStore::local_missed_notifications`]）：
     /// 通知段闸>0 但本线程表查无该 store 登记即 +1——「本地档挂注册线程、
@@ -778,15 +780,18 @@ struct StoreInner<S, A, Op> {
 ///
 /// # Panic 契约
 ///
-/// `S::Clone` 必须 panic-free：外部持有快照（强计数 ≥2）时，状态落位走
-/// `Arc::make_mut` 克隆分支，`S::clone` 在 state 锁内执行——clone panic 即毒锁，
-/// snapshot/dispatch 从此恒 panic，**实例整体报废且状态不可取出**。这是文档化
-/// 显式契约而非可恢复路径：state 锁内「只剩 memcpy 与计数」的形态纪律不为用户
-/// State 的 panic-free 性兜底。对照：`S::Drop` 的 panic 已由「旧快照锁外析构」
-/// 排除（见 `drain_owned` 落位段）；解释器 panic 不报废实例（毒锁恢复+计数，
-/// 见 [`Self::runtime_panic_count`]）；reducer panic 同不报废（计数+审计现场，
-/// 见 [`Self::reducer_panic_count`]——action 本体已出队随栈展开丢失，状态不前进；
-/// 本次调用已产的暂存效果随未提交迁移一并丢弃，不执行）。
+/// **`S::Clone` 不在框架的调用面上**（issue#160）：状态落位要么原地
+/// `mem::replace`（唯一持有，稳态零分配），要么换到装着新值的新分配（共享态，
+/// 与旧 `Arc::make_mut` 共享分支同为一次分配）——两条路径都**不调用**
+/// `S::clone`，state 锁内也不跑任何用户代码。于是 `Clone` 的实现自由度不受本库
+/// 约束：既没有「clone 在锁内 panic ⇒ 毒锁报废」这条契约，也没有「clone 重入
+/// `snapshot()` 即自锁死锁／慢 clone 拖住全体读者」的风险。
+/// `S::Drop` 的 panic 由「旧快照锁外析构」排除（见 `drain_owned` 落位段：旧值
+/// 析构 panic 是「状态已提交」之后的失败，不记 reducer 失败、不毒 state 锁）；
+/// 解释器 panic 不报废实例（毒锁恢复+计数，见 [`Self::runtime_panic_count`]）；
+/// reducer panic 同不报废（计数+审计现场，见 [`Self::reducer_panic_count`]——
+/// action 本体已出队随栈展开丢失，状态不前进；本次调用已产的暂存效果随未提交
+/// 迁移一并丢弃，不执行）。
 ///
 /// ## Action 析构义务（unwind 清理期，issue#66）
 ///
@@ -1865,7 +1870,8 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ///    计数闸，零本地订阅时一次 relaxed 读即短路；
     /// 3. **不计入 [`Self::subscriber_count`]**（该计数只看跨线程订阅）；回调
     ///    panic 与跨线程订阅同一纪律：fail-closed 摘除 + [`Self::subscriber_panics`]
-    ///    计数。
+    ///    计数。摘除同时**回落本地闸计数**（issue#162）——否则闸长期虚高，
+    ///    后续每拍都误记跨线程 miss（真实原因是回调已被摘除）。
     /// 4. **跨线程 miss 显形**：他线程 dispatch 不触达本档——每次「闸>0 而
     ///    dispatch 线程表查无本 store 登记」计入 [`Self::local_missed_notifications`]
     ///    （「挂错档」检测；触发语义不变，只留痕）。
@@ -1903,9 +1909,13 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         }
         let sub_id = next_local_sub_id();
         let store_id = self.inner.store_id;
-        local_subs::register(store_id, sub_id, Box::new(f));
+        // 在册令牌（issue#162）：TLS 登记与票据共享。panic 摘除与票据 Drop
+        // 竞争时只有 `swap(false)` 到 false 的一方回落闸计数——既不漏减
+        // （摘除后闸虚高 = 每拍误记跨线程 miss），也不双减（下溢 = 门控恒真）。
+        let active = Arc::new(AtomicBool::new(true));
+        local_subs::register(store_id, sub_id, Arc::clone(&active), Box::new(f));
         self.inner.local_subs.fetch_add(1, Ordering::Release);
-        LocalSubscription::new(store_id, sub_id, Arc::clone(&self.inner.local_subs))
+        LocalSubscription::new(store_id, sub_id, Arc::clone(&self.inner.local_subs), active)
     }
 
     /// 活跃订阅者数（跨线程订阅；本地订阅不入此表，见 [`Self::subscribe_local`]）。
@@ -3270,8 +3280,10 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         let snapshot_notified = inner
             .notify_cache
             .with_mut(|cache| notify_snapshot_consumers(inner, cache, &notified_next));
-        // 通知节点（R1-2）：只在当拍确有订阅者收到快照时记录——零订阅者的
-        // dispatch 无 Notified 事件（时间线如实，不造心跳噪声）。
+        // 通知节点（R1-2）：只在当拍**真有订阅回调被调用**时记录——零订阅者的
+        // dispatch 无 Notified；「有在册登记但本拍没人被调用」（本地订阅在他线程
+        // 查不到、快照后已注销的槽位）同样不记（issue#145：时间线要能当投递 trace
+        // 用，闸/登记数不是投递证据）。
         if snapshot_notified {
             audit_emit(inner, AuditEventKind::Notified);
         }
@@ -3305,24 +3317,35 @@ fn detach_deferred<A: Send + 'static>(
     record
 }
 
-/// CoW 快照落位（快照分配税消除）：稳态
-/// （current 已放手、无外部 snapshot() 持有者）强计数=1 → make_mut 原地
-/// 写入零分配；有外部持有者时自动克隆新分配、旧分配冻结——持有者永见旧
-/// 快照，快照一致性逐比特保持（CoW 即快照语义的业界标准实现）。
-/// **mem::replace 把旧 S 挪出锁外析构是本形态最大风险点**：原地赋值会在
-/// state 锁内 drop 旧值，S:Drop panic 即毒锁变砖——锁内必须
-/// 只剩 memcpy 与计数原子，析构在本函数返回后的 drop(old_snapshot) 处（锁外）发生。
-fn place_snapshot<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
-    inner: &Arc<StoreInner<S, A, Op>>,
-    next_val: S,
-) -> S {
-    let old_snapshot = {
-        let mut slot = lock(&inner.state);
-        std::mem::replace(Arc::make_mut(&mut slot), next_val)
+/// CoW 快照落位（快照分配税消除）：稳态（无外部 snapshot() 持有者）强计数
+/// =1 → 原地写入零分配；有外部持有者时换到新分配、旧分配冻结——持有者永见
+/// 旧快照，快照一致性逐比特保持（CoW 即快照语义的业界标准实现）。
+///
+/// **锁内零用户代码**（issue#160）：没有 `S: Clone` 约束不是笔误——落位要装的是
+/// `next_val`，旧值的克隆从来不是必需的：
+/// - 唯一持有 → 锁内一次 `mem::replace`（稳态零分配）；
+/// - 共享 → 锁内 `Arc::new(next_val)` 换分配（与旧 `Arc::make_mut` 共享分支
+///   同为一次分配），旧分配整块留给持有者，**不调用 `S::clone`**。
+///
+/// 旧实现走 `Arc::make_mut`：共享态**持锁**克隆当前值再覆盖——宿主 `Clone` 因此
+/// 在 state 锁内运行（重入 `store.snapshot()` 即自锁死锁、慢 clone 拖住全体读者、
+/// panic 毒锁 ⇒ 其后按 fail-fast 全线 panic = 实例变砖）。本形态把这三条风险
+/// 一起消掉，而不是搬家。
+///
+/// `S::drop` 同样在锁外：`mem::replace` 换出的旧值只在本函数返回后由调用方析构
+/// （旧值 Drop panic 是「状态已提交」之后的事，不得记成 reducer 失败）；仍有
+/// 外部持有者时旧值归持有者，本函数只降级自己那一份 `Arc`（也在锁外）。
+fn place_snapshot<S, A, Op>(inner: &Arc<StoreInner<S, A, Op>>, next_val: S) -> Option<S> {
+    let mut slot = lock(&inner.state);
+    let Some(cell) = Arc::get_mut(&mut slot) else {
+        // 共享：新分配装新值（一次分配，同 make_mut 共享分支），旧分配冻结。
+        let old_snapshot = std::mem::replace(&mut *slot, Arc::new(next_val));
+        // 放手 state 锁再可能析构旧值：本线程恰是最后一个持有者时才真析构。
+        drop(slot);
+        return Arc::try_unwrap(old_snapshot).ok();
     };
-    // 退役快照交还调用方：析构在锁外，且**在调用方推进阶段之后**——旧值析构
-    // panic 是「状态已提交」之后的事，不得记成 reducer 失败。
-    old_snapshot
+    // 唯一持有：锁内只剩一次 memcpy，无任何用户代码可跑，零分配。
+    Some(std::mem::replace(cell, next_val))
 }
 
 /// 转发环：逐条借出转发（只转发**已提交**的效果——暂存区在提交点已并入队列）。
@@ -3489,8 +3512,10 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
     }
 }
 
-/// 通知段：本地订阅先行、跨线程订阅随后（确定性），返回当拍是否有订阅者
-/// 收到快照（审计 `Notified` 节点的判据）。
+/// 通知段：本地订阅先行、跨线程订阅随后（确定性），返回当拍**是否真有订阅
+/// 回调被调用**（审计 `Notified` 的唯一判据，issue#145）——「在册/闸>0」不等于
+/// 「被调用」：他线程 dispatch 查不到本地登记、快照后已注销的跨线程槽位，
+/// 都不得记成投递成功。
 fn notify_snapshot_consumers<
     S: Clone + Send + Sync + 'static,
     A: Send + 'static,
@@ -3500,26 +3525,29 @@ fn notify_snapshot_consumers<
     cache: &NotifyCache<S>,
     notified_next: &Option<Arc<S>>,
 ) -> bool {
+    let mut invoked = 0;
     // 本地订阅（单线程档）：先于跨线程广播判读——零本地订阅一次 relaxed
     // 读即短路；有本地订阅时零跨线程订阅也必触发（快照按需取，本地闭包
     // panic 摘除计入 subscriber_panics，fail-closed）。同一 dispatch 通知
     // 序：本地先行、跨线程随后（确定性）。
-    let local_notified = inner.local_subs.load(Ordering::Relaxed) > 0;
-    if local_notified {
+    if inner.local_subs.load(Ordering::Relaxed) > 0 {
         let snapshot = Arc::clone(&lock(&inner.state));
-        let (matched, poisoned, cause) = local_notify(inner.store_id, &*snapshot);
+        let outcome = local_notify(inner.store_id, &*snapshot, &inner.local_subs);
         // 跨线程 miss 留痕（读侧 local_missed_notifications）：闸>0 说明有线程
         // 持有本地订阅，本线程表却查无该 store——本拍 dispatch 到不了任何
         // 本地订阅（触发语义不变，只从「零触发零信号」变「miss 看得见」）。
-        if matched == 0 {
+        if outcome.matched == 0 {
             inner.local_missed.fetch_add(1, Ordering::Relaxed);
         }
-        if poisoned > 0 {
+        if outcome.removed > 0 {
             inner
                 .subscriber_panics
-                .fetch_add(poisoned, Ordering::Release);
-            *lock(&inner.subscriber_panic_cause) = cause;
+                .fetch_add(outcome.removed, Ordering::Release);
+            *lock(&inner.subscriber_panic_cause) = outcome.cause;
         }
+        // 只认真正进入的回调数（issue#145）：闸/匹配数是「在册」观察，不是投递
+        // 证据——他线程 dispatch 查不到登记时 matched=0 而已计入 miss。
+        invoked += outcome.invoked;
     }
     if let Some(next) = notified_next {
         for slot in cache.slots.iter() {
@@ -3532,6 +3560,9 @@ fn notify_snapshot_consumers<
             if !slot.alive.load(Ordering::Acquire) {
                 continue;
             }
+            // 调用计数落在最后一次 alive 检查之后、进入回调之前（issue#145）：
+            // 快照之后才注销的槽位既不被调用，也不得再算「收到」。
+            invoked += 1;
             let notified = catch_unwind(AssertUnwindSafe(|| {
                 let mut notify = lock(&slot.notify);
                 notify(next);
@@ -3548,7 +3579,8 @@ fn notify_snapshot_consumers<
             }
         }
     }
-    local_notified || notified_next.is_some()
+    // 被调用后 panic 也算收到（回调确实收到了快照，失败另由 panic 计数留痕）。
+    invoked > 0
 }
 
 // ── 本地订阅：线程本地登记机制在 runtime/local_subs.rs（关注面切缝）────────
@@ -3864,6 +3896,189 @@ mod tests {
         // 析构在锁外 ⇒ state mutex 未中毒 ⇒ store 继续可用（毒锁形态下此处必 panic）
         store.dispatch(Tick::Tick);
         store.dispatch(Tick::Tick);
+    }
+
+    // ── issue#160：落位路径不调用宿主 S::clone（锁内零用户代码）────────────
+
+    /// `Clone` 被调用时的行为（策略由测试选；落位路径本不该调用它）。
+    enum ClonePolicy {
+        /// 计数 + 回看 state 锁：真在持锁时被调用即记违约（对「本线程已持锁」
+        /// 而言 `try_lock` 与 `lock()` 判定等价——真用 `lock()` 会挂死）。
+        Probe(Arc<AtomicBool>),
+        /// 若被调用必须炸（panic 毒锁风险的可观察化）。
+        Panic,
+        /// 若被调用即停靠在测试闸上（阻塞型 clone 的可观察化）。
+        Park(Arc<CapacitySettle>),
+    }
+
+    /// 落位观测状态：`calls` 记录 `Clone` 被调用次数（期望恒 0，issue#160）。
+    /// `inner` 是测试夹具的循环引用（store 内核 ↔ 状态），进程内泄漏无害。
+    struct CloneProbeState {
+        policy: Arc<ClonePolicy>,
+        calls: Arc<AtomicUsize>,
+        inner: Option<Arc<StoreInner<CloneProbeState, Tick, Infallible>>>,
+        value: u32,
+    }
+
+    impl Clone for CloneProbeState {
+        fn clone(&self) -> Self {
+            self.calls.fetch_add(1, Ordering::Release);
+            match &*self.policy {
+                ClonePolicy::Probe(locked) => {
+                    if let Some(inner) = &self.inner {
+                        let free = inner.state.try_lock().is_ok();
+                        if !free {
+                            locked.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                ClonePolicy::Panic => panic!("issue#160 探针：用户 S::clone 被调用"),
+                ClonePolicy::Park(gate) => gate.park(),
+            }
+            Self {
+                policy: Arc::clone(&self.policy),
+                calls: Arc::clone(&self.calls),
+                inner: self.inner.clone(),
+                value: self.value,
+            }
+        }
+    }
+
+    struct CloneProbeFeature {
+        policy: Arc<ClonePolicy>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Reducer for CloneProbeFeature {
+        type State = CloneProbeState;
+        type Action = Tick;
+        type Op = Infallible;
+        fn initial(&self) -> CloneProbeState {
+            CloneProbeState {
+                policy: Arc::clone(&self.policy),
+                calls: Arc::clone(&self.calls),
+                inner: None,
+                value: 0,
+            }
+        }
+        fn reduce(
+            &self,
+            s: &CloneProbeState,
+            _: Tick,
+            _out: &mut EffectBuf<Tick, Infallible>,
+        ) -> CloneProbeState {
+            // 显式构造（不经 `clone`）：本测试只观测落位路径。
+            CloneProbeState {
+                policy: Arc::clone(&s.policy),
+                calls: Arc::clone(&s.calls),
+                inner: s.inner.clone(),
+                value: s.value + 1,
+            }
+        }
+    }
+
+    /// 重入型 clone：修复前 `Arc::make_mut` 持 state 锁调用宿主 `Clone`——重入
+    /// `store.snapshot()` 即自锁死锁、clone panic 毒锁。本形态根本不调用 clone。
+    #[test]
+    fn state_clone_is_never_invoked_by_placement() {
+        let locked = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = SyncStore::new(
+            CloneProbeFeature {
+                policy: Arc::new(ClonePolicy::Probe(Arc::clone(&locked))),
+                calls: Arc::clone(&calls),
+            },
+            NopRuntime,
+        );
+        // 回填 store 内核句柄（fresh state 唯一持有 ⇒ get_mut 必成），让探针能回看锁
+        let inner = Arc::clone(&store.inner);
+        {
+            let mut slot = lock(&store.inner.state);
+            Arc::get_mut(&mut slot)
+                .expect("fresh store state is uniquely owned")
+                .inner = Some(inner);
+        }
+        store.dispatch(Tick::Tick); // 唯一持有 ⇒ 原地快路径
+        let held = store.snapshot(); // 制造共享 ⇒ 下一拍走共享分支
+        store.dispatch(Tick::Tick);
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            0,
+            "落位路径不得调用宿主 S::clone（issue#160）"
+        );
+        assert!(
+            !locked.load(Ordering::Acquire),
+            "state 锁内不得跑任何用户代码"
+        );
+        assert_eq!(
+            (held.value, store.snapshot().value),
+            (1, 2),
+            "快照冻结与状态推进语义不变"
+        );
+    }
+
+    /// 阻塞型 clone：修复前 clone 在 state 锁内停靠 ⇒ dispatch 延迟 = 宿主 clone
+    /// 时长、读者被一起拖住。本形态 clone 从不进入停靠点。
+    #[test]
+    fn blocking_state_clone_cannot_stall_placement_or_readers() {
+        let gate = Arc::new(CapacitySettle::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(SyncStore::new(
+            CloneProbeFeature {
+                policy: Arc::new(ClonePolicy::Park(Arc::clone(&gate))),
+                calls: Arc::clone(&calls),
+            },
+            NopRuntime,
+        ));
+        store.dispatch(Tick::Tick);
+        let held = store.snapshot(); // 共享 ⇒ 落位走共享分支
+        gate.arm();
+        let worker = Arc::clone(&store);
+        let handle = std::thread::spawn(move || worker.dispatch(Tick::Tick));
+        // 有界观察「clone 从不进入停靠点」（旧实现：此刻它正持着 state 锁停靠）
+        let parked = gate.wait_entered(Duration::from_millis(100));
+        assert!(
+            !parked,
+            "落位路径不得调用宿主 S::clone（阻塞型 clone 会停靠在闸上）"
+        );
+        // 读者照常取快照（旧实现下会被持锁的 clone 挡住）
+        let _read = store.snapshot();
+        gate.release();
+        handle.join().expect("dispatch 线程不得 panic");
+        assert_eq!(calls.load(Ordering::Acquire), 0, "clone 调用次数必须为 0");
+        assert_eq!(
+            (held.value, store.snapshot().value),
+            (1, 2),
+            "快照冻结与状态推进语义不变"
+        );
+    }
+
+    /// panic 型 clone：修复前 clone 在 state 锁内 panic ⇒ 毒锁 ⇒ 其后按
+    /// fail-fast 全线 panic = 实例变砖。本形态 clone 从不被调用。
+    #[test]
+    fn panicking_state_clone_cannot_poison_state() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store = SyncStore::new(
+            CloneProbeFeature {
+                policy: Arc::new(ClonePolicy::Panic),
+                calls: Arc::clone(&calls),
+            },
+            NopRuntime,
+        );
+        store.dispatch(Tick::Tick);
+        let held = store.snapshot(); // 共享 ⇒ 落位走共享分支
+        store.dispatch(Tick::Tick);
+        store.dispatch(Tick::Tick); // 毒锁形态下此处必 panic
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            0,
+            "落位路径不得调用宿主 S::clone（issue#160）"
+        );
+        assert_eq!(
+            (held.value, store.snapshot().value),
+            (1, 3),
+            "panic 型 clone 不存在 ⇒ 状态照常前进"
+        );
     }
 
     // ── 残留弃队留痕 ────────────────────

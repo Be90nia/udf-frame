@@ -1,9 +1,10 @@
 #![cfg(feature = "runtime")]
-//! 健壮性修复回归：解释器 panic / S::Clone panic / 效果吞没 / 回灌活锁四景。
+//! 健壮性修复回归：解释器 panic / S::Clone 不被落位路径调用 / 效果吞没 / 回灌活锁四景。
 //!
 //! - 解释器 panic、效果续转、回灌预算三测为红测转绿（修复前必败）；
-//! - S::Clone 锁内 panic 为文档化显式契约（必须 panic-free，违者实例报废），
-//!   行为前后不变——本测为契约金丝，钉死「报废」语义防未来漂移。
+//! - issue#160 起落位路径**不再调用** `S::clone`（唯一持有内联写、共享态换成
+//!   装着新值的新分配）⇒「clone 在 state 锁内 panic = 实例报废」这条旧契约路径
+//!   不可达。本文件钉死新语义：会 panic 的 clone 也打不坏实例（防未来实现漂移）。
 
 use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
 use skeleton_infra::runtime::SyncStore as Store;
@@ -116,10 +117,11 @@ fn interpreter_panic_does_not_brick_runtime_mutex() {
     );
 }
 
-// ── S::Clone 锁内 panic 整体变砖（文档化契约）────────────────────────────
+// ── S::Clone 不被落位路径调用（issue#160 后的契约金丝）────────────────────
 
 struct CloneBoomState {
     gate: Arc<AtomicBool>,
+    value: u32,
 }
 
 impl Clone for CloneBoomState {
@@ -129,6 +131,7 @@ impl Clone for CloneBoomState {
         }
         CloneBoomState {
             gate: Arc::clone(&self.gate),
+            value: self.value,
         }
     }
 }
@@ -144,9 +147,10 @@ impl Reducer for CloneBoomFeature {
     fn initial(&self) -> CloneBoomState {
         CloneBoomState {
             gate: Arc::clone(&self.gate),
+            value: 0,
         }
     }
-    // 直构不走 trait clone：clone 闸只由 make_mut 克隆分支触发
+    // 直构不走 trait clone：clone 闸只可能被落位路径触发——而它不再触发。
     fn reduce(
         &self,
         s: &CloneBoomState,
@@ -155,79 +159,31 @@ impl Reducer for CloneBoomFeature {
     ) -> CloneBoomState {
         CloneBoomState {
             gate: Arc::clone(&s.gate),
+            value: s.value + 1,
         }
     }
 }
 
-/// 契约金丝（行为前后不变）：外部持有快照时状态落位走 make_mut 克隆
-/// 分支，`S::clone` 在 state 锁内 panic = 毒锁 = 实例整体报废（snapshot/dispatch
-/// 从此恒 panic，状态不可取出）。此为文档化显式契约（Store doc「Panic 契约」节），
-/// 非可恢复路径——钉死语义防未来实现漂移。
+/// issue#160 契约金丝（旧金丝 `clone_panic_inside_state_lock_bricks_instance_by_contract`
+/// 的触发条件已被消除，随之作废）：外部持有快照时落位**不走克隆分支**，`S::clone`
+/// 根本不被调用——会 panic 的 clone 也打不坏 state 锁，实例不报废。
 #[test]
-fn clone_panic_inside_state_lock_bricks_instance_by_contract() {
+fn clone_panic_cannot_brick_state_lock() {
     let store = Store::new(
         CloneBoomFeature {
             gate: Arc::new(AtomicBool::new(false)),
         },
         NopFx::<DemoAction> { _m: PhantomData },
     );
-    let held = store.snapshot(); // 外部持有：强计数 ≥2 → make_mut 必走克隆分支
-    held.gate.store(true, Ordering::SeqCst);
-    let r = catch_unwind(AssertUnwindSafe(|| store.dispatch(DemoAction::Noop)));
-    assert!(
-        r.is_err(),
-        "make_mut 克隆分支的 S::clone panic 必须如实传播"
-    );
-    let brick1 = catch_unwind(AssertUnwindSafe(|| store.snapshot()));
-    let msg1 = brick1
-        .as_ref()
-        .err()
-        .map(|b| panic_message(b.as_ref()))
-        .unwrap_or_default();
-    assert!(
-        msg1.contains("poisoned"),
-        "契约：state 毒锁 → snapshot 报废（实际：{msg1}）"
-    );
-    drop(held);
-    let brick2 = catch_unwind(AssertUnwindSafe(|| store.snapshot()));
-    assert!(
-        brick2.is_err(),
-        "F2 契约：报废不因外部持有释放而解除（毒锁粘滞）"
-    );
-}
-
-/// 毒锁消息必须自含——子系统名（skeleton Store state lock）+ 契约指位
-/// （Store「Panic 契约」文档节）+ 严重度（实例整体报废、状态不可取出），
-/// 禁裸 std PoisonError 让排查者再翻文档。
-#[test]
-fn poisoned_lock_message_names_subsystem_and_contract() {
-    let store = Store::new(
-        CloneBoomFeature {
-            gate: Arc::new(AtomicBool::new(false)),
-        },
-        NopFx::<DemoAction> { _m: PhantomData },
-    );
-    let held = store.snapshot(); // 外部持有：make_mut 必走克隆分支
-    held.gate.store(true, Ordering::SeqCst);
-    let _ = catch_unwind(AssertUnwindSafe(|| store.dispatch(DemoAction::Noop)));
-    let brick = catch_unwind(AssertUnwindSafe(|| store.snapshot()));
-    let msg = brick
-        .as_ref()
-        .err()
-        .map(|b| panic_message(b.as_ref()))
-        .unwrap_or_default();
-    assert!(
-        msg.contains("skeleton Store state lock poisoned"),
-        "子系统名必须在消息内（非自含缺陷本体）：{msg}"
-    );
-    assert!(
-        msg.contains("Panic 契约"),
-        "必须指向 Store Panic 契约文档节：{msg}"
-    );
-    assert!(
-        msg.contains("状态不可取出"),
-        "严重度判断必须在消息内：{msg}"
-    );
+    let held = store.snapshot(); // 外部持有：强计数 ≥2
+    held.gate.store(true, Ordering::SeqCst); // clone 一旦被调用必 panic
+    // 旧实现：这里走 make_mut 克隆分支 ⇒ panic + 毒锁 + 实例永久报废。
+    store.dispatch(DemoAction::Noop);
+    store.dispatch(DemoAction::Noop);
+    let snap = catch_unwind(AssertUnwindSafe(|| store.snapshot()))
+        .expect("state 锁不得被用户 Clone 毒化（issue#160）");
+    assert_eq!(snap.value, 2, "状态照常推进");
+    assert_eq!(held.value, 0, "外部持有者仍见旧快照（CoW 冻结语义不变）");
 }
 
 // ── 部分转发失败静默吞效果 ───────────────────────────────────────────────
