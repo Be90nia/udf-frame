@@ -818,11 +818,7 @@ pub fn temp_dir_in(root: impl AsRef<Path>, prefix: &str) -> io::Result<TempDir> 
     Ok(TempDir { path, armed: true })
 }
 
-fn report_tempdir_cleanup_failure_to(
-    writer: &mut impl Write,
-    path: &Path,
-    err: &io::Error,
-) {
+fn report_tempdir_cleanup_failure_to(writer: &mut impl Write, path: &Path, err: &io::Error) {
     // Formatting and writing are both fallible. Never let a diagnostic turn Drop
     // into a panic, especially while another panic is already unwinding.
     let _ = writeln!(
@@ -846,7 +842,7 @@ impl Drop for TempDir {
         if let Err(err) = rm_all(&self.path) {
             // Drop is strictly best-effort: no host tracing subscriber and no
             // infallible stderr macro. Explicit close() remains error-reporting.
-            report_tempdir_cleanup_failure(&self.path, &err);
+            report_tempdir_cleanup_failure(&self.path, &err.err);
         }
     }
 }
@@ -860,7 +856,10 @@ mod tempdir_drop_reporting_tests {
 
     impl Write for BrokenWriter {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected stderr failure"))
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected stderr failure",
+            ))
         }
 
         fn flush(&mut self) -> io::Result<()> {
