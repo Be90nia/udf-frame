@@ -1429,7 +1429,7 @@ impl<G: SpawnGate> ThreadPool<G> {
                 }
                 self.notify_retire_tokens();
             }
-            if spawn_failure.is_some() {
+            if spawn_failure.is_some() || spawn_panic.is_some() {
                 break;
             }
             // ③ 下一轮：对账最新目标（并发 resize 期间目标可能已变）——补足到
