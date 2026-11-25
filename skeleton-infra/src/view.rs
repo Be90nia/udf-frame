@@ -1550,7 +1550,20 @@ where
         let mut pending: Vec<(usize, M::View)> = Vec::new(); // (绑定注册序, view)
         let mut panicked = false;
         for (bi, b) in bound.iter().enumerate() {
-            if !self.map.input_changed(b.index, state) {
+            // #152/#189：`input_changed` 与 `project` 同为**采用方代码**，panic 禁穿出
+            // `on_notify`——否则 `SyncStore` 按「订阅者 panic」摘除整条桥订阅，桥从此
+            // 静默不再收更新。判不出「未变」⇒ 按已变更 fail-visible 投影 + 计数 + 毒化
+            // （与 project panic 同口径；禁把不确定性吞成「未变」而丢一拍）。
+            let sentinel_changed =
+                match catch_unwind(AssertUnwindSafe(|| self.map.input_changed(b.index, state))) {
+                    Ok(changed) => changed,
+                    Err(_) => {
+                        self.projection_panics.fetch_add(1, Ordering::Relaxed);
+                        panicked = true;
+                        true
+                    }
+                };
+            if !sentinel_changed {
                 continue;
             }
             self.projection_runs.fetch_add(1, Ordering::Relaxed);

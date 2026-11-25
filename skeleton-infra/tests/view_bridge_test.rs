@@ -117,6 +117,72 @@ fn build(arm: Arc<AtomicBool>) -> TestBridge {
     .expect("static declarations are well-formed")
 }
 
+/// #152/#189：采用方 `input_changed` panic 必须在桥边界收容——不得穿出
+/// `dispatch`（否则 `SyncStore` 按订阅者 panic 摘除整条桥订阅），且计数 + 毒化
+/// 显形，解除注入后后续拍仍到达（订阅未被摘）。
+#[test]
+fn sentinel_panic_is_contained_and_keeps_the_subscription() {
+    static DECLS: [BindingDecl; 1] = [BindingDecl {
+        path: "/count",
+        kind: PayloadTag(1),
+    }];
+
+    struct SentinelMap {
+        arm: Arc<AtomicBool>,
+    }
+
+    impl ViewMap<App> for SentinelMap {
+        type View = V;
+        fn bindings(&self) -> &[BindingDecl] {
+            &DECLS
+        }
+        fn project(&self, _: usize, s: &App) -> V {
+            V::C(s.count)
+        }
+        fn input_changed(&self, _: usize, _: &App) -> bool {
+            assert!(!self.arm.load(Ordering::SeqCst), "injected sentinel panic");
+            true
+        }
+    }
+
+    let arm = Arc::new(AtomicBool::new(false));
+    let store = SyncStore::new(AppReducer, NoFx);
+    let bridge = ViewBridge::<App, u32, SentinelMap, Intent, Json, Region>::mount(
+        store,
+        SentinelMap {
+            arm: Arc::clone(&arm),
+        },
+        Intent,
+        Encoders {
+            json: Some(Json),
+            region: None,
+        },
+    )
+    .expect("static declarations are well-formed");
+    bridge.bind("/count").unwrap();
+    bridge.seal().expect("seal before dispatch");
+
+    assert!(bridge.send_intent(json!(1)).unwrap());
+    arm.store(true, Ordering::SeqCst); // 下一拍哨兵 panic
+    assert!(
+        bridge.send_intent(json!(2)).unwrap(),
+        "哨兵 panic 不得穿出 dispatch（否则订阅被摘）"
+    );
+    assert_eq!(bridge.projection_panics(), 1, "哨兵 panic 必须计数");
+    assert!(bridge.take_patches().resync, "毒化必须经返回值显形");
+
+    // 订阅未被摘除：解除注入后下一拍仍产出补丁（被摘则这里恒空）。
+    arm.store(false, Ordering::SeqCst);
+    assert!(bridge.send_intent(json!(4)).unwrap());
+    let batch = bridge.take_patches();
+    assert_eq!(
+        batch.patches.len(),
+        1,
+        "后续拍必须仍到达：{:?}",
+        batch.patches
+    );
+}
+
 /// 毒化-重同步闭环四步断言（规格 §8②）：panic ⇒ 计数+闩 ⇒ 次批 resync ⇒
 /// snapshot_doc 全量且复位 ⇒ 后续变更补丁恢复到达。
 #[test]
