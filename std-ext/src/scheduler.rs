@@ -1805,8 +1805,9 @@ mod tests {
 
 
     #[cfg(feature = "log-embed")]
-    use super::*;
-    use skeleton::clock::MockClock;
+    mod telemetry_boundary_tests {
+        use super::*;
+        use skeleton::clock::MockClock;
     use std::sync::atomic::AtomicUsize;
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Metadata};
