@@ -112,6 +112,10 @@ type AuditCallback = Box<dyn FnMut(&PoolAuditEvent) + Send>;
 #[cfg(feature = "testing")]
 type ResizeEpochHook = Box<dyn FnMut(u64) + Send>;
 
+/// Worker startup handoff hook (unit-test-only deterministic interleaving seam).
+#[cfg(test)]
+type WorkerStartHook = Box<dyn FnMut(u64) + Send>;
+
 /// 审计槽（订阅态的单槽内容）：容量环 + 实时回调 + 订阅代次（形态同
 /// `audit::AuditSink`）+ **在途派发状态 + 待投递 FIFO**（issue#75）。
 struct AuditSlot {
@@ -922,7 +926,7 @@ struct Shared {
     resize_epoch_hook: Mutex<Option<ResizeEpochHook>>,
     /// Test-only pause after OS spawn but before reservation commit.
     #[cfg(test)]
-    worker_start_hook: Mutex<Option<Box<dyn FnMut(u64) + Send>>>,
+    worker_start_hook: Mutex<Option<WorkerStartHook>>,
     #[cfg(test)]
     worker_loop_entries: AtomicU64,
 }
