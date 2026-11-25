@@ -27,7 +27,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1672,6 +1672,29 @@ fn multi_producer_dispatch(c: &mut Criterion) {
     mp_group(c, MpMode::Dispatch);
 }
 
+/// 一次 `fetch_add(1, Relaxed)` 的成本——`CountingAllocator` 干扰的**上界**估计量。
+///
+/// 用途：把 `state_layout_*` 臂每拍的分配事件数换算成「时间上界」，判断实测差
+/// 距能否由 instrumentation 的原子开销解释。**上界而非精确值**，因为：
+/// ① 分配器包装本身的间接成本（栈帧 / 分支 / TLS 查找）两侧共有，本臂不含，
+///    这部分会被算进「上界」之外 ⇒ 只覆盖原子面；
+/// ② 生产里的计数原子与业务数据同处 hot 进程，cache line 竞争下单点成本通常
+///    高于本臂的独占计数器；
+/// ③ 不同计数点可能是 `fetch_add` 之外的形态（`load` 更便宜），故按最贵形态取。
+static MICRO_RMW_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn alloc_atomics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("alloc_atomics");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("relaxed_rmw", |b| {
+        b.iter(|| {
+            let prev = MICRO_RMW_COUNTER.fetch_add(1, Ordering::Relaxed);
+            black_box(prev)
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     fxscope_spawn_join,
@@ -1688,6 +1711,7 @@ criterion_group!(
     state_layout_update_scope,
     state_layout_retention,
     multi_producer_admission,
-    multi_producer_dispatch
+    multi_producer_dispatch,
+    alloc_atomics
 );
 criterion_main!(benches);

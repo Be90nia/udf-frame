@@ -317,6 +317,9 @@ jobs:
               "multi_producer_dispatch/bounded_saturated_p4",
               "multi_producer_dispatch/slow_reducer_p4",
               "multi_producer_dispatch/causal_feedback_p4",
+              # ── allocator instrumentation 干扰上界 micro 臂（issue#103）──
+              # 单臂单组：只钉「组消失」；读数随机器变，不设阈值。
+              "alloc_atomics/relaxed_rmw",
           }
           base_keys = {k for k in baseline if not k.startswith("_")}
           expected_keys = EXPECTED_BENCH_IDS | base_keys

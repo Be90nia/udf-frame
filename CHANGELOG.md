@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Perf(bench): `alloc_atomics/relaxed_rmw` micro 臂 + `state_layout` 基准方差定性（issue#103）
+- bench 新增 micro 臂 `alloc_atomics/relaxed_rmw`（一次 `fetch_add(1, Relaxed)` 的 ns/op），作为 `CountingAllocator` instrumentation 干扰的**上界估计量**；`perf.yml` 期望清单同步登记该 ID。既有 `state_layout_*` 臂零改动，公共 API 零变化。
+- `state_layout_*` 相对 11-23 参考的 +8%~+14% 漂移定性：**跨会话/机器状态水平差，非代码回归**。同会话 OLD（`e5cbf26`）↔NEW（HEAD）二进制交替配对 8 轮：同一份旧代码隔两日差 −16.8%…+21.6%（20 个可比臂中 11 个区间不重叠），而 OLD→NEW 的配对比值有 28 臂落在 ±1–4% 配对噪声内；代码效应只有 4 臂达到或触及判据且幅度 ≤2.4%（`state_layout_update_scope/sharded_256parts_1k_all_{noretain,retain}` +1.7%/+1.6% 变慢、`state_layout_update/mono_16m_retain` −2.4% 变快、`state_layout_retention/sharded_window16` +1.3% 为边缘件），方向不一、未 bisect。
+- instrumentation 变化排除：`state_layout_*` 与 bench 二进制的 `#[global_allocator] CountingAllocator` 同提交 `60a81de` 引入，11-23 基线 HEAD `e5cbf26` 已含它。
+- 纪律：本机跨会话比较在 ±20% 内无判别力；性能归因必须用**同会话二进制交替配对**——单会话重复测量分不开「代码」与「会话」两个变量，「bench 臂没改」也不能证明被测路径没改。
+
 ### Fix(perf): 修正 12 条 scheduler 期望 ID —— 滚动基线恢复提升（#96 发现）
 - `perf.yml` 的 `EXPECTED_BENCH_IDS` 曾把 scheduler 组写成下划线形态（`scheduler/register_1000`），而 bench 实际注册的是 group+参数形态（`scheduler/register/1000`）⇒ 完整性闸每轮判缺 12 条、`complete=false` ⇒ **滚动基线从未提升**（性能回归对比等于失效）。
 - 按 `cargo bench ... -- --list` 实测改正 12 条；复核对 manifest ∪ 两 crate `--list`：expected 51 / actual 125、`missing_keys=[]`、`missing_groups=[]`。闸的 `complete` 逻辑与「不完整不提升基线」策略未动。
