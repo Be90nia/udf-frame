@@ -1363,6 +1363,7 @@ impl<G: SpawnGate> ThreadPool<G> {
             }
         };
         let mut spawn_failure = None;
+        let mut spawn_panic = None;
         loop {
             // ① 锁内：缺口席位预留 + 缩容令牌对账（目标已在上面提交；OS 线程
             //    创建在锁外，见下）。
@@ -1408,9 +1409,11 @@ impl<G: SpawnGate> ThreadPool<G> {
                     Ok(Err(failure)) => Some(failure.error),
                     Err(payload) => {
                         // Current slot was rolled back by ReservationGuard::drop.
-                        // Release the rest of this batch before resuming the original panic.
+                        // Release the rest of this batch, then defer rethrow until the
+                        // already-committed resize event has been emitted outside locks.
                         self.rollback_reservations(ids.len() - index - 1);
-                        std::panic::resume_unwind(payload);
+                        spawn_panic = Some(payload);
+                        break;
                     }
                 };
                 if let Some(error) = failure {
@@ -1451,6 +1454,9 @@ impl<G: SpawnGate> ThreadPool<G> {
         //    resize/execute/metrics。目标被更晚发起的调用覆盖时不发（那次调用负责）。
         if committed {
             self.base.emit_resize(ResizeOutcome::Resized);
+        }
+        if let Some(payload) = spawn_panic {
+            std::panic::resume_unwind(payload);
         }
         match spawn_failure {
             None => Ok(()),
