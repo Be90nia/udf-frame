@@ -11,7 +11,7 @@
 //!    任意停顿点都只让读者拿到「完整旧快照 / 重试耗尽 / 拒收」，绝不混合；编码器/
 //!    背衬故障 contain 成 typed 失败且订阅存活；容量不足保持上一份已知良好区域。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -160,15 +160,18 @@ type Bridge = ViewBridge<App, u32, Map, Intent, Json, Enc>;
 fn build(backing: Arc<dyn RegionBacking>, mode: Mode) -> (Arc<Bridge>, Arc<Mutex<Mode>>) {
     let store = SyncStore::new(Red, NoFx);
     let (encoder, cell) = enc(mode);
-    let bridge = Arc::new(ViewBridge::mount(
-        store,
-        Map,
-        Intent,
-        Encoders {
-            json: Some(Json),
-            region: Some((encoder, backing)),
-        },
-    ));
+    let bridge = Arc::new(
+        ViewBridge::mount(
+            store,
+            Map,
+            Intent,
+            Encoders {
+                json: Some(Json),
+                region: Some((encoder, backing)),
+            },
+        )
+        .expect("static declarations are well-formed"),
+    );
     (bridge, cell)
 }
 
@@ -445,6 +448,130 @@ fn reader_skips_unknown_kind_and_malformed_segments() {
     assert_eq!(read.region_id, 1);
 }
 
+// ── ②b 判定权：原子序列 vs header 字节（SAB 撕裂读） ──
+
+/// 共享区形态：字节镜像与原子序列**可故意不一致**——模拟 SAB 上 header `8..16`
+/// 的 8 字节普通读撕裂（低半旧/高半新）或陈旧镜像。判定权必须只在原子序列。
+struct SplitBacking {
+    bytes: Mutex<Vec<u8>>,
+    seq: AtomicU64,
+}
+
+impl SplitBacking {
+    fn new(bytes: Vec<u8>, seq: u64) -> Self {
+        Self {
+            bytes: Mutex::new(bytes),
+            seq: AtomicU64::new(seq),
+        }
+    }
+    fn bytes_copy(&self) -> Vec<u8> {
+        self.bytes.lock().expect("split backing").clone()
+    }
+}
+
+impl RegionBacking for SplitBacking {
+    fn len(&self) -> usize {
+        self.bytes.lock().expect("split backing").len()
+    }
+    fn with_bytes_mut(&self, write: &mut dyn FnMut(&mut [u8])) {
+        write(&mut self.bytes.lock().expect("split backing"))
+    }
+    fn with_bytes(&self, read: &mut dyn FnMut(&[u8])) {
+        read(&self.bytes.lock().expect("split backing"))
+    }
+    fn store_publish_seq(&self, seq: u64) -> Result<(), SeqError> {
+        self.seq.store(seq, Ordering::Release);
+        Ok(())
+    }
+    fn load_publish_seq(&self) -> Result<u64, SeqError> {
+        Ok(self.seq.load(Ordering::Acquire))
+    }
+}
+
+#[test]
+fn lock_free_reader_takes_sequence_from_atomic_not_header_bytes() {
+    let decls = decls();
+    // 字节镜像 = 撕裂/陈旧残留（序列 odd，内容已是新值）；原子值 = 稳定 even。
+    // 若拿字节当判据，这条稳定的已提交区域会被误判成「写者在途」。
+    let bytes = region_auto(3, &[(0, KIND, tlv(TAG_U64, &42u64.to_le_bytes()))]);
+    let backing = SplitBacking::new(bytes, INITIAL_SEQ);
+    let read = RegionReader::read_lock_free(&backing, &decls, 4)
+        .expect("一致性判定权在原子序列：不得因字节 odd 拒收");
+    assert_eq!(read.sequence, INITIAL_SEQ, "上报的是原子值，不是字节值");
+    assert_eq!(read.values, vec![(BindingId(0), json!(42))]);
+    assert!(!read.needs_resync);
+
+    // 变异证据：把判定改回读字节 8..16 ⇒ 上面那条必红（此处显形为 odd 拒收）。
+    let snapshot = backing.bytes_copy();
+    assert!(
+        matches!(
+            RegionReader::read_snapshot(&snapshot, &decls),
+            Err(RegionError::WriterInProgress { sequence: 3 })
+        ),
+        "不可变快照入口仍以字节为真相（无并发写者）"
+    );
+}
+
+#[test]
+fn lock_free_reader_reports_writer_in_progress_from_odd_atomic() {
+    let decls = decls();
+    // 字节镜像 even（看起来已提交）；原子值 odd（写者真在途）⇒ 必须拒收。
+    let bytes = region_auto(INITIAL_SEQ, &[(0, KIND, tlv(TAG_U64, &7u64.to_le_bytes()))]);
+    let backing = SplitBacking::new(bytes, INITIAL_SEQ + 1);
+    let err = RegionReader::read_lock_free(&backing, &decls, 3).expect_err("原子值 odd ⇒ 不得接受");
+    assert!(
+        matches!(err, RegionError::WriterInProgress { sequence } if sequence == INITIAL_SEQ + 1),
+        "{err}"
+    );
+}
+
+/// 每次 load 返回**不同的 even** 值（持续提交的写者）：前后永不相等 ⇒ 重试耗尽
+/// （与「原子值一直是 odd」的 writer-in-progress 区分开）。
+struct ChurnBacking {
+    bytes: Mutex<Vec<u8>>,
+    loads: AtomicU64,
+}
+
+impl ChurnBacking {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Mutex::new(bytes),
+            loads: AtomicU64::new(0),
+        }
+    }
+}
+
+impl RegionBacking for ChurnBacking {
+    fn len(&self) -> usize {
+        self.bytes.lock().expect("churn backing").len()
+    }
+    fn with_bytes_mut(&self, write: &mut dyn FnMut(&mut [u8])) {
+        write(&mut self.bytes.lock().expect("churn backing"))
+    }
+    fn with_bytes(&self, read: &mut dyn FnMut(&[u8])) {
+        read(&self.bytes.lock().expect("churn backing"))
+    }
+    fn store_publish_seq(&self, _seq: u64) -> Result<(), SeqError> {
+        Ok(())
+    }
+    fn load_publish_seq(&self) -> Result<u64, SeqError> {
+        // 2, 4, 6, …：恒 even 但每次都在变 ⇒ 没有任何一次读是稳定提交态。
+        Ok(INITIAL_SEQ + SEQ_STEP * self.loads.fetch_add(1, Ordering::Acquire))
+    }
+}
+
+#[test]
+fn lock_free_reader_reports_retry_exhaustion_under_churn() {
+    let decls = decls();
+    let bytes = region_auto(INITIAL_SEQ, &[(0, KIND, tlv(TAG_U64, &7u64.to_le_bytes()))]);
+    let backing = ChurnBacking::new(bytes);
+    let err = RegionReader::read_lock_free(&backing, &decls, 4).expect_err("序列持续变化");
+    assert!(
+        matches!(err, RegionError::RetryExhausted { attempts: 4 }),
+        "持续提交 ⇒ 重试耗尽（不是 writer-in-progress）: {err}"
+    );
+}
+
 // ── ③ 写侧事务：确定性交错夹具 ──
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -570,7 +697,8 @@ fn seqlock_interleavings_never_accept_mixed_snapshots() {
         let backing = Gated::new(4096, Arc::clone(&gate));
         let (bridge, _) = build(Arc::clone(&backing) as Arc<dyn RegionBacking>, Mode::U64);
         bridge.bind(PATH).unwrap();
-        assert!(bridge.send_intent(json!(1)).unwrap(), "封板 + 首发布");
+        bridge.seal().expect("seal publishes the initial region");
+        assert!(bridge.send_intent(json!(1)).unwrap(), "首发布");
         let before = try_read(backing.as_ref(), &decls).expect("stable before");
         assert_eq!(before.values, vec![(BindingId(0), json!(1))], "{pause:?}");
         assert_eq!(before.sequence, bridge.region_version(), "{pause:?}");
@@ -591,7 +719,8 @@ fn seqlock_interleavings_never_accept_mixed_snapshots() {
                 .expect("old snapshot accepted (atomic entry)");
             assert_eq!(lf.values, snap.values);
         } else {
-            // 事务进行中：不可变快照入口拒 odd；原子入口有界重试后显形 writer busy。
+            // 事务进行中：不可变快照入口读字节判 odd；原子入口只认原子值，同样
+            // 拒收但按「写者在途」显形（耗尽时最后观测仍是 odd）。
             let err = try_read(backing.as_ref(), &decls).expect_err("odd must be rejected");
             assert!(
                 matches!(err, RegionError::WriterInProgress { sequence } if sequence % 2 == 1),
@@ -600,7 +729,7 @@ fn seqlock_interleavings_never_accept_mixed_snapshots() {
             let err = RegionReader::read_lock_free(backing.as_ref(), &decls, 4)
                 .expect_err("writer busy must be visible");
             assert!(
-                matches!(err, RegionError::RetryExhausted { attempts: 4 }),
+                matches!(err, RegionError::WriterInProgress { sequence } if sequence % 2 == 1),
                 "{pause:?}: {err}"
             );
         }
@@ -618,23 +747,24 @@ fn seqlock_interleavings_never_accept_mixed_snapshots() {
 
 #[test]
 fn arena_exhaustion_rolls_over_region_id_and_keeps_watermark() {
-    // arena = 32B：每拍 13B 段填充 16B ⇒ 两拍后耗尽，第三拍换区（版本延续）。
+    // arena = 32B：封板初始段 16B + 一拍 16B 占满，第三段换区（版本延续）。
     let backing = Arc::new(VecBacking::new(HEADER_LEN + ENTRY_LEN + 32));
     let (bridge, _) = build(Arc::clone(&backing) as Arc<dyn RegionBacking>, Mode::U64);
     bridge.bind(PATH).unwrap();
-    for _ in 0..4 {
+    bridge.seal().expect("seal publishes the initial region");
+    for _ in 0..2 {
         assert!(bridge.send_intent(json!(1)).unwrap());
     }
     assert!(bridge.region_id() > 1, "arena 耗尽 ⇒ 换区握手");
     assert_eq!(bridge.region_id(), 2);
     let batch = bridge.take_patches();
-    assert_eq!(batch.to_version, INITIAL_SEQ + 4 * SEQ_STEP, "水位单调延续");
+    assert_eq!(batch.to_version, INITIAL_SEQ + 2 * SEQ_STEP, "水位单调延续");
     assert_eq!(bridge.region_version(), batch.to_version, "换区后仍同源");
     let read = read(backing.as_ref(), &decls());
     assert_eq!(read.region_id, bridge.region_id());
     assert_eq!(
         read.values,
-        vec![(BindingId(0), json!(4))],
+        vec![(BindingId(0), json!(2))],
         "重映射后可读现值"
     );
     assert_eq!(bridge.region_failure(), None);
@@ -650,10 +780,12 @@ fn encoder_faults_are_typed_and_recoverable() {
         (Mode::NonFinite, WriterFault::NonFiniteF64),
     ] {
         let backing = Arc::new(VecBacking::new(4096));
-        let (bridge, cell) = build(Arc::clone(&backing) as Arc<dyn RegionBacking>, mode);
+        let (bridge, cell) = build(Arc::clone(&backing) as Arc<dyn RegionBacking>, Mode::U64);
         bridge.bind(PATH).unwrap();
-        assert!(bridge.send_intent(json!(1)).unwrap());
+        bridge.seal().expect("seal publishes the initial region");
         // 封板事务成功；本条变更编码失败 ⇒ 水位不推进、已提交 region 保持有效。
+        set_mode(&cell, mode);
+        assert!(bridge.send_intent(json!(1)).unwrap());
         assert_eq!(bridge.region_version(), INITIAL_SEQ, "{mode:?}");
         assert_eq!(
             bridge.region_failure(),
@@ -684,11 +816,11 @@ fn encoder_faults_are_typed_and_recoverable() {
 #[test]
 fn encoder_panic_is_contained_and_subscription_survives() {
     let backing = Arc::new(VecBacking::new(4096));
-    let (bridge, _) = build(
-        Arc::clone(&backing) as Arc<dyn RegionBacking>,
-        Mode::PanicOnce,
-    );
+    let (bridge, cell) = build(Arc::clone(&backing) as Arc<dyn RegionBacking>, Mode::U64);
     bridge.bind(PATH).unwrap();
+    bridge.seal().expect("seal publishes the initial region");
+
+    set_mode(&cell, Mode::PanicOnce);
     assert!(bridge.send_intent(json!(1)).unwrap()); // 编码器 panic（首变更）
     assert_eq!(
         bridge.region_failure(),
@@ -743,7 +875,14 @@ fn backing_without_atomic_sequence_rejects_lock_free_mode() {
         Some(RegionFailure::BackingUnsupported),
         "装配期即拒绝 lock-free 区域模式"
     );
-    // JSON 通道不受影响；区域永不对外宣称水位。
+    // 封板：区域初始事务失败必须显形（JSON 通道不受影响）。
+    assert!(matches!(
+        bridge.seal(),
+        Err(skeleton_infra::view::SealError::Region(
+            RegionFailure::BackingUnsupported
+        ))
+    ));
+    // JSON 通道照常；区域永不对外宣称水位。
     assert!(bridge.send_intent(json!(1)).unwrap());
     let batch = bridge.take_patches();
     assert_eq!(batch.patches[0].value, json!(1));
@@ -756,6 +895,15 @@ fn backing_too_small_for_header_and_index_fails_visibly() {
     let backing = Arc::new(VecBacking::new(16));
     let (bridge, _) = build(Arc::clone(&backing) as Arc<dyn RegionBacking>, Mode::U64);
     bridge.bind(PATH).unwrap();
+    assert!(matches!(
+        bridge.seal(),
+        Err(skeleton_infra::view::SealError::Region(
+            RegionFailure::HeaderIndexTooLarge {
+                required: _,
+                capacity: 16
+            }
+        ))
+    ));
     assert!(bridge.send_intent(json!(1)).unwrap());
     assert_eq!(
         bridge.region_failure(),
@@ -771,15 +919,17 @@ fn backing_too_small_for_header_and_index_fails_visibly() {
 
 #[test]
 fn capacity_exhaustion_keeps_last_known_good_region() {
-    // 32 头 + 24 索引 + 16 arena：一条 10 字节载荷（5+10=15 → 填充 16）刚好放下，
-    // 12 字节载荷（17 → 24）连全量重编也放不下。
+    // 32 头 + 24 索引 + 16 arena：封板初始段 8B + 10 字节载荷（5+10=15 → 填充
+    // 16）各占一段刚好放下，12 字节载荷（17 → 24）连全量重编也放不下。
     let backing = Arc::new(VecBacking::new(HEADER_LEN + ENTRY_LEN + 16));
     let (bridge, _) = build(Arc::clone(&backing) as Arc<dyn RegionBacking>, Mode::Bytes);
     bridge.bind(PATH).unwrap();
+    bridge.seal().expect("seal publishes the initial region");
     assert!(bridge.send_intent(json!(10)).unwrap());
     let ok = read(backing.as_ref(), &decls());
     assert_eq!(ok.sequence, INITIAL_SEQ + SEQ_STEP);
     assert_eq!(ok.values.len(), 1);
+    let ok_region_id = bridge.region_id();
 
     assert!(bridge.send_intent(json!(2)).unwrap()); // 12 字节载荷
     match bridge.region_failure() {
@@ -790,7 +940,7 @@ fn capacity_exhaustion_keeps_last_known_good_region() {
         }) => {
             assert_eq!(required, HEADER_LEN + ENTRY_LEN + 24);
             assert_eq!(capacity, HEADER_LEN + ENTRY_LEN + 16);
-            assert_eq!(region_id, 1, "换区失败：region_id 不得前进");
+            assert_eq!(region_id, ok_region_id, "换区失败：region_id 不得前进");
         }
         other => panic!("expect CapacityExceeded, got {other:?}"),
     }
@@ -850,6 +1000,7 @@ fn backing_panic_marks_unavailable_until_explicit_reseed() {
     let backing = PanicBacking::new(4096);
     let (bridge, _) = build(Arc::clone(&backing) as Arc<dyn RegionBacking>, Mode::U64);
     bridge.bind(PATH).unwrap();
+    bridge.seal().expect("seal publishes the initial region");
     assert!(bridge.send_intent(json!(1)).unwrap());
     let committed = bridge.region_version();
     assert_eq!(committed, INITIAL_SEQ + SEQ_STEP);
@@ -911,4 +1062,115 @@ fn decode_batch_enforces_version_and_kind_vocabulary() {
     assert_eq!(read.unknown_tags_skipped, 3);
     assert!(read.needs_resync);
     assert!(!read.unsupported_version);
+}
+
+// ── 初始区域全量发布（#155 / #190）：封板即可用，且未变的绑定也一定有值 ──────
+
+/// 双绑定：`/n`（随状态变）+ `/fixed`（恒定 7，后续拍永不进 diff 集）。
+struct TwoMap;
+
+static TWO_DECLS: [BindingDecl; 2] = [
+    BindingDecl {
+        path: "/n",
+        kind: PayloadTag(KIND),
+    },
+    BindingDecl {
+        path: "/fixed",
+        kind: PayloadTag(2),
+    },
+];
+
+impl ViewMap<App> for TwoMap {
+    type View = V;
+    fn bindings(&self) -> &[BindingDecl] {
+        &TWO_DECLS
+    }
+    fn project(&self, index: usize, s: &App) -> V {
+        V::N(if index == 0 { s.n } else { 7 })
+    }
+}
+
+struct TwoEnc;
+
+impl RegionEncoder for TwoEnc {
+    type View = V;
+    fn covers(&self) -> Coverage {
+        Coverage::All
+    }
+    fn encode(&self, v: &V, w: &mut RegionWriter) {
+        let V::N(n) = v;
+        w.u64(u64::from(*n));
+    }
+}
+
+/// Region-only：`seal()` 必须发布全部已登记绑定的现值——Store 之后保持空闲也
+/// 不会留下空区域（#155）；且只改一个绑定时，未变的绑定照样可读（#190）。
+#[test]
+fn region_only_seal_publishes_every_registered_binding() {
+    let backing = Arc::new(VecBacking::new(4096));
+    let bridge: ViewBridge<App, u32, TwoMap, Intent, Json, TwoEnc> = ViewBridge::mount(
+        SyncStore::new(Red, NoFx),
+        TwoMap,
+        Intent,
+        Encoders {
+            json: None,
+            region: Some((TwoEnc, Arc::clone(&backing) as Arc<dyn RegionBacking>)),
+        },
+    )
+    .expect("valid declaration table");
+    bridge.bind("/n").unwrap();
+    bridge.bind("/fixed").unwrap();
+    bridge.seal().expect("Region-only seal must publish values");
+
+    let sealed = read(backing.as_ref(), &TWO_DECLS);
+    assert_eq!(sealed.sequence, INITIAL_SEQ, "封板即首个已提交 even 水位");
+    assert_eq!(
+        sealed.values,
+        vec![(BindingId(0), json!(0)), (BindingId(1), json!(7))],
+        "全量初始发布：UI 无需等后续变更就能取到基线"
+    );
+
+    assert!(bridge.send_intent(json!(3)).unwrap());
+    let read = read(backing.as_ref(), &TWO_DECLS);
+    assert_eq!(read.region_id, bridge.region_id());
+    assert_eq!(read.sequence, INITIAL_SEQ + SEQ_STEP);
+    assert_eq!(
+        read.values,
+        vec![(BindingId(0), json!(3)), (BindingId(1), json!(7))],
+        "未变的绑定不得退回 len=0（旧实现永不发布它）"
+    );
+    assert_eq!(bridge.region_version(), read.sequence);
+}
+
+/// 双通道：`snapshot_doc()` 之后只改一个绑定 ⇒ 区域里两条绑定都有值（#190 回归）。
+#[test]
+fn dual_channel_snapshot_seeds_every_covered_region_entry() {
+    let backing = Arc::new(VecBacking::new(4096));
+    let bridge: ViewBridge<App, u32, TwoMap, Intent, Json, TwoEnc> = ViewBridge::mount(
+        SyncStore::new(Red, NoFx),
+        TwoMap,
+        Intent,
+        Encoders {
+            json: Some(Json),
+            region: Some((TwoEnc, Arc::clone(&backing) as Arc<dyn RegionBacking>)),
+        },
+    )
+    .expect("valid declaration table");
+    bridge.bind("/n").unwrap();
+    bridge.bind("/fixed").unwrap();
+    bridge.seal().unwrap();
+
+    let snap = bridge.snapshot_doc().expect("sealed committed snapshot");
+    assert_eq!(snap.version, INITIAL_SEQ);
+    assert_eq!(snap.doc.pointer("/n"), Some(&json!(0)));
+    assert_eq!(snap.doc.pointer("/fixed"), Some(&json!(7)));
+
+    assert!(bridge.send_intent(json!(1)).unwrap());
+    let read = read(backing.as_ref(), &TWO_DECLS);
+    assert_eq!(
+        read.values,
+        vec![(BindingId(0), json!(1)), (BindingId(1), json!(7))],
+        "未变的 /fixed 仍带封板初值"
+    );
+    assert!(!read.needs_resync);
 }

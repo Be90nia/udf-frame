@@ -243,24 +243,27 @@ fn main() {
     // ── 都开：水位自洽（断言链①）+ latest-wins + Touch 零补丁 + 跨通道同源 ──
     let store = SyncStore::new(AppReducer, NoFx);
     let backing = Arc::new(VecBacking::new(8192));
-    let bridge: ViewBridge<App, Msg, DemoMap, DemoIntent, DemoJson, DemoRegion> = ViewBridge::mount(
-        store,
-        DemoMap::new(),
-        DemoIntent,
-        Encoders {
-            json: Some(DemoJson),
-            region: Some((DemoRegion, Arc::clone(&backing) as Arc<dyn RegionBacking>)),
-        },
-    );
+    let bridge: ViewBridge<App, Msg, DemoMap, DemoIntent, DemoJson, DemoRegion> =
+        ViewBridge::mount(
+            store,
+            DemoMap::new(),
+            DemoIntent,
+            Encoders {
+                json: Some(DemoJson),
+                region: Some((DemoRegion, Arc::clone(&backing) as Arc<dyn RegionBacking>)),
+            },
+        )
+        .expect("声明表合法（装配期校验）");
     assert!(bridge.bind("/nope").is_err(), "unknown path must Err");
     assert_eq!(
         bridge.bind(PATH_COUNT).unwrap(),
         skeleton_infra::view::BindingId(0)
     );
     bridge.bind(PATH_REMAINING).unwrap();
+    bridge.seal().expect("封板：初始视图 + 初始区域全量");
 
-    // 首挂快照：全量 + 投影数 == 绑定数 + 封板水位 == INITIAL_SEQ（even）。
-    let snap = bridge.snapshot_doc();
+    // 封板快照：全量 + 封板水位 == INITIAL_SEQ（even）。
+    let snap = bridge.snapshot_doc().expect("sealed committed snapshot");
     assert_eq!(snap.version, INITIAL_SEQ);
     assert_eq!(snap.doc.pointer(PATH_COUNT), Some(&json!(0)));
     assert_eq!(
@@ -308,13 +311,17 @@ fn main() {
         assert_eq!(bridge.region_version(), batch.to_version, "跨通道同源");
         applied = batch.to_version;
     }
-    assert_eq!(bridge.snapshot_doc().version, applied, "快照版本 == 桥水位");
+    assert_eq!(
+        bridge.snapshot_doc().expect("committed snapshot").version,
+        applied,
+        "快照版本 == 桥水位"
+    );
 
     // 人为倒退（UI applied 落后）⇒ 缺段判定 ⇒ snapshot_doc 重同步（路径被走到）。
     applied = 1;
     let batch = bridge.take_patches();
     assert_ne!(batch.from_version, applied);
-    let snap = bridge.snapshot_doc();
+    let snap = bridge.snapshot_doc().expect("committed snapshot");
     applied = snap.version;
     assert_eq!(applied, bridge.region_version());
 
@@ -346,8 +353,10 @@ fn main() {
                 json: Some(DemoJson),
                 region: None,
             },
-        );
+        )
+        .expect("声明表合法");
     only_json.bind(PATH_COUNT).unwrap();
+    only_json.seal().expect("封板");
     only_json.send_intent(json!({"op": "add", "n": 1})).unwrap();
     assert_eq!(only_json.region_version(), 0, "只开 Json：区域通道不存在");
     assert_eq!(only_json.region_id(), 0);
@@ -364,9 +373,20 @@ fn main() {
                 json: None,
                 region: Some((DemoRegion, Arc::clone(&backing) as Arc<dyn RegionBacking>)),
             },
-        );
+        )
+        .expect("声明表合法");
     only_region.bind(PATH_COUNT).unwrap();
     only_region.bind(PATH_REMAINING).unwrap();
+    only_region.seal().expect("封板即初始区域全量");
+    // Region-only 的基线在封板：Store 保持空闲也可读（#155）。
+    let decls = DemoMap::new().bindings().to_vec();
+    let initial = read_region(&backing, &decls);
+    assert_eq!(initial.sequence, INITIAL_SEQ);
+    assert_eq!(
+        value_of(&initial.values, skeleton_infra::view::BindingId(1)),
+        Some(&json!({ FIELD_REMAINING: 0 })),
+        "封板即全量（不等后续变更）"
+    );
     only_region
         .send_intent(json!({"op": "add", "n": 7}))
         .unwrap();
@@ -378,7 +398,6 @@ fn main() {
     let rid = only_region.region_id();
 
     // 镜像读取器回读 + 双编码一致性（区域段回读 == to_json 语义）。
-    let decls = DemoMap::new().bindings().to_vec();
     let read = read_region(&backing, &decls);
     assert_eq!(
         read.sequence,
@@ -407,9 +426,11 @@ fn main() {
                 json: None,
                 region: Some((DemoRegion, Arc::clone(&small) as Arc<dyn RegionBacking>)),
             },
-        );
+        )
+        .expect("声明表合法");
     swapper.bind(PATH_COUNT).unwrap();
     swapper.bind(PATH_REMAINING).unwrap();
+    swapper.seal().expect("封板即初始区域全量");
     for _ in 0..8 {
         swapper.send_intent(json!({"op": "add", "n": 1})).unwrap();
     }

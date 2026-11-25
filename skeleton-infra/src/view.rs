@@ -4,17 +4,31 @@
 //! `ViewBridge` 以**纯订阅者**挂 `Store` 通知面（核心零改动）。线程模型：通知体
 //! 在 dispatch 线程同步执行，pull 侧跨线程 ⇒ 桥内态单把粗锁成组迁移（last/脏位/
 //! 毒化位一次动齐），投影在锁外，哨兵胞锁为外层短叶锁（先取先放零嵌套），绑定表
-//! 首通知封板后只读。版本语义（同步档 = MVP 唯一范围）：出站版本 = 桥内已提交
+//! 封板后只读。版本语义（同步档 = MVP 唯一范围）：出站版本 = 桥内已提交
 //! **even 序列**（区域头 publish-sequence 与 JSON 批 `to_version` 同源同值；
 //! odd 只表示区域写事务进行中，永不作为已提交版本暴露）；`delivered_epoch` 是
 //! 交付游标——`take_patches` 与 `snapshot_doc` 同为交付点（快照重同步后下批
-//! `from_version == snapshot.version`）。装配纪律：mount → 全部 bind → 才允许
-//! dispatch。
+//! `from_version == snapshot.version`）。
 //!
-//! 回调边界纪律（#140 区域侧 / #188 / #211）：`RegionEncoder::{covers,encode}` 与
+//! # 装配生命周期（#222 §B，检查型而非惯例）
+//!
+//! `mount`（**fallible**：捕获并编译 `bindings()` 声明、校验路径）→ `bind`（选取
+//! 要发布的路径，`BindingId` = 登记序）→ `seal`（捕获**一次**稳定 Store 快照 →
+//! 投影已登记绑定 → 提交初始已提交视图，水位 [`INITIAL_SEQ`] → 发布初始区域全量）
+//! → 才允许 dispatch。封板前的通知只计数（[`ViewBridge::pre_seal_notifications`]）
+//! 不投影，禁静默吞吐。**并发前置条件**：`mount`/`bind`/`seal` 必须在任何 dispatch
+//! 之前完成（同线程装配）；`Store` 适配器做不到就须先提供「订阅 + 快照」原子设施，
+//! 本桥不用两次独立读去掩盖这个竞态。
+//!
+//! 快照语义（#104）：`snapshot_doc` 从**已提交投影值 + 同一临界区捕获的桥水位**
+//! 构造，不再独立采样 Store 后套新版本；只有「有绑定无已知良好值/毒化」时才走
+//! 版本校验下的重投影修复。
+//!
+//! 回调边界纪律（#140 区域侧 / #188 / #211）：`RegionEncoder::encode` 与
 //! `RegionBacking::{len,with_bytes,with_bytes_mut,store/load_publish_seq}` 均为
 //! 采用方代码——**任何桥内互斥量下都不调用**；panic 在桥边界 contain 成 typed
-//! 失败 + 计数，Store 订阅保持存活。
+//! 失败 + 计数，Store 订阅保持存活。两编码器的 `covers()` 只在装配期（`mount`，
+//! 锁外）各求值一次并缓存，运行期零调用（#222 §2.1）。
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -28,7 +42,7 @@ use skeleton::view::region_layout::{
     OFFSET_REGION_ID, SEG_ALIGN, SEQ_STEP, TAG_BYTES, TAG_F64, TAG_I64, TAG_JSON, TAG_NULL,
     TAG_U64, TAG_UTF8, TLV_HEADER_LEN,
 };
-use skeleton::view::{IntentMap, PROTOCOL_VERSION, PayloadTag, ViewMap};
+use skeleton::view::{BindingDecl, IntentMap, PROTOCOL_VERSION, PayloadTag, ViewMap};
 use skeleton::{ActionSender, Store, Subscription};
 
 pub mod read;
@@ -48,7 +62,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub enum BindError {
     /// 未知路径（不在 `ViewMap::bindings()` 词表内，装配期 fail-visible）。
     UnknownPath { path: String },
-    /// 首通知已封板：绑定表只读，运行期动态注册属二期断点。
+    /// 该路径不被任何已配置编码器覆盖（#173：**全构建** typed 错误，不是
+    /// `debug_assert!`）——没有输出通道能发布它，登记即静默缺值。
+    UncoveredBinding { path: String },
+    /// 已封板：绑定表只读，运行期动态注册属二期断点。
     Sealed,
 }
 
@@ -56,12 +73,123 @@ impl fmt::Display for BindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownPath { path } => write!(f, "unknown binding path: {path}"),
-            Self::Sealed => write!(f, "binding table sealed after first notification"),
+            Self::UncoveredBinding { path } => {
+                write!(f, "binding covered by no configured encoder: {path}")
+            }
+            Self::Sealed => write!(f, "binding table sealed (seal() already ran)"),
         }
     }
 }
 
 impl std::error::Error for BindError {}
+
+/// 装配（`mount`）失败词表：#222 §2.1/§2.2 的**一次性声明捕获 + 校验**——
+/// 声明表非法时桥根本不被构造（不泄漏订阅、不暴露半装配句柄）。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum MountError {
+    /// `ViewMap::bindings()` panic（采用方代码在装配边界 contain）。
+    DeclarationsPanicked,
+    /// 声明数超出 `BindingId` 的 `u32` 表示域。
+    TooManyBindings { count: usize },
+    /// 非根绝对 RFC 6901 指针不合法：空/根指针、缺前导 `/`、非法 `~` 转义。
+    InvalidPath {
+        path: &'static str,
+        detail: &'static str,
+    },
+    /// 两条声明解码到同一指针（含规范化后相同的原始拼写）。
+    DuplicatePath { path: &'static str },
+    /// 一条声明是另一条的严格前缀 ⇒ 不可表示为单棵 JSON 树（如 `/a` 与 `/a/b`）。
+    PrefixCollision {
+        path: &'static str,
+        other: &'static str,
+    },
+    /// 编码器 `covers()` panic（采用方代码，装配边界 contain）。
+    CoveragePanicked { channel: &'static str },
+}
+
+impl fmt::Display for MountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeclarationsPanicked => write!(f, "ViewMap::bindings panicked"),
+            Self::TooManyBindings { count } => {
+                write!(f, "too many binding declarations: {count}")
+            }
+            Self::InvalidPath { path, detail } => {
+                write!(f, "invalid binding path {path:?}: {detail}")
+            }
+            Self::DuplicatePath { path } => {
+                write!(f, "duplicate binding path {path:?}")
+            }
+            Self::PrefixCollision { path, other } => write!(
+                f,
+                "binding path {path:?} collides with prefix binding {other:?}"
+            ),
+            Self::CoveragePanicked { channel } => {
+                write!(f, "{channel} encoder covers() panicked")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MountError {}
+
+/// 封板（`seal`）失败词表。已封板后的重入是幂等成功，不是错误。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SealError {
+    /// 现态快照入口 panic（`Store::snapshot`，采用方代码在边界 contain）。
+    SnapshotPanicked,
+    /// 初始区域事务失败：桥仍已封板、JSON 通道不受影响，但区域通道转 unavailable
+    /// （恢复只能走 [`ViewBridge::reseed_region`]）。
+    Region(RegionFailure),
+}
+
+impl fmt::Display for SealError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SnapshotPanicked => write!(f, "Store::snapshot panicked during seal"),
+            Self::Region(failure) => {
+                write!(f, "initial region publication failed: {failure}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SealError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SnapshotPanicked => None,
+            Self::Region(f) => Some(f),
+        }
+    }
+}
+
+/// 重同步快照失败词表（#104 req 3 / #222 §6）：**禁把部分树当完整快照交付**。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SnapshotError {
+    /// 未封板：`seal()` 之前没有已提交视图基线（pre-seal 水位恒 0）。
+    Unsealed,
+    /// 修复重投影再次失败 ⇒ 文档不完整（原因见 `projection_panics()` / `resync`）。
+    Incomplete,
+    /// 修复期间水位持续推进，Store 快照与已提交水位无法配对（重试耗尽）。
+    Raced { attempts: u32 },
+}
+
+impl fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsealed => write!(f, "bridge not sealed: call seal() first"),
+            Self::Incomplete => write!(f, "snapshot incomplete: a bound value is missing/stale"),
+            Self::Raced { attempts } => {
+                write!(f, "snapshot repair lost the race after {attempts} attempts")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
 
 /// 意图翻译失败词表（`IntentMap::Err` 的参考形态；机器以本类型统一出站错误面）。
 #[derive(Debug)]
@@ -111,9 +239,12 @@ pub enum RegionError {
     Truncated { need: usize, got: usize },
     /// 结构性损坏：偏移/长度/几何不可表示、重叠、越界、重复 BindingId。
     Malformed { detail: &'static str },
-    /// 序列为 odd：写事务进行中，本次不得接受（不可变快照入口）。
+    /// 序列为 odd：写事务进行中，本次不得接受。**两个入口都会产生**——不可变快照
+    /// 入口在字节里读到 odd 即拒收；lock-free 入口在重试耗尽且**最后一次原子观测
+    /// 仍为 odd** 时也归此处（判定权只在原子序列，不看头里的字节镜像）。
     WriterInProgress { sequence: u64 },
-    /// 前后两次序列不等且重试已耗尽（写者持续占用）：可见的 writer busy。
+    /// 重试耗尽：序列在**两个 even 之间**持续变化（写者一直在提交），前后两次读数
+    /// 无法配对——可见的 writer busy（不是「写者占用不放」，而是写入持续推进）。
     RetryExhausted { attempts: u32 },
     /// backing 不提供对齐原子序列能力（SAB 原子读不可用）。
     SequenceUnavailable,
@@ -220,8 +351,8 @@ pub enum RegionFailure {
         capacity: usize,
         region_id: u32,
     },
-    /// `RegionEncoder::covers` panic（#188）。
-    CoversPanicked,
+    /// 未封板：区域通道的初始事务属 `seal()`（#222 §B），之前没有已提交水位。
+    Unsealed,
     /// `RegionEncoder::encode` panic（#188）。
     EncoderPanicked { path: &'static str },
     /// 编码器输出不合法（#141/#153/#168/#185）。
@@ -260,7 +391,7 @@ impl fmt::Display for RegionFailure {
                 f,
                 "region {region_id} arena capacity exceeded: need {required}, capacity {capacity}"
             ),
-            Self::CoversPanicked => write!(f, "RegionEncoder::covers panicked"),
+            Self::Unsealed => write!(f, "region channel not initialized: call seal() first"),
             Self::EncoderPanicked { path } => {
                 write!(f, "RegionEncoder::encode panicked at {path}")
             }
@@ -642,19 +773,105 @@ fn pad8(n: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// 装配期编译后的声明（`bind` 的查找表；`ViewMap::bindings()` 装配期只调用一次）。
+#[derive(Clone)]
+struct Decl {
+    path: &'static str,
+    kind: PayloadTag,
+    /// RFC 6901 解码后的段序列（文档建树用；热路径零拆串零解码）。
+    segments: Vec<String>,
+}
+
+/// 编译一条 RFC 6901 指针（#146 / #222 §2.2）。v1 视图桥支持**非根绝对指针**这个
+/// 明确子集：空/根指针、缺前导 `/`、`~` 后非 `0`/`1` 全部在装配期 typed 拒绝。
+fn compile_pointer(path: &'static str) -> Result<Vec<String>, MountError> {
+    let Some(rest) = path.strip_prefix('/') else {
+        return Err(MountError::InvalidPath {
+            path,
+            detail: "must be a non-root absolute pointer starting with '/'",
+        });
+    };
+    let mut segments = Vec::new();
+    let mut cur = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '/' => segments.push(std::mem::take(&mut cur)),
+            '~' => match chars.next() {
+                Some('0') => cur.push('~'),
+                Some('1') => cur.push('/'),
+                _ => {
+                    return Err(MountError::InvalidPath {
+                        path,
+                        detail: "only ~0 and ~1 escapes are valid",
+                    });
+                }
+            },
+            c => cur.push(c),
+        }
+    }
+    segments.push(cur);
+    Ok(segments)
+}
+
+fn is_strict_prefix(prefix: &[String], of: &[String]) -> bool {
+    prefix.len() < of.len() && of[..prefix.len()] == *prefix
+}
+
+/// 一次性捕获 + 校验声明表（#222 §2.1）：路径编译、重复解码指针、前缀冲突、
+/// 条数可表示性。未通过 ⇒ 桥不被构造。
+fn compile_declarations(src: &[BindingDecl]) -> Result<Vec<Decl>, MountError> {
+    u32::try_from(src.len()).map_err(|_| MountError::TooManyBindings { count: src.len() })?;
+    let mut decls: Vec<Decl> = Vec::with_capacity(src.len());
+    for d in src {
+        let segments = compile_pointer(d.path)?;
+        for prev in &decls {
+            if prev.segments == segments {
+                return Err(MountError::DuplicatePath { path: d.path });
+            }
+            if is_strict_prefix(&prev.segments, &segments)
+                || is_strict_prefix(&segments, &prev.segments)
+            {
+                return Err(MountError::PrefixCollision {
+                    path: d.path,
+                    other: prev.path,
+                });
+            }
+        }
+        decls.push(Decl {
+            path: d.path,
+            kind: d.kind,
+            segments,
+        });
+    }
+    Ok(decls)
+}
+
 /// 封板后的绑定表条目（只读）。`index` = `bindings()` 序（ViewMap 调用序）；
-/// 表位置 = 绑定注册序（last/脏位/区域条目寻址序）。
+/// 表位置 = 绑定**登记**序（`BindingId`、last/脏位/区域条目寻址序）。
+#[derive(Clone)]
 struct Bound {
     index: usize,
     id: BindingId,
     path: &'static str,
     kind: PayloadTag,
+    /// 装配期编译的解码段（#146：运行期不拆串、不解码转义）。
+    segments: Vec<String>,
+    /// 覆盖判定（装配期缓存：热路径零 `covers()` 采用方调用，#222 §2.1）。
+    json_cover: bool,
+    region_cover: bool,
 }
 
 /// 桥内折叠态（单锁成组：last/脏位/毒化/版本/交付游标）。
 struct Core<V> {
-    bound: Option<Arc<[Bound]>>, // 首通知封板
-    registered: Vec<usize>,      // 已登记 bindings() 序（重复 bind 幂等）
+    /// 装配期编译的声明表（`bind` 查找面）。
+    decls: Arc<[Decl]>,
+    /// 已登记绑定（`bind` 登记序 = `BindingId` 序）。
+    registered: Vec<Bound>,
+    /// `Some` = 已封板（`seal` 之后只读）。
+    bound: Option<Arc<[Bound]>>,
+    /// 封板进行中（禁并发 `bind` 挤进尚未投影的绑定）。
+    sealing: bool,
     last: Vec<Option<V>>,
     dirty: Vec<bool>,
     poisoned: bool,
@@ -757,7 +974,7 @@ impl<R: RegionEncoder> RegionChannel<R> {
         self.state.is_none()
     }
 
-    /// 首通知封板（**纯内存**）：条目定死 + 固定 `Header + Index` 容量校验。
+    /// 封板（**纯内存**）：条目定死 + 固定 `Header + Index` 容量校验。
     /// 放不进 = seal 失败（#142），不是 arena-full。
     fn begin_seal(&mut self, bound: &[Bound]) -> Result<(), RegionFailure> {
         if let Some(f) = &self.state {
@@ -798,18 +1015,37 @@ impl<R: RegionEncoder> RegionChannel<R> {
         Ok(())
     }
 
-    /// 封板事务计划：committed even = [`INITIAL_SEQ`]，全条目 `len == 0`
-    /// （「未发布」——空输出**不是**删除标记）。
-    fn plan_initial(&self) -> PublishPlan {
-        PublishPlan {
-            region_id: self.region_id,
-            sequence: INITIAL_SEQ,
-            entries: self.entries.clone(),
-            cursor: self.arena_start,
-            segments: Vec::new(),
-            header: header_bytes(self.region_id, self.count),
-            capacity: self.capacity,
+    /// 封板事务计划：committed even = [`INITIAL_SEQ`]，**初始全量区域发布**
+    /// （#155/#190）：已登记绑定的现值各占一段，不等后续变更——Region-only 部署
+    /// 封板即可用。放不下 ⇒ typed `CapacityExceeded`（封板失败，不是 arena-full）。
+    fn plan_initial(&self, segs: &[Seg]) -> Result<PublishPlan, RegionFailure> {
+        let mut need = 0usize;
+        for s in segs {
+            need = need
+                .checked_add(s.padded.len())
+                .ok_or(RegionFailure::CapacityExceeded {
+                    required: usize::MAX,
+                    capacity: self.capacity,
+                    region_id: self.region_id,
+                })?;
         }
+        let required =
+            self.arena_start
+                .checked_add(need)
+                .ok_or(RegionFailure::CapacityExceeded {
+                    required: usize::MAX,
+                    capacity: self.capacity,
+                    region_id: self.region_id,
+                })?;
+        if required > self.capacity {
+            return Err(RegionFailure::CapacityExceeded {
+                required,
+                capacity: self.capacity,
+                region_id: self.region_id,
+            });
+        }
+        self.place(segs, INITIAL_SEQ, true, self.arena_start)
+            .ok_or(RegionFailure::GenerationExhausted)
     }
 
     /// 增量计划；`None` = arena 不足（调用方先做全量重编，再走 [`Self::plan_reseed`]）。
@@ -1051,6 +1287,9 @@ struct Notifier<S, M: ViewMap<S>, J: JsonEncoder, R: RegionEncoder> {
     json: Option<Arc<J>>,
     region: Mutex<Option<RegionChannel<R>>>,
     core: Mutex<Core<M::View>>,
+    /// 两编码器的覆盖词表（装配期求值一次，此后逐绑定查缓存，热路径零调用）。
+    json_covers: Option<Coverage>,
+    region_covers: Option<Coverage>,
     projection_runs: AtomicU64,
     projection_panics: AtomicU64,
     region_encodes: AtomicU64,
@@ -1060,7 +1299,8 @@ struct Notifier<S, M: ViewMap<S>, J: JsonEncoder, R: RegionEncoder> {
     region_failure: Mutex<Option<RegionFailure>>,
     /// 失败累计（含瞬时失败，如 `PublishBusy`）。
     region_failures: AtomicU64,
-    assembly_gaps: AtomicU64,
+    /// 封板前到达的通知（装配纪律违约：可见计数，不投影不发布）。
+    pre_seal_notifications: AtomicU64,
     _s: std::marker::PhantomData<fn(&S)>,
 }
 
@@ -1070,47 +1310,50 @@ where
     J: JsonEncoder<View = M::View> + Send + Sync + 'static,
     R: RegionEncoder<View = M::View> + Send + Sync + 'static,
 {
-    /// 绑定表封板快照（首通知时从 `map.bindings()` 封板，此后只读）。
-    /// 返回 `true` = 本次刚封板（调用方须在**锁外**发布区域初始事务）。
-    fn bound_of(&self, core: &mut Core<M::View>) -> (Arc<[Bound]>, bool) {
-        if let Some(b) = &core.bound {
-            return (Arc::clone(b), false);
-        }
-        let bound: Arc<[Bound]> = self
-            .map
-            .bindings()
-            .iter()
-            .enumerate()
-            .map(|(index, d)| Bound {
-                index,
-                id: BindingId(index as u32),
-                path: d.path,
-                kind: d.kind,
-            })
-            .collect();
-        core.last = vec![None; bound.len()];
-        core.dirty = vec![false; bound.len()];
-        // 封板即首个 committed even 水位：JSON/快照/区域三面同源同值。
-        core.version = INITIAL_SEQ;
-        core.bound = Some(Arc::clone(&bound));
-        (bound, true)
+    /// 已封板绑定表（`None` = 未封板——装配纪律要求先 `seal()`）。
+    fn sealed_bound(&self) -> Option<Arc<[Bound]>> {
+        lock(&self.core).bound.as_ref().map(Arc::clone)
     }
 
-    /// 区域封板事务（`core` 锁外调用）：建表（纯内存）→ 发布初始 even 水位。
-    fn seal_region(&self, bound: &[Bound]) {
+    /// 初始区域发布（#155/#190，`core` 锁外）：建表（纯内存）→ **全量**初始
+    /// 段落位 → 一次事务提交。水位 = 封板 even（[`INITIAL_SEQ`]）。
+    fn seal_region(
+        &self,
+        bound: &[Bound],
+        items: &[(usize, M::View)],
+    ) -> Result<(), RegionFailure> {
+        let Some(encoder) = self.region_encoder() else {
+            return Ok(()); // 未挂区域通道
+        };
+        let segs = match self.encode_segments(encoder.as_ref(), bound, items) {
+            Ok(segs) => segs,
+            Err(f) => {
+                self.fail_region(f.clone(), false);
+                return Err(f);
+            }
+        };
         let plan = {
             let mut rg = lock(&self.region);
             let Some(ch) = rg.as_mut() else {
-                return;
+                return Ok(());
             };
-            if let Err(f) = ch.begin_seal(bound) {
-                drop(rg);
-                self.fail_region(f, true);
-                return;
+            let outcome = ch.begin_seal(bound).and_then(|()| ch.plan_initial(&segs));
+            match outcome {
+                Ok(p) => p,
+                Err(f) => {
+                    drop(rg);
+                    self.fail_region(f.clone(), true);
+                    return Err(f);
+                }
             }
-            ch.plan_initial()
         };
+        self.region_encodes
+            .fetch_add(segs.len() as u64, Ordering::Relaxed);
         self.publish_plan(plan);
+        match lock(&self.region_failure).clone() {
+            None => Ok(()),
+            Some(f) => Err(f),
+        }
     }
 
     /// 取区域编码器（锁内只做 `Arc::clone`，无采用方调用）。通道 unavailable 时
@@ -1125,69 +1368,38 @@ where
         lock(&self.region).as_ref().is_some_and(|ch| ch.ready())
     }
 
-    /// `covers()` 逐绑定求值（采用方代码，锁外；panic ⇒ 可见失败 #188）。
-    fn coverage(&self, encoder: &R, bound: &[Bound]) -> Option<Vec<bool>> {
-        match catch_unwind(AssertUnwindSafe(|| {
-            let covers = encoder.covers();
-            bound
-                .iter()
-                .map(|b| covers.covers(b.path))
-                .collect::<Vec<bool>>()
-        })) {
-            Ok(v) => Some(v),
-            Err(_) => {
-                self.fail_region(RegionFailure::CoversPanicked, false);
-                None
-            }
-        }
-    }
-
     /// 逐绑定编码（采用方代码，锁外）：每绑定恰一段非空完整 TLV（#168/#185），
-    /// 宽度/有限性由 writer 自报（#141/#153）。返回 `None` = 已记录可见失败。
+    /// 宽度/有限性由 writer 自报（#141/#153）。覆盖判定吃装配期缓存。
     fn encode_segments(
         &self,
         encoder: &R,
         bound: &[Bound],
         items: &[(usize, M::View)],
-        covered: &[bool],
-    ) -> Option<Vec<Seg>> {
+    ) -> Result<Vec<Seg>, RegionFailure> {
         let mut writer = RegionWriter::new();
         let mut segs: Vec<Seg> = Vec::new();
         for (bi, view) in items {
-            if !covered.get(*bi).copied().unwrap_or(false) {
+            if !bound[*bi].region_cover {
                 continue;
             }
             writer.clear();
             if catch_unwind(AssertUnwindSafe(|| encoder.encode(view, &mut writer))).is_err() {
-                self.fail_region(
-                    RegionFailure::EncoderPanicked {
-                        path: bound[*bi].path,
-                    },
-                    false,
-                );
-                return None;
+                return Err(RegionFailure::EncoderPanicked {
+                    path: bound[*bi].path,
+                });
             }
             let seg = writer.as_slice();
-            let fault = writer.fault().or_else(|| validate_single_tlv(seg).err());
-            if let Some(fault) = fault {
-                self.fail_region(
-                    RegionFailure::EncoderOutput {
-                        path: bound[*bi].path,
-                        fault,
-                    },
-                    false,
-                );
-                return None;
+            if let Some(fault) = writer.fault().or_else(|| validate_single_tlv(seg).err()) {
+                return Err(RegionFailure::EncoderOutput {
+                    path: bound[*bi].path,
+                    fault,
+                });
             }
             let Ok(len) = u32::try_from(seg.len()) else {
-                self.fail_region(
-                    RegionFailure::EncoderOutput {
-                        path: bound[*bi].path,
-                        fault: WriterFault::PayloadTooLong,
-                    },
-                    false,
-                );
-                return None;
+                return Err(RegionFailure::EncoderOutput {
+                    path: bound[*bi].path,
+                    fault: WriterFault::PayloadTooLong,
+                });
             };
             let mut padded = seg.to_vec();
             padded.resize(pad8(seg.len()), 0);
@@ -1197,7 +1409,7 @@ where
                 padded,
             });
         }
-        Some(segs)
+        Ok(segs)
     }
 
     /// 区域增量发布：**锁外编码 → 锁内计划 → 锁外事务 → 锁内提交**。
@@ -1209,11 +1421,9 @@ where
         if !self.region_ready() {
             return;
         }
-        let Some(covered) = self.coverage(encoder.as_ref(), bound) else {
-            return;
-        };
-        let Some(segs) = self.encode_segments(encoder.as_ref(), bound, changed, &covered) else {
-            return;
+        let segs = match self.encode_segments(encoder.as_ref(), bound, changed) {
+            Ok(segs) => segs,
+            Err(f) => return self.fail_region(f, false),
         };
         // 计划：锁内纯算术（无采用方调用）。
         let plan = {
@@ -1238,11 +1448,9 @@ where
     /// 全量重编 + 换区（增量耗尽路径 / `reseed_region` 恢复口）。
     fn reseed_with(&self, bound: &[Bound], encoder: &R, sequence: u64) {
         let items = self.full_snapshot(bound);
-        let Some(covered) = self.coverage(encoder, bound) else {
-            return;
-        };
-        let Some(segs) = self.encode_segments(encoder, bound, &items, &covered) else {
-            return;
+        let segs = match self.encode_segments(encoder, bound, &items) {
+            Ok(segs) => segs,
+            Err(f) => return self.fail_region(f, false),
         };
         let plan = {
             let rg = lock(&self.region);
@@ -1331,14 +1539,13 @@ where
         }
     }
 
+    /// 通知体（dispatch 线程同步）。封板前到达 = 装配纪律违约：只计数不投影
+    /// （禁静默吞吐，也禁事后补投影掩盖边界不一致）。
     fn on_notify(&self, state: &S) {
-        let (bound, first) = {
-            let mut core = lock(&self.core);
-            self.bound_of(&mut core)
+        let Some(bound) = self.sealed_bound() else {
+            self.pre_seal_notifications.fetch_add(1, Ordering::Relaxed);
+            return;
         };
-        if first {
-            self.seal_region(&bound);
-        }
         // 锁外：哨兵粗闸（跳投影）→ 单点投影（panic catch：三态提交唯一缺口）。
         let mut pending: Vec<(usize, M::View)> = Vec::new(); // (绑定注册序, view)
         let mut panicked = false;
@@ -1395,6 +1602,12 @@ impl<S, T: Store<State = S> + Send + Sync> SnapshotSource<S> for T {
     }
 }
 
+/// 快照完整性判据（#104 / #222 §6）：每个槽位都有已知良好投影且未毒化。
+/// 不完整 ⇒ 走 `repair`，不许把部分树当完整快照交付。
+fn bridge_complete<V>(core: &Core<V>) -> bool {
+    !core.poisoned && core.last.iter().all(Option::is_some)
+}
+
 /// 桥内部件：通知态 + 现态源（store）+ 上行句柄 + 意图翻译。
 struct Inner<S, A, M, I, J, R>
 where
@@ -1408,10 +1621,11 @@ where
     intents: Arc<I>,
 }
 
-/// 语言边界视图桥（ADR 0006 参考机器）。装配纪律：**mount → 全部 `bind` 完成
-/// 后才允许 dispatch**（首通知封板绑定表）。装配后句柄可跨线程共享（Send +
-/// Sync）；票据归桥，桥 Drop = 注销订阅；store 所有权随桥（`snapshot_doc` 现态
-/// 源），桥 Drop ⇒ store 随桥回收（上行句柄经 `send_intent` 透传闭门 false）。
+/// 语言边界视图桥（ADR 0006 参考机器）。装配纪律（#222 §B）：**mount（fallible）
+/// → 全部 `bind` → `seal()` 完成后才允许 dispatch**（`seal` 封板绑定表并提交初始
+/// 已提交视图 + 初始区域全量）。装配后句柄可跨线程共享（Send + Sync）；票据归桥，
+/// 桥 Drop = 注销订阅；store 所有权随桥（`snapshot_doc` 修复路径的现态源），桥
+/// Drop ⇒ store 随桥回收（上行句柄经 `send_intent` 透传闭门 false）。
 pub struct ViewBridge<S, A, M, I, J, R>
 where
     M: ViewMap<S>,
@@ -1432,14 +1646,41 @@ where
     J: JsonEncoder<View = M::View> + Send + Sync + 'static,
     R: RegionEncoder<View = M::View> + Send + Sync + 'static,
 {
-    /// 装配：store.subscribe 挂桥（票据归桥所有，桥 Drop = 注销）。store 以
-    /// 所有权移入（`snapshot_doc` 现态源）；投影/翻译/编码器由桥与通知闭包共享。
-    /// 背衬不支持对齐原子发布序列 ⇒ 区域通道装配期即 unavailable（lock-free
-    /// 模式被拒绝；`region_failure()` 显形），JSON 通道不受影响。
-    pub fn mount<T>(store: T, map: M, intents: I, encoders: Encoders<J, R>) -> Self
+    /// 装配（**fallible**，#222 §2.1/§B）：一次性捕获并编译 `ViewMap::bindings()`
+    /// 声明（路径语法/重复解码指针/前缀冲突/条数可表示性），然后 `store.subscribe`
+    /// 挂桥（票据归桥所有，桥 Drop = 注销）。声明非法 ⇒ `Err`，不泄漏订阅、不暴露
+    /// 半装配句柄。背衬不支持对齐原子发布序列 ⇒ 区域通道装配期即 unavailable
+    /// （lock-free 模式被拒绝；`region_failure()` 显形），JSON 通道不受影响。
+    ///
+    /// **并发前置条件**：`mount` → `bind` → [`Self::seal`] 必须在任何 dispatch 之前
+    /// 完成（同线程装配）——封板前的通知只计数不投影。
+    pub fn mount<T>(
+        store: T,
+        map: M,
+        intents: I,
+        encoders: Encoders<J, R>,
+    ) -> Result<Self, MountError>
     where
         T: Store<State = S, Action = A> + Send + Sync + 'static,
     {
+        let decls = match catch_unwind(AssertUnwindSafe(|| map.bindings())) {
+            Ok(src) => compile_declarations(src)?,
+            Err(_) => return Err(MountError::DeclarationsPanicked),
+        };
+        let json_covers = match encoders.json.as_ref() {
+            Some(j) => match catch_unwind(AssertUnwindSafe(|| j.covers())) {
+                Ok(c) => Some(c),
+                Err(_) => return Err(MountError::CoveragePanicked { channel: "json" }),
+            },
+            None => None,
+        };
+        let region_covers = match encoders.region.as_ref() {
+            Some((r, _)) => match catch_unwind(AssertUnwindSafe(|| r.covers())) {
+                Ok(c) => Some(c),
+                Err(_) => return Err(MountError::CoveragePanicked { channel: "region" }),
+            },
+            None => None,
+        };
         let (region, initial_failure) = match encoders.region {
             Some((enc, backing)) => {
                 let ch = RegionChannel::new(Arc::new(enc), backing);
@@ -1453,14 +1694,18 @@ where
             json: encoders.json.map(Arc::new),
             region: Mutex::new(region),
             core: Mutex::new(Core {
-                bound: None,
+                decls: decls.into(),
                 registered: Vec::new(),
+                bound: None,
+                sealing: false,
                 last: Vec::new(),
                 dirty: Vec::new(),
                 poisoned: false,
                 version: 0,
                 delivered_epoch: 0,
             }),
+            json_covers,
+            region_covers,
             projection_runs: AtomicU64::new(0),
             projection_panics: AtomicU64::new(0),
             region_encodes: AtomicU64::new(0),
@@ -1468,7 +1713,7 @@ where
             region_id_cur: AtomicU32::new(0),
             region_failure: Mutex::new(initial_failure),
             region_failures: AtomicU64::new(0),
-            assembly_gaps: AtomicU64::new(0),
+            pre_seal_notifications: AtomicU64::new(0),
             _s: std::marker::PhantomData,
         });
         let cb = Arc::clone(&notify);
@@ -1480,52 +1725,50 @@ where
             sender,
             intents: Arc::new(intents),
         });
-        Self {
+        Ok(Self {
             inner,
             _ticket: ticket,
-        }
+        })
     }
 
-    /// 绑定注册（**装配期专用**）：路径校验（未知路径 Err）→ 内部索引句柄；首
-    /// 通知封板后显式 `Err(BindError::Sealed)`；重复 bind 同路径返回既有句柄。
+    /// 绑定注册（**装配期专用**）：`BindingId` = **登记序**（不是 `bindings()` 序），
+    /// 未登记的声明不投影、不编码、不发布；重复 bind 同路径幂等返回既有 ID；未封板
+    /// 前失败**不占 ID、不改登记态**。路径不被任何已配置编码器覆盖 ⇒ 全构建
+    /// typed `Err(UncoveredBinding)`（#173）。封板后显式 `Err(BindError::Sealed)`。
     pub fn bind(&self, path: &str) -> Result<BindingId, BindError> {
         let notify = &self.inner.notify;
-        // 错误优先级保持：封板先于未知路径。
-        if lock(&notify.core).bound.is_some() {
+        let mut core = lock(&notify.core);
+        if core.bound.is_some() || core.sealing {
             return Err(BindError::Sealed);
         }
-        let decls = notify.map.bindings();
-        let index =
-            decls
-                .iter()
-                .position(|d| d.path == path)
-                .ok_or_else(|| BindError::UnknownPath {
-                    path: path.to_string(),
-                })?;
-        // 覆盖判定是采用方代码（`covers()`），必须在锁外求值（#222 §2.1）。
-        let json_cover = notify
-            .json
-            .as_ref()
-            .is_some_and(|j| j.covers().covers(path));
-        let region_cover = notify
-            .region_encoder()
-            .is_some_and(|e| e.covers().covers(path));
+        let Some(index) = core.decls.iter().position(|d| d.path == path) else {
+            return Err(BindError::UnknownPath {
+                path: path.to_string(),
+            });
+        };
+        // 覆盖判定吃装配期缓存（#222 §2.1：热路径零 `covers()` 调用）。
+        let json_cover = notify.json_covers.is_some_and(|c| c.covers(path));
+        let region_cover = notify.region_covers.is_some_and(|c| c.covers(path));
         if !json_cover && !region_cover {
-            notify.assembly_gaps.fetch_add(1, Ordering::Relaxed);
-            debug_assert!(
-                false,
-                "assembly gap: bound path {path} covered by no encoder"
-            );
+            return Err(BindError::UncoveredBinding {
+                path: path.to_string(),
+            });
         }
-        let mut core = lock(&notify.core);
-        if core.bound.is_some() {
-            return Err(BindError::Sealed); // 并发封板：注册面已关
+        if let Some(seen) = core.registered.iter().find(|b| b.index == index) {
+            return Ok(seen.id); // 幂等
         }
-        if let Some(&seen) = core.registered.iter().find(|&&r| r == index) {
-            return Ok(BindingId(seen as u32)); // 幂等
-        }
+        let decl = core.decls[index].clone();
+        // mount 已校验声明数 ≤ u32::MAX，登记集是声明集的子集 ⇒ 不会截断。
         let id = BindingId(core.registered.len() as u32);
-        core.registered.push(index);
+        core.registered.push(Bound {
+            index,
+            id,
+            path: decl.path,
+            kind: decl.kind,
+            segments: decl.segments,
+            json_cover,
+            region_cover,
+        });
         Ok(id)
     }
 
@@ -1554,19 +1797,18 @@ where
         let mut core = lock(&notify.core);
         let bound = match &core.bound {
             Some(b) => Arc::clone(b),
-            None => return empty_batch(0, false),
+            None => return empty_batch(0),
         };
         let resync = core.poisoned;
         let from = core.delivered_epoch;
         core.delivered_epoch = core.version;
         let mut patches = Vec::new();
         if let Some(j) = &notify.json {
-            let covers = j.covers();
             for (bi, b) in bound.iter().enumerate() {
                 if !core.dirty[bi] {
                     continue;
                 }
-                if covers.covers(b.path) {
+                if b.json_cover {
                     if let Some(v) = &core.last[bi] {
                         patches.push(Patch {
                             path: b.path,
@@ -1589,64 +1831,153 @@ where
         }
     }
 
-    /// 重同步原语：**现态全量重投影**（不信缓存、哨兵旁路，O(view) 一次性）+
-    /// 锁内一次完成「换 last + 清脏 + 复位毒化」。快照即交付：`delivered_epoch`
-    /// 推进至当前消费代数 ⇒ 重同步后下一批 `from_version == snapshot.version`。
-    pub fn snapshot_doc(&self) -> Snapshot {
+    /// 显式封板（#222 §B）：捕获**一次**稳定 Store 快照 → 投影全部已登记绑定 →
+    /// 提交初始已提交视图（水位 [`INITIAL_SEQ`]）→ 发布初始区域**全量**
+    /// （#155/#190：Region-only 部署封板即可用，不等后续变更）。
+    ///
+    /// 幂等：已封板再调 = `Ok(())`。初始投影 panic 被 contain（`projection_panics`
+    /// 计数 + 毒化 ⇒ 快照走修复路径），仍算封板成功；区域事务失败返回
+    /// [`SealError::Region`]——桥仍已封板、JSON 通道可用，区域通道转 unavailable
+    /// 直到显式 [`Self::reseed_region`]。
+    pub fn seal(&self) -> Result<(), SealError> {
         let notify = &self.inner.notify;
-        let (bound, first) = {
+        let bound: Arc<[Bound]> = {
             let mut core = lock(&notify.core);
-            notify.bound_of(&mut core)
+            if core.bound.is_some() {
+                return Ok(());
+            }
+            core.sealing = true; // 关掉 bind 面，防止封板期间的登记漏投影
+            core.registered.clone().into()
         };
-        if first {
-            notify.seal_region(&bound);
-        }
-        let state = self.inner.store.snapshot(); // Arc<S> 用完即弃，不驻留
-        let mut views: Vec<M::View> = Vec::with_capacity(bound.len());
+        let state = match catch_unwind(AssertUnwindSafe(|| self.inner.store.snapshot())) {
+            Ok(state) => state,
+            Err(_) => {
+                lock(&notify.core).sealing = false;
+                return Err(SealError::SnapshotPanicked);
+            }
+        };
+        let mut views: Vec<Option<M::View>> = Vec::with_capacity(bound.len());
         let mut panicked = false;
         for b in bound.iter() {
+            notify.projection_runs.fetch_add(1, Ordering::Relaxed);
             match catch_unwind(AssertUnwindSafe(|| notify.map.project(b.index, &state))) {
-                Ok(v) => views.push(v),
+                Ok(v) => views.push(Some(v)),
                 Err(_) => {
                     notify.projection_panics.fetch_add(1, Ordering::Relaxed);
                     panicked = true;
+                    views.push(None);
                 }
             }
         }
-        let doc;
-        let version;
+        // 区域初始事务的输入在锁外取（`View::clone` 是采用方代码）。
+        let items: Vec<(usize, M::View)> = views
+            .iter()
+            .enumerate()
+            .filter_map(|(bi, v)| v.as_ref().map(|v| (bi, v.clone())))
+            .collect();
         {
             let mut core = lock(&notify.core);
-            version = core.version;
-            for (bi, v) in views.iter().enumerate() {
-                core.last[bi] = Some(v.clone());
+            core.last = views;
+            core.dirty = vec![false; bound.len()];
+            core.poisoned = panicked;
+            core.version = INITIAL_SEQ;
+            core.bound = Some(Arc::clone(&bound));
+            core.sealing = false;
+        }
+        notify
+            .seal_region(&bound, &items)
+            .map_err(SealError::Region)
+    }
+
+    /// 重同步原语（#104）：**从已提交投影值 + 同一临界区捕获的桥水位**构造文档，
+    /// 不再独立采样 Store 后套新版本。只有「有绑定无已知良好值 / 毒化」时才走
+    /// 版本校验下的重投影修复。快照即交付：`delivered_epoch` 推进至该水位 ⇒
+    /// 重同步后下一批 `from_version == snapshot.version`。
+    ///
+    /// 不完整（修复后仍有缺失/仍毒化）⇒ [`SnapshotError::Incomplete`]，禁把部分
+    /// 树当完整快照交付。
+    pub fn snapshot_doc(&self) -> Result<Snapshot, SnapshotError> {
+        let notify = &self.inner.notify;
+        let (bound, complete) = {
+            let core = lock(&notify.core);
+            match &core.bound {
+                Some(b) => (Arc::clone(b), bridge_complete(&core)),
+                None => return Err(SnapshotError::Unsealed),
             }
-            core.dirty.iter_mut().for_each(|d| *d = false);
-            if !panicked {
-                core.poisoned = false; // 成组复位（重同步以现态为准，哨兵旁路）
+        };
+        if !complete {
+            self.repair(&bound)?;
+        }
+        let mut core = lock(&notify.core);
+        let version = core.version;
+        let doc = match &notify.json {
+            Some(j) => assemble_doc(&bound, &core.last, j.as_ref()),
+            None => Value::Object(serde_json::Map::new()),
+        };
+        core.dirty.iter_mut().for_each(|d| *d = false);
+        core.delivered_epoch = version;
+        Ok(Snapshot { version, doc })
+    }
+
+    /// 修复重投影（#104 req 3）：Store 快照与已提交水位必须描述**同一逻辑边界**。
+    ///
+    /// 协议：读水位 `v0` → 采 Store 快照 → 锁外投影 → 复核水位仍为 `v0` 才提交
+    /// （变了 = 期间确实有通知被消费，重试；有界 ⇒ 不无限自旋）。两个方向的
+    /// 不对称是这个协议成立的关键：采样到的状态只可能**新于** `v0`（未消费的通知
+    /// 尚未投影，其值随后由补丁重放同一值 ⇒ 幂等），绝不会**旧于** `v0`——旧状态
+    /// 套新版本才是 #104 的真缺陷。
+    ///
+    /// `Ok(())` 的承诺即「每个槽位都是已知良好投影且毒化已复位」，是快照完整性的
+    /// 唯一闸门（`snapshot_doc` 只在此处判不完整）。
+    fn repair(&self, bound: &[Bound]) -> Result<(), SnapshotError> {
+        const ATTEMPTS: u32 = 4;
+        let notify = &self.inner.notify;
+        for _ in 0..ATTEMPTS {
+            let v0 = lock(&notify.core).version;
+            let state = match catch_unwind(AssertUnwindSafe(|| self.inner.store.snapshot())) {
+                Ok(state) => state,
+                Err(_) => return Err(SnapshotError::Incomplete),
+            };
+            let mut views: Vec<Option<M::View>> = Vec::with_capacity(bound.len());
+            let mut panicked = false;
+            for b in bound.iter() {
+                notify.projection_runs.fetch_add(1, Ordering::Relaxed);
+                match catch_unwind(AssertUnwindSafe(|| notify.map.project(b.index, &state))) {
+                    Ok(v) => views.push(Some(v)),
+                    Err(_) => {
+                        notify.projection_panics.fetch_add(1, Ordering::Relaxed);
+                        panicked = true;
+                        views.push(None);
+                    }
+                }
             }
-            core.delivered_epoch = version; // 快照即交付（补审 N2）
-            doc = match &notify.json {
-                Some(j) => assemble_doc(&bound, &views, j.as_ref()),
-                None => Value::Object(serde_json::Map::new()),
+            let mut core = lock(&notify.core);
+            if core.version != v0 {
+                continue; // 期间消费过通知 ⇒ 边界不配，重试
+            }
+            core.last = views;
+            core.dirty.iter_mut().for_each(|d| *d = true);
+            core.poisoned = panicked;
+            return if panicked {
+                Err(SnapshotError::Incomplete)
+            } else {
+                Ok(())
             };
         }
-        Snapshot { version, doc }
+        Err(SnapshotError::Raced { attempts: ATTEMPTS })
     }
 
     /// 显式全量重编（区域通道 unavailable 后的**唯一恢复口**，#172/#211）：以
     /// 桥内已提交现值为内容做一次全量换区事务；成功才清 failure 并推进
     /// `region_id`/序列（sequence 随桥水位 +[`SEQ_STEP`]，跨通道同源不变）。
-    /// 宿主违约并发调用（与 dispatch 重叠）⇒ `PublishBusy`，不破坏已提交状态。
+    /// 宿主违约并发调用（与 dispatch 重叠）⇒ `PublishBusy`，不破坏已提交状态；
+    /// 未封板 ⇒ `Unsealed`。
     pub fn reseed_region(&self) -> Result<(), RegionFailure> {
         let notify = &self.inner.notify;
-        let (bound, first) = {
-            let mut core = lock(&notify.core);
-            notify.bound_of(&mut core)
+        let bound = match &lock(&notify.core).bound {
+            Some(b) => Arc::clone(b),
+            None => return Err(RegionFailure::Unsealed),
         };
-        if first {
-            notify.seal_region(&bound);
-        }
         let Some(encoder) = notify.region_encoder() else {
             return Err(RegionFailure::BackingUnsupported);
         };
@@ -1706,53 +2037,68 @@ where
     pub fn projection_panics(&self) -> u64 {
         self.inner.notify.projection_panics.load(Ordering::Relaxed)
     }
+
+    /// 封板前到达的通知累计（装配纪律违约的可见面：这些通知没有投影也没有发布，
+    /// 绑定的初始基线由 `seal()` 那一次快照决定）。
+    pub fn pre_seal_notifications(&self) -> u64 {
+        self.inner
+            .notify
+            .pre_seal_notifications
+            .load(Ordering::Relaxed)
+    }
 }
 
-fn empty_batch(version: u64, resync: bool) -> PatchBatch {
+fn empty_batch(version: u64) -> PatchBatch {
     PatchBatch {
         patches: Vec::new(),
-        resync,
+        resync: false,
         from_version: version,
         to_version: version,
         protocol_version: PROTOCOL_VERSION,
     }
 }
 
-/// 全量文档组装：按绑定路径建树（RFC 6901 段直插；`~0`/`~1` 转义段名列二期）。
-fn assemble_doc<J: JsonEncoder>(bound: &[Bound], views: &[J::View], json: &J) -> Value {
-    let covers = json.covers();
+/// 逐段下钻到叶父对象（缺的中间层补空对象；非对象挡路 = `None`）。
+fn doc_parent<'a>(
+    root: &'a mut Value,
+    parents: &[String],
+) -> Option<&'a mut serde_json::Map<String, Value>> {
+    let mut node = root;
+    for seg in parents {
+        let Value::Object(map) = node else {
+            return None;
+        };
+        node = map
+            .entry(seg.clone())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    }
+    match node {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+/// 全量文档组装：按**装配期编译的**路径段建树（#146：运行期零拆串、零转义解码；
+/// 重复指针/前缀冲突已在 `mount` 拒绝 ⇒ 此处形状必然可表示）。覆盖判定吃缓存。
+/// `None` 槽 = 该绑定无已知良好投影（调用方已判不完整，这里跳过该叶）。
+fn assemble_doc<J: JsonEncoder>(bound: &[Bound], views: &[Option<J::View>], json: &J) -> Value {
     let mut root = Value::Object(serde_json::Map::new());
     for (bi, b) in bound.iter().enumerate() {
-        if !covers.covers(b.path) {
+        if !b.json_cover {
             continue;
         }
-        let leaf = json.to_json(&views[bi]);
-        let segs: Vec<&str> = b.path.split('/').skip(1).collect();
-        let Some((last, parents)) = segs.split_last() else {
-            debug_assert!(false, "binding path must be absolute (leading '/')");
+        let Some(view) = &views[bi] else {
             continue;
         };
-        let mut node = &mut root;
-        let mut ok = true;
-        for seg in parents {
-            if !node.is_object() {
-                debug_assert!(false, "binding path collides with non-object at {seg}");
-                ok = false;
-                break;
-            }
-            node = node
-                .as_object_mut()
-                .expect("checked is_object")
-                .entry(seg.to_string())
-                .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        }
-        if ok {
-            node = node
-                .as_object_mut()
-                .expect("leaf parent is object")
-                .entry(last.to_string())
-                .or_insert(Value::Null);
-            *node = leaf; // replace 语义
+        let leaf = json.to_json(view);
+        // 非根绝对指针：编译期保证至少一段。
+        let (last, parents) = b
+            .segments
+            .split_last()
+            .expect("compiled pointer has at least one segment");
+        // 不可达：前缀冲突在 mount 已拒。真撞上时只丢这一叶，不整份清空。
+        if let Some(map) = doc_parent(&mut root, parents) {
+            map.insert(last.clone(), leaf); // replace 语义
         }
     }
     root

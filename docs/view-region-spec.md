@@ -96,13 +96,18 @@ tag 空间（只增不改、退役号不复用；与 `PayloadTag` 是两张不�
 ## 4. 读侧协议（两个独立入口）
 
 - **不可变字节快照**（整读拷贝，宿主已持有稳定副本）：
-  `RegionReader::read_snapshot(bytes, decls)`。普通 load、单次扫描；序列必须为
-  even，odd ⇒ `WriterInProgress`。
+  `RegionReader::read_snapshot(bytes, decls)`。普通 load、单次扫描；序列取自 header
+  字节 `8..16`（无并发写者 ⇒ 字节即真相），odd ⇒ `WriterInProgress`。
 - **SAB 直读**（无锁）：`RegionReader::read_lock_free(backing, decls, retries)`。
   ① 对齐原子 **acquire load** 序列；② odd ⇒ 重试；③ 扫描 Header/Index/段；
   ④ 再 acquire load；⑤ **前后相等且为 even** 才接受（`region_id` 的变化天然被同一次
-  稳定读观察到）；不等 ⇒ 重试；⑥ 重试**有界**，耗尽 ⇒ 可见的
-  `RetryExhausted { attempts }`（写者忙不得把读者拖成死循环）。
+  稳定读观察到）；不等 ⇒ 重试；⑥ 重试**有界**（写者忙不得把读者拖成死循环），耗尽时
+  按最后一次原子观测分两种可见结局：仍是 odd ⇒ `WriterInProgress { sequence }`
+  （写者在途）；一直在 even 之间变化 ⇒ `RetryExhausted { attempts }`（持续提交）。
+- **判定权只在原子序列**：SAB 形态下 `with_bytes` 借出的就是共享内存，header `8..16`
+  的 8 字节**普通读可撕裂**（低半旧/高半新）——因此 lock-free 入口把已 load 到的原子
+  值作为唯一判据，**不得**再解释字节 `8..16`。把撕裂读出的 odd 当作「写者在途」会
+  把一份已提交区域误判成不可读，违反「一致性判定权只在原子序列」。
 
 读侧只消费「稳定 even」下的字节：**多字段索引撕裂不可能被接受**，因为任何撕裂都发生
 在 odd 窗口内。`gen` 与 Header 序列的复读**不**构成第二套协议——判定权只在序列。
@@ -165,11 +170,15 @@ JSON 通道同规则：`decode_batch` 对缺失或不支持的 `protocol_version
 1. **未知条目 `kind`** ⇒ 跳过该条目整段 + `unknown_tags_skipped += 1` +
    `needs_resync = true`；其余条目照常。`kind == 0` = 未声明（JSON 自描述语义），
    按已知处理。
-2. **段内任一 TLV 不可解**（未知 tag 0x07–0xFF / TLV 头截断 / 载荷截断 /
-   定宽 tag 长度不符 / 非法 UTF-8 / 非法 JSON / 非有限 f64 / `null` 载荷非空 /
-   段内残留 1–4 字节）⇒ **整段失效**（不把半解数组当完整值），计数一次 + resync。
-3. 每跳过一次 ⇒ 计数 + 置提示（宿主据此全量重取）。**禁 panic、禁整区 Err**。
-4. 仍属**结构性损坏**（索引不可信 ⇒ typed `Err(RegionError)`，整区不采信）：
+2. **未知 TLV tag**（0x07–0xFF）⇒ 读侧按其 checked `len` 消耗该 TLV 以保住框架
+   （framing 必须继续可解析），但**整条绑定段失效**——不是「只跳过这一条 TLV」，
+   也不得把同段其余 TLV 拼成半解数组当完整值。该段只计**一次**
+   `unknown_tags_skipped` 并置 `needs_resync`；同区其他独立条目照常返回。
+3. **段内其它不可解**（TLV 头截断 / 载荷截断 / 定宽 tag 长度不符 / 非法 UTF-8 /
+   非法 JSON / 非有限 f64 / `null` 载荷非空 / 段内残留 1–4 字节）与未知 tag 同款：
+   整段失效 + 计数一次 + resync。
+4. 每跳过一次 ⇒ 计数 + 置提示（宿主据此全量重取）。**禁 panic、禁整区 Err**。
+5. 仍属**结构性损坏**（索引不可信 ⇒ typed `Err(RegionError)`，整区不采信）：
    magic 不符、`protocol_version` 不支持、`flags` 非 0、`index_offset ≠ 32`、
    索引越界/几何溢出、`binding_id` 重复、段偏移未对齐、段落进 Header/Index、
    段 end 溢出或越界。

@@ -68,29 +68,38 @@ impl RegionReader {
     /// 未知 tag/`.kind` ⇒ 跳过该项 + 计数 + `needs_resync`；**禁整区失败**。
     /// 结构损坏（magic/版本/偏移/几何/截断）= 索引不可信 ⇒ `Err(RegionError)`。
     pub fn read_snapshot(bytes: &[u8], decls: &[BindingDecl]) -> Result<RegionRead, RegionError> {
-        scan(bytes, decls)
+        scan(bytes, decls, None)
     }
 
     /// SAB 直读入口：`acquire load → 扫描 → acquire load`，两次相等且为 even 才
-    /// 接受（写者 odd 期间或前后变化一律重试）；重试耗尽 ⇒ `RetryExhausted`。
+    /// 接受（写者 odd 期间或前后变化一律重试）；重试耗尽 ⇒ 可见的 writer-busy。
     ///
-    /// 与 [`Self::read_snapshot`] 是**两个独立入口**：前者允许普通 load 并对不可变
-    /// 快照免重试，后者要求 backing 提供对齐原子序列能力。
+    /// **一致性判定权只在原子序列**：`with_bytes` 借出的就是共享内存，header
+    /// `8..16` 的 8 字节普通读可能撕裂（低半旧/高半新）——扫描期因此**不解释**
+    /// 字节里的序列（见私有 `scan` 的 `authoritative_seq` 参数）。耗尽时若最后一次原子观测
+    /// 仍为 odd ⇒ `WriterInProgress`；序列一直在 even 之间变化 ⇒ `RetryExhausted`。
+    ///
+    /// 与 [`Self::read_snapshot`] 是**两个独立入口**：后者读不可变字节副本（无并发
+    /// 写者，字节即真相），本入口要求 backing 提供对齐原子序列能力。
     pub fn read_lock_free(
         backing: &dyn RegionBacking,
         decls: &[BindingDecl],
         retries: u32,
     ) -> Result<RegionRead, RegionError> {
         let attempts = retries.max(1);
+        let mut last_seen = None;
         for _ in 0..attempts {
             let before = load_seq(backing)?;
+            last_seen = Some(before);
             if before % 2 != 0 {
                 continue; // odd = 写事务进行中：本次不得接受
             }
             let mut slot: Option<Result<RegionRead, RegionError>> = None;
             let scanned = catch_unwind(AssertUnwindSafe(|| {
                 backing.with_bytes(&mut |bytes| {
-                    slot = Some(scan(bytes, decls));
+                    // 判定权只在原子序列：扫描期不读字节 8..16（共享内存上的普通
+                    // 8 字节读可撕裂，读出的 odd 是伪影而非写者状态）。
+                    slot = Some(scan(bytes, decls, Some(before)));
                 })
             }));
             if scanned.is_err() {
@@ -102,12 +111,15 @@ impl RegionReader {
             let after = load_seq(backing)?;
             if after == before {
                 // 前后一致 ⇒ 本次读的是一份完整提交态；结构错误才是真错误。
-                let mut read = scanned?;
-                read.sequence = after;
-                return Ok(read);
+                return scanned;
             }
         }
-        Err(RegionError::RetryExhausted { attempts })
+        // 耗尽时区分两种可见结局：最后一次原子观测仍是 odd = 写者在途；
+        // 序列一直在 even 之间变化 = 持续提交（重试耗尽）。
+        match last_seen {
+            Some(sequence) if sequence % 2 == 1 => Err(RegionError::WriterInProgress { sequence }),
+            _ => Err(RegionError::RetryExhausted { attempts }),
+        }
     }
 }
 
@@ -127,7 +139,15 @@ fn truncated(need: usize, got: usize) -> RegionError {
 }
 
 /// 读一次区域字节（`read_snapshot` / `read_lock_free` 共用的纯扫描）。
-fn scan(bytes: &[u8], decls: &[BindingDecl]) -> Result<RegionRead, RegionError> {
+///
+/// `authoritative_seq`：lock-free 入口传入**已 acquire load 到的原子序列**——此时
+/// header 字节 `8..16` 不参与判定（共享内存上的 8 字节普通读可撕裂，读出的 odd 是
+/// 伪影而不是写者状态）。`None` = 不可变字节快照形态：无并发写者，字节即真相。
+fn scan(
+    bytes: &[u8],
+    decls: &[BindingDecl],
+    authoritative_seq: Option<u64>,
+) -> Result<RegionRead, RegionError> {
     if bytes.len() < HEADER_LEN {
         return Err(truncated(HEADER_LEN, bytes.len()));
     }
@@ -154,11 +174,16 @@ fn scan(bytes: &[u8], decls: &[BindingDecl]) -> Result<RegionRead, RegionError> 
             detail: "header flags must be zero in v1",
         });
     }
-    let sequence = u64::from_le_bytes(
-        bytes[OFFSET_PUBLISH_SEQ..OFFSET_REGION_ID]
-            .try_into()
-            .expect("8 bytes"),
-    );
+    // 一致性判定权：优先用调用方给的原子序列（lock-free 形态）；不可变快照形态
+    // 才解释字节 8..16（无并发写者 ⇒ 字节即真相）。
+    let sequence = match authoritative_seq {
+        Some(seq) => seq,
+        None => u64::from_le_bytes(
+            bytes[OFFSET_PUBLISH_SEQ..OFFSET_REGION_ID]
+                .try_into()
+                .expect("8 bytes"),
+        ),
+    };
     if sequence % 2 != 0 {
         return Err(RegionError::WriterInProgress { sequence });
     }
