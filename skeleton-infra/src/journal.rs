@@ -11,6 +11,27 @@
 //!   **JSON 对象**（tag 平铺的前提）——非对象载荷（`A=u64` 裸数字等）首条
 //!   append 即 Err(Serialize)。
 //!
+//! - **记录上限**：[`DEFAULT_MAX_RECORD_BYTES`]（16 MiB，**含终止换行**）是头行/
+//!   action 行/snapshot 行/[`Replay`] 逐行读/快照扫描的同一上限。写侧走有界
+//!   序列化（超限=`RecordTooLarge`，writer 与文件保持健康、文件不变），读侧走有界
+//!   读行（超限=`RecordTooLarge` 带物理行号，不物化巨串、不静默跳过）。更大载荷的
+//!   应用用 [`JsonlJournal::create_with_limit`]/[`JsonlJournal::open_with_limit`]
+//!   显式 opt in——安全 API 无「无上限」哨兵。
+//! - **记录形状**：头行之后每行必须是 JSON 对象且顶层 `t` 为**字符串**——`"a"`
+//!   反序列化、`"s"` 与未知字符串 tag 跳过计数（schema 演化）、其余（非对象/
+//!   缺 tag/非字符串 tag/坏 JSON）fail-closed `Corrupt`（带物理行号）。头行由
+//!   [`JsonlJournal::replay`] 单独消费校验，不计数。
+//! - **文件权限**（#181）：Unix 新建账本 `0600`（`OpenOptionsExt::mode`，独立于
+//!   umask）；[`JsonlJournal::open`] 校验已有文件无 group/other 位（有则
+//!   `InsecurePermissions`，**不隐式 chmod**）；Windows 隐私靠父目录 ACL 继承，
+//!   本件不声称自动加固。
+//! - **写侧 fail-stop**（#106 ③）：任何 write/flush/sync 失败 ⇒ writer `poisoned`，
+//!   后续 append/snapshot/flush 一律 `Err(Poisoned)` 直到 reopen/恢复——记录边界
+//!   已不确定时继续追加=在残行后写史，宁停不猜。
+//! - **create 失败不留下半成品**（#212）：同目录独占临时文件初始化 + 硬链接原子
+//!   发布（目标已存在即 `EEXIST`，`create_new` 语义与「绝不覆盖已有文件」原样保留）；
+//!   失败只删本次创建的临时文件并保留原始 IO 错误。
+//!
 //! 零依赖纪律（同 text.rs 先例）：thiserror 不入 manifest，手写同形
 //! `Display`/`Error` impl（错误文案与 thiserror 派生形态逐字一致），引入
 //! thiserror 依赖时可换回派生。
@@ -29,6 +50,23 @@ use serde::de::DeserializeOwned;
 
 /// 写缓冲容量（64KiB，禁逐行 flush）。
 const WRITE_BUF: usize = 64 * 1024;
+
+/// 单条 JSONL 记录编码上限默认值：**16 MiB，含终止换行**（#217 R2 拍板值）。
+///
+/// 头行、action 行、snapshot 行、[`Replay`] 逐行读、[`Journal::restore_stream`]
+/// 快照扫描共用同一上限（即 [`JsonlJournal`] 的实例上限）。更大载荷的应用用
+/// [`JsonlJournal::create_with_limit`]/[`JsonlJournal::open_with_limit`] 显式上调。
+pub const DEFAULT_MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
+/// 行缓冲容量回收阈值：单条记录达此量级（远高于常态小记录）后缓冲回收到
+/// [`LINE_BUF_KEEP`]——超大行不得把峰值容量挂在读侧迭代器的生命周期上（#217 ④）。
+const LINE_BUF_SHRINK_ABOVE: usize = 1024 * 1024;
+
+/// 行缓冲回收后的保留容量（常态记录远小于它，回收后不再抖动）。
+const LINE_BUF_KEEP: usize = 8 * 1024;
+
+/// 版本头字节（create 写出、open/replay 校验的唯一定义点；`v` 升级时同步改）。
+const HEADER_LINE: &[u8] = b"{\"v\":1}\n";
 
 /// 账本错误（fail-visible 面：Display 含路径/行号，`source` 链保源头）。
 #[derive(Debug)]
@@ -57,6 +95,34 @@ pub enum JournalError {
         /// 调用方期望版本。
         expected: u32,
     },
+    /// 单条记录编码字节（含终止换行）越过配置上限（#217）。
+    ///
+    /// 读侧带物理行号（`Some`）；写侧序列化时无行号（`None`）。越限记录既不被
+    /// 截断也不被当未知 tag 跳过——fail-closed。
+    RecordTooLarge {
+        /// 越限记录所在物理行号（从 1 起；写侧序列化时 `None`）。
+        line: Option<u64>,
+        /// 配置的上限（字节，含终止换行）。
+        limit: usize,
+    },
+    /// 版本头缺终止换行（#106 ②）：空文件或崩溃截断的头行。
+    ///
+    /// 接受无换行的头会让首条 append 直接粘在头上，破坏第一条记录边界。
+    HeaderUnterminated,
+    /// 已有账本文件带 group/other 权限位（#181：Unix only，**不隐式 chmod**）。
+    InsecurePermissions {
+        /// 账本文件路径。
+        path: PathBuf,
+        /// 实际权限位（`mode & 0o777`）。
+        mode: u32,
+    },
+    /// 写侧已被前一次 write/flush/sync 失败置为 fail-stop（#106 ③）。
+    ///
+    /// 记录边界已不确定：继续追加=在残行后写史。reopen/恢复前一律拒绝。
+    Poisoned {
+        /// 账本文件路径。
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for JournalError {
@@ -68,6 +134,33 @@ impl fmt::Display for JournalError {
             Self::VersionMismatch { found, expected } => {
                 write!(f, "version mismatch: file={found}, expected={expected}")
             }
+            Self::RecordTooLarge { line, limit } => match line {
+                Some(line) => write!(
+                    f,
+                    "record at line {line} exceeds the {limit} byte record limit (incl. newline)"
+                ),
+                None => write!(
+                    f,
+                    "record exceeds the {limit} byte record limit (incl. newline)"
+                ),
+            },
+            Self::HeaderUnterminated => {
+                write!(
+                    f,
+                    "journal header is not newline-terminated (empty/truncated header)"
+                )
+            }
+            Self::InsecurePermissions { path, mode } => write!(
+                f,
+                "insecure journal permissions at {}: mode {mode:o} grants group/other access; \
+                 chmod 600 or use a private parent directory",
+                path.display()
+            ),
+            Self::Poisoned { path } => write!(
+                f,
+                "journal at {} is poisoned by a previous write/flush/sync failure; reopen to recover",
+                path.display()
+            ),
         }
     }
 }
@@ -79,6 +172,8 @@ impl std::error::Error for JournalError {
             Self::Serialize(e) => Some(e),
             Self::Corrupt { source, .. } => Some(source),
             Self::VersionMismatch { .. } => None,
+            Self::RecordTooLarge { .. } | Self::HeaderUnterminated => None,
+            Self::InsecurePermissions { .. } | Self::Poisoned { .. } => None,
         }
     }
 }
@@ -110,6 +205,14 @@ pub enum ReplayError {
         /// 反序列化失败源头。
         source: serde_json::Error,
     },
+    /// 单行编码字节（含终止换行）越过配置上限（#217）。该物理行剩余字节已丢弃
+    /// 以保证后续行号正确；不保留超限行的缓冲容量。
+    RecordTooLarge {
+        /// 越限行所在物理行号（从 1 起）。
+        line: u64,
+        /// 配置的上限（字节，含终止换行）。
+        limit: usize,
+    },
 }
 
 impl fmt::Display for ReplayError {
@@ -117,6 +220,10 @@ impl fmt::Display for ReplayError {
         match self {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Corrupt { line, .. } => write!(f, "corrupt json at line {line}"),
+            Self::RecordTooLarge { line, limit } => write!(
+                f,
+                "record at line {line} exceeds the {limit} byte record limit (incl. newline)"
+            ),
         }
     }
 }
@@ -126,6 +233,7 @@ impl std::error::Error for ReplayError {
         match self {
             Self::Io(e) => Some(e),
             Self::Corrupt { source, .. } => Some(source),
+            Self::RecordTooLarge { .. } => None,
         }
     }
 }
@@ -177,6 +285,10 @@ where
     /// （零依赖）。
     ///
     /// BufWriter 缓冲，非逐行 flush；`snapshot_every` 命中时自动 flush（见模块注）。
+    ///
+    /// 失败面（#217/#106③）：载荷编码越过实例记录上限 ⇒ `Err(RecordTooLarge)`；
+    /// 前一次 write/flush/sync 失败 ⇒ `Err(Poisoned)`。两者都**不写字节**，但
+    /// 前者 writer 保持健康、后者需 reopen/恢复。
     fn append_action(&mut self, action: &A) -> Result<(), JournalError>;
 
     /// 快照读侧（流式）：自最新 "s" 行起播——`Some((快照态, 后续 action 回放))`；
@@ -196,9 +308,12 @@ where
     fn append_snapshot(&mut self, state: &Self::State) -> Result<(), JournalError>;
 
     /// 只读回放迭代器（逐行懒解析）。**双层 Result 语义**：外层 `Err`=调用级
-    /// 失败（文件打不开等，调用本身）；内层迭代 item 的 `Result<A, ReplayError>`=
-    /// 行级——未知变体行：跳过+计数（schema 演化）；畸形 JSON 行：`Err`
-    /// fail-closed（禁静默跳过）。调用成功后逐行消费。
+    /// 失败（文件打不开/头行不可校验等，调用本身）；内层迭代 item 的
+    /// `Result<A, ReplayError>`=行级——`"s"` 行与未知字符串 tag 行跳过+计数
+    /// （schema 演化）；非对象/缺顶层 string `t`/坏 JSON：`Err(Corrupt)`；单行越过
+    /// 记录上限：`Err(RecordTooLarge)`——一律 fail-closed（禁静默跳过）。
+    ///
+    /// 版本头由本方法单独消费校验（#177）：不计数，且首条 action 的物理行号仍为 2。
     /// 可见性=已 flush 前缀；实时面用 Store 快照。
     fn replay(&self) -> Result<Replay<'_, A>, JournalError>;
 }
@@ -213,6 +328,18 @@ pub type DynJournal<A, S> = dyn Journal<A, State = S>;
 pub type SnapshotStream<'j, A, S> = Option<(S, Replay<'j, A>)>;
 
 /// JSONL 追加式账本（`Journal` 默认实现；单写者）。
+///
+/// # 契约要点
+///
+/// - **记录上限**：构造期钉死（默认 [`DEFAULT_MAX_RECORD_BYTES`]=16 MiB 含换行），
+///   头行/action/snapshot/回放/快照扫描同用此值（#217）。
+/// - **文件权限**（#181）：Unix 新建 `0600`（独立于 umask）；`open` 拒绝已有的
+///   group/other 可读文件（`InsecurePermissions`，不隐式 chmod）。**Windows**：无
+///   POSIX 权限位，隐私完全依赖父目录 ACL 继承——调用方须把账本放进私有目录，
+///   本件不声称自动 ACL 加固。
+/// - **写侧 fail-stop**（#106 ③）：write/flush/sync 失败即 `poisoned`，直到 reopen。
+/// - **create-new 语义**（#212）：目标已存在 ⇒ `Err(AlreadyExists)`，绝不删除/
+///   覆盖调用方已有文件；初始化失败只清本次创建的临时文件。
 ///
 /// # Examples
 ///
@@ -241,6 +368,10 @@ pub struct JsonlJournal<A, S> {
     version: u32,
     snapshot_every: Option<u64>,
     append_count: u64,
+    /// 单条记录编码上限（字节，含终止换行；构造期钉死，见 [`DEFAULT_MAX_RECORD_BYTES`]）。
+    max_record_bytes: usize,
+    /// 写侧 fail-stop 位（#106 ③）：任一 write/flush/sync 失败后置位。
+    poisoned: bool,
     /// open 时截断的崩溃残行字节数（Debug 可见留痕——残行必未越过 flush 点=非持久）。
     truncated_tail: u64,
     /// A/S 类型标记（不进存储布局；`fn()` 形对 Send/Sync/变体中性）。
@@ -254,6 +385,8 @@ impl<A, S> fmt::Debug for JsonlJournal<A, S> {
             .field("version", &self.version)
             .field("snapshot_every", &self.snapshot_every)
             .field("append_count", &self.append_count)
+            .field("max_record_bytes", &self.max_record_bytes)
+            .field("poisoned", &self.poisoned)
             .field("truncated_tail", &self.truncated_tail)
             .finish_non_exhaustive()
     }
@@ -268,51 +401,128 @@ struct Header {
 }
 
 impl<A, S> JsonlJournal<A, S> {
-    /// 新建文件+写版本头 `{"v":1}`；文件已存在=Err(Io kind AlreadyExists，Display 含路径)。
+    /// 新建文件+写版本头 `{"v":1}`（记录上限取 [`DEFAULT_MAX_RECORD_BYTES`]）；
+    /// 文件已存在=Err(Io kind AlreadyExists，Display 含路径)。
+    ///
+    /// 初始化实现（#212）：**同目录独占临时文件**（`create_new`）写头 → `flush` +
+    /// `sync_all`（#106：create 成功=头行已落盘）→ **硬链接原子发布**到目标路径。
+    /// 硬链接在目标已存在时失败 `EEXIST`，故 `create_new` 语义与「绝不覆盖/删除
+    /// 已有文件」由文件系统原子保证，不需要「先查后建」的竞态窗口。任一步失败：
+    /// 关闭句柄 → best-effort 删除**本次创建的临时文件** → 保留原始 IO 错误
+    /// （清理失败并入错误文案：`temp file … cleanup failed`）。目标路径不会出现
+    /// 「看似已建但打不开」的半成品。
+    ///
+    /// `shortcut:` 依赖文件系统支持硬链接（NTFS/主流 Unix 均满足）；FAT/exFAT 等
+    /// 不支持硬链接的卷上 create 直接报底层 IO 错误，需要时再补「独占目标+直写」退化路径。
     pub fn create(path: impl AsRef<Path>) -> Result<Self, JournalError> {
+        Self::create_with_limit(path, DEFAULT_MAX_RECORD_BYTES)
+    }
+
+    /// 同 [`JsonlJournal::create`]，但显式覆盖单条记录编码上限（字节，含终止换行）。
+    ///
+    /// 仅当应用存在**已证实**更大的 action/snapshot 载荷时上调；上限同样作用于
+    /// 头行/回放/快照扫描（#217）。上限小于头行字节数（9B）时立即 `RecordTooLarge`
+    /// ——不建出自身不可 open 的账本。
+    pub fn create_with_limit(
+        path: impl AsRef<Path>,
+        max_record_bytes: usize,
+    ) -> Result<Self, JournalError> {
         let path = path.as_ref();
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|e| io_err(path, e))?;
+        // 上限必须容得下头行，否则建出来的账本自身不可 open（fail-visible，不留陷阱）。
+        if HEADER_LINE.len() > max_record_bytes {
+            return Err(JournalError::RecordTooLarge {
+                line: None,
+                limit: max_record_bytes,
+            });
+        }
+        let tmp = temp_sibling(path);
+        let file = open_new_private(&tmp).map_err(|e| io_err(path, e))?;
         let mut writer = BufWriter::with_capacity(WRITE_BUF, file);
-        // 版本头写后即刷：open 往返与挂载校验都依赖头行对读侧可见（flush 点=持久点）。
-        writer
-            .write_all(b"{\"v\":1}\n")
-            .map_err(|e| io_err(path, e))?;
-        writer.flush().map_err(|e| io_err(path, e))?;
+        // 版本头写后即刷+落盘：open 往返与挂载校验都依赖头行对读侧可见（flush 点=持久点）。
+        let init = (|| -> std::io::Result<()> {
+            #[cfg(test)]
+            fault::check("create-write")?;
+            writer.write_all(HEADER_LINE)?;
+            writer.flush()?;
+            #[cfg(test)]
+            fault::check("create-flush")?;
+            writer.get_ref().sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = init {
+            // 句柄必须先关（Windows 上开着删不掉），再清临时文件。
+            drop(writer);
+            return Err(create_failed(path, &tmp, e));
+        }
+        // 原子发布：hard_link 不覆盖已存在目标（`EEXIST`），删除临时名退场。
+        if let Err(e) = std::fs::hard_link(&tmp, path) {
+            drop(writer);
+            return Err(create_failed(path, &tmp, e));
+        }
+        // 临时名退场失败只留一个孤儿 tmp 名字（账本已可用），不升级为错误。
+        let _ = std::fs::remove_file(&tmp);
         Ok(Self {
             writer,
             path: path.to_path_buf(),
             version: 1,
             snapshot_every: None,
             append_count: 0,
+            max_record_bytes,
+            poisoned: false,
             truncated_tail: 0,
             _types: PhantomData,
         })
     }
 
     /// 追加挂载：读版本头校验 → 尾部完整性校验 → append 从截断点续写。
+    /// 记录上限取 [`DEFAULT_MAX_RECORD_BYTES`]（覆盖用 [`JsonlJournal::open_with_limit`]）。
+    ///
+    /// 头行校验含**换行框架**（#106 ②）：头行必须以 `\n` 终止（空文件/崩溃截断的
+    /// 头行 ⇒ `HeaderUnterminated`），否则首条 append 会直接粘在头上破坏记录边界。
+    /// 头行超过记录上限 ⇒ `RecordTooLarge{line: Some(1)}`。
     ///
     /// 末行无 `\n` 结尾=崩溃残行 → 截断到上一完整行边界并计数留痕（`Debug` 可见）。
     /// 残行截断安全：残行必未完整越过 flush 点=非持久，截断不丢任何已持久 action；
     /// 拒绝挂载会令账本报废不可修，故取截断+fail-visible。
     pub fn open(path: impl AsRef<Path>, expected_version: u32) -> Result<Self, JournalError> {
+        Self::open_with_limit(path, expected_version, DEFAULT_MAX_RECORD_BYTES)
+    }
+
+    /// 同 [`JsonlJournal::open`]，但显式覆盖单条记录编码上限（含头行与后续回放/扫描）。
+    /// 须与创建该账本时的 [`JsonlJournal::create_with_limit`] 取同值，否则读写口径不一致。
+    pub fn open_with_limit(
+        path: impl AsRef<Path>,
+        expected_version: u32,
+        max_record_bytes: usize,
+    ) -> Result<Self, JournalError> {
         let path = path.as_ref();
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(|e| io_err(path, e))?;
+        // #181：已有文件不得带 group/other 权限位（不隐式 chmod）。
+        check_private(&file, path)?;
         let mut reader = BufReader::new(file);
 
-        // ① 版本头校验。
-        let mut header_line = String::new();
-        let header_len = reader
-            .read_line(&mut header_line)
-            .map_err(|e| io_err(path, e))?;
-        let header: Header = serde_json::from_str(header_line.trim_end())
+        // ① 版本头校验（有界读行 + 换行框架 + deny_unknown_fields）。
+        let mut header_line: Vec<u8> = Vec::new();
+        let header_len = match read_line_limited(&mut reader, &mut header_line, max_record_bytes)
+            .map_err(|e| io_err(path, e))?
+        {
+            LineRead::Eof => return Err(JournalError::HeaderUnterminated),
+            LineRead::TooLarge => {
+                return Err(JournalError::RecordTooLarge {
+                    line: Some(1),
+                    limit: max_record_bytes,
+                });
+            }
+            LineRead::Line => header_line.len() as u64,
+        };
+        if !header_line.ends_with(b"\n") {
+            return Err(JournalError::HeaderUnterminated);
+        }
+        let header: Header = serde_json::from_slice(&header_line)
             .map_err(|e| JournalError::Corrupt { line: 1, source: e })?;
         if header.v != expected_version {
             return Err(JournalError::VersionMismatch {
@@ -324,7 +534,7 @@ impl<A, S> JsonlJournal<A, S> {
         // ② 尾部完整性：末行无 \n=崩溃残行 → 截断到上一完整行边界。
         let mut truncated_tail = 0u64;
         let size = reader.seek(SeekFrom::End(0)).map_err(|e| io_err(path, e))?;
-        if size > header_len as u64 {
+        if size > header_len {
             let last = find_last_newline(reader.get_mut(), size).map_err(|e| io_err(path, e))?;
             if let Some(pos) = last {
                 let complete_end = pos + 1;
@@ -346,6 +556,8 @@ impl<A, S> JsonlJournal<A, S> {
             version: header.v,
             snapshot_every: None,
             append_count: 0,
+            max_record_bytes,
+            poisoned: false,
             truncated_tail,
             _types: PhantomData,
         })
@@ -363,13 +575,19 @@ impl<A, S> JsonlJournal<A, S> {
     /// 真持久）。读侧可见性另有分界——未 flush 的缓冲在**干净 drop** 时由
     /// `BufWriter` 兜底写出（重开同样可见）；真正丢数据的分界是**进程崩溃/
     /// `mem::forget`**（缓冲未落盘），不是 drop。
+    ///
+    /// 失败面（#106 ③）：flush 或 `sync_all` 任一失败 ⇒ writer 置 `poisoned`，
+    /// 后续 flush/append 一律 `Err(Poisoned)`（原 IO 错误随本次返回，记录是否
+    /// 已落盘=提交歧义，由调用方按 fail-closed 处理）。
     pub fn flush(&mut self) -> Result<(), JournalError> {
-        self.writer.flush().map_err(|e| io_err(&self.path, e))?;
-        self.writer
-            .get_ref()
-            .sync_all()
-            .map_err(|e| io_err(&self.path, e))?;
-        Ok(())
+        self.reject_if_poisoned()?;
+        let flushed = self.writer.flush();
+        self.guard_io(flushed)?;
+        #[cfg(test)]
+        let synced = fault::check("flush-sync").and_then(|()| self.writer.get_ref().sync_all());
+        #[cfg(not(test))]
+        let synced = self.writer.get_ref().sync_all();
+        self.guard_io(synced)
     }
 
     /// 每 n 次 append 自动 flush 一次（0/None=关闭自动快照；见模块注）。
@@ -378,6 +596,27 @@ impl<A, S> JsonlJournal<A, S> {
     pub fn with_snapshot_every(mut self, n: u64) -> Self {
         self.snapshot_every = if n == 0 { None } else { Some(n) };
         self
+    }
+
+    /// 写侧 fail-stop 闸（#106 ③）：poisoned 后一律拒绝，直到 reopen/恢复。
+    fn reject_if_poisoned(&self) -> Result<(), JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned {
+                path: self.path.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 任一 write/flush/sync 失败 ⇒ 置 poisoned 并原样上抛（#106 ③：记录边界已不确定）。
+    fn guard_io(&mut self, r: std::io::Result<()>) -> Result<(), JournalError> {
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.poisoned = true;
+                Err(io_err(&self.path, e))
+            }
+        }
     }
 }
 
@@ -398,15 +637,201 @@ fn find_last_newline(file: &mut std::fs::File, size: u64) -> std::io::Result<Opt
     Ok(None)
 }
 
-/// 行格式打标：`{"t":"<tag>", ...payload}` 平铺同层。
+/// 有界读行的结果。
+enum LineRead {
+    /// 文件结束（未读到任何字节）。
+    Eof,
+    /// 读到一条完整行（含终止 `\n`；末行无换行时也算 `Line`）。
+    Line,
+    /// 读满 `limit` 字节仍未见换行 ⇒ 越过记录上限；该物理行剩余字节已丢弃。
+    TooLarge,
+}
+
+/// 行缓冲容量回收（#217 ④）：超大记录处理完后不把峰值容量留在复用缓冲里。
+fn release_oversize(buf: &mut Vec<u8>) {
+    if buf.capacity() > LINE_BUF_SHRINK_ABOVE {
+        buf.shrink_to(LINE_BUF_KEEP);
+    }
+}
+
+/// 有界读一行到 `buf`（#217：读侧不得靠无界 `read_line` 先分配再判长）。
 ///
-/// 先序列化后拼接：serde 失败发生在任何字节落盘前，不产生残行。
-/// tag 置首、载荷保序（确定性）；payload 非对象=显式拒绝（Err(Serialize)）；
-/// payload 顶层 `"t"` 键=显式拒绝（Err(Serialize)）——平铺成重复键后 serde_json
-/// 后键覆盖前键，replay 整行被当未知 tag 静默跳过=真相源丢史。
-fn tagged_line<T: Serialize>(tag: &str, value: &T) -> Result<String, JournalError> {
-    let body = serde_json::to_string(value)?;
-    if !(body.starts_with('{') && body.ends_with('}')) {
+/// 最多读 `limit` 字节（含终止换行）；越限即刻停并把该物理行余量吞掉（不分配），
+/// 使后续行号仍是物理行号。`buf` 的长度不会超过 `limit`。
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<LineRead> {
+    buf.clear();
+    let mut too_large = false;
+    loop {
+        let (take, done) = {
+            let avail = reader.fill_buf()?;
+            if avail.is_empty() {
+                return Ok(if too_large {
+                    LineRead::TooLarge
+                } else if buf.is_empty() {
+                    LineRead::Eof
+                } else {
+                    LineRead::Line
+                });
+            }
+            let (take, done) = match avail.iter().position(|&b| b == b'\n') {
+                Some(pos) => (pos + 1, true),
+                None => (avail.len(), false),
+            };
+            if !too_large && buf.len() + take <= limit {
+                buf.extend_from_slice(&avail[..take]);
+            } else {
+                too_large = true;
+            }
+            (take, done)
+        };
+        reader.consume(take);
+        if done {
+            return Ok(if too_large {
+                LineRead::TooLarge
+            } else {
+                LineRead::Line
+            });
+        }
+    }
+}
+
+/// 去掉行尾 ASCII 空白（`\n`/`\r`/空格/制表）——等价旧 `str::trim_end` 的切尾。
+fn trim_ascii_end(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    &bytes[..end]
+}
+
+/// 同目录独占临时文件名（`.{name}.{pid}.{seq}.tmp`）——同目录=同文件系统，
+/// 硬链接发布才可能原子（#212）。落在目标同目录也便于残留识别与人工清理。
+fn temp_sibling(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = path.parent().unwrap_or_else(|| Path::new(""));
+    dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()))
+}
+
+/// 独占新建账本文件（#181：Unix `0600` 由 `mode` 直接给，`umask` 只能减位不能加位
+/// ⇒ 独立于 umask；Windows 无 POSIX 权限位，隐私靠父目录 ACL 继承）。
+fn open_new_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// 已有账本隐私校验（#181：Unix only，**不隐式 chmod**）。
+#[cfg(unix)]
+fn check_private(file: &std::fs::File, path: &Path) -> Result<(), JournalError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = file
+        .metadata()
+        .map_err(|e| io_err(path, e))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(JournalError::InsecurePermissions {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+/// Windows/其他平台：无 POSIX 权限位可校验，隐私由父目录 ACL 继承承担（见类型文档）。
+#[cfg(not(unix))]
+fn check_private(_file: &std::fs::File, _path: &Path) -> Result<(), JournalError> {
+    Ok(())
+}
+
+/// 初始化失败收尾（#212）：只删**本次创建的临时文件**，原始 IO 错误（含 kind）
+/// 原样保留；清理失败并入错误文案（不吞、也不掩盖原始失败）。
+fn create_failed(path: &Path, tmp: &Path, source: std::io::Error) -> JournalError {
+    match std::fs::remove_file(tmp) {
+        Ok(()) => io_err(path, source),
+        Err(cleanup) => io_err(
+            path,
+            std::io::Error::new(
+                source.kind(),
+                format!(
+                    "{source}; temp file {} cleanup failed: {cleanup}",
+                    tmp.display()
+                ),
+            ),
+        ),
+    }
+}
+
+/// 有界序列化落点（#217 R2）：写满 `cap` 字节后再写即拒，**不先物化超限载荷**。
+///
+/// `Write::write` 在越界时一个字节都不写（先判后写），越界事实由 `overflowed`
+/// 上报——`serde_json` 只把它当 io 错误，超限与真序列化失败靠这个标志区分。
+struct BoundedSink {
+    buf: Vec<u8>,
+    cap: usize,
+    overflowed: bool,
+}
+
+impl Write for BoundedSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() + data.len() > self.cap {
+            self.overflowed = true;
+            return Err(std::io::Error::other("journal record exceeds limit"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 行格式打标：`{"t":"<tag>", ...payload}` 平铺同层，返回**完整行字节（含终止换行）**。
+///
+/// 有界序列化（#217 R2）：载荷写进 [`BoundedSink`]（容量 = `limit` − 帧开销），
+/// 越限即拒写 ⇒ 不先物化超限载荷；`limit` 含 `{"t":"<tag>",` + `}` + `\n` 的帧开销。
+/// serde 失败/非对象载荷/顶层 `"t"` 保留键都在**零字节落盘前**拒绝（返回 Err 时
+/// 调用方文件未动、writer 仍健康）。
+///
+/// tag 置首、载荷保序（确定性）；payload 顶层 `"t"` 键=显式拒绝（Err(Serialize)）
+/// ——平铺成重复键后 serde_json 后键覆盖前键，replay 整行被当未知 tag 静默跳过
+/// =真相源丢史。
+fn tagged_line<T: Serialize>(tag: &str, value: &T, limit: usize) -> Result<Vec<u8>, JournalError> {
+    let prefix = format!("{{\"t\":\"{tag}\"");
+    // 帧开销：prefix + `,` + `\n`（body 自带外层 `{}`，剥掉 `{`/`}` 后原位重建）。
+    let mut sink = BoundedSink {
+        buf: Vec::new(),
+        cap: limit.saturating_sub(prefix.len() + 1),
+        overflowed: false,
+    };
+    if let Err(e) = serde_json::to_writer(&mut sink, value) {
+        return Err(if sink.overflowed {
+            JournalError::RecordTooLarge { line: None, limit }
+        } else {
+            JournalError::Serialize(e)
+        });
+    }
+    let body = sink.buf;
+    if !(body.starts_with(b"{") && body.ends_with(b"}")) {
         return Err(JournalError::Serialize(serde_json::Error::io(
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -415,7 +840,7 @@ fn tagged_line<T: Serialize>(tag: &str, value: &T) -> Result<String, JournalErro
         )));
     }
     // 保留键探测（append 冷路径 IO 主导，成本可忽略；失败发生在写字节之前）。
-    let probe: serde_json::Value = serde_json::from_str(&body)?;
+    let probe: serde_json::Value = serde_json::from_slice(&body)?;
     if probe.get("t").is_some() {
         return Err(JournalError::Serialize(serde_json::Error::io(
             std::io::Error::new(
@@ -424,12 +849,15 @@ fn tagged_line<T: Serialize>(tag: &str, value: &T) -> Result<String, JournalErro
             ),
         )));
     }
-    let inner = &body[1..body.len() - 1];
-    Ok(if inner.is_empty() {
-        format!("{{\"t\":\"{tag}\"}}")
-    } else {
-        format!("{{\"t\":\"{tag}\",{inner}}}")
-    })
+    let mut line = Vec::with_capacity(prefix.len() + body.len() + 2);
+    line.extend_from_slice(prefix.as_bytes());
+    if body.len() > 2 {
+        line.push(b',');
+        line.extend_from_slice(&body[1..body.len() - 1]);
+    }
+    line.push(b'}');
+    line.push(b'\n');
+    Ok(line)
 }
 
 impl<A, S> Journal<A> for JsonlJournal<A, S>
@@ -440,13 +868,13 @@ where
     type State = S;
 
     fn append_action(&mut self, action: &A) -> Result<(), JournalError> {
-        let line = tagged_line("a", action)?;
-        self.writer
-            .write_all(line.as_bytes())
-            .map_err(|e| io_err(&self.path, e))?;
-        self.writer
-            .write_all(b"\n")
-            .map_err(|e| io_err(&self.path, e))?;
+        self.reject_if_poisoned()?;
+        // 有界序列化先于任何字节落盘（#217 R2）：超限=Err 且 writer/文件保持不变。
+        let line = tagged_line("a", action, self.max_record_bytes)?;
+        #[cfg(test)]
+        self.guard_io(fault::check("append-write"))?;
+        let written = self.writer.write_all(&line);
+        self.guard_io(written)?;
         self.append_count += 1;
         // 自动 flush（with_snapshot_every 命中；快照节奏归调用方 snapshot()，见模块注）。
         if let Some(n) = self.snapshot_every {
@@ -462,28 +890,38 @@ where
         // 一律跳过且不解析——含更早快照行与畸形行；行后畸形由增量回放 fail-closed）。
         let file = std::fs::File::open(&self.path).map_err(|e| io_err(&self.path, e))?;
         let mut reader = BufReader::new(file);
-        let mut line = String::new();
+        let mut line: Vec<u8> = Vec::new();
         let mut offset = 0u64;
         let mut line_no = 0u64;
         let mut latest: Option<(S, u64, u64)> = None; // (快照态, 行后字节偏移, 行号)
         loop {
-            line.clear();
-            let n = reader
-                .read_line(&mut line)
-                .map_err(|e| io_err(&self.path, e))?;
-            if n == 0 {
-                break;
+            // 扫描面同一回收策略（#217 ④）：超大行不得把峰值容量挂在本调用上。
+            release_oversize(&mut line);
+            match read_line_limited(&mut reader, &mut line, self.max_record_bytes)
+                .map_err(|e| io_err(&self.path, e))?
+            {
+                LineRead::Eof => break,
+                LineRead::TooLarge => {
+                    line_no += 1;
+                    release_oversize(&mut line);
+                    return Err(JournalError::RecordTooLarge {
+                        line: Some(line_no),
+                        limit: self.max_record_bytes,
+                    });
+                }
+                LineRead::Line => {}
             }
             line_no += 1;
+            let n = line.len() as u64;
             // 扫描只认 "s" 行：畸形行/其他 tag 行不在此处裁决（留给回放面）。
             // 快照探测=字节前缀短路：tagged_line 恒产 `{"t":"s"...}` tag 置首形，
             // 非 "s" 形行零 JSON 解析——此前逐行 Value 解析成本 ≈ 全量 typed 回放
             //（0.40 vs 0.43µs/行），叠加增量回放=快照加速收益反转（perf-journal
             // §3-C）。非 writer 形（tag 不置首）漏检只退化全量重放：真相源恒为
             // action 流，终态不变。
-            let trimmed = line.trim_end();
-            let is_snapshot = if trimmed.starts_with("{\"t\":\"s\"") {
-                serde_json::from_str::<serde_json::Value>(trimmed)
+            let trimmed = trim_ascii_end(&line);
+            let is_snapshot = if trimmed.starts_with(b"{\"t\":\"s\"") {
+                serde_json::from_slice::<serde_json::Value>(trimmed)
                     .ok()
                     .and_then(|v| (v.get("t").and_then(|t| t.as_str()) == Some("s")).then_some(v))
             } else {
@@ -494,7 +932,7 @@ where
                     m.remove("t");
                 }
                 match serde_json::from_value::<S>(v) {
-                    Ok(state) => latest = Some((state, offset + n as u64, line_no)),
+                    Ok(state) => latest = Some((state, offset + n, line_no)),
                     // 账本声称的快照读不出来=fail-closed，禁静默回退旧快照。
                     Err(e) => {
                         return Err(JournalError::Corrupt {
@@ -504,7 +942,7 @@ where
                     }
                 }
             }
-            offset += n as u64;
+            offset += n;
         }
         match latest {
             None => Ok(None),
@@ -518,7 +956,8 @@ where
                         reader: BufReader::new(file),
                         line_no: snap_line,
                         skipped: 0,
-                        buf: String::new(),
+                        limit: self.max_record_bytes,
+                        buf: Vec::new(),
                         _marker: PhantomData,
                         _anchor: PhantomData,
                     },
@@ -528,15 +967,13 @@ where
     }
 
     fn append_snapshot(&mut self, state: &S) -> Result<(), JournalError> {
+        self.reject_if_poisoned()?;
+        // 序列化先于任何字节落盘（#217 R2 有界 sink）：超限=快照未落盘、writer 健康。
+        let line = tagged_line("s", state, self.max_record_bytes)?;
         // flush 先行：快照行必须落在全部已 append action 之后（先落盘后 apply 的持久点纪律）。
         self.flush()?;
-        let line = tagged_line("s", state)?;
-        self.writer
-            .write_all(line.as_bytes())
-            .map_err(|e| io_err(&self.path, e))?;
-        self.writer
-            .write_all(b"\n")
-            .map_err(|e| io_err(&self.path, e))?;
+        let written = self.writer.write_all(&line);
+        self.guard_io(written)?;
         // 快照行即写即刷：读侧可见性=已 flush 前缀，不刷的快照对恢复无用。
         self.flush()?;
         Ok(())
@@ -544,11 +981,38 @@ where
 
     fn replay(&self) -> Result<Replay<'_, A>, JournalError> {
         let file = std::fs::File::open(&self.path).map_err(|e| io_err(&self.path, e))?;
+        let mut reader = BufReader::new(file);
+        // #177：完整回放先消费并校验头行（**不计数**）——首条 action 的物理行号仍为 2。
+        let mut header: Vec<u8> = Vec::new();
+        match read_line_limited(&mut reader, &mut header, self.max_record_bytes)
+            .map_err(|e| io_err(&self.path, e))?
+        {
+            LineRead::Eof => return Err(JournalError::HeaderUnterminated),
+            LineRead::TooLarge => {
+                return Err(JournalError::RecordTooLarge {
+                    line: Some(1),
+                    limit: self.max_record_bytes,
+                });
+            }
+            LineRead::Line => {}
+        }
+        if !header.ends_with(b"\n") {
+            return Err(JournalError::HeaderUnterminated);
+        }
+        let parsed: Header = serde_json::from_slice(&header)
+            .map_err(|e| JournalError::Corrupt { line: 1, source: e })?;
+        if parsed.v != self.version {
+            return Err(JournalError::VersionMismatch {
+                found: parsed.v,
+                expected: self.version,
+            });
+        }
         Ok(Replay {
-            reader: BufReader::new(file),
-            line_no: 0,
+            reader,
+            line_no: 1,
             skipped: 0,
-            buf: String::new(),
+            limit: self.max_record_bytes,
+            buf: Vec::new(),
             _marker: PhantomData,
             _anchor: PhantomData,
         })
@@ -611,19 +1075,29 @@ fn collect_replay<A: DeserializeOwned>(
                     source,
                 },
                 ReplayError::Corrupt { line, source } => JournalError::Corrupt { line, source },
+                ReplayError::RecordTooLarge { line, limit } => JournalError::RecordTooLarge {
+                    line: Some(line),
+                    limit,
+                },
             })
         })
         .collect()
 }
 
-/// 回放迭代器：Item=`Result<A, ReplayError>`；跳过面=未知 "t" tag 行与快照行
-///（skipped_unknown 计数）；畸形行 fail-closed。
+/// 回放迭代器：Item=`Result<A, ReplayError>`。
+///
+/// 记录形状契约（#178）：头行之后每行必须是 JSON 对象且顶层 `t` 为字符串——
+/// `"a"` 反序列化，`"s"` 与未知字符串 tag 跳过并计入 [`Replay::skipped_unknown`]
+/// （schema 演化），其余（非对象/缺 tag/非字符串 tag/坏 JSON）fail-closed `Corrupt`。
+/// 单行越过记录上限 ⇒ `RecordTooLarge`（#217），且越限行不保留缓冲容量。
 pub struct Replay<'j, A> {
     reader: BufReader<std::fs::File>,
     /// 当前行号（从 1 起；跨过跳过面后保持绝对行号语义）。
     line_no: u64,
     skipped: u64,
-    buf: String,
+    /// 单行编码上限（含终止换行；与写侧同一值）。
+    limit: usize,
+    buf: Vec<u8>,
     _marker: PhantomData<fn() -> A>,
     _anchor: PhantomData<&'j ()>,
 }
@@ -632,17 +1106,34 @@ impl<'j, A: DeserializeOwned> Iterator for Replay<'j, A> {
     type Item = Result<A, ReplayError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let item = self.step();
+        // 出错/读尽即回收超大行缓冲（#217 ④）：峰值容量不留在迭代器生命周期上。
+        if !matches!(item.as_ref(), Some(Ok(_))) {
+            release_oversize(&mut self.buf);
+        }
+        item
+    }
+}
+
+impl<'j, A: DeserializeOwned> Replay<'j, A> {
+    fn step(&mut self) -> Option<Result<A, ReplayError>> {
         loop {
-            self.buf.clear();
-            let n = match self.reader.read_line(&mut self.buf) {
-                Ok(n) => n,
+            // 上一条超大记录的峰值容量先回收（复用缓冲不长期膨胀）。
+            release_oversize(&mut self.buf);
+            match read_line_limited(&mut self.reader, &mut self.buf, self.limit) {
+                Ok(LineRead::Eof) => return None,
+                Ok(LineRead::Line) => {}
+                Ok(LineRead::TooLarge) => {
+                    self.line_no += 1;
+                    return Some(Err(ReplayError::RecordTooLarge {
+                        line: self.line_no,
+                        limit: self.limit,
+                    }));
+                }
                 Err(e) => return Some(Err(ReplayError::Io(e))),
-            };
-            if n == 0 {
-                return None;
             }
             self.line_no += 1;
-            let value: serde_json::Value = match serde_json::from_str(self.buf.trim_end()) {
+            let value: serde_json::Value = match serde_json::from_slice(&self.buf) {
                 Ok(v) => v,
                 Err(e) => {
                     return Some(Err(ReplayError::Corrupt {
@@ -651,7 +1142,21 @@ impl<'j, A: DeserializeOwned> Iterator for Replay<'j, A> {
                     }));
                 }
             };
-            if value.get("t").and_then(|t| t.as_str()) == Some("a") {
+            // #178：顶层 `t` 必须是字符串——非对象/缺 tag/非字符串 tag 都是
+            // writer 产不出的形状，按损坏 fail-closed（禁当未知变体静默跳过）。
+            let is_action = match value.get("t") {
+                Some(serde_json::Value::String(tag)) => tag == "a",
+                _ => {
+                    return Some(Err(ReplayError::Corrupt {
+                        line: self.line_no,
+                        source: serde_json::Error::io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "journal record must be a JSON object with a top-level string \"t\" tag",
+                        )),
+                    }));
+                }
+            };
+            if is_action {
                 // 摘掉 tag 后整行交给 A：payload 缺字段走 schema default（add-only 演化），
                 // 真畸形=Err fail-closed（禁静默跳过）。
                 let mut payload = value;
@@ -663,7 +1168,7 @@ impl<'j, A: DeserializeOwned> Iterator for Replay<'j, A> {
                     source: e,
                 }));
             }
-            // "s" 行与未知 tag 一律跳过+计数（schema 演化）。
+            // "s" 行与未知 string tag 一律跳过+计数（schema 演化）。
             self.skipped += 1;
         }
     }
@@ -671,8 +1176,39 @@ impl<'j, A: DeserializeOwned> Iterator for Replay<'j, A> {
 
 impl<'j, A> Replay<'j, A> {
     /// 未知变体/快照行跳过计数（fail-visible：>0 必显式报告，禁静默）。
+    ///
+    /// 版本头**不计入**（[`JsonlJournal::replay`] 单独消费校验，#177）：header-only
+    /// 账本恒为 0，一条快照行或一条未知 string tag 各 +1。
     pub fn skipped_unknown(&self) -> u64 {
         self.skipped
+    }
+}
+
+/// 故障注入（**仅测试编译**）：`cargo test` 的 lib 单元测试用它在 write/flush/sync
+/// 处制造真实 IO 失败——磁盘满/只读盘在 CI 里不可复现，而 #212 的失败清理与
+/// #106 ③ 的 poison 态必须被红过再绿。集成测试编的是非 `cfg(test)` lib，不含本模块。
+#[cfg(test)]
+mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// 待触发的故障点；命中一次即解除（重试路径不被连带打断）。
+        static ARMED: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    /// 武装一个故障点（下一个命中该 stage 的检查返回 Err）。
+    pub(super) fn arm(stage: &'static str) {
+        ARMED.with(|a| a.set(Some(stage)));
+    }
+
+    /// 命中已武装的 stage ⇒ 模拟一次 IO 失败。
+    pub(super) fn check(stage: &'static str) -> std::io::Result<()> {
+        let armed = ARMED.with(Cell::get);
+        if armed != Some(stage) {
+            return Ok(());
+        }
+        ARMED.with(|a| a.set(None));
+        Err(std::io::Error::other(format!("injected fault: {stage}")))
     }
 }
 
@@ -711,7 +1247,6 @@ mod tests {
 
     /// 用例目录守卫：Drop 收尾清理（含 panic 路径）——断言失败也留不下垃圾。
     struct CaseDir(PathBuf);
-
     impl std::ops::Deref for CaseDir {
         type Target = Path;
 
@@ -740,6 +1275,17 @@ mod tests {
     }
     fn rest(j: &JsonlJournal<Act, St>) -> Option<(St, Replay<'_, Act>)> {
         j.restore_stream().unwrap()
+    }
+
+    /// 手写账本夹具：Unix 上权限收紧到 `0600`——`open` 会拒 group/other 可读的已有
+    /// 文件（#181），裸 `fs::write` 在 `umask 022` 下产 0644 会把夹具变成隐私错误。
+    fn write_private(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     /// 恒等序列：中文/引号/反斜杠/换行转义/空串。
@@ -774,7 +1320,7 @@ mod tests {
             let mut r = rep(&j);
             let got: Vec<Act> = r.by_ref().map(Result::unwrap).collect();
             assert_eq!(got, acts);
-            assert_eq!(r.skipped_unknown(), 1); // 仅版本头
+            assert_eq!(r.skipped_unknown(), 0); // 版本头不计入（#177）
         }
     }
 
@@ -802,7 +1348,7 @@ mod tests {
         }
         // 版本头未知字段：deny_unknown_fields → fail-closed。
         let seeded = dir.join("seeded.jsonl");
-        std::fs::write(&seeded, "{\"v\":1,\"seed\":42}\n").unwrap();
+        write_private(&seeded, "{\"v\":1,\"seed\":42}\n");
         match JsonlJournal::<Act, St>::open(&seeded, 1) {
             Err(JournalError::Corrupt { line: 1, .. }) => {}
             other => panic!("expected Corrupt at line 1, got {other:?}"),
@@ -823,7 +1369,7 @@ mod tests {
     fn header_unknown_field_rejected_fail_closed() {
         let dir = case_dir("header-unknown-field");
         let path = dir.join("j.jsonl");
-        std::fs::write(&path, "{\"v\":1,\"extra\":true}\n").unwrap();
+        write_private(&path, "{\"v\":1,\"extra\":true}\n");
         match JsonlJournal::<Act, St>::open(&path, 1) {
             Err(JournalError::Corrupt { line, .. }) => assert_eq!(line, 1),
             other => panic!("expected Corrupt at line 1, got {other:?}"),
@@ -872,13 +1418,12 @@ mod tests {
             let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
             app(&mut j, &a1);
             j.flush().unwrap();
-            // 手工注入未知 tag 行与无 tag 行（schema 演化）。
+            // 手工注入未知 string tag 行（合法的 schema 演化形）。
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
                 .unwrap();
             writeln!(f, "{{\"t\":\"future_tag\",\"x\":1}}").unwrap();
-            writeln!(f, "{{\"note\":\"no tag at all\"}}").unwrap();
         }
         {
             let mut j = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
@@ -887,8 +1432,40 @@ mod tests {
             let mut r = rep(&j);
             let got: Vec<Act> = r.by_ref().map(Result::unwrap).collect();
             assert_eq!(got, vec![a1, a2]);
-            assert_eq!(r.skipped_unknown(), 3); // 版本头+future_tag+无 tag
+            assert_eq!(r.skipped_unknown(), 1); // 仅 future_tag（版本头不计入）
         }
+    }
+
+    /// #178：无 tag 的对象是 writer 产不出的形状——不得当未知变体静默跳过，
+    /// 必须带物理行号 fail-closed，且不计入 skipped_unknown。
+    #[test]
+    fn untagged_object_fails_closed_and_is_not_counted() {
+        let dir = case_dir("untagged-object");
+        let path = dir.join("j.jsonl");
+        {
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
+            app(
+                &mut j,
+                &Act {
+                    id: 1,
+                    label: "a".into(),
+                },
+            );
+            j.flush().unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "{{\"note\":\"no tag at all\"}}").unwrap();
+        }
+        let j = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
+        let mut r = rep(&j);
+        assert!(r.next().unwrap().is_ok()); // 行 2 完整
+        match r.next() {
+            Some(Err(ReplayError::Corrupt { line, .. })) => assert_eq!(line, 3),
+            other => panic!("expected Corrupt at line 3, got {other:?}"),
+        }
+        assert_eq!(r.skipped_unknown(), 0, "损坏行不计入未知变体计数");
     }
 
     #[test]
@@ -942,7 +1519,7 @@ mod tests {
             let mut r = rep(&j);
             let got: Vec<Act> = r.by_ref().map(Result::unwrap).collect();
             assert_eq!(got, vec![a1, a2]); // "s" 行不混入
-            assert_eq!(r.skipped_unknown(), 2); // 版本头+"s" 行
+            assert_eq!(r.skipped_unknown(), 1); // 仅 "s" 行（版本头不计入）
         }
     }
 
@@ -1283,6 +1860,204 @@ mod tests {
         assert!(
             snap_ms <= full_ms * 2 + 200,
             "快照恢复出现量级倒挂（反转回归）：snap={snap_ms}ms full={full_ms}ms（容差 2x+200ms）"
+        );
+    }
+
+    // ── #212：create 阶段失败不得留下「看似已建但打不开」的半成品 ────────────
+
+    /// 头行写失败：目标路径不存在、临时文件已清、原始 IO 错误如实上抛、重试可建成。
+    #[test]
+    fn create_write_failure_leaves_no_artifact_and_retry_succeeds() {
+        let dir = case_dir("create-write-fail");
+        let path = dir.join("j.jsonl");
+        fault::arm("create-write");
+        match JsonlJournal::<Act, St>::create(&path) {
+            Err(JournalError::Io { path: p, source }) => {
+                assert_eq!(p, path, "错误携带目标账本路径");
+                assert!(source.to_string().contains("create-write"), "{source}");
+            }
+            other => panic!("expected Io(write fault), got {other:?}"),
+        }
+        assert!(!path.exists(), "失败后目标路径必须不存在（不留半成品）");
+        assert_eq!(
+            std::fs::read_dir(&*dir).unwrap().count(),
+            0,
+            "本次创建的临时文件必须被清掉"
+        );
+        // 重试：同一路径可建成并 open（此前失败不阻塞重试）。
+        let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
+        app(
+            &mut j,
+            &Act {
+                id: 1,
+                label: "a".into(),
+            },
+        );
+        j.flush().unwrap();
+        drop(j);
+        let j = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
+        assert_eq!(rep(&j).count(), 1);
+    }
+
+    /// flush/sync 失败（发布之前）走同一条清理路径。
+    #[test]
+    fn create_flush_failure_leaves_no_artifact_and_retry_succeeds() {
+        let dir = case_dir("create-flush-fail");
+        let path = dir.join("j.jsonl");
+        fault::arm("create-flush");
+        match JsonlJournal::<Act, St>::create(&path) {
+            Err(JournalError::Io { source, .. }) => {
+                assert!(source.to_string().contains("create-flush"), "{source}");
+            }
+            other => panic!("expected Io(flush fault), got {other:?}"),
+        }
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
+        JsonlJournal::<Act, St>::create(&path).unwrap();
+    }
+
+    /// create-new 语义不变：目标已存在 ⇒ AlreadyExists，且**不删不覆盖**调用方文件。
+    #[test]
+    fn create_never_touches_preexisting_file() {
+        let dir = case_dir("create-existing");
+        let path = dir.join("j.jsonl");
+        write_private(&path, "caller-owned\n");
+        match JsonlJournal::<Act, St>::create(&path) {
+            Err(JournalError::Io { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+            }
+            other => panic!("expected Io(AlreadyExists), got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "caller-owned\n",
+            "已有文件内容不得被改动"
+        );
+        assert_eq!(
+            std::fs::read_dir(&*dir).unwrap().count(),
+            1,
+            "失败路径不得残留临时文件"
+        );
+    }
+
+    // ── #106 ③：写侧 fail-stop（poisoned） ───────────────────────────────
+
+    /// 写失败 ⇒ poisoned；后续 append/flush 一律 Err(Poisoned)；reopen 后恢复，
+    /// 且文件里没有半条记录（先序列化后写 + 残行截断）。
+    #[test]
+    fn append_write_failure_poisons_writer_until_reopen() {
+        let dir = case_dir("poison-append");
+        let path = dir.join("j.jsonl");
+        let a1 = Act {
+            id: 1,
+            label: "a".into(),
+        };
+        {
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
+            app(&mut j, &a1);
+            j.flush().unwrap();
+            fault::arm("append-write");
+            match j.append_action(&Act {
+                id: 2,
+                label: "b".into(),
+            }) {
+                Err(JournalError::Io { source, .. }) => {
+                    assert!(source.to_string().contains("append-write"), "{source}");
+                }
+                other => panic!("expected Io, got {other:?}"),
+            }
+            match j.append_action(&Act {
+                id: 3,
+                label: "c".into(),
+            }) {
+                Err(JournalError::Poisoned { path: p }) => assert_eq!(p, path),
+                other => panic!("expected Poisoned, got {other:?}"),
+            }
+            assert!(
+                matches!(j.flush(), Err(JournalError::Poisoned { .. })),
+                "poisoned 后 flush 同样拒绝（同一条 fail-stop 边界）"
+            );
+        }
+        let j = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
+        let got: Vec<Act> = rep(&j).map(Result::unwrap).collect();
+        assert_eq!(got, vec![a1], "poisoned 后不得有半条记录入账");
+    }
+
+    /// flush 成功但 `sync_all` 失败也 poison（#106 R2「poison on sync failure」）：
+    /// 记录可能已成残行，继续追加=在残行后写史。
+    #[test]
+    fn sync_failure_poisons_writer_until_reopen() {
+        let dir = case_dir("poison-sync");
+        let path = dir.join("j.jsonl");
+        let a1 = Act {
+            id: 1,
+            label: "a".into(),
+        };
+        {
+            let mut j = JsonlJournal::<Act, St>::create(&path).unwrap();
+            app(&mut j, &a1);
+            fault::arm("flush-sync");
+            match j.flush() {
+                Err(JournalError::Io { source, .. }) => {
+                    assert!(source.to_string().contains("flush-sync"), "{source}");
+                }
+                other => panic!("expected Io(sync fault), got {other:?}"),
+            }
+            match j.append_action(&Act {
+                id: 2,
+                label: "b".into(),
+            }) {
+                Err(JournalError::Poisoned { .. }) => {}
+                other => panic!("expected Poisoned, got {other:?}"),
+            }
+        }
+        // sync 失败≠记录不存在：flush 已把字节交给 OS，reopen 后可见。
+        let j = JsonlJournal::<Act, St>::open(&path, 1).unwrap();
+        let got: Vec<Act> = rep(&j).map(Result::unwrap).collect();
+        assert_eq!(got, vec![a1]);
+    }
+
+    /// #217：写侧超限拒绝后 writer 保持健康（非 poisoned）+ 文件零变化。
+    #[test]
+    fn oversized_write_rejection_keeps_writer_healthy() {
+        let dir = case_dir("oversize-write");
+        let path = dir.join("j.jsonl");
+        let limit = 128usize;
+        let mut j = JsonlJournal::<Act, St>::create_with_limit(&path, limit).unwrap();
+        app(
+            &mut j,
+            &Act {
+                id: 1,
+                label: "a".into(),
+            },
+        );
+        j.flush().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        match j.append_action(&Act {
+            id: 2,
+            label: "x".repeat(limit),
+        }) {
+            Err(JournalError::RecordTooLarge {
+                line: None,
+                limit: l,
+            }) => assert_eq!(l, limit),
+            other => panic!("expected RecordTooLarge, got {other:?}"),
+        }
+        match j.append_snapshot(&St { count: u64::MAX }) {
+            // 快照行 `{"t":"s","count":18446744073709551615}` = 37B < 128：正常写入
+            Ok(()) => {}
+            other => panic!("小快照不应被拒: {other:?}"),
+        }
+        j.flush().unwrap();
+        // 超限 action 零字节落盘（快照行是之后正常写的，比对只针对 action 前缀）。
+        let after = std::fs::read(&path).unwrap();
+        assert!(
+            after.starts_with(&before),
+            "超限拒绝不得改动既有前缀（writer 健康、非 poisoned）"
+        );
+        assert!(
+            String::from_utf8_lossy(&after[before.len()..]).starts_with("{\"t\":\"s\""),
+            "超限拒绝后下一条正常写入照常落盘"
         );
     }
 }
