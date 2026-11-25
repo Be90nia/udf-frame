@@ -863,7 +863,10 @@ mod tempdir_drop_reporting_tests {
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected stderr failure"))
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected stderr failure",
+            ))
         }
     }
 
