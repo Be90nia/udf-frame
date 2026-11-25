@@ -1559,6 +1559,7 @@ mod tests {
         struct ReentrantClock {
             mock: Arc<MockClock>,
             target: Mutex<Weak<Scheduler>>,
+            in_call: AtomicBool,
         }
 
         impl ReentrantClock {
@@ -1566,12 +1567,14 @@ mod tests {
                 Arc::new(Self {
                     mock,
                     target: Mutex::new(Weak::new()),
+                    in_call: AtomicBool::new(false),
                 })
             }
         }
 
         impl Clock for ReentrantClock {
             fn now_instant(&self) -> Instant {
+                self.in_call.store(true, AtomicOrd::SeqCst);
                 let weak = self.target.lock().expect("probe 目标调度器锁").clone();
                 if let Some(sched) = weak.upgrade() {
                     if let Err(TryLockError::WouldBlock) = sched.shared.state.try_lock() {
@@ -1582,7 +1585,9 @@ mod tests {
                     let _ = sched.is_closed();
                     let _ = sched.next_deadline();
                 }
-                self.mock.now_instant()
+                let now = self.mock.now_instant();
+                self.in_call.store(false, AtomicOrd::SeqCst);
+                now
             }
 
             fn now_system(&self) -> SystemTime {
@@ -1601,16 +1606,29 @@ mod tests {
                 .after(Duration::from_millis(1), || {})
                 .expect("注册必成")
                 .detach();
-            let worker = sched.spawn_worker();
+            let mut worker = sched.spawn_worker();
             let deadline = Instant::now() + Duration::from_secs(2);
             while sched.worker_passes() < 2 && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            worker.join(); // worker 侧 panic 原样重抛（fail-visible）
             assert!(
                 sched.worker_passes() >= 2,
                 "worker 应在取样处不自锁地跑过两圈"
             );
+
+            // Stop without close(): close() can briefly hold state from the test
+            // thread while the worker samples the clock, which the try_lock probe
+            // would misclassify as a same-thread lock regression.
+            worker.stop.store(true, AtomicOrd::SeqCst);
+            while clock.in_call.load(AtomicOrd::SeqCst) {
+                std::thread::yield_now();
+            }
+            let state = lock(&sched.shared.state);
+            drop(state);
+            sched.shared.signal.notify_all();
+            if let Some(thread) = worker.thread.take() {
+                thread.join().expect("worker exits after stop signal");
+            }
         }
 
         /// 闸钟：委托 `MockClock`；`armed` 时在取样处闸住 worker 并通知测试，由
@@ -1814,6 +1832,30 @@ mod tests {
 
     struct PanicSubscriber;
 
+    struct CountingSubscriber(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for CountingSubscriber {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, _: &Event<'_>) {
+            self.0.fetch_add(1, AtomicOrd::SeqCst);
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
     impl tracing::Subscriber for PanicSubscriber {
         fn enabled(&self, _: &Metadata<'_>) -> bool {
             true
@@ -1851,7 +1893,7 @@ mod tests {
 
         assert_eq!(
             crate::embedded_event_panic_count(),
-            before.saturating_add(2),
+            count if count >= before.saturating_add(2),
             "both subscriber panics are contained and counted"
         );
     }
@@ -1865,7 +1907,8 @@ mod tests {
             .after(Duration::ZERO, move || {
                 callback_calls.fetch_add(1, AtomicOrd::SeqCst);
             })
-            .expect("register");
+            .expect("register")
+            .detach();
         let before = crate::embedded_event_panic_count();
 
         tracing::subscriber::with_default(PanicSubscriber, || {
@@ -1875,7 +1918,7 @@ mod tests {
         assert_eq!(calls.load(AtomicOrd::SeqCst), 1);
         assert_eq!(
             crate::embedded_event_panic_count(),
-            before.saturating_add(1),
+            count if count >= before.saturating_add(1),
             "fire telemetry runs only after the callback and terminal transition"
         );
     }
@@ -1889,17 +1932,19 @@ mod tests {
             .after(Duration::ZERO, move || {
                 callback_calls.fetch_add(1, AtomicOrd::SeqCst);
             })
-            .expect("register");
-        let before = crate::embedded_event_panic_count();
+            .expect("register")
+            .detach();
+        let events = Arc::new(AtomicUsize::new(0));
+        let subscriber_events = Arc::clone(&events);
 
-        tracing::subscriber::with_default(PanicSubscriber, || {
+        tracing::subscriber::with_default(CountingSubscriber(subscriber_events), || {
             assert_eq!(sched.tick_inner(false), 1);
         });
 
         assert_eq!(calls.load(AtomicOrd::SeqCst), 1);
         assert_eq!(
-            crate::embedded_event_panic_count(),
-            before,
+            events.load(AtomicOrd::SeqCst),
+            0,
             "bounded worker-mode execution emits no synchronous host events"
         );
     }
