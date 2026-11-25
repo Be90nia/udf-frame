@@ -1799,3 +1799,75 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "log-embed"))]
+mod telemetry_boundary_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata};
+
+    struct PanicSubscriber;
+
+    impl tracing::Subscriber for PanicSubscriber {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, _: &Event<'_>) {
+            panic!("injected scheduler telemetry panic");
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test]
+    fn cancel_returns_actual_cas_result_when_subscriber_panics() {
+        let sched = Scheduler::new(Arc::new(MockClock::new()));
+        let handle = sched.after(Duration::from_secs(60), || {}).expect("register");
+        let before = crate::embedded_event_panic_count();
+
+        tracing::subscriber::with_default(PanicSubscriber, || {
+            assert!(handle.cancel(), "first cancellation wins");
+            assert!(!handle.cancel(), "second cancellation loses");
+        });
+
+        assert_eq!(
+            crate::embedded_event_panic_count(),
+            before.saturating_add(2),
+            "both subscriber panics are contained and counted"
+        );
+    }
+
+    #[test]
+    fn worker_mode_tick_never_invokes_synchronous_subscriber() {
+        let sched = Scheduler::new(Arc::new(MockClock::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        sched.after(Duration::ZERO, move || {
+            callback_calls.fetch_add(1, AtomicOrd::SeqCst);
+        }).expect("register");
+        let before = crate::embedded_event_panic_count();
+
+        tracing::subscriber::with_default(PanicSubscriber, || {
+            assert_eq!(sched.tick_inner(false), 1);
+        });
+
+        assert_eq!(calls.load(AtomicOrd::SeqCst), 1);
+        assert_eq!(
+            crate::embedded_event_panic_count(),
+            before,
+            "bounded worker-mode execution emits no synchronous host events"
+        );
+    }
+}
