@@ -18,7 +18,8 @@
 #![cfg(feature = "log-embed")]
 
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -191,6 +192,170 @@ fn shutdown_timed_out_outcome_warns() {
         Level::WARN,
         &["name=stuck", "kind=timed_out"],
     );
+}
+
+// ---- 顺序契约探针（#121 / #193）：订阅器=同步用户回调，其内重入协调器不得被挡 ----
+
+type ProbeFn = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// 只在一个 target 上动手的探针：记录事件字段，首次命中时执行一次探针闭包并
+/// 保存人读结论（闭包内自起线程 + 有界超时——探针挂死时测试在 2s 内红，不挂 CI）。
+struct Probe {
+    target: &'static str,
+    once: AtomicBool,
+    probe: ProbeFn,
+    seen: Mutex<Vec<String>>,
+    outcome: Mutex<Option<String>>,
+}
+
+impl Probe {
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().expect("probe mutex").clone()
+    }
+
+    fn verdict(&self) -> String {
+        self.outcome
+            .lock()
+            .expect("probe mutex")
+            .clone()
+            .expect("探针未执行（事件未命中 target 或不可达）")
+    }
+}
+
+fn probe_for(
+    target: &'static str,
+    probe: impl Fn() -> String + Send + Sync + 'static,
+) -> Arc<Probe> {
+    Arc::new(Probe {
+        target,
+        once: AtomicBool::new(false),
+        probe: Arc::new(probe),
+        seen: Mutex::new(Vec::new()),
+        outcome: Mutex::new(None),
+    })
+}
+
+impl Subscriber for Probe {
+    fn enabled(&self, _: &Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+    fn event(&self, event: &Event<'_>) {
+        if event.metadata().target() != self.target {
+            return;
+        }
+        let mut writer = FieldWriter(String::new());
+        event.record(&mut writer);
+        self.seen.lock().expect("probe mutex").push(writer.0);
+        if self.once.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let verdict = (self.probe)();
+        *self.outcome.lock().expect("probe mutex") = Some(verdict);
+    }
+    fn enter(&self, _: &Id) {}
+    fn exit(&self, _: &Id) {}
+}
+
+/// #121：注册埋点在**提交并放锁之后**发——订阅器内另起线程重入 `register`
+/// 不得被注册锁挡死，且事件描述的是已提交的注册（`count`=提交后计数）。
+#[test]
+fn shutdown_registry_event_emitted_after_commit_and_unlock() {
+    let c = Arc::new(ShutdownCoordinator::new());
+    let probe = probe_for("skeleton::shutdown::registry", {
+        let c = Arc::clone(&c);
+        move || {
+            let c = Arc::clone(&c);
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(c.register("from-subscriber", || {}));
+            });
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(Ok(())) => "registered".to_string(),
+                Ok(Err(e)) => format!("register error: {e:?}"),
+                Err(_) => {
+                    "blocked：注册埋点发出时协调器锁仍被持有（重入 register 自锁）".to_string()
+                }
+            }
+        }
+    });
+    let _guard = tracing::subscriber::set_default(Arc::clone(&probe));
+
+    c.register("first", || {}).unwrap();
+
+    assert_eq!(probe.verdict(), "registered");
+    let seen = probe.seen();
+    assert_eq!(seen.len(), 1, "只有成功注册发事件；实际捕获={seen:?}");
+    assert!(
+        seen[0].contains("name=first") && seen[0].contains("count=1"),
+        "事件须描述已提交的注册（名+提交后计数），实际={:?}",
+        seen[0]
+    );
+
+    // 被拒注册不发成功事件（重名 = 提交前早返）。
+    assert!(c.register("first", || {}).is_err());
+    assert_eq!(probe.seen().len(), 1, "被拒注册不得发事件");
+}
+
+/// #193：报告埋点在**报告提交 + `Done` + 唤醒 + 放锁之后**发——订阅器内另起
+/// 线程做第二次 `shutdown()` 必须立刻拿到同一份已提交报告（而不是等本栈把
+/// `Done` 置位 ⇒ 自等挂死）。
+#[test]
+fn shutdown_report_event_emitted_after_terminal_state() {
+    let c = Arc::new(ShutdownCoordinator::new());
+    c.register("only", || {}).unwrap();
+    let probe = probe_for("skeleton::shutdown::report", {
+        let c = Arc::clone(&c);
+        move || {
+            let c = Arc::clone(&c);
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(c.shutdown());
+            });
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(report) => format!("second-caller-report:{}", report.per_component.len()),
+                Err(_) => "blocked：报告埋点发出时终态未提交（并发叫者等 Done 挂死）".to_string(),
+            }
+        }
+    });
+    let _guard = tracing::subscriber::set_default(Arc::clone(&probe));
+
+    let report = c.shutdown();
+
+    assert_eq!(report.per_component.len(), 1);
+    assert_eq!(
+        probe.verdict(),
+        "second-caller-report:1",
+        "报告埋点必须在终态提交+唤醒之后发"
+    );
+    assert!(c.is_shutdown());
+}
+
+/// #193 第 4 条：订阅器 panic 由 embed 边界就地 contain（#225）——首叫照常拿到
+/// 报告、状态机已终态、失败在计数器上可见、后续叫者拿同一份报告而不挂死。
+#[test]
+fn report_event_subscriber_panic_cannot_strand_terminal_state() {
+    let c = Arc::new(ShutdownCoordinator::new());
+    c.register("only", || {}).unwrap();
+    let before = skeleton_infra::embedded_event_panic_count();
+    let probe = probe_for("skeleton::shutdown::report", || {
+        panic!("injected subscriber panic")
+    });
+    let _guard = tracing::subscriber::set_default(Arc::clone(&probe));
+
+    let report = c.shutdown();
+
+    assert_eq!(report.per_component.len(), 1, "首叫照常拿到报告");
+    assert!(
+        skeleton_infra::embedded_event_panic_count() > before,
+        "订阅器 panic 必须被计数（可观察失败通道）"
+    );
+    assert!(c.is_shutdown(), "诊断 panic 不得回滚终态");
+    assert_eq!(c.shutdown(), report, "后续叫者拿同一份已提交报告，不挂死");
 }
 
 // ---- fx 域（target skeleton::fx；panic 且句柄已被丢=异常路径 warn）----

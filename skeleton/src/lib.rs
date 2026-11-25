@@ -91,6 +91,7 @@ pub mod view;
 use std::collections::VecDeque;
 pub use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// State：值语义只读快照的形状约束。契约：禁内部可变性（无 Mutex/Cell 字段）、
 /// 非法状态进类型（互斥态用嵌套 enum，禁 bool 旗子）。
@@ -619,6 +620,28 @@ impl<A> ActionSender<A> {
 /// 类型层以 `#[must_use]` 拦截裸调用。注销即时生效：注销后不再收到任何通知，
 /// 实现方的订阅计数读侧同步回落。
 ///
+/// # 注销回调契约（实现方必须兑现，#137）
+///
+/// 注销回调在**票据 Drop 的线程上同步执行**（包含正在 panic unwind 的时刻），
+/// 故必须是最小的「摘表 + 失活」动作：
+///
+/// - **禁 panic**：Drop 面用 `catch_unwind` 就地 contain（unwind 期逃逸的 panic
+///   = 进程 abort），失败计入 [`subscription_teardown_panic_count`]——不静默，
+///   计数器就是可观察失败通道。要拿原始 panic 载荷请显式调
+///   [`Subscription::unsubscribe`]。
+/// - **禁阻塞、禁等待在途工作**：Drop 只尽最大努力（best-effort）摘表，不等待
+///   任何在途通知/别的注销完成——尤其**不得等待「本次回调返回才能推进」的工作**
+///   （那就是自等死锁）。
+/// - **禁重入等待**：回调里注销别的票据合法，但不得等待当前 Drop（或通知栈）
+///   返回。
+///
+/// **订阅回调内注销自己**（持有票据的回调在自己的通知里 drop 它）合法：注销 =
+/// 失活 + 摘表，参考实现不等待正在跑的回调，本次通知照常完成（in-flight 语义，
+/// **不承诺** quiescent 退订）；此后的通知不再触达该订阅。
+///
+/// 同族票据（[`pool::PoolAuditTicket`]）已持同一套 Drop 契约（contain + 有界
+/// 计数器 + 显式关闭面）；两者生命周期语义各自独立，不互相代理。
+///
 /// 票据对采用方不透明：字段私有，经实现方 [`Store::subscribe`] 取得。
 #[must_use = "订阅票据被丢弃即立即注销（Drop=注销）——`store.subscribe(..);` 裸调用 = 静默死订阅；绑定持有才持续收通知"]
 pub struct Subscription<S> {
@@ -626,21 +649,60 @@ pub struct Subscription<S> {
     _state: std::marker::PhantomData<fn() -> S>,
 }
 
+static SUBSCRIPTION_TEARDOWN_PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of unsubscribe callbacks that panicked while being invoked by
+/// [`Subscription`]'s `Drop`.
+///
+/// Drop 面无法返回错误 ⇒ 本计数器是可观察的失败通道。显式
+/// [`Subscription::unsubscribe`] 把 panic 作为 `Err` 原样交给调用方、不计入。
+/// 值饱和于 `u64::MAX`，不回绕。
+pub fn subscription_teardown_panic_count() -> u64 {
+    SUBSCRIPTION_TEARDOWN_PANICS.load(Ordering::Relaxed)
+}
+
+fn record_subscription_teardown_panic() {
+    let _ =
+        SUBSCRIPTION_TEARDOWN_PANICS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_add(1))
+        });
+}
+
 impl<S> Subscription<S> {
     /// 实现面便利：由 store 实现方构造——`unsubscribe` 在票据 Drop 时执行一次
     /// （摘表 + 计数回落等注销语义由实现方定义）。
+    ///
+    /// 回调契约见 [`Subscription`] 类型文档「注销回调契约」：**不 panic、有界、
+    /// 非阻塞、不等待当前 Drop/通知栈**。
     pub fn new(unsubscribe: impl FnOnce() + Send + Sync + 'static) -> Self {
         Self {
             unsubscribe: Some(Box::new(unsubscribe)),
             _state: std::marker::PhantomData,
         }
     }
+
+    /// 显式注销（消费票据）：注销回调的 panic 以 `Err(原始载荷)` 返回，不吞、
+    /// 不 abort。回调恰好执行一次（panic 亦然），此后再 Drop 本票据不会重跑。
+    ///
+    /// 需要「阻塞式/可失败 teardown」的调用方用本入口自己组合；Drop 面只保留
+    /// 最小非阻塞 best-effort 兜底（见类型文档）。
+    pub fn unsubscribe(mut self) -> Result<(), Box<dyn std::any::Any + Send>> {
+        let Some(unsubscribe) = self.unsubscribe.take() else {
+            return Ok(());
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(unsubscribe))
+    }
 }
 
 impl<S> Drop for Subscription<S> {
     fn drop(&mut self) {
-        if let Some(unsubscribe) = self.unsubscribe.take() {
-            unsubscribe();
+        let Some(unsubscribe) = self.unsubscribe.take() else {
+            return;
+        };
+        // 恰好一次；panic 就地 contain（Drop 里逃逸的 panic 在 unwind 期 = abort）。
+        // 失败不静默：计入可观察计数器。Drop 不等待、不重试。
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(unsubscribe)).is_err() {
+            record_subscription_teardown_panic();
         }
     }
 }

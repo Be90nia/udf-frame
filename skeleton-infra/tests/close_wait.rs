@@ -198,3 +198,37 @@ fn close_wait_after_reducer_panic_is_drained() {
         CloseWaitOutcome::Drained
     );
 }
+
+/// ⑤ 零超时 = 立即做一次谓词检查（#122）：在跑时即刻 TimedOutStillRunning，
+/// 只界等待、不取消在跑的 reducer。
+#[test]
+fn close_wait_timeout_zero_is_immediate_predicate_check() {
+    let (store, entered, release) = gated_store();
+    let worker = {
+        let store = Arc::clone(&store);
+        thread::spawn(move || store.dispatch(1))
+    };
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reducer 未进场");
+
+    assert_eq!(
+        store.close_wait_timeout(Duration::ZERO),
+        CloseWaitOutcome::TimedOutStillRunning
+    );
+
+    release.send(()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(*store.snapshot(), 1, "零超时只界等待，不得取消 reducer");
+}
+
+/// ⑥ 不可表示的有限超时（`Duration::MAX`，#122）：溢出臂必须给出可表示的远期
+/// 截止，不得退化成 `None`=无界等待。已静止时立即 Drained（不挂死、不溢出 panic）。
+#[test]
+fn close_wait_timeout_max_duration_saturates_and_still_returns() {
+    let store = SyncStore::new(Panicky, NoFx);
+    assert_eq!(
+        store.close_wait_timeout(Duration::MAX),
+        CloseWaitOutcome::Drained
+    );
+}

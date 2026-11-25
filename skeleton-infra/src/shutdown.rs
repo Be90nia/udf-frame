@@ -49,6 +49,8 @@
 //! | 组件闭包内重入 shutdown 自锁（HANG 无留痕） | 双锚 `ThreadId` 检查：驱动线程（内联闭包）+役中 watchdog 线程集（带超时组件闭包），重入就地 panic → 被编排面捕获记 `Failed`；无关线程并发叫仍=阻塞等首叫同报告 |
 //! | watchdog 线程创建失败/上报通道断连被静默 | 显式 `Failed`（fail-visible，`await_watchdog` 四分支单测钉死） |
 //! | watchdog 执行数无上界（超时 abandon 后照跑，线程随组件数线性增长） | 容量闸 `with_max_watchdogs` 许可上限 + live/peak 读数；许可耗尽 → 组件**未启动**显式 `Failed` |
+//! | 持锁发埋点（订阅器重入 `register`/`is_shutdown` 自锁、panic 毒化注册锁） | 事件字段锁内取定、**提交后放锁再发**（#121） |
+//! | 报告埋点先于终态（订阅器 panic/阻塞 ⇒ 已跑完的停机滞留 `Running`，并发叫者永久等 `Done`） | 先提交报告+`Done`+唤醒+放锁，**再发**报告埋点（#193） |
 //!
 //! log-embed 埋点（级别规范：正常流转=info / 异常终态=warn；target
 //! `skeleton::shutdown[::phase]`，字段化纪律见 lib.rs `embed_event!` 注）：
@@ -430,6 +432,10 @@ impl ShutdownCoordinator {
     /// 停机启动后/完成后=Err([`RegisterError::Closed`])；重名=
     /// Err([`RegisterError::Duplicate`])。名字一次分配随组件存续到报告行
     /// （move，零二次分配）。
+    ///
+    /// 成功注册的埋点**在提交并放锁之后**发出（#121）：订阅器是同步用户回调，
+    /// 其内重入 `register`/`is_shutdown` 不会自锁、其 panic 也不会毒化注册锁；
+    /// 事件描述的是已提交的注册（名+提交后计数），被拒注册不发事件。
     pub fn register<F>(&self, name: impl Into<String>, shutdown: F) -> Result<(), RegisterError>
     where
         F: FnOnce() + Send + 'static,
@@ -463,16 +469,26 @@ impl ShutdownCoordinator {
         if g.components.iter().any(|c| c.name == name) {
             return Err(RegisterError::Duplicate(name));
         }
+        // 提交组件并取定事件字段（#121）：埋点在**锁外**发——tracing 订阅器是
+        // 同步用户回调，持锁发会让其重入 register/is_shutdown 自锁、panic 还会
+        // 毒化注册锁。事件字段全是锁内取定的不可变值（名 + 已提交后的计数），
+        // 故锁外发出的事件描述的是**已提交**的注册；被拒注册不发事件（早返）。
+        #[cfg(feature = "log-embed")]
+        let event_name = name.clone();
+        g.components.push(Component { name, timeout, f });
+        #[cfg(feature = "log-embed")]
+        let count = g.components.len() as u64;
+        drop(g);
         // 埋点「注册」：成功注册一条 info（名/注册后计数/超时毫秒；None=等到底，
         // Option None 字段缺席=tracing 语义）。
+        #[cfg(feature = "log-embed")]
         embed_event!(
             info,
             target: "skeleton::shutdown::registry",
-            name = %name,
-            count = g.components.len() as u64 + 1,
+            name = %event_name,
+            count = count,
             timeout_ms = timeout.map(|d| d.as_millis() as u64)
         );
-        g.components.push(Component { name, timeout, f });
         Ok(())
     }
 
@@ -480,6 +496,12 @@ impl ShutdownCoordinator {
     /// 叫）阻塞等首叫完成，返回同一报告。组件闭包内重入（内联驱动线程/役中
     /// watchdog 线程双锚）=panic 装甲（被编排面捕获记 `Failed`，非 HANG 无
     /// 留痕）；无关线程的并发叫=合法等待者，等首叫同报告。
+    ///
+    /// **诊断在终态之后**（#193）：报告先提交、phase→`Done`、唤醒全部等待者并
+    /// 放锁，之后才发 `skeleton::shutdown::report` 埋点。订阅器是同步用户回调
+    /// （可阻塞/可重入/可 panic）——放在提交前会让已跑完的停机滞留 `Running`、
+    /// 并发叫者永久等 `Done`。panic 由 embed 边界就地 contain（#225），不回滚
+    /// 终态；故首叫之后（含并发叫）恒取到同一份已提交报告。
     pub fn shutdown(&self) -> ShutdownReport {
         let mut g = lock(&self.inner);
         match g.phase {
@@ -529,9 +551,9 @@ impl ShutdownCoordinator {
             .map(|c| c.run(&self.watchdogs, self.max_watchdogs))
             .collect();
         let report = ShutdownReport { per_component };
-        // 埋点「整体报告」：编排收口一条 info（组件数/三态计数）。
+        // 事件字段先取定（#193）：报告要随终态提交给等待者，之后才发诊断。
         #[cfg(feature = "log-embed")]
-        {
+        let (components, stopped, timed_out, failed) = {
             let (mut stopped, mut timed_out, mut failed) = (0u64, 0u64, 0u64);
             for o in &report.per_component {
                 match o.kind {
@@ -540,20 +562,32 @@ impl ShutdownCoordinator {
                     OutcomeKind::Failed { .. } => failed += 1,
                 }
             }
-            embed_event!(
-                info,
-                target: "skeleton::shutdown::report",
-                components = report.per_component.len() as u64,
-                stopped = stopped,
-                timed_out = timed_out,
-                failed = failed
-            );
-        }
+            (
+                report.per_component.len() as u64,
+                stopped,
+                timed_out,
+                failed,
+            )
+        };
 
         let mut g = lock(&self.inner);
         g.report = Some(report.clone());
         g.phase = Phase::Done;
         self.done.notify_all(); // 锁内改状态后唤醒并发第二叫，无丢唤窗
+        drop(g);
+        // 埋点「整体报告」在**终态提交 + 唤醒 + 放锁之后**发（#193）：订阅器是
+        // 同步用户回调（可阻塞/可重入/可 panic）——放在提交前会让已完成停机滞留
+        // `Running`、并发叫者永久等 Done。此刻并发第二叫已能取到已提交报告；
+        // panic 由 embed 边界就地 contain（#225 计数可见），即使逃逸也不回滚终态。
+        #[cfg(feature = "log-embed")]
+        embed_event!(
+            info,
+            target: "skeleton::shutdown::report",
+            components = components,
+            stopped = stopped,
+            timed_out = timed_out,
+            failed = failed
+        );
         report
     }
 
