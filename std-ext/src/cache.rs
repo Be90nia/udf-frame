@@ -1978,6 +1978,31 @@ mod lock_boundary_probe {
 
     #[cfg(feature = "log-embed")]
     #[test]
+    fn shared_cache_remains_usable_after_subscriber_panic() {
+        use skeleton::clock::MockClock;
+        use std::time::Duration;
+        use tracing::subscriber::with_default;
+
+        let lru = SyncLruCache::new(1);
+        lru.insert("a".to_owned(), 1);
+        with_default(
+            CallbackSubscriber(Box::new(|| panic!("injected cache subscriber panic"))),
+            || lru.insert("b".to_owned(), 2),
+        );
+        assert_eq!(lru.get("b"), Some(2), "LRU mutation survives telemetry panic");
+
+        let clock = Arc::new(MockClock::new());
+        let ttl = SyncTtlCache::new(clock.clone(), 1);
+        ttl.insert("a".to_owned(), 1, Duration::from_secs(1));
+        with_default(
+            CallbackSubscriber(Box::new(|| panic!("injected cache subscriber panic"))),
+            || ttl.insert("b".to_owned(), 2, Duration::from_secs(1)),
+        );
+        assert_eq!(ttl.get(&"b".to_owned()), Some(2), "TTL cache remains usable");
+    }
+
+    #[cfg(feature = "log-embed")]
+    #[test]
     fn sync_ttl_events_run_after_core_unlock() {
         use skeleton::clock::MockClock;
         use std::sync::atomic::{AtomicUsize, Ordering};
