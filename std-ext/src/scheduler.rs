@@ -222,6 +222,8 @@ struct HeapState {
     heap: BinaryHeap<Reverse<Entry>>,
     closed: bool,
     next_seq: u64,
+    /// Cancellation epoch observed by the last heap scan. Protected by state mutex.
+    scanned_cancel_epoch: usize,
 }
 
 /// 驱动线程名（诊断面：线程列表可归因谁在跑；多 worker 共用同名——worker
@@ -343,9 +345,12 @@ struct Shared {
     /// 裁决、尚未入堆」的状态锁窗口停靠——`set_capacity` 此刻必被同一把锁挡住。
     #[cfg(test)]
     register_gate: CapacitySettle,
-    /// 已取消但可能仍在堆内的条目数（#52，近似计数）：取消 O(1) 递增，
-    /// 清扫后归零——漂移至多「清扫期间落地的那次取消」，良性。
-    tombstones: AtomicUsize,
+    /// Monotonic hint advanced by every successful cancellation. It is a scan
+    /// trigger, never an exact heap-resident tombstone count (#109/#123).
+    cancel_epoch: AtomicUsize,
+    /// Deterministic interleaving seam for the cancellation-during-scan regression.
+    #[cfg(test)]
+    reclaim_scan_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
     /// OS 线程创建注入缝（issue#87）：生产恒 [`spawn_worker_thread`]，测试换
     /// 成失败桩以确定性模拟创建失败。`fn` 指针 ⇒ 只在起 worker 时一次间接
     /// 调用（热路径零成本）。
@@ -428,6 +433,7 @@ impl Scheduler {
                     heap: BinaryHeap::new(),
                     closed: false,
                     next_seq: 0,
+                    scanned_cancel_epoch: 0,
                 }),
                 signal: Condvar::new(),
                 panics: AtomicU64::new(0),
@@ -437,7 +443,9 @@ impl Scheduler {
                 rejected: AtomicU64::new(0),
                 #[cfg(test)]
                 register_gate: CapacitySettle::new(),
-                tombstones: AtomicUsize::new(0),
+                cancel_epoch: AtomicUsize::new(0),
+                #[cfg(test)]
+                reclaim_scan_gate: Mutex::new(None),
                 spawn,
             }),
         }
@@ -820,8 +828,6 @@ impl Scheduler {
             // 清 pending：堆内全部标 Cancelled（句柄侧可见）；已出堆在途条目
             // 不在堆里，回调跑完为止（同步代码无中断面）。
             let drained = std::mem::take(&mut s.heap);
-            // 堆已清空 ⇒ 无墓碑残留（#52 计数归零）。
-            self.shared.tombstones.store(0, AtomicOrd::SeqCst);
             drained
         };
         #[cfg(feature = "log-embed")]
@@ -989,7 +995,7 @@ impl TaskHandle {
                 let won = shared.retire(&self.cell, CANCELLED);
                 if won {
                     // 墓碑计数（#52）：取消 O(1) 递增（不摘堆、不扫堆）。
-                    shared.tombstones.fetch_add(1, AtomicOrd::SeqCst);
+                    shared.cancel_epoch.fetch_add(1, AtomicOrd::SeqCst);
                     // 唤醒驱动线程：park 锚可能需重算（墓碑被清扫后锚提前）。
                     shared.signal.notify_all();
                 }
