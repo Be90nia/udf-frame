@@ -1857,6 +1857,30 @@ mod telemetry_boundary_tests {
     }
 
     #[test]
+    fn manual_tick_finishes_callback_before_subscriber_panic_is_contained() {
+        let sched = Scheduler::new(Arc::new(MockClock::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        sched
+            .after(Duration::ZERO, move || {
+                callback_calls.fetch_add(1, AtomicOrd::SeqCst);
+            })
+            .expect("register");
+        let before = crate::embedded_event_panic_count();
+
+        tracing::subscriber::with_default(PanicSubscriber, || {
+            assert_eq!(sched.tick(), 1);
+        });
+
+        assert_eq!(calls.load(AtomicOrd::SeqCst), 1);
+        assert_eq!(
+            crate::embedded_event_panic_count(),
+            before.saturating_add(1),
+            "fire telemetry runs only after the callback and terminal transition"
+        );
+    }
+
+    #[test]
     fn worker_mode_tick_never_invokes_synchronous_subscriber() {
         let sched = Scheduler::new(Arc::new(MockClock::new()));
         let calls = Arc::new(AtomicUsize::new(0));
