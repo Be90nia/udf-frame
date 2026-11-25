@@ -534,14 +534,16 @@ pub trait RejectPolicy: Send + Sync + 'static {
     fn on_reject(&self, task: Task, pool: &PoolHandle) -> Result<(), Task>;
 }
 // 默认四件套（Java TPE 同名）：AbortPolicy（退还）/ CallerRunsPolicy（提交线程内联）
-// / DiscardPolicy（丢弃+计数）/ DiscardOldestPolicy（弃队头换血）
+// / DiscardPolicy（丢弃+计数）/ DiscardOldestPolicy（仅队列满且未 shutdown 时弃队头换血；
+//   停机后提交一律退还调用方，绝不 pop/换血，#118）
 
 pub struct PoolHandle { /* 策略受限操作柄 */ }
 impl PoolHandle {
     pub fn queue_len(&self) -> usize;
     pub fn is_shutdown(&self) -> bool;
-    pub fn pop_oldest(&self) -> Option<Task>;
+    pub fn pop_oldest(&self) -> Option<Task>;                       // 停机后恒 None
     pub fn offer(&self, task: Task) -> bool;
+    pub fn replace_oldest(&self, task: Task) -> Result<(), Task>;   // 单临界区：先判 shutdown，再换血（#118）
 }
 
 pub struct ThreadPool { /* base + policy + shared */ }
@@ -552,21 +554,27 @@ impl ThreadPool {
     pub fn resize(&self, t: ThreadPoolTuning) -> Result<(), PoolResizeError>;
     pub fn metrics(&self) -> ThreadPoolMetrics;
     pub fn shutdown(&self);                                      // 幂等；排空后退役
-    pub fn join(&self);                                          // 等 workers==0
+    pub fn join(&self);                                          // 等 workers==0；worker 任务内调用 = fail-fast panic（#132）
+    pub fn try_join(&self) -> Result<(), SelfJoinError>;         // 可判定面：worker 任务内返回 Err，不阻塞（#132）
     pub fn subscribe_audit(&self, f: impl FnMut(&PoolAuditEvent) + Send + 'static) -> PoolAuditTicket;
     pub fn take_audit_events(&self) -> Vec<PoolAuditEvent>;
 }
 impl Drop for ThreadPool { /* 发优雅关闭信号，不 join */ }
 
+pub struct SelfJoinError { /* … */ }   // worker 任务内 join 的 typed 拒绝（#132）
+
 pub struct ThreadPoolMetrics {
     pub core: usize, pub workers: usize, pub busy: usize, pub idle: usize,
     pub queue_len: usize, pub queue_cap: usize,
     pub completed: u64, pub rejected: u64, pub task_panics: u64,
+    pub discarded: u64,   // 被拒绝策略消灭的已接收任务（与 rejected 分账，#118）
     pub shape: PoolMetrics,   // 经 Borrow<PoolMetrics> 可达核心形
 }
 ```
 
 - 构造 fail-fast：`core == 0` / `max == 0` / `core > max` / `queue_cap == 0` panic。
+- **自 join（#132）**：`join()` 在 worker 任务内调用 = fail-fast panic；`try_join()` 返回 `SelfJoinError`（不阻塞）。`Drop` 只发关闭信号、不 join；外部 owner 是确定性收尾点。判定用池作用域 TLS 身份（不靠线程名/id）。
+- **拒绝策略与指标（#118）**：`DiscardOldestPolicy` 走 `replace_oldest` 单临界区——停机后绝不 pop/换血，任务退还调用方；`pop_oldest` 停机恒 `None`；被策略消灭的已接收任务计入 `discarded`（与 `rejected` 分账）。
 - `execute`：队列有位即入队（FIFO）；队列满且 workers<max → 新 worker first-task 交接（不越限排队）；队列满且到 max 或已 shutdown → 拒绝策略。每次提交恰一次 `Box` 分配（类型擦除不可避免）。
 - 拒绝策略在**锁外**调用；`rejected` 计数在策略触发时已 +1。任务 panic 摘除（worker 存活接续）+ `task_panics` 留痕。
 
@@ -859,6 +867,8 @@ drop(again);
 drop(ticket);
 ```
 
+- `acquire` 的超时（#116）：`now + timeout` 超出 `Instant` 表示范围 ⇒ 按「无实际期限」等待（`Condvar` 无超时路径，不 panic、不忙等）；有限超时仍按同一绝对期限回环复判。空闲命中/工厂创建/伪唤醒复判共用同一策略。
+
 ### alloc_site — 分配站点目录（issue#6，2026-10-30）
 
 **feature**：`memgov`。**依赖面**：纯 std。按站点归集资源计数的机制层：**编译期静态表注册**（`alloc_sites!` 宏，常量初始化——无 ctor/无惰性）+ 每站点原子计数/独立开关 + 全局闸一把切 + `&'static str` 查表零分配。
@@ -1022,7 +1032,7 @@ pub async fn retry_if_async<T, E, F, Fut, P, S>( /* 同形 + retryable 判定 */
 
 语义契约：
 
-- **政策显式**：次数/退避/预算构造期一次定死（`Copy`，运行期只读）。`new` Panics：`max_attempts == 0`（首试不是重试，零次执行请勿调用）、`base` 为零（零退避=忙等风暴）——构造期 fail-closed。
+- **政策显式**：次数/退避/预算构造期一次定死（`Copy`，运行期只读）。`new` Panics：`max_attempts == 0`（首试不是重试，零次执行请勿调用）、`base` 为零（零退避=忙等风暴）、**`max_delay` 为零**（零上限把每次重试延迟压成 0=忙等风暴；要立即重试请不睡眠）——构造期 fail-closed。
 - `max_attempts` 含首试。第 N 次失败后（且裁决放行）睡 `backoff_delay(N, base, max_delay)`；`base > max_delay` 合法（saturating 语义静默截平）。
 - `with_budget`：累计耗时（注入钟口径）≥ budget 即停（`OutOfBudget` 带 elapsed）。预算闸在每次退避睡眠**之前**检查；`budget = 0` 合法=失败即停。
 - 判定器先于睡眠：`retryable` 为 false 的错误立即停（快路径零睡眠，`Exhausted.attempts` = 拒绝时的执行次数）。
@@ -1369,7 +1379,7 @@ pub struct ExceedsCapacity { pub requested: u32, pub capacity: f64 }
 - `acquire` 阻塞形态=**锁外睡到再查**（零自旋：每轮真实 park，睡粒度下限 1ns 防忙转）；睡眠绝不持锁。
 - `acquire(0)` = 恒成功 no-op；`acquire(n>capacity)` 立即 `Err(ExceedsCapacity)`（等待也无法满足，禁静默无限等）。
 - 时间面只消费单调面 `now_instant`（回拨结构性排除）；测量与睡眠同钟（`Sleeper` 超 trait 绑 `Clock`）。
-- `new` Panics：`capacity`/`refill_rate` ≤0、NaN、inf（死桶/无限流不该经限流器表达）。
+- `new` Panics：`capacity`/`refill_rate` ≤0、NaN、inf（死桶/无限流不该经限流器表达）。数值域=任意**正有限**（不设最小速率门槛）；等待换算超出 `Duration` 表示范围时饱和到 `Duration::MAX`（不回绕、不 panic；`TryAcquireError::wait()` 原样返回饱和值）。
 - 公平性：多 acquirer 非 FIFO（无排队序）；活性保证——缺口单调收敛，有限 acquirer 集合内无永久饥饿。
 
 ```rust
@@ -2157,6 +2167,10 @@ impl FxScope {
 }
 impl Default for FxScope { /* new() */ }
 
+// 取消源所有权（#119）：`new()` 持**内部**取消源——首次进入停机（`shutdown` /
+// `shutdown_timeout` 任一赢家）与 `Drop` 都会取消它；`with_source` 注入的外部源
+// **不被**本 scope 取消（所有权归调用方）。取消=通知，无宽限期；`close()` ≠ 取消。
+
 pub struct Spawned<T> { /* … */ }   // Drop 不 abort——任务归生命周期集托管
 impl<T: Send + 'static> Spawned<T> {
     pub async fn join(self) -> Result<T, TaskError>;
@@ -2362,6 +2376,8 @@ where S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
     pub fn receive(&mut self, expected: ExpectedEffect<Op>)
     where A: std::fmt::Debug, Op: std::fmt::Debug + PartialEq;   // 弹出最早效果比对
     pub fn state(&self) -> &S;                    // 最近一次 dispatch 后的 idle 状态
+    pub fn pending_effects(&self) -> usize;       // 只读：尚未 receive 的效果数
+    pub fn finish(&self);                         // 断言无残留（第一条第 0 位 + 剩余总数）；不在 Drop panic（#210）
 }
 
 #[derive(Debug, PartialEq)]
@@ -2646,7 +2662,9 @@ impl ViewBridge<S, A, M, I, J, R> {
 }
 ```
 
-要点：桥 = 纯订阅者（票据归桥，Drop = 注销；store 所有权随桥）；版本 = 桥内单调消费代数（同步档，与区域头同源，撕裂结构性不可能）；投影 panic = 毒化唯一残因（catch + 计数 + `resync` 位 ⇒ `snapshot_doc` 收口）；未知标签跳过（读侧 `view::read` 实现一次，TS/Py/C 镜像复刻，禁整区失败）；正典验收环 `examples/view_bridge_demo.rs`，行为面 `tests/view_bridge_test.rs`。
+要点：桥 = 纯订阅者（票据归桥，Drop = 注销；store 所有权随桥）；**版本 = 已提交的 even 发布序列**（封板 2、每条通知 +2；odd 只在发布进行中可见，永不外露为已提交版本；JSON `to_version`/`Snapshot.version`/区域头共用同一 even 水位）；投影 panic = 毒化残因（catch + 计数 + `resync` 位 ⇒ `snapshot_doc` 收口）；未知标签跳过（读侧 `view::read` 实现一次，TS/Py/C 镜像复刻，禁整区失败）；正典验收环 `examples/view_bridge_demo.rs`，行为面 `tests/view_bridge_test.rs` 与 `tests/view_region_wire.rs`。
+
+**v1 线格式与区域发布（#171/#187/#222 §B）**：Header 32B 冻结——`0..4` magic `UVBR`、`4..6` protocol major、`6..8` flags、`8..16` **8 字节对齐的 publication sequence**（原子读写）、`16..20` region_id、`20..24` binding_count、`24..32` index_offset(=32)。写事务：`odd → payload → index/header（跳过 seq 字节）→ even`；读事务是**两个独立入口**——`read_snapshot(&[u8], decls)` 用于不可变快照，`read_lock_free(..)` 用于 SAB（前后 acquire-load 必须相等且 even；odd/变化先拒后有界重试，耗尽报 `RetryExhausted`）。`RegionBacking` 必须提供对齐原子 publish-sequence 能力（默认 `Unsupported`，装配期拒绝 SAB 模式，**禁字节拷贝降级**）；backing/encoder 的 panic 在桥边界 contain 成 typed 失败；事务中途失败 ⇒ 区域 unavailable，唯一恢复口 `reseed_region()`。不支持 major 在读任何 v1 偏移之前拒绝；结构损坏 typed `Err`，逐条目畸形计入跳过 + resync。常量与命名工件见 `docs/view-bridge-constants/`（`--check` 在 CI 断言与 manifest 一致）。
 
 **边界：同一进程内 vs 跨进程/跨重启**。桥保证的是**同一进程内**的自洽与重同步——票据、补丁水位、快照与区域版本都活在同一个桥实例里，`snapshot_doc()` 是进程内重同步原语、**不是持久化**。进程死亡后 UI 侧无从复现：**视图复现由 store/持久化层负责**（journal 回放或采用方自有存储），桥不缓存状态、不作此承诺（Android 分层对照：ViewModel 保进程内，SavedStateHandle 保进程死亡——后者不属渲染层职责）。
 
@@ -2670,9 +2688,8 @@ impl ViewBridge<S, A, M, I, J, R> {
 | 域 | target | 事件点 | 级别 |
 |---|---|---|---|
 | scheduler | `skeleton::scheduler::{register,cancel,close,fire}` | 注册/取消/点火/墓碑跳过=debug（取消仅限显式 `cancel()`；`TaskHandle::drop` 静默取消不发事件）；关闸拒绝、**容量触顶拒绝注册（#58）**、回调 panic、超载退化重臂=warn；close=info；worker 退出不埋（#221 §2.5：有界进度收尾禁宿主回调） | 混合 |
-| ratelimit | `skeleton::ratelimit::{try_acquire,acquire}` | 快路径拒绝与超容量拒绝=warn（available/wait_ns/capacity）；阻塞等待分段与醒后重查=debug（round/deficit）；成功扣减零事件 | 混合 |
-| retry | `skeleton::retry::{attempt,verdict,backoff}` | 尝试开始=debug；重试放行=warn（backoff_ms）；停机终态=info；退避截平=warn（linear_ms→capped_ms） | 混合 |
-| backoff | `skeleton::backoff` | 计算入参/结果（attempt/base_ms/max_ms/delay_ms）=debug（纯函数域唯一埋点） | debug |
+| ratelimit | `skeleton::ratelimit::{try_acquire,acquire}` | 快路径拒绝与超容量拒绝=warn（available/wait_ns/capacity）；阻塞等待分段与醒后重查=debug（round/deficit）；成功扣减零事件；`wait_ns` 字段饱和到 `u64::MAX`，不回绕（#149） | 混合 |
+| retry | `skeleton::retry::{attempt,verdict,backoff}` | 尝试开始=debug；重试放行=warn（backoff_ms）；停机终态=info；退避截平=warn（linear_ms→capped_ms）；`*_ms` 字段饱和到 `u64::MAX`，不回绕（#149） | 混合 |
 | fsx | `skeleton::fsx::{walk,copy}` | walk 帧推进=debug（depth/sort）；copy 逐项=debug + 部分失败=warn（copied/path/error）；**TempDir Drop 清理失败不发事件**（#221 §6：析构路径只做 best-effort stderr 报告） | 混合 |
 | cache | `skeleton::cache::{evict,purge}` | evict（kind=ttl/ttl_sweep/capacity，key 指纹/僵尸数/LRU 序）=debug（真回收才发）；purge=info（回收数/残留） | 混合 |
 | shutdown | `skeleton::shutdown::{registry,run,report}` | 注册成功/逐组件开始/终态 Stopped/整体报告=info；TimedOut/Failed=warn | 混合 |

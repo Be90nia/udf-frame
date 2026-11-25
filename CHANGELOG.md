@@ -4,6 +4,27 @@
 
 ## [Unreleased]
 
+### Fix(view): v1 线格式原子迁移——32B Header + 对齐 odd/even seqlock + 两读入口 + 读写加固（#171 #187 #107 #165 #186 #154 #153 #141 #142 #172 #168 #185 #188 #211）
+- Header 按 #222 §B 冻结（32B；publication sequence 在 `8..16`、8 字节对齐，原子读写）；`RegionBacking` 新增对齐原子 publish-sequence 能力（默认 `Unsupported`、装配期拒绝 SAB 模式；**禁字节拷贝降级**）。写事务 `odd → payload → index/header → even`；even 序列为唯一水位（封板 2、每拍 +2）。
+- 读侧两个独立入口：`read_snapshot`（不可变快照，普通 load）与 `read_lock_free`（SAB，前后 acquire-load 相等且 even，odd/变化先拒后有界重试，耗尽 typed `RetryExhausted`）；不支持的 protocol major 在读任何 v1 偏移之前拒绝。
+- 读侧加固：索引几何/偏移全 `try_from`+checked；结构损坏 typed `Err`，逐条目畸形计数 + resync；非有限 `f64` 拒收；未知 kind/tag 只跳该条目；`decode_batch` 的 kind 判定收紧（不再回绕成 0）。
+- 作家侧：seal 时校验 Header+Index 容量；reseed 先算总尺寸再动 live 状态；每绑定恰一个非空 TLV（空输出不是删除标记）；backing/encoder panic 在桥边界 contain 成 typed 失败，事务中途失败 ⇒ 区域 unavailable，唯一恢复口 `reseed_region()`。
+- 原子迁移单位：常量 manifest + TS/Py/C 生成物 + Rust 写端/读端 + `docs/view-region-spec.md` + demo + fixtures 一起改（**不宣称与旧 v1 字节兼容**）。
+
+### Fix(pool/fx): acquire 超时溢出、weight 守卫收窄、停机拒绝、自 join、TestStore 残留、默认 token 取消（#116/#117/#118/#132/#210/#119）
+- `MemoryPool::acquire`：`now + timeout` 不可表示 ⇒ 按「无实际期限」等待（不 panic、不忙等），三种等待路径共用同一绝对期限复判。
+- `ObjectPool` weight-hook 重入守卫由「线程级布尔」改为「按池实例身份」：跨池组合不再误拦，同池重入仍 fail-fast（#117）。
+- `ThreadPool`：`DiscardOldestPolicy` 走 `replace_oldest` 单临界区，停机后绝不 pop/换血；新增 `ThreadPoolMetrics.discarded` 与 `rejected` 分账。worker 任务内 `join()` = fail-fast panic，新增 `try_join() -> Result<(), SelfJoinError>`。
+- `TestStore` 新增 `pending_effects()` / `finish()`（无残留断言，不在 Drop panic）。
+- `FxScope`：默认内部取消源在首次停机与 Drop 时取消；`with_source` 注入的外部源不被取消；文档写明「取消=通知、无宽限期、close≠cancel」。
+
+### Fix(retry/ratelimit/iter): 零 max_delay 拒绝、TokenBucket 等待饱和、fold 短路、DedupBy size_hint、full_jitter 全值域（#114/#147/#115/#148/#150/#151/#156）
+- `RetryPolicy::new` 拒绝零 `max_delay`（与零 `base` 同等 fail-closed，避免忙等风暴）；`base > max_delay` 的截平语义不变。
+- TokenBucket 等待换算改 `Duration::try_from_secs_f64(..).unwrap_or(Duration::MAX)`，保留 1ns 下界；构造期数值域明确为任意正有限。
+- `process_results` 的 fold 在 next 已撞错后立即短路（零拉取，`pos` 不增）；`DedupBy::size_hint` 三态计入 held item 与 fused 墓碑。
+- `full_jitter` 覆盖整个 `Duration` 值域（128 位随机面 + u128 纳秒归约；模归约偏差 ≤ d/2^128 已文档化）。
+- duration→u64 遥测字段改饱和（`telemetry_ms`/`telemetry_ns`），不回绕。
+
 ### Fix(telemetry): backoff 纯性与各域事件后置、fx 成因/自停机、测试看门狗 abort（#200/#201/#202/#204/#205/#206/#133）
 - `backoff_delay` 不再发事件（纯算术、零时钟零随机零回调）；观测上移到 `retry` 的 verdict/backoff 事件（仍含 attempt/base_ms/max_ms/backoff_ms）。
 - retry / ratelimit / process_results / fx 的事件全部后置到动作、结果或睡眠之后：订阅者 panic 不再改变尝试次数、typed 错误、睡眠量与限流结果。**剩余限制**：阻塞型订阅者仍可推迟该事件点之后的时间线（已写进各模块文档）。
