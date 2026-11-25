@@ -76,6 +76,28 @@ jobs:
           assert_no_tokio "udf-skeleton-infra (default features)" -p udf-skeleton-infra
           assert_no_tokio "udf-skeleton-infra --no-default-features --features runtime" -p udf-skeleton-infra --no-default-features --features runtime
           assert_no_tokio "udf-std-ext (default features)" -p udf-std-ext
+
+          # 反向控制（台账断言 #3 / 蓝图 §13 行 1「negative control」）：上面三条
+          # ok 只有在探测器**能报红**时才有意义——同一探测器在必须含 tokio 的面
+          # 上不回红 ⇒ 它是恒绿的假闸。下面两条不是新闸，是上面三条的鉴别力证明。
+          assert_tokio_present() {
+            local label="$1" tree
+            shift
+            if ! tree="$(cargo tree "$@" -e normal 2>&1)"; then
+              echo "::error::cargo tree failed for reverse control: $label"
+              printf '%s\n' "$tree"
+              fail=1
+              return
+            fi
+            if printf '%s\n' "$tree" | grep -q tokio; then
+              echo "ok (reverse control): $label exposes tokio"
+            else
+              echo "::error::reverse control failed: $label dependency graph has no tokio — the tokio-free assertion above is not discriminating"
+              fail=1
+            fi
+          }
+          assert_tokio_present "udf-skeleton-infra --features tokio" -p udf-skeleton-infra --features tokio
+          assert_tokio_present "udf-skeleton-infra --all-features" -p udf-skeleton-infra --all-features
           exit "$fail"
 
       # 契约 doctest 门（r2 审计建议-2 单列口径随迁）：skeleton 为纯契约 crate，

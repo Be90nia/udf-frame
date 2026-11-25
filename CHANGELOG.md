@@ -166,7 +166,7 @@
 - **修复**：新增共享件 `tests/common/guards.rs`（`#[path]` 引入，同 `log_capture.rs` 惯例）：`wait_until` 用 `std::time::Instant` 截止（5s）；`bounded` 用独立 std 线程睡 10s + `oneshot` + `tokio::select! { biased, ... }`（future 已就绪优先于火警）。4 处内联 `tokio::time::timeout(LIMIT, …)` 全部改 `bounded`；5 个测试文件净 −83 行（删掉两份重复 helper）。
 - **验证**：5 目标 ×10 连跑（串行/默认各 5）50/50 绿；**变异**：`pending()` → 10s panic、`|| false` → 5s panic（原始 panic 文本留 `verify/2026-11-23-hang-guard/mutation.log`）；full 592 passed/0；clippy/fmt 0。
 
-### Docs: 层边界清单落地 + 9 条文档矛盾清零（C1–C9）,2026-11-23;reports/2026-11-23-layer-boundaries.md)
+### Docs: 层边界清单落地 + 9 条文档矛盾清零（C1–C9）,2026-11-23;docs/audit/2026-11-23-blueprint-assertions.md)
 - **层边界清单**：5 层 / 32 行「职责｜承载者｜依据｜边界点」+ 蓝图 59 条可机判断言逐条核对（48 Conform / 2 Diverged / 9 Not-verifiable）+ 结构级复核（`skeleton ← std-ext ← skeleton-infra` 零反向引用；全仓唯一 `tokio::spawn` 在 `fx.rs`）。
 - **C1**：std-ext `log-embed` 调用点统一为实测 **七域 48 / 合计九域 55**（backoff1/cache9/fsx6/iter2/ratelimit4/retry12/scheduler14；infra 本 crate 7），并写入口径；此前 README/reference/lib.rs/Cargo.toml 分别写 35/41/42。
 - **C2**：`ShutdownReport` 文档代码块 3 字段 → 8 字段；蓝图「six buckets」改为「五终局桶互斥穷尽 + 正交 `timed_out` + 证据标志」。
