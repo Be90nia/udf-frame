@@ -1802,12 +1802,11 @@ mod tests {
             );
         }
     }
-}
 
-#[cfg(all(test, feature = "log-embed"))]
-mod telemetry_boundary_tests {
+
+    #[cfg(feature = "log-embed")]
     use super::*;
-    use crate::clock::MockClock;
+    use skeleton::clock::MockClock;
     use std::sync::atomic::AtomicUsize;
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Metadata};
@@ -1904,3 +1903,6 @@ mod telemetry_boundary_tests {
         );
     }
 }
+}
+
+
