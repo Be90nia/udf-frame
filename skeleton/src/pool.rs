@@ -233,9 +233,9 @@ mod pool_audit_ticket_drop_tests {
         }));
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            pool_audit_ticket_drop_panic_count(),
-            before.saturating_add(1)
+        assert!(
+            pool_audit_ticket_drop_panic_count() >= before.saturating_add(1),
+            "the global counter may also include concurrent tests, but this Drop must increment it"
         );
     }
 
