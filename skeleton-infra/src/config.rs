@@ -40,6 +40,91 @@ use std::path::Path;
 #[cfg(feature = "config-json")]
 use skeleton::config::ConfigError;
 
+// ── 配置文件读入上限（#197/#127：配置面不再无界注水）──
+
+/// 配置文件读入上限默认值：8 MiB。
+///
+/// 配置文件是手写/机器生成的小文本，8 MiB 已远超常见量级；需要更大上限时用
+/// [`ConfigFile::max_file_bytes`] 显式放开。上限只管**读入**，不承诺约束解析后的
+/// 值树规模或 `.layer()` 的合并深度（后者见 [`ConfigFile`] 合并语义）。
+#[cfg(feature = "config-json")]
+pub const DEFAULT_MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+/// 配置文件超读入上限的错误载荷（挂在 `ConfigError::File` 的 `source` 上，
+/// 路径由 `ConfigError::File::path` 给出）。
+///
+/// `observed` 是「至少读到多少」：读入路径读满 `limit + 1` 即停，故超限时它恰为
+/// `limit + 1`；metadata 提前拒绝时给文件元数据长度（可能缩到 `usize` 上限）。
+#[cfg(feature = "config-json")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigFileTooLarge {
+    /// 调用方配置的上限（字节）。
+    pub limit: usize,
+    /// 观测到的大小（至少这么多字节）。
+    pub observed: usize,
+}
+
+#[cfg(feature = "config-json")]
+impl fmt::Display for ConfigFileTooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "file exceeds {}-byte config file limit (read at least {} bytes)",
+            self.limit, self.observed
+        )
+    }
+}
+
+#[cfg(feature = "config-json")]
+impl std::error::Error for ConfigFileTooLarge {}
+
+/// 超限错误：`ConfigError::File` 带路径，`source` 带上限与观测大小。
+#[cfg(feature = "config-json")]
+fn too_large_error(path: &Path, limit: usize, observed: usize) -> ConfigError {
+    ConfigError::File {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            ConfigFileTooLarge { limit, observed },
+        ),
+    }
+}
+
+/// 读配置文件：metadata 只作提前拒绝的优化（大小可能在 metadata 与读之间变化），
+/// **上限由读入强制**——最多读 `limit + 1` 字节（[`read_bounded`]）。
+#[cfg(feature = "config-json")]
+fn read_file_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, ConfigError> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > limit as u64 {
+            let observed = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+            return Err(too_large_error(path, limit, observed));
+        }
+    }
+    let file = std::fs::File::open(path).map_err(|source| ConfigError::File {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    read_bounded(file, path, limit)
+}
+
+/// 读入强制闸（不经 metadata，故 metadata 失效/不可用时仍是唯一判据）：
+/// 读满 `limit + 1` 即停，超限报错——绝不截断成功、绝不部分接受。
+#[cfg(feature = "config-json")]
+fn read_bounded(reader: impl Read, path: &Path, limit: usize) -> Result<Vec<u8>, ConfigError> {
+    let mut bytes = Vec::new();
+    reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| ConfigError::File {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > limit {
+        return Err(too_large_error(path, limit, bytes.len()));
+    }
+    Ok(bytes)
+}
+
 // ── ConfigFile：分层装配 + 原子保存（config-json/config-toml feature 面）──
 //
 // 拍板 2026-10-17：配置文件读写=框架一等公民；常驻核心保持零依赖格式盲，
