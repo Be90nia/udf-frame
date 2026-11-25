@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+### Fix(drop): LeakGuard::drop 与 TaskHandle::drop 不再触发宿主回调（issue#183/#143 残留）
+- `LeakGuard::drop` 不再 `eprintln!`（stderr 不可写会 panic）：改 best-effort 可失败写入并忽略错误；类型文档删掉「panic-in-drop 会被吞」的错误声明。
+- `TaskHandle::drop` 改为静默取消：取消语义（CAS/墓碑/notify）不变，但析构路径不再同步调用宿主 tracing subscriber（#221 §2.5）；显式 `cancel()` 仍发 `skeleton::scheduler::cancel` 事件。
+- 测试：`leak_drop_report_write_failure_does_not_panic`、`scheduler_drop_cancel_is_silent`。
+
 ### Fix(journal): 记录上限/权限/初始化原子发布/回放形状 fail-closed（issue#217/#212/#181/#178/#177/#106）
 - **记录上限**：新增 `DEFAULT_MAX_RECORD_BYTES`（16 MiB，含终止换行）与 `create_with_limit`/`open_with_limit`；写侧经有界 sink 序列化（超限零落盘、writer 保持健康），读侧（头行/回放/快照扫描）读满上限未见换行即报 `JournalError::RecordTooLarge`/`ReplayError::RecordTooLarge`（带物理行号），超大行处理完回收行缓冲容量。
 - **初始化不留半成品**：`create` 改「同目录独占临时文件 → 写头 + flush + `sync_all` → `hard_link` 原子发布」，失败只清本次临时文件并保留原始 IO 错误；`create_new` 语义不变（目标存在即失败，绝不覆盖）。

@@ -6,6 +6,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// 淘汰策略（必选参数——「上限+策略必填」由构造签名类型强制，非约定自觉）：
@@ -284,8 +285,11 @@ unsafe impl GlobalAlloc for CountingAllocator {
 }
 
 /// 泄漏断言 guard（三类判据之一：allocs/bytes 回基线）。
-/// Drop 兜底尽力而为——panic-in-drop 会被吞，**规范用法=测试尾显式 [`LeakGuard::check`]**
-/// /`expect_empty`/fx 侧 `FxScope::expect_body_idle`。
+///
+/// Drop 兜底**绝不 panic**：只做 best-effort stderr 写入，格式化/写入失败即放弃
+/// 诊断（正在 unwind 时尤其不能升级成二次 panic）；stderr 不可写则泄漏报告静默
+/// 丢弃。**规范用法=测试尾显式 [`LeakGuard::check`]**/`expect_empty`/fx 侧
+/// `FxScope::expect_body_idle`——只有显式路径才把错误交给调用方。
 pub struct LeakGuard {
     baseline_allocs: usize,
     baseline_bytes: usize,
@@ -345,10 +349,22 @@ impl LeakGuard {
     }
 }
 
+fn report_leak_to(writer: &mut impl Write, report: &LeakReport) {
+    // Formatting and writing are both fallible. Never let a diagnostic turn Drop
+    // into a panic, especially while another panic is already unwinding.
+    let _ = writeln!(
+        writer,
+        "LeakGuard drop 兜底（尽力而为，请改用显式 check()）: {report:?}"
+    );
+}
+
 impl Drop for LeakGuard {
     fn drop(&mut self) {
         if let Err(report) = self.check() {
-            eprintln!("LeakGuard drop 兜底（尽力而为，请改用显式 check()）: {report:?}");
+            // Drop 侧唯一输出面=stderr：析构里不得同步调用宿主 tracing subscriber。
+            let stderr = io::stderr();
+            let mut writer = stderr.lock();
+            report_leak_to(&mut writer, &report);
         }
     }
 }
@@ -1071,6 +1087,37 @@ mod tests {
         assert!(
             guard.check().is_ok(),
             "降级态下真实泄漏也报 Ok（观测面未在岗）"
+        );
+    }
+
+    /// Drop 诊断写失败不得升级成 panic：stderr 不可写=放弃报告，不是二次 panic。
+    #[test]
+    fn leak_drop_report_write_failure_does_not_panic() {
+        struct BrokenWriter;
+
+        impl Write for BrokenWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected stderr failure",
+                ))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected stderr failure",
+                ))
+            }
+        }
+
+        let mut writer = BrokenWriter;
+        report_leak_to(
+            &mut writer,
+            &LeakReport {
+                allocs_delta: 1,
+                bytes_delta: 64,
+            },
         );
     }
 

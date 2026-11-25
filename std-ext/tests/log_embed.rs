@@ -380,6 +380,40 @@ fn scheduler_register_cancel_fire_events() {
     );
 }
 
+/// Drop 走静默取消路径（#221 §2.5）：析构不发 cancel 事件，取消语义不变。
+#[test]
+fn scheduler_drop_cancel_is_silent() {
+    let cap = capture();
+    let clock = Arc::new(MockClock::new());
+    let sched = Scheduler::new(clock.clone());
+    let _guard = tracing::subscriber::set_default(cap.clone());
+
+    // 对照臂：显式 cancel 仍发一条。
+    let h = sched.after(Duration::from_millis(10), || {}).unwrap();
+    assert!(h.cancel(), "首次取消成功");
+    cap.assert_event(
+        "skeleton::scheduler::cancel",
+        Level::DEBUG,
+        &["cancelled=true"],
+    );
+
+    // armed 句柄直接 Drop：零事件（宿主回调不得在析构里同步执行）。
+    let h2 = sched.after(Duration::from_millis(10), || {}).unwrap();
+    let before_drop = cap.len();
+    drop(h2);
+    assert_eq!(
+        cap.len(),
+        before_drop,
+        "Drop 发了事件（events len {} → {}）",
+        before_drop,
+        cap.len()
+    );
+
+    // 但取消语义照旧：到期不点火（`h` 也是取消态）。
+    clock.advance(Duration::from_millis(10));
+    assert_eq!(sched.tick(), 0, "Drop 已静默取消该任务");
+}
+
 #[test]
 fn scheduler_register_after_close_warns() {
     let cap = capture();

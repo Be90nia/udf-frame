@@ -28,7 +28,9 @@
 //! - **cancel 线性化点 = 状态原子位**：CAS 置位成功即承诺「此后不再点火」；
 //!   已出堆条目的检查-执行窗口内落地的取消不可撤（本次照跑，文档化
 //!   语义；单线程 tick 确定性面无此窗口）；执行中取消 ⇒ 周期任务不再
-//!   重臂。`cancel` 幂等；句柄 RAII（Drop 即 cancel），[`TaskHandle::detach`]
+//!   重臂。`cancel` 幂等；句柄 RAII（Drop 即**静默** cancel：取消语义相同、
+//!   不发 tracing 事件——宿主 subscriber 回调不得在析构里同步执行），
+//!   [`TaskHandle::detach`]
 //!   是 fire-and-forget 逃生门（只解除取消、不接管所有权，TaskCell 随之
 //!   回收——#55）；
 //! - **close = 关闸 + 清 pending + 在途跑完**（拍板点）：注册显式
@@ -963,7 +965,8 @@ fn rearm_deadline(prev: Instant, period: Duration, now: Instant) -> Instant {
     }
 }
 
-/// 任务句柄：RAII cancel（Drop 即 [`TaskHandle::cancel`]）+ 幂等。
+/// 任务句柄：RAII cancel（Drop 即静默取消——语义同 [`TaskHandle::cancel`] 但不发
+/// 任何 tracing 事件）+ 幂等。
 ///
 /// 非 `Clone`（Clone + Drop-cancel = 意外取消陷阱）；fire-and-forget 走
 /// [`TaskHandle::detach`]。`Send + Sync`（任意线程取消）。
@@ -982,7 +985,20 @@ impl TaskHandle {
     /// Cancelled/Done 返 false）。已出堆条目检查-执行窗口内落地的取消不可
     /// 撤（本次照跑，模块头注「cancel 线性化点」节）；执行中取消 ⇒ 周期
     /// 任务不再重臂。
+    ///
+    /// 显式调用发 `skeleton::scheduler::cancel` 埋点事件；[`Drop`] 走同一取消
+    /// 语义但**不发任何事件**（宿主 subscriber 回调不得在析构里同步执行）。
     pub fn cancel(&self) -> bool {
+        self.cancel_inner(true)
+    }
+
+    /// 取消主体：唯一区别是 `emit`——`false` 为 Drop 静默路径。事件在状态
+    /// 锁外发射（订阅方 IO 不持锁）。
+    fn cancel_inner(&self, emit: bool) -> bool {
+        // feature 关时宏消除，emit 无读者（别用 allow 压，显式消费）。
+        #[cfg(not(feature = "log-embed"))]
+        let _ = emit;
+
         let cancelled = match self.sched.upgrade() {
             Some(shared) => {
                 // 退役（PENDING→CANCELLED）：CAS 赢家释放额度（#58，恰好一次）。
@@ -1003,7 +1019,9 @@ impl TaskHandle {
                     .is_ok()
             }
         };
-        embed_event!(debug, target: "skeleton::scheduler::cancel", cancelled = cancelled);
+        if emit {
+            embed_event!(debug, target: "skeleton::scheduler::cancel", cancelled = cancelled);
+        }
         cancelled
     }
 
@@ -1021,8 +1039,10 @@ impl TaskHandle {
 impl Drop for TaskHandle {
     fn drop(&mut self) {
         // 仅 armed 才取消：detach 置 armed=false ⇒ 只释放 Arc，不取消。
+        // 析构路径不发 tracing 事件（#221 §2.5）：宿主 subscriber 回调不得在
+        // Drop 内同步执行。
         if self.armed {
-            let _ = self.cancel();
+            let _ = self.cancel_inner(false);
         }
     }
 }

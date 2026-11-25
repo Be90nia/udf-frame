@@ -782,7 +782,7 @@ pub struct LeakReport { pub allocs_delta: isize, pub bytes_delta: isize }
 pub fn expect_empty<K: Ord, V>(reg: &BoundedRegistry<K, V>);  // 非空即 panic（判据二）
 ```
 
-Drop 兜底尽力而为——**规范用法=测试尾显式 `check()`**/`expect_empty`/fx 侧 `expect_body_idle`。判据三（任务面）在 `FxScope::expect_body_idle`（任务体结束口径）；要「跟踪集合已完全收割」的更强判据用 `expect_fully_reaped_idle`。
+Drop 兜底尽力而为、**绝不 panic**：只做 best-effort stderr 写入（可失败、忽略错误，写不出去即放弃诊断——unwind 期尤其不能升级成二次 panic），**规范用法=测试尾显式 `check()`**/`expect_empty`/fx 侧 `expect_body_idle`。判据三（任务面）在 `FxScope::expect_body_idle`（任务体结束口径）；要「跟踪集合已完全收割」的更强判据用 `expect_fully_reaped_idle`。
 
 **churn 口径（live × total 联用判级）**：窗口 churn = `total_allocs(t2) − total_allocs(t1)`。live 净额对「即用即还」恒 0——净 0 无法区分「真零分配」与「同量 churn」；联用：live 平 + total 增 = 高 churn 零泄漏，两者皆平 = 窗口真零分配。realloc 成功按「换块」计（total 两面各 +1；live 面不动）。total_allocs 与 total_deallocs 差值长期不等 = 累计泄漏/外部遗忘面。
 
@@ -1218,9 +1218,9 @@ impl Scheduler {
     pub fn try_spawn_worker(self: &Arc<Self>) -> std::io::Result<WorkerHandle>;  // #87：失败原样返回 io::Error、零残留；失败后注册照常、tick() 内核照常点火
 }
 
-pub struct TaskHandle { /* … */ }   // RAII（Drop 即 cancel）；非 Clone；Send + Sync
+pub struct TaskHandle { /* … */ }   // RAII（Drop 即**静默** cancel——取消语义不变、不发 tracing 事件）；非 Clone；Send + Sync
 impl TaskHandle {
-    pub fn cancel(&self) -> bool;   // 线性化点=状态 CAS；幂等（已完成取消返 false）
+    pub fn cancel(&self) -> bool;   // 线性化点=状态 CAS；幂等（已完成取消返 false）；显式调用发 skeleton::scheduler::cancel 事件
     pub fn detach(self);            // fire-and-forget 逃生门（消费句柄不触发 Drop-cancel；#55：只解除取消，TaskCell 随之释放，不泄漏）
 }
 
@@ -2653,11 +2653,11 @@ impl ViewBridge<S, A, M, I, J, R> {
 
 | 域 | target | 事件点 | 级别 |
 |---|---|---|---|
-| scheduler | `skeleton::scheduler::{register,cancel,close,fire,worker}` | 注册/取消/点火/墓碑跳过=debug；关闸拒绝、**容量触顶拒绝注册（#58）**、回调 panic、超载退化重臂、驱动内部 panic=warn；close 与 worker 退出=info | 混合 |
+| scheduler | `skeleton::scheduler::{register,cancel,close,fire}` | 注册/取消/点火/墓碑跳过=debug（取消仅限显式 `cancel()`；`TaskHandle::drop` 静默取消不发事件）；关闸拒绝、**容量触顶拒绝注册（#58）**、回调 panic、超载退化重臂=warn；close=info；worker 退出不埋（#221 §2.5：有界进度收尾禁宿主回调） | 混合 |
 | ratelimit | `skeleton::ratelimit::{try_acquire,acquire}` | 快路径拒绝与超容量拒绝=warn（available/wait_ns/capacity）；阻塞等待分段与醒后重查=debug（round/deficit）；成功扣减零事件 | 混合 |
 | retry | `skeleton::retry::{attempt,verdict,backoff}` | 尝试开始=debug；重试放行=warn（backoff_ms）；停机终态=info；退避截平=warn（linear_ms→capped_ms） | 混合 |
 | backoff | `skeleton::backoff` | 计算入参/结果（attempt/base_ms/max_ms/delay_ms）=debug（纯函数域唯一埋点） | debug |
-| fsx | `skeleton::fsx::{walk,copy,tempdir}` | walk 帧推进=debug（depth/sort）；copy 逐项=debug + 部分失败=warn（copied/path/error）；tempdir Drop 清理失败=warn | 混合 |
+| fsx | `skeleton::fsx::{walk,copy}` | walk 帧推进=debug（depth/sort）；copy 逐项=debug + 部分失败=warn（copied/path/error）；**TempDir Drop 清理失败不发事件**（#221 §6：析构路径只做 best-effort stderr 报告） | 混合 |
 | cache | `skeleton::cache::{evict,purge}` | evict（kind=ttl/ttl_sweep/capacity，key 指纹/僵尸数/LRU 序）=debug（真回收才发）；purge=info（回收数/残留） | 混合 |
 | shutdown | `skeleton::shutdown::{registry,run,report}` | 注册成功/逐组件开始/终态 Stopped/整体报告=info；TimedOut/Failed=warn | 混合 |
 | iter | `skeleton::iter::process_results` | 首 Err 短路=warn（pos=已产出 Ok 数，0 起）；next/fold 双通路各一点 | warn |
