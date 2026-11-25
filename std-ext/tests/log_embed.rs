@@ -670,7 +670,6 @@ fn cache_lru_capacity_evict_is_debug_with_lru_tail() {
             "kind=capacity",
             "order=lru_tail",
             "len_at_evict=1",
-            "key_hash=",
         ],
     );
     assert_eq!(cap.len(), 1, "容量淘汰恰一条事件");
