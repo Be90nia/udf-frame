@@ -1314,6 +1314,11 @@ impl<G: SpawnGate> ThreadPool<G> {
     /// 自带「部分生效」状态（目标 core / 实际存活 worker 数），调用方不必回查
     /// 指标即可判断池处于什么状态（已建 worker 继续服务，可重试 resize 补齐）。
     /// 失败另经 [`ThreadPoolMetrics::spawn_failures`] 计数留痕（fail-visible）。
+    ///
+    /// **与 shutdown 并发**：已经进入 OS 创建阶段的单个 reservation 可以完成
+    /// reservation→live 交接，随后 worker 观察 shutdown 并退役；尚未尝试的批次
+    /// reservation 会回滚，后续增长轮次停止。shutdown 后调用 resize 只提交配置
+    /// 边界，不会重新启动 worker。
     pub fn resize(&self, t: ThreadPoolTuning) -> Result<(), PoolResizeError> {
         // ① 纯校验（零锁、零状态变更）：此刻没有任何内部锁在持，拒绝事件可就地
         //    发射（issue#99：拒绝事件也必须在锁外）。
@@ -1391,7 +1396,8 @@ impl<G: SpawnGate> ThreadPool<G> {
             }
             // ② 锁外：OS 线程创建 + 创建闸裁决（禁持调度锁跨创建/跨用户闸门）。
             for (index, worker_id) in ids.iter().enumerate() {
-                if lock(&self.shared.inner).shutdown {
+                let shutting_down = { lock(&self.shared.inner).shutdown };
+                if shutting_down {
                     self.rollback_reservations(ids.len() - index);
                     break;
                 }
@@ -2258,6 +2264,25 @@ mod reservation_handoff_regressions {
         pool.shutdown();
         pool.join();
         assert_eq!(pool.metrics().completed, 2);
+    }
+
+    #[test]
+    fn resize_after_shutdown_does_not_restart_workers() {
+        let pool = ThreadPool::new(ThreadPoolTuning::new(1, 2, 8));
+        pool.shutdown();
+        pool.join();
+        let entries = pool.shared.worker_loop_entries.load(Ordering::SeqCst);
+
+        // The target boundary may be updated, but shutdown is terminal and growth
+        // must not create workers that can only start and immediately exit.
+        pool.resize(ThreadPoolTuning::new(2, 2, 8))
+            .expect("resize target update after shutdown");
+        assert_eq!(pool.metrics().workers, 0);
+        assert_eq!(
+            pool.shared.worker_loop_entries.load(Ordering::SeqCst),
+            entries,
+            "resize after shutdown must not start another worker"
+        );
     }
 
     #[test]
