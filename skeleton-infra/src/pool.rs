@@ -1635,6 +1635,7 @@ impl<G: SpawnGate> ThreadPool<G> {
                         reconcile_shrink(&mut g);
                     }
                     self.shared.retired.notify_all();
+                    self.shared.work.notify_all();
                     return Err(SpawnFailure {
                         error: ThreadSpawnError::from(std::io::Error::other(
                             "worker startup handoff receiver disappeared",
@@ -1688,6 +1689,7 @@ impl<G: SpawnGate> ThreadPool<G> {
             reconcile_shrink(&mut g);
         }
         self.shared.retired.notify_all();
+        self.shared.work.notify_all();
     }
 }
 
