@@ -1826,7 +1826,6 @@ mod tests {
         }
     }
 
-
     #[cfg(feature = "log-embed")]
     mod telemetry_boundary_tests {
         use super::*;
@@ -1953,5 +1952,3 @@ mod tests {
         }
     }
 }
-
-
