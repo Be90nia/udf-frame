@@ -1387,20 +1387,28 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         Q: Hash + Eq + ?Sized,
     {
         let now = self.clock.now_instant();
-        let (hit, retired) = {
+        let (hit, retired, due) = {
             let mut g = self.lock_core();
             let (due, retired) = Self::expire_if_due(&mut g, &self.expired, k, now);
             if due {
-                (None, retired)
+                (None, retired, true)
             } else {
                 let hit = g.get_mut(k).map(|e| e.value.clone());
                 if hit.is_some() {
                     self.hits.fetch_add(1, Ordering::Relaxed);
                 }
-                (hit, retired)
+                (hit, retired, false)
             }
         };
         retired.retire();
+        if due {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "ttl",
+                expired_total = self.expired.load(Ordering::Relaxed)
+            );
+        }
         hit
     }
 
@@ -1417,16 +1425,24 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         V: Clone,
     {
         let now = self.clock.now_instant();
-        let (hit, retired) = {
+        let (hit, retired, due) = {
             let mut g = self.lock_core();
             let (due, retired) = Self::expire_if_due(&mut g, &self.expired, k, now);
             if due {
-                (None, retired)
+                (None, retired, true)
             } else {
-                (g.peek(k).map(|e| e.value.clone()), retired)
+                (g.peek(k).map(|e| e.value.clone()), retired, false)
             }
         };
         retired.retire();
+        if due {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "ttl",
+                expired_total = self.expired.load(Ordering::Relaxed)
+            );
+        }
         hit
     }
 
@@ -1544,15 +1560,7 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
             // 值（含用户 V）一并进退休批 ⇒ 解锁后才析构（issue#71）。
             retired.value = value;
             expired.fetch_add(1, Ordering::Relaxed);
-            // 埋点「TTL 过期驱逐（惰性单条）」：触碰即回收留痕（键指纹+累计）。
-            #[cfg(feature = "log-embed")]
-            embed_event!(
-                debug,
-                target: "skeleton::cache::evict",
-                kind = "ttl",
-                key_hash = key_fingerprint(k),
-                expired_total = expired.load(Ordering::Relaxed)
-            );
+
             return (true, retired);
         }
         (false, Retired::empty())
