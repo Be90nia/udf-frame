@@ -233,12 +233,11 @@ pub use size_class_pool::{SizeClassHandle, SizeClassMetrics, SizeClassPool, Size
 #[cfg(feature = "compose")]
 pub use compose::{Combine, combine};
 
-
-#[cfg(all(test, feature = "log-embed"))]
+#[cfg(all(test, feature = "log-embed"))
 mod embedded_event_panic_tests {
     use super::*;
-    use tracing::{Event, Metadata};
     use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata};
 
     struct PanicSubscriber;
 
