@@ -198,8 +198,9 @@ pub fn mask_secrets(input: &str, secrets: &[&str]) -> String {
 
 /// release 构建下 [`std_ext::paths::home_dir`] 返回 None（std 文档：Unix=HOME 未设
 /// 且 passwd 无条目；Windows=USERPROFILE 未设且 GetUserProfileDirectory 失败；
-/// UWP 恒 None——工程内常规目标前两者有平台回退，此分支属防御面）。落地禁
-/// 静默回退 cwd，故构造期显式 Err。
+/// UWP 恒 None——工程内常规目标前两者有平台回退，此分支属防御面），或返回了
+/// **非绝对**路径（#179：相对 `$HOME`／passwd home 空串，`paths::home_dir` 已按
+/// None 过滤）。落地禁静默回退 cwd，故构造期显式 Err。
 #[derive(Debug)]
 pub struct HomeDirUnresolvable;
 
@@ -207,14 +208,81 @@ impl std::fmt::Display for HomeDirUnresolvable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "home directory unresolvable (std::env::home_dir returned None); \
-             refusing to fall back to the current directory — set USERPROFILE/HOME \
-             or supply a custom LogPathResolver"
+            "home directory unresolvable (std::env::home_dir returned None or a \
+             relative path); refusing to fall back to the current directory — set \
+             USERPROFILE/HOME to an absolute path or supply a custom LogPathResolver"
         )
     }
 }
 
 impl std::error::Error for HomeDirUnresolvable {}
+
+/// [`DefaultPathResolver::new`] 的构造失败面（#175/#113/#179）：区分「家锚不可
+/// 用」与「project_name 非法」——前者是环境问题（换机器/换用户），后者是配置
+/// 问题（改名字），处置不同，禁混成一个错误。
+#[derive(Debug)]
+pub enum LogPathError {
+    /// home 不可解析或不是绝对路径（#179）。
+    HomeUnresolvable(HomeDirUnresolvable),
+    /// project_name 不是单一安全路径组件（#175/#113）。
+    InvalidProjectName {
+        /// 被拒的原始名字。
+        name: String,
+        /// 违反的规则（诊断面，静态文案）。
+        reason: &'static str,
+    },
+}
+
+impl std::fmt::Display for LogPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HomeUnresolvable(err) => err.fmt(f),
+            Self::InvalidProjectName { name, reason } => write!(
+                f,
+                "invalid project name {name:?}: {reason}; project_name must be a single \
+                 directory name — no path separators, `.`/`..`, drive/UNC prefix or \
+                 control characters"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LogPathError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HomeUnresolvable(err) => Some(err),
+            Self::InvalidProjectName { .. } => None,
+        }
+    }
+}
+
+/// project_name 语法（#175/#113）：**单个 `Normal` 路径组件**，即一个目录名，
+/// 不是相对路径表达式。拒绝空串、`/` 与 `\`（两平台分隔符都拒，禁把名字当
+/// 多组件路径解释）、`.`/`..`、NUL/控制字符、以及 `components()` 给出的
+/// 非 `Normal` 形（Windows 的盘符/UNC `Prefix`、根）。
+///
+/// 不静默改写（清洗会把不同输入折叠到同一目录，属歧义输入应拒绝）；不依赖
+/// 字符串前缀判断。
+fn validate_project_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("must not be empty");
+    }
+    if name.chars().any(|c| c == '/' || c == '\\') {
+        return Err("must not contain a path separator (`/` or `\\`)");
+    }
+    if name.chars().any(char::is_control) {
+        return Err("must not contain control or NUL characters");
+    }
+    let mut components = std::path::Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(component)), None)
+            if component == std::ffi::OsStr::new(name) =>
+        {
+            Ok(())
+        }
+        _ => Err("must be a single normal path component (no `.`/`..`, root or drive/UNC prefix)"),
+    }
+}
 
 /// 默认路径解析器（拍板 2026-10-17）：debug 构建=编译期
 /// `CARGO_MANIFEST_DIR`/log（框架自身开发态，零运行时猜测）；release 构建=
@@ -222,14 +290,19 @@ impl std::error::Error for HomeDirUnresolvable {}
 /// （那会把开发者机器路径烧进发布物，隐私面；测试钉死）。`project_name`
 /// 为构造参数。
 ///
-/// home 在构造期一次性解析：解析失败显式 Err（禁静默落 cwd），此后
-/// [`LogPathResolver::log_root`] 恒不可失败。
+/// **`project_name` 语法**（#175/#113，debug/release 同判）：一个目录名 = 单个
+/// `Normal` 路径组件，非空，不含 `/`、`\`、NUL/控制字符，不是 `.`/`..`，也
+/// 不是盘符/UNC 前缀形——它**不是**相对路径表达式，含分隔符或穿越组件的值
+/// 一律 `Err(LogPathError::InvalidProjectName)`（不静默清洗）。
+///
+/// home 在构造期一次性解析：解析失败或**非绝对**（#179）显式 Err（禁静默落
+/// cwd），此后 [`LogPathResolver::log_root`] 恒不可失败。
 ///
 /// # Examples
 ///
 /// ```
 /// let r = skeleton_infra::logx::DefaultPathResolver::new("agentwiki")
-///     .expect("debug 构建不解析 home，恒 Ok；release 构建需 home 可解析");
+///     .expect("名字合法；debug 构建不解析 home，release 构建需 home 可解析");
 /// // debug 构建下 r.log_root() == <本 crate 工程目录>/log（编译期锚）
 /// ```
 ///
@@ -249,20 +322,26 @@ pub struct DefaultPathResolver {
 }
 
 impl DefaultPathResolver {
-    /// debug 构建恒 Ok（home 不参与）；release 构建立即解析 home，
-    /// None → `Err(HomeDirUnresolvable)`。
-    pub fn new(project_name: impl Into<String>) -> Result<Self, HomeDirUnresolvable> {
+    /// 名字恒校验（debug 也校验——名字未被使用不是接受非法值的理由）；
+    /// debug 构建此后恒 Ok，release 构建紧接着解析 home，None/非绝对 →
+    /// `Err(LogPathError::HomeUnresolvable)`。
+    pub fn new(project_name: impl Into<String>) -> Result<Self, LogPathError> {
+        let project_name = project_name.into();
+        validate_project_name(&project_name).map_err(|reason| {
+            LogPathError::InvalidProjectName {
+                name: project_name.clone(),
+                reason,
+            }
+        })?;
         #[cfg(not(debug_assertions))]
         {
-            let home = std_ext::paths::home_dir().ok_or(HomeDirUnresolvable)?;
-            Ok(Self {
-                project_name: project_name.into(),
-                home,
-            })
+            let home = std_ext::paths::home_dir()
+                .ok_or(LogPathError::HomeUnresolvable(HomeDirUnresolvable))?;
+            Ok(Self { project_name, home })
         }
         #[cfg(debug_assertions)]
         {
-            let _ = project_name.into(); // debug 分支零字段，参数仅签名存在
+            let _ = project_name; // debug 分支零字段，名字只过校验不入布局
             Ok(Self {})
         }
     }
@@ -402,6 +481,15 @@ impl SoftFailureReporter for StderrReporter {
 ///
 /// 时间戳/文件名恒 UTC（std 无本地时区 API，chrono 依赖判否）。
 ///
+/// **隐私策略**（#180，显式而非隐含）：
+///
+/// - **Unix**：新建根 `0700`、每日文件 `0600`，用 `mode` 直接给（独立于进程
+///   umask，umask 只能清位）；**既有**路径若带 group/other 位则拒绝——根在
+///   [`FileSink::new`] 返回 `PermissionDenied`，当日文件在打开时返回错（软失败
+///   计数 + 一次告警，不落任何字节）。本件**不隐式 chmod** 调用方目录/文件。
+/// - **Windows**：无 POSIX 权限位，目录/文件权限沿用父目录 ACL 继承——父 ACL
+///   未收紧时本路径**不是隐私边界**，宿主需自管 ACL（本件不宣称私有）。
+///
 /// # Examples
 ///
 /// ```no_run
@@ -480,9 +568,159 @@ impl std::fmt::Debug for SinkState {
     }
 }
 
+/// 建日志根并回报**本调用是否新建了它**（#180 权限 + #130 归属）。
+///
+/// 归属判据 = 非递归 `create` 的 `AlreadyExists`：原子，没有 `exists()` 的
+/// check-then-create 窗口。回收决策只认这个回执（`remove_dir` 成功**不**证明
+/// 目录是本调用建的）。
+///
+/// Unix：新建 `0700`（`mode` 独立于 umask——umask 只能清位）；既有根校验无
+/// group/other 位（**不隐式 chmod** 调用方目录）。Windows 无 POSIX 权限位：
+/// 权限沿用父目录 ACL 继承，本件不宣称私有。
+#[cfg(unix)]
+fn create_root(root: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(root) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            check_private_dir(root)?;
+            Ok(false)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // 父级缺失 ⇒ 根不可能已存在，整棵由本次新建（各级同 0700）。
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(root)?;
+            Ok(true)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_root(root: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::DirBuilder::new().create(root) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            check_private_dir(root)?;
+            Ok(false)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(root)?;
+            Ok(true)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// 既有根目录判定 + 隐私校验（#180）。Unix：group/other 有位即拒绝（静默
+/// chmod 调用方目录越界）；其他平台只判「是目录」，隐私由父 ACL 继承承担。
+#[cfg(unix)]
+fn check_private_dir(root: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = std::fs::metadata(root)?;
+    if !metadata.is_dir() {
+        return Err(not_a_dir(root));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "log root {} is group/other accessible (mode {mode:03o}); \
+                 refusing to write logs there — tighten it or pick another root",
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_private_dir(root: &std::path::Path) -> std::io::Result<()> {
+    if std::fs::metadata(root)?.is_dir() {
+        Ok(())
+    } else {
+        Err(not_a_dir(root))
+    }
+}
+
+fn not_a_dir(root: &std::path::Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("log root {} exists and is not a directory", root.display()),
+    )
+}
+
+/// 打开前的根目录兜底（根可能被外部删除后重建）：新建时同样 `0700`；既有根
+/// **不**复检权限（构造期已校验，续写路径不因外部 umask 变化改判——软失败面
+/// 只保证自己新建的路径私有）。
+#[cfg(unix)]
+fn ensure_root_exists(root: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(root)
+}
+
+#[cfg(not(unix))]
+fn ensure_root_exists(root: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)
+}
+
+/// 打开当日落点追加句柄（#180）：Unix 新建 `0600`（`mode` 独立于 umask），
+/// 既有文件校验无 group/other 位（**不隐式 chmod**，拒绝早于写入首字节）。
+fn open_day_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    check_private_file(&file, path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn check_private_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "log file {} is group/other accessible (mode {mode:03o}); \
+                 refusing to append to a non-private file",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_private_file(_file: &std::fs::File, _path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 impl FileSink {
     /// 建汇：立即递归创建根目录（配置错误在此显式失败，禁等到首行才爆）；
     /// 文件按日懒开（无事件不落空文件）。诊断走默认 [`StderrReporter`]。
+    ///
+    /// 权限（#180）：Unix 新建根 `0700`；**既有**根带 group/other 位则
+    /// `Err(PermissionDenied)`（不静默 chmod 调用方目录）。Windows 无 POSIX
+    /// 权限位，权限沿用父目录 ACL 继承——父 ACL 未收紧时本路径**不构成隐私
+    /// 边界**（每日文件 `0600` 的保护只在 Unix 成立）。
     pub fn new(root: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
         Self::with_reporter(root, std::sync::Arc::new(StderrReporter))
     }
@@ -495,7 +733,7 @@ impl FileSink {
         reporter: std::sync::Arc<dyn SoftFailureReporter>,
     ) -> std::io::Result<Self> {
         let root = root.into();
-        std::fs::create_dir_all(&root)?;
+        create_root(&root)?;
         Ok(Self {
             root,
             state: std::sync::Mutex::new(SinkState {
@@ -586,11 +824,8 @@ impl FileSink {
             let path = self
                 .root
                 .join(state.target.file_name(day).expect("not Stopped"));
-            std::fs::create_dir_all(&self.root)?;
-            let file = std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&path)?;
+            ensure_root_exists(&self.root)?;
+            let file = open_day_file(&path)?;
             state.writer = Some(Box::new(std::io::BufWriter::new(file)));
         }
         // ponytail: 极端跨进程竞争下行仍可能按 write() 边界交错（常规文件
@@ -1161,6 +1396,14 @@ impl tracing::field::Visit for LineFields<'_> {
 /// Err——0.3.23 源码 util.rs 实证）。本地资源（日志根目录）先建，任何
 /// 配置错误在任何全局被触碰之前显式失败。
 ///
+/// # 失败收尾契约（#130）
+///
+/// `AlreadyInit` 时只回收**本次调用新建**的空日志根（归属由非递归
+/// `create` 的 `AlreadyExists` 原子判定）——既有根即使为空也属于调用方状态，
+/// 一律保留；非空根自然保留（只做 `remove_dir`，从不递归删除）。
+/// 残留竞态：另一个初始化者可能刚建根就被本调用回收，它的下一行会重建根
+/// （0700）并续写——不丢行、不越权；该窗口不可移植地消除。
+///
 /// # Examples
 ///
 /// ```no_run
@@ -1178,6 +1421,11 @@ pub fn init_with_file(
     use tracing_subscriber::util::SubscriberInitExt as _;
 
     let root = resolver.log_root();
+    // #130：归属回执——只有本调用**新建**的根才允许在 init 失败时回收。
+    let root_created_here = create_root(&root).map_err(|source| LogInitError::RootCreate {
+        root: root.clone(),
+        source,
+    })?;
     let sink = std::sync::Arc::new(FileSink::new(root.clone()).map_err(|source| {
         LogInitError::RootCreate {
             root: root.clone(),
@@ -1199,10 +1447,13 @@ pub fn init_with_file(
         )
         .try_init()
         .map_err(|_| {
-            // AlreadyInit：尽力回收本次新建的空日志根（审计吹毛：失败路径
-            // 副作用不残留）。remove_dir 只删空目录——根非空=本来就有内容，
-            // 自然失败保留，不掩盖原错误。
-            let _ = std::fs::remove_dir(&root);
+            // AlreadyInit：只回收**本次新建**的空日志根（#130——既有根即使为
+            // 空也是调用方状态，`remove_dir` 成功不代表归属）；非空根自然保留。
+            // 残留竞态（不可移植消除）：另一初始化者可能刚建根就被本调用回收，
+            // 它的下一行会重建根（0700）并续写——不丢行、不越权。
+            if root_created_here {
+                let _ = std::fs::remove_dir(&root);
+            }
             LogInitError::AlreadyInit
         })
 }
@@ -1495,6 +1746,84 @@ mod file_sink_tests {
             release_root(Path::new("/home/u"), "agentwiki"),
             Path::new("/home/u").join(".agentwiki").join("log")
         );
+    }
+
+    // #175 条 3：最终根必须仍在 home 之下（不只靠字符串前缀——用组件级
+    // containment 独立复核归一后的布局）。
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_root_stays_under_home() {
+        let home = Path::new("/home/u");
+        let root = release_root(home, "agentwiki");
+        assert!(
+            std_ext::paths::ensure_inside(home, &root, std_ext::paths::CaseStrategy::CaseSensitive)
+                .is_ok(),
+            "release 根必须位于 home 之内: {root:?}"
+        );
+    }
+
+    // #175/#113：project_name 必须是单一 Normal 组件；debug 也校验（名字未参与
+    // 布局不是接受非法值的理由），故本测试两构建同跑。
+    #[test]
+    fn resolver_rejects_non_component_project_names() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "foo/../../outside",
+            "a/b",
+            "a\\b",
+            "\\server\\share",
+            "foo\0bar",
+            "foo\nbar",
+            "./agentwiki",
+            "agentwiki/",
+        ] {
+            match DefaultPathResolver::new(bad) {
+                Err(LogPathError::InvalidProjectName { name, .. }) => {
+                    assert_eq!(name, bad, "错误须回传原始名字");
+                }
+                Ok(_) => panic!("traversal/separator name must be rejected: {bad:?}"),
+                Err(other) => panic!("expected InvalidProjectName for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    // Windows 平台前缀形（盘符/verbatim）由 components() 判为非 Normal ⇒ 拒绝。
+    #[cfg(windows)]
+    #[test]
+    fn resolver_rejects_drive_and_unc_prefixed_names() {
+        for bad in ["C:", "C:foo", r"\\?\C:\x", r"\\server\share"] {
+            assert!(
+                matches!(
+                    DefaultPathResolver::new(bad),
+                    Err(LogPathError::InvalidProjectName { .. })
+                ),
+                "Windows 前缀形名字必须被拒: {bad:?}"
+            );
+        }
+    }
+
+    // Unix 上 `C:foo` 不含分隔符、是普通目录名（平台语义由 components() 决定，
+    // 禁跨平台臆断）。debug 分支不解析 home，故只在 debug 断言接受。
+    #[cfg(all(not(windows), debug_assertions))]
+    #[test]
+    fn resolver_accepts_colon_name_on_unix() {
+        assert!(
+            DefaultPathResolver::new("C:foo").is_ok(),
+            "Unix 上冒号是合法目录名字符"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn resolver_accepts_single_component_names() {
+        for good in ["agentwiki", ".hidden", "a.b-c_d", "名字", "a b"] {
+            assert!(
+                DefaultPathResolver::new(good).is_ok(),
+                "合法单一组件名字必须被接受: {good:?}"
+            );
+        }
     }
 
     // debug 构建编译期锚：恒 = CARGO_MANIFEST_DIR/log，home 不参与。

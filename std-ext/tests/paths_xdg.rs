@@ -47,12 +47,27 @@ impl Drop for EnvGuard {
     }
 }
 
+#[cfg(unix)]
+const ABS_HOME: &str = "/xdg-test-home";
+#[cfg(windows)]
+const ABS_HOME: &str = r"C:\xdg-test-home";
+
 #[test]
 fn home_dir_follows_env_injection() {
     let _s = serial();
     let _g = EnvGuard::save(HOME_VAR);
-    std::env::set_var(HOME_VAR, "/xdg-test-home");
-    assert_eq!(home_dir(), Some(PathBuf::from("/xdg-test-home")));
+    std::env::set_var(HOME_VAR, ABS_HOME);
+    assert_eq!(home_dir(), Some(PathBuf::from(ABS_HOME)));
+}
+
+/// #179：相对家锚 fail closed——`home_dir` 恒不返回相对路径（否则 XDG 默认链
+/// 与 release 日志根会静默变成 cwd 相对路径）。
+#[test]
+fn relative_home_env_rejected() {
+    let _s = serial();
+    let _g = EnvGuard::save(HOME_VAR);
+    std::env::set_var(HOME_VAR, "relative-home");
+    assert_eq!(home_dir(), None, "相对家锚必须 fail closed");
 }
 
 #[cfg(not(windows))]

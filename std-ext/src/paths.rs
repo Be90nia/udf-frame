@@ -322,6 +322,11 @@ fn first_prefix(path: &Path) -> Option<Component<'_>> {
 ///
 /// 相对/绝对类型混杂按 NotInside 自然失败（相对路径不可能在绝对基准内）。
 ///
+/// **词法 containment，不是 OS 沙箱**（#111）：判定只做纯文本归一 + 组件比较，
+/// 不解析符号链接、不查文件系统（TOCTOU 无解面）。需要「真实同一路径」的
+/// 调用方必须两侧都 [`canonicalize_compat`] 后再判定，并自行承担"判定后路径
+/// 又被替换"的竞态——本函数不承诺任何跨权限边界保证。
+///
 /// # Examples
 ///
 /// ```
@@ -372,9 +377,56 @@ fn fold_starts_with(path: &Path, base: &Path) -> bool {
 }
 
 fn a_fold_eq(a: Component<'_>, b: Component<'_>) -> bool {
-    a.as_os_str()
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    os_ascii_fold_eq(a.as_os_str(), b.as_os_str())
+}
+
+/// 原生表示逐单元 ASCII 折叠（#111）：`to_string_lossy` 会把不同的非法编码
+/// 归一成同一个 U+FFFD，让两个不同组件比较相等（containment 假阳性）。
+/// 折叠只映射 ASCII A–Z，其余单元必须精确相等。
+///
+/// Unix：裸字节逐字节比较（非法 UTF-8 序列逐字节对表）。
+#[cfg(unix)]
+fn os_ascii_fold_eq(a: &OsStr, b: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// Windows：UTF-16 码元逐单元比较（未配对代理项按原值对表）。
+#[cfg(windows)]
+fn os_ascii_fold_eq(a: &OsStr, b: &OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let mut a = a.encode_wide();
+    let mut b = b.encode_wide();
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if fold_u16(x) == fold_u16(y) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// 仅折 ASCII A–Z；非 ASCII 码元原值返回（不做 Unicode 折叠）。
+#[cfg(windows)]
+fn fold_u16(unit: u16) -> u16 {
+    if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
+        unit + 32
+    } else {
+        unit
+    }
+}
+
+/// 其余平台：非 UTF-8 表示没有无损单元可折，保守退化为精确比较——宁可漏报
+/// 相等，也不制造「不同组件判等」的假阳性。
+#[cfg(not(any(unix, windows)))]
+fn os_ascii_fold_eq(a: &OsStr, b: &OsStr) -> bool {
+    match (a.to_str(), b.to_str()) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => a == b,
+    }
 }
 
 // ===== 家目录与 XDG 用户基目录（env 解析面，零 IO——不创建目录） =====
@@ -389,6 +441,12 @@ fn a_fold_eq(a: Component<'_>, b: Component<'_>) -> bool {
 /// - **Windows**：`$USERPROFILE`（设且非空）→ `GetUserProfileDirectory`
 ///   （std 声明该回退将来可能变化）；UWP 目标恒 None。1.85 前此函数在
 ///   Windows 读 `$HOME`（Cygwin/MinGW 环境会给 `/home/you` 类非标准形态）。
+///
+/// # 绝对性（#179）
+///
+/// 结果**恒为绝对路径或 None**：平台解析器给出相对路径（Unix 相对 `$HOME`、
+/// passwd home 字段为空串等）时按 None 处置——否则 [`config_dir`]/
+/// [`cache_dir`]/[`data_dir`] 与 release 日志根会静默变成 cwd 相对路径。
 ///
 /// # 调用方处置指引（None 时）
 ///
@@ -407,21 +465,24 @@ fn a_fold_eq(a: Component<'_>, b: Component<'_>) -> bool {
 /// ```
 /// use std_ext::paths::home_dir;
 ///
-/// // 家可能不可解析（passwd 无条目/UWP）——按 None 分支处置，禁静默回退 cwd
+/// // 家可能不可解析（passwd 无条目/UWP/相对锚）——按 None 分支处置，禁静默回退 cwd
 /// if let Some(home) = home_dir() {
+///     assert!(home.is_absolute());
 ///     let dot_cfg = home.join(".config"); // 子目录布局归调用方
 ///     println!("{dot_cfg:?}");
 /// }
 /// ```
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::home_dir()
+    std::env::home_dir().filter(|home| home.is_absolute())
 }
 
 /// XDG 用户基目录解析核（纯函数，无 env 访问——单测全矩阵零 env 竞争）。
 ///
 /// 语义（XDG Base Directory Spec v0.8 原文锚定）：
-/// - `home` 缺失 ⇒ `None`（链断传播——契约拍板比 spec 更保守的 fail-closed：
-///   家锚缺失不出路径；spec 仅在回退默认值时才需要 `$HOME`）；
+/// - `home` 缺失**或非绝对** ⇒ `None`（链断传播——契约拍板比 spec 更保守的
+///   fail-closed：家锚缺失/相对不出路径；spec 仅在回退默认值时才需要
+///   `$HOME`。绝对性由本核独立校验，#179：即使平台解析器漏网，默认分支也
+///   不会拼出 cwd 相对路径）；
 /// - env 值**空 = 未设**（"either not set or empty"）；
 /// - **相对值 = invalid，忽略**回退默认（"All paths ... must be absolute ...
 ///   relative path ... invalid and ignore it"）；
@@ -438,7 +499,7 @@ fn resolve_xdg_dir(
     env_value: Option<&OsStr>,
     default_suffix: &str,
 ) -> Option<PathBuf> {
-    let home = home?;
+    let home = home.filter(|home| home.is_absolute())?;
     let from_env = env_value
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -1066,6 +1127,56 @@ mod tests {
         );
     }
 
+    // #111：折叠必须在原生表示上做。`to_string_lossy` 会把不同的非法编码
+    // 归一成同一个 U+FFFD ⇒ 两个不同组件判等 ⇒ containment 假阳性。
+    #[cfg(unix)]
+    #[test]
+    fn case_insensitive_distinct_invalid_utf8_not_equal() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let base = Path::new(OsStr::from_bytes(b"/a/\xFFx"));
+        let path = Path::new(OsStr::from_bytes(b"/a/\xFEx/f"));
+        assert!(
+            ensure_inside(base, path, CaseStrategy::CaseInsensitive).is_err(),
+            "不同非法字节组件不得因 lossy 占位符判为相等"
+        );
+        // 同一组件的非 ASCII 字节精确相等仍算 inside（折叠只碰 ASCII）
+        let same = Path::new(OsStr::from_bytes(b"/a/\xFFx/f"));
+        assert!(ensure_inside(base, same, CaseStrategy::CaseInsensitive).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn case_insensitive_distinct_unpaired_surrogates_not_equal() {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        // 0xD800 与 0xDC00 都是未配对代理项：lossy 转换后同为 U+FFFD。
+        let base = PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'a' as u16,
+            b'\\' as u16,
+            0xD800,
+        ]));
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'a' as u16,
+            b'\\' as u16,
+            0xDC00,
+            b'\\' as u16,
+            b'f' as u16,
+        ]));
+        assert!(
+            ensure_inside(&base, &path, CaseStrategy::CaseInsensitive).is_err(),
+            "不同未配对代理项不得因 lossy 占位符判为相等"
+        );
+        let same = PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'a' as u16,
+            b'\\' as u16,
+            0xD800,
+            b'\\' as u16,
+            b'f' as u16,
+        ]));
+        assert!(ensure_inside(&base, &same, CaseStrategy::CaseInsensitive).is_ok());
+    }
+
     #[test]
     fn error_display_mentions_both_paths() {
         let err = NotInside {
@@ -1102,6 +1213,24 @@ mod tests {
             assert_eq!(
                 resolve_xdg_dir(home, Some(OsStr::new("rel")), ".config"),
                 None
+            );
+        }
+
+        #[test]
+        fn xdg_relative_or_empty_home_rejected() {
+            // #179：相对/空家锚 ⇒ fail closed（默认分支会产出 cwd 相对路径）。
+            // 纯核独立校验绝对性，不依赖平台解析器是否已过滤。
+            let rel = Path::new("rel/home");
+            assert_eq!(
+                resolve_xdg_dir(Some(rel), Some(OsStr::new("/abs/cfg")), ".config"),
+                None,
+                "相对家锚即使 XDG 值为绝对也不出路径（契约：家锚不可用即链断）"
+            );
+            assert_eq!(resolve_xdg_dir(Some(rel), None, ".config"), None);
+            assert_eq!(
+                resolve_xdg_dir(Some(Path::new("")), None, ".config"),
+                None,
+                "空家锚（passwd home 字段为空串）同判"
             );
         }
 
