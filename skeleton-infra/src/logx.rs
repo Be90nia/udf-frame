@@ -546,7 +546,46 @@ impl FileSink {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.writer.is_none() || state.day != day {
+        // 每次调用至多退役「换日旧句柄」与「失败句柄」；Vec 不 push 即不分配，
+        // 故热路径（成功写入）零分配。
+        let mut retired: Vec<Box<dyn std::io::Write + Send>> = Vec::new();
+        let mut notice = None;
+        let result = self.write_locked(&mut state, day, buf, &mut retired, &mut notice);
+        drop(state);
+        drop(retired);
+        if let Some(message) = notice {
+            self.reporter.report(&message);
+        }
+        result
+    }
+
+    /// [`Self::try_write_line`] 的锁内体：不碰 [`SoftFailureReporter`]、不析构
+    /// 句柄——退役句柄与诊断消息交回调用方在锁外处理。
+    fn write_locked(
+        &self,
+        state: &mut SinkState,
+        day: i64,
+        buf: &[u8],
+        retired: &mut Vec<Box<dyn std::io::Write + Send>>,
+        notice: &mut Option<String>,
+    ) -> std::io::Result<()> {
+        if state.day != day {
+            // 换日：落点阶梯归零；旧句柄退役（锁外析构）。
+            state.day = day;
+            state.target = Target::Main;
+            retired.extend(state.writer.take());
+        }
+        if state.target == Target::Stopped {
+            return Err(std::io::Error::other(
+                "log file fail-stopped for the current UTC day \
+                 (main and recovery file both failed)",
+            ));
+        }
+        if state.writer.is_none() {
+            // 打开失败 ≠ 写失败：落点不动，下一行重试同一落点（只重试新行）。
+            let path = self
+                .root
+                .join(state.target.file_name(day).expect("not Stopped"));
             std::fs::create_dir_all(&self.root)?;
             let file = std::fs::OpenOptions::new()
                 .append(true)
@@ -1533,5 +1572,224 @@ mod file_sink_tests {
             std::fs::read_to_string(root.join(today)).expect("file"),
             "ok\n"
         );
+    }
+
+    // #184：软失败契约不依赖诊断出口成功——坏 stderr（诊断全丢）下仍返回整行
+    // 长度、不 panic、丢弃计数权威。
+    #[test]
+    fn soft_failure_survives_broken_reporter() {
+        use std::io::Write as _;
+        let scratch = scratch("broken-reporter");
+        let root = scratch.path().join("blocked");
+        std::fs::write(&root, b"x").expect("placeholder file at root path");
+        let mut sink = FileSink {
+            root: root.clone(),
+            state: std::sync::Mutex::new(SinkState {
+                day: i64::MIN,
+                target: Target::Main,
+                writer: None,
+            }),
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            warned: std::sync::atomic::AtomicBool::new(false),
+            reporter: std::sync::Arc::new(SilentReporter),
+        };
+
+        assert_eq!(
+            sink.write(b"line\n").expect("soft path never errs"),
+            5,
+            "write 恒返回整行长度（软失败面）"
+        );
+        assert_eq!(sink.write(b"line\n").expect("soft path never errs"), 5);
+        assert_eq!(sink.dropped_lines(), 2, "丢弃计数不依赖诊断出口");
+    }
+
+    // #112/#198：写失败后句柄必须退役（半行前缀留在原文件），下一行改落恢复
+    // 文件——新行不接在半行后面；只失败那一行计丢弃。
+    #[test]
+    fn partial_write_failure_retires_writer_and_rolls_to_recovery_file() {
+        use std::io::Write as _;
+        let scratch = scratch("partial");
+        let root = scratch.path().join("logs");
+        let reporter = std::sync::Arc::new(RecordingReporter::default());
+        let mut sink = FileSink::with_reporter(&root, reporter.clone()).expect("root creatable");
+
+        let day = utc_epoch_days(SystemTime::now());
+        let main_path = root.join(day_file_name(day));
+        install_writer(&sink, day, Target::Main, &main_path, Fault::PartialWrite);
+
+        let failed_line = b"record-1\n";
+        sink.write_all(failed_line).expect("soft path never errs");
+        assert_eq!(sink.dropped_lines(), 1, "失败行计丢弃");
+
+        sink.write_all(b"record-2\n").expect("soft path never errs");
+        assert_eq!(sink.dropped_lines(), 1, "重开后新行不再丢");
+
+        let main = std::fs::read_to_string(&main_path).expect("main file readable");
+        assert_eq!(
+            main, "reco",
+            "主文件尾巴=注入的半行前缀（不截断、不修复）：{main:?}"
+        );
+        let recovery_path = root.join(recovery_file_name(day));
+        assert_eq!(
+            std::fs::read_to_string(&recovery_path).expect("recovery file"),
+            "record-2\n",
+            "新行只进恢复文件，不接半行后"
+        );
+
+        let messages = reporter.messages();
+        assert_eq!(
+            messages.len(),
+            2,
+            "首失败一次告警 + 落点降级一次诊断: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("recovery")),
+            "降级诊断须点名恢复落点: {messages:?}"
+        );
+    }
+
+    // #198：flush 失败同属「记录边界不确定」——整行虽已写入，句柄仍须退役并切
+    // 恢复文件（禁把后续行追加到可疑句柄）。
+    #[test]
+    fn flush_failure_retires_writer_and_rolls_to_recovery_file() {
+        use std::io::Write as _;
+        let scratch = scratch("flush");
+        let root = scratch.path().join("logs");
+        let mut sink =
+            FileSink::with_reporter(&root, std::sync::Arc::new(SilentReporter)).expect("root");
+
+        let day = utc_epoch_days(SystemTime::now());
+        let main_path = root.join(day_file_name(day));
+        install_writer(&sink, day, Target::Main, &main_path, Fault::Flush);
+
+        sink.write_all(b"record-1\n").expect("soft path never errs");
+        assert_eq!(sink.dropped_lines(), 1);
+        sink.write_all(b"record-2\n").expect("soft path never errs");
+        assert_eq!(sink.dropped_lines(), 1);
+
+        assert_eq!(
+            std::fs::read_to_string(&main_path).expect("main file"),
+            "record-1\n",
+            "主文件保持原样（不重复写、不追加新行）"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(recovery_file_name(day))).expect("recovery file"),
+            "record-2\n"
+        );
+    }
+
+    // #198：恢复文件也失败 → 当日 fail-stop：后续行只计数、不再开新文件（禁
+    // 每次失败造文件把故障放大），dropped_lines 逐行准确。
+    #[test]
+    fn recovery_failure_fail_stops_without_creating_more_files() {
+        use std::io::Write as _;
+        let scratch = scratch("fail-stop");
+        let root = scratch.path().join("logs");
+        let mut sink =
+            FileSink::with_reporter(&root, std::sync::Arc::new(SilentReporter)).expect("root");
+
+        let day = utc_epoch_days(SystemTime::now());
+        let main_path = root.join(day_file_name(day));
+        let recovery_path = root.join(recovery_file_name(day));
+
+        install_writer(&sink, day, Target::Main, &main_path, Fault::PartialWrite);
+        sink.write_all(b"record-1\n").expect("soft path never errs");
+        assert_eq!(sink.dropped_lines(), 1);
+
+        install_writer(
+            &sink,
+            day,
+            Target::Recovery,
+            &recovery_path,
+            Fault::AlwaysWrite,
+        );
+        sink.write_all(b"record-2\n").expect("soft path never errs");
+        assert_eq!(sink.dropped_lines(), 2);
+        assert_eq!(
+            sink.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .target,
+            Target::Stopped,
+            "恢复文件也失败 → 当日 fail-stop（不再有新落点可试）"
+        );
+
+        // 当日已 fail-stop：不再尝试 IO，逐行计丢弃。
+        sink.write_all(b"record-3\n").expect("soft path never errs");
+        assert_eq!(sink.dropped_lines(), 3);
+
+        assert_eq!(
+            file_count(&root),
+            2,
+            "只存在主文件与恢复文件，fail-stop 不造新文件"
+        );
+    }
+
+    // 换日必须把落点阶梯归零：上一日 poisoned 不得影响新一日的正常文件。
+    #[test]
+    fn day_rollover_resets_poisoned_target_to_main_file() {
+        let scratch = scratch("rollover-poison");
+        let root = scratch.path().join("logs");
+        let sink = FileSink::with_reporter(&root, std::sync::Arc::new(SilentReporter))
+            .expect("root creatable");
+        let d0 = SystemTime::UNIX_EPOCH + Duration::from_secs(20_743 * 86_400 + 3_600);
+        let d1 = d0 + Duration::from_secs(86_400);
+        let day0 = utc_epoch_days(d0);
+        let day1 = utc_epoch_days(d1);
+
+        install_writer(
+            &sink,
+            day0,
+            Target::Main,
+            &root.join(day_file_name(day0)),
+            Fault::AlwaysWrite,
+        );
+        assert!(sink.try_write_line(d0, b"lost\n").is_err(), "注入故障面");
+        assert_eq!(
+            sink.dropped_lines(),
+            0,
+            "try_write_line 不做计数（软面在 write_line_soft）"
+        );
+
+        sink.try_write_line(d1, b"fresh\n").expect("新一日主文件");
+        assert_eq!(
+            std::fs::read_to_string(root.join(day_file_name(day1))).expect("day1 file"),
+            "fresh\n",
+            "换日回落主文件而不是上一日的恢复文件"
+        );
+        assert!(
+            !root.join(recovery_file_name(day1)).exists(),
+            "新一日不产生恢复文件"
+        );
+    }
+
+    // #184 Round 2：sink 失败时 MakeWriter 壳仍返回 Ok(len)——tracing-subscriber
+    // 0.3 只在 writer 返回 Err 时走自己的 stderr fallback，那会绕过本件的软失败
+    // 面（重抛日志 IO 错误到业务）。
+    #[cfg(feature = "log")]
+    #[test]
+    fn file_sink_writer_keeps_full_length_on_sink_failure() {
+        use std::io::Write as _;
+        let scratch = scratch("writer-shell");
+        let root = scratch.path().join("logs");
+        let sink = std::sync::Arc::new(
+            FileSink::with_reporter(&root, std::sync::Arc::new(SilentReporter)).expect("root"),
+        );
+        let day = utc_epoch_days(SystemTime::now());
+        install_writer(
+            &sink,
+            day,
+            Target::Main,
+            &root.join(day_file_name(day)),
+            Fault::AlwaysWrite,
+        );
+
+        let mut writer = FileSinkWriter::new(std::sync::Arc::clone(&sink));
+        assert_eq!(
+            writer.write(b"line\n").expect("软失败面恒 Ok"),
+            5,
+            "壳不得把 sink 失败变成 io::Error"
+        );
+        assert_eq!(sink.dropped_lines(), 1);
     }
 }
