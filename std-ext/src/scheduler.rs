@@ -645,9 +645,10 @@ impl Scheduler {
             // 额度占用：注册成功即占一条（退役时恰好释放一次，#58）。
             self.shared.live.fetch_add(1, AtomicOrd::SeqCst);
         }
-        embed_event!(debug, target: "skeleton::scheduler::register", seq = seq, kind = kind_name, delay_ms = delay.as_millis() as u64);
         // 唤醒驱动线程：更早 deadline 的注册即时生效（非睡满旧锚）。
+        // Telemetry must not sit before this mandatory wakeup.
         self.shared.signal.notify_all();
+        embed_event!(debug, target: "skeleton::scheduler::register", seq = seq, kind = kind_name, delay_ms = delay.as_millis() as u64);
         Ok(TaskHandle {
             cell,
             armed: true,
@@ -696,25 +697,33 @@ impl Scheduler {
             TaskKind::Once(run) => {
                 // take 后锁外执行：回调体已消费，双执行结构性排除。
                 let taken = run.lock().unwrap_or_else(PoisonError::into_inner).take();
-                if let Some(run) = taken {
+                let callback_panicked = if let Some(run) = taken {
                     if catch_unwind(AssertUnwindSafe(run)).is_err() {
                         self.shared.panics.fetch_add(1, AtomicOrd::SeqCst);
-                        embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "panic");
+                        true
+                    } else {
+                        false
                     }
-                }
+                } else {
+                    false
+                };
                 // 终态 DONE：此后 cancel 返 false（测试 cancel_after_fire）。
                 // 退役赢家释放额度（#58，恰好一次）：CAS 失败 = 检查-执行
                 // 窗口内被 cancel ⇒ 额度已由取消方释放。
                 self.shared.retire(&entry.task, DONE);
+                if callback_panicked {
+                    // The live slot is released before invoking the host subscriber.
+                    embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "panic");
+                }
                 // CAS 失败=检查-执行窗口内被 cancel：本次照跑（文档化语义）。
             }
             TaskKind::Every { period, fire } => {
                 if catch_unwind(AssertUnwindSafe(fire)).is_err() {
                     // panic 摘除不再臂（JDK 语义）；留痕 fail-visible。
                     self.shared.panics.fetch_add(1, AtomicOrd::SeqCst);
-                    embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "panic");
                     // 退役（不再臂）⇒ 释放额度（#58，恰好一次）。
                     self.shared.retire(&entry.task, DONE);
+                    embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "panic");
                     return true;
                 }
                 // 重臂锚取回调完成后的当前时刻：超载（完成时已越下锚）⇒
@@ -724,13 +733,10 @@ impl Scheduler {
                 // 异常路径（超载退化重臂）：下锚已被完成时刻越过（或锚溢出）
                 // ⇒ 周期语义降级为固定延迟，留痕。
                 #[cfg(feature = "log-embed")]
-                if entry
+                let overloaded = entry
                     .deadline
                     .checked_add(*period)
-                    .is_none_or(|anchor| anchor <= now)
-                {
-                    embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "overload_rearm", period_ms = period.as_millis() as u64);
-                }
+                    .is_none_or(|anchor| anchor <= now);
                 // 锁内裁决重臂：close 或执行中 cancel 赢了 ⇒ 摘除。
                 // 残余窗口（裁决后 cancel 落地）由惰性墓碑兜底：取消成功，
                 // 该条目到点被墓碑逻辑吃掉。
@@ -749,6 +755,11 @@ impl Scheduler {
                 }));
                 drop(s);
                 // 不 notify：重臂只会把 deadline 推后，park 锚提前无害。
+                // Publish the new heap entry before invoking the host subscriber.
+                #[cfg(feature = "log-embed")]
+                if overloaded {
+                    embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "overload_rearm", period_ms = period.as_millis() as u64);
+                }
             }
         }
         true
@@ -800,7 +811,7 @@ impl Scheduler {
     ///
     /// 回调内调用合法（重入安全，测试钉死）。
     pub fn close(&self) {
-        {
+        let drained = {
             let mut s = lock(&self.shared.state);
             if s.closed {
                 return; // 幂等
@@ -811,19 +822,19 @@ impl Scheduler {
             let drained = std::mem::take(&mut s.heap);
             // 堆已清空 ⇒ 无墓碑残留（#52 计数归零）。
             self.shared.tombstones.store(0, AtomicOrd::SeqCst);
-            drop(s); // CAS 是原子操作，锁外逐个标记不持锁
-            #[cfg(feature = "log-embed")]
-            let cleared = drained.len() as u64;
-            for Reverse(e) in drained {
-                // 全部标 Cancelled（句柄侧可见）；退役赢家释放额度（#58，
-                // 恰好一次）。
-                self.shared.retire(&e.task, CANCELLED);
-            }
-            // 终态（close）：清 pending 计数留痕；幂等重入（已 closed 早退）不发。
-            embed_event!(info, target: "skeleton::scheduler::close", cleared = cleared);
+            drained
+        };
+        #[cfg(feature = "log-embed")]
+        let cleared = drained.len() as u64;
+        for Reverse(e) in drained {
+            // 全部标 Cancelled（句柄侧可见）；退役赢家释放额度（#58，
+            // 恰好一次）。退役与析构均在状态锁外。
+            self.shared.retire(&e.task, CANCELLED);
         }
-        // 唤醒驱动线程：close 即退（park 中早醒重算）。
+        // 唤醒驱动线程：close 即退（park 中早醒重算）。必须先于同步 subscriber。
         self.shared.signal.notify_all();
+        // 终态（close）：清 pending 计数留痕；幂等重入（已 closed 早退）不发。
+        embed_event!(info, target: "skeleton::scheduler::close", cleared = cleared);
     }
     /// 墓碑清扫（#52）：已取消但仍在堆内的条目在原 deadline 之前被回收。
     ///
@@ -862,9 +873,9 @@ impl Scheduler {
         // 堆内已无墓碑 ⇒ 计数归零（清扫期间落地的那次取消可能漂移，良性）。
         self.shared.tombstones.store(0, AtomicOrd::SeqCst);
         if reclaimed > 0 {
-            embed_event!(debug, target: "skeleton::scheduler::fire", reclaimed = reclaimed as u64);
             // 唤醒驱动线程：park 锚（堆顶 deadline）可能提前 ⇒ 重算。
             self.shared.signal.notify_all();
+            embed_event!(debug, target: "skeleton::scheduler::fire", reclaimed = reclaimed as u64);
         }
         reclaimed
     }
@@ -1084,12 +1095,11 @@ fn worker_loop(sched: Arc<Scheduler>, stop: Arc<AtomicBool>) {
         sched.shared.worker_passes.fetch_add(1, AtomicOrd::SeqCst);
         if stop.load(AtomicOrd::SeqCst) {
             // 终态（worker 退出）：只停本 worker（信标），不关闸。
-            embed_event!(info, target: "skeleton::scheduler::worker", reason = "stopped");
+            // No synchronous telemetry on a bounded-progress teardown path.
             return;
         }
         if sched.is_closed() {
             // 终态（worker 退出）：close 是唯一正常出口。
-            embed_event!(info, target: "skeleton::scheduler::worker", reason = "closed");
             return;
         }
         // 墓碑清扫（#52）：取消后尽快回收，避免驱动为墓碑多醒一拍。
@@ -1107,7 +1117,7 @@ fn worker_loop(sched: Arc<Scheduler>, stop: Arc<AtomicBool>) {
                 if catch_unwind(AssertUnwindSafe(|| sched.tick())).is_err() {
                     sched.shared.panics.fetch_add(1, AtomicOrd::SeqCst);
                     // 异常路径（驱动内部 panic）：留痕后退出，不静默带病续跑。
-                    embed_event!(warn, target: "skeleton::scheduler::worker", reason = "internal_panic");
+                    // Do not invoke a synchronous host subscriber while terminating the worker.
                     return;
                 }
             }
