@@ -1363,21 +1363,25 @@ impl<G: SpawnGate> ThreadPool<G> {
             //    创建在锁外，见下）。
             let (ids, shrink_pending) = {
                 let mut g = lock(&self.shared.inner);
-                // 缩容令牌：只从**可退休的真实 worker** 计（issue#34：在途席位
-                // 不是可退役 worker），按**最新 core** 对账（issue#69：陈旧令牌
-                // 禁留——并发 resize 后按最新目标收敛）。
                 reconcile_shrink(&mut g);
-                // 增长缺口：按**已承诺总量**（真实 + 在途席位）计（issue#69：
-                // 在途预留已占席位，禁重复预留同一缺口 ⇒ workers ≤ max 恒成立）。
-                let before = g.workers;
-                let deficit = g.core.saturating_sub(g.workers);
-                let ids: Vec<u64> = (0..deficit).map(|_| reserve_worker(&mut g)).collect();
-                debug_assert!(
-                    g.workers <= before.max(g.core),
-                    "growth must not push committed population above max"
-                );
-                debug_assert!(g.reservations <= g.workers, "reservations ⊆ committed");
-                (ids, g.shrinking > 0)
+                if g.shutdown {
+                    // Shutdown is terminal: do not start replacement workers while an
+                    // earlier in-flight reservation is being committed/retired.
+                    (Vec::new(), false)
+                } else {
+                    // Growth counts committed workers + in-flight reservations, so
+                    // concurrent resizes cannot reserve the same missing seats.
+                    let before = g.workers;
+                    let deficit = g.core.saturating_sub(g.workers);
+                    let ids: Vec<u64> =
+                        (0..deficit).map(|_| reserve_worker(&mut g)).collect();
+                    debug_assert!(
+                        g.workers <= before.max(g.core),
+                        "growth must not push committed population above max"
+                    );
+                    debug_assert!(g.reservations <= g.workers, "reservations ⊆ committed");
+                    (ids, g.shrinking > 0)
+                }
             };
             if shrink_pending {
                 // 唤醒空闲 worker 认领退出令牌（缩容生效点）。
@@ -1388,6 +1392,10 @@ impl<G: SpawnGate> ThreadPool<G> {
             }
             // ② 锁外：OS 线程创建 + 创建闸裁决（禁持调度锁跨创建/跨用户闸门）。
             for (index, worker_id) in ids.iter().enumerate() {
+                if lock(&self.shared.inner).shutdown {
+                    self.rollback_reservations(ids.len() - index);
+                    break;
+                }
                 let attempt =
                     catch_unwind(AssertUnwindSafe(|| self.create_worker(None, *worker_id)));
                 let failure = match attempt {
