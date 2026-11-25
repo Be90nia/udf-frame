@@ -18,6 +18,11 @@
 //!   =全路径 fail-visible（错误显式上浮禁吞）+零缓存判定（每步现查）。
 //! - **部分失败中间态**：`copy_tree` 中途首错即停，已处理量以计数显式申报
 //!   （`CopyError::Partial`/`Cycle` 携带 report），禁 fs_extra 式静默半途。
+//! - **落点自我嵌套**（#108）：`copy_tree` 建目录**之前**比对「解析后落点」与
+//!   解析后源根（`..`/符号链接父目录一律先解析），落点等于或位于源树内即
+//!   `Prepare(InvalidInput)`——否则新建的落点会成为遍历的一部分，树被复制进
+//!   自己（实测表现为返回成功的错位/半截复制）。判定与建目录之间仍是 TOCTOU
+//!   窗口（声明项，非 OS 沙箱）。
 //! - **Windows 260 路径长度**：本域零归一零剥离（归一面在 [`crate::paths`]），
 //!   verbatim `\\?\` 形态原样透传（`PathBuf::push` 保留前缀），>260 深树以
 //!   verbatim 根遍历可达（集成测试实测钉死）。
@@ -550,6 +555,13 @@ impl std::error::Error for CopyError {
 /// 也会与穿透语义混淆。需要穿链接请先 `canonicalize` 出真实目录再传。根非目录
 /// （常规文件等）同为 `Prepare(InvalidInput)`。
 ///
+/// 落点包含关系（#108）：`dst` 解析后**等于或位于** `src` 内一律
+/// `Prepare(InvalidInput)`——判定用 `canonicalize(源根)` 与「解析后的目标父 +
+/// 目标叶子」，`..` 与符号链接父目录一视同仁（词面前缀会被两者骗过）。否则
+/// 新建的 `dst` 会成为 `src` 遍历的一部分，树被复制进自己（实测 `Sort::ByName`
+/// 的逐目录快照会把它压成「返回成功的错位/半截复制」，同样是坏结果）。判定与
+/// 建目录之间仍有 TOCTOU 窗口：本检查是纵深防御，**不是** OS 级沙箱。
+///
 /// # Examples
 ///
 /// ```no_run
@@ -604,6 +616,10 @@ fn copy_tree_inner(src: &Path, dst: &Path, links: SymlinkPolicy) -> Result<CopyR
             err: io::Error::new(io::ErrorKind::InvalidInput, "source is not a directory"),
         });
     }
+    // 落点包含关系（#108）：目标解析进源树内 ⇒ 建目录后它成为遍历的一部分，
+    // 树被复制进自己。实测（`Sort::ByName` 的逐目录快照）表现为「返回成功的
+    // 错位/半截复制」而非无限层增长——两种都不可接受，一律在建目录前拒绝。
+    reject_dst_inside_src(src, dst)?;
     fs::create_dir(dst).map_err(|err| CopyError::Prepare {
         path: dst.to_path_buf(),
         err,
@@ -670,6 +686,48 @@ fn copy_tree_inner(src: &Path, dst: &Path, links: SymlinkPolicy) -> Result<CopyR
         }
     }
     Ok(report)
+}
+
+/// 目标落点必须在源树之外（#108）：`create_dir(dst)` 之前比对**解析后**位置。
+///
+/// 词面前缀不够：`..` 与符号链接父目录能把树外的字符串解析进树内。判定 =
+/// `canonicalize(源根)` vs `canonicalize(目标父) + 目标叶子`（目标契约上不存
+/// 在，故只解析父；已存在的目标由 `create_dir` 独占语义报 AlreadyExists）。
+/// 判定与建目录之间仍是 TOCTOU 窗口——这是纵深防御，不是 OS 沙箱（同根符号
+/// 链接检查的权衡声明）。
+fn reject_dst_inside_src(src: &Path, dst: &Path) -> Result<(), CopyError> {
+    let Some(leaf) = dst.file_name() else {
+        // 无叶子（根/`..` 等）：create_dir 必 AlreadyExists，无递归面
+        return Ok(());
+    };
+    let parent = match dst.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    // 目标父不可解析（不存在/无权限）：此路不建目录、不复制，失败面留给随后的
+    // create_dir（它在同一父上落位并把原因显式上浮）——不在本函数另造错误面。
+    let Ok(parent_real) = fs::canonicalize(parent) else {
+        return Ok(());
+    };
+    let src_real = fs::canonicalize(src).map_err(|err| CopyError::Prepare {
+        path: src.to_path_buf(),
+        err,
+    })?;
+    let resolved = parent_real.join(leaf);
+    if resolved.starts_with(&src_real) {
+        return Err(CopyError::Prepare {
+            path: dst.to_path_buf(),
+            err: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "destination resolves to {} inside source tree {}; refusing to copy a tree into itself",
+                    resolved.display(),
+                    src_real.display()
+                ),
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// 保链复制：Unix `symlink(target)` 原样重建（悬空照留）；Windows 需解析出

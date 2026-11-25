@@ -356,6 +356,90 @@ fn copy_symlink_dir_root_is_prepare_error_for_both_policies() {
     }
 }
 
+#[test]
+fn copy_dst_inside_src_is_prepare_error_without_creating_it() {
+    let g = guard("dstinsrc");
+    let src = g.path().join("src");
+    fs::create_dir(&src).unwrap();
+    write_file(src.join("a.txt"), b"a");
+    // #108 原文形态：新建落点落在源树内 = 树复制进自己。闸门移除时本用例实测
+    // 返回 Ok 的错位/半截复制（`Sort::ByName` 逐目录快照限制住嵌套层数），所以
+    // 变异下这里是确定红而不是无界建目录。
+    let dst = src.join("copy-tree-destination");
+    match copy_tree(&src, &dst, SymlinkPolicy::Preserve).unwrap_err() {
+        CopyError::Prepare { path, err } => {
+            assert_eq!(path, dst, "错误定位回目标落点");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                err.to_string().contains("inside source tree"),
+                "带因：{err}"
+            );
+        }
+        other => panic!("expected Prepare, got {other:?}"),
+    }
+    assert!(!dst.exists(), "拒绝发生在 create_dir 之前（零中间态）");
+    let entries: Vec<String> = fs::read_dir(&src)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries, ["a.txt"], "源树未被写入：{entries:?}");
+}
+
+#[test]
+fn copy_dst_equal_to_src_is_prepare_error() {
+    let g = guard("dstequal");
+    let src = g.path().join("src");
+    fs::create_dir(&src).unwrap();
+    match copy_tree(&src, &src, SymlinkPolicy::Preserve).unwrap_err() {
+        CopyError::Prepare { path, err } => {
+            assert_eq!(path, src);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        other => panic!("expected Prepare, got {other:?}"),
+    }
+}
+
+#[test]
+fn copy_dst_dotdot_path_into_src_is_prepare_error() {
+    // 词面看着在树外（`other/../src/...`），解析后才落在 src 内：词面前缀检查
+    // 骗不过解析后比对。
+    let g = guard("dstdotdot");
+    let src = g.path().join("src");
+    fs::create_dir(&src).unwrap();
+    let other = g.path().join("other");
+    fs::create_dir(&other).unwrap();
+    let dst = other.join("..").join("src").join("copy-tree-destination");
+    match copy_tree(&src, &dst, SymlinkPolicy::Preserve).unwrap_err() {
+        CopyError::Prepare { path, err } => {
+            assert_eq!(path, dst);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        other => panic!("expected Prepare, got {other:?}"),
+    }
+    assert!(!src.join("copy-tree-destination").exists());
+}
+
+#[test]
+fn copy_dst_through_symlinked_parent_into_src_is_prepare_error() {
+    let g = guard("dstlinkparent");
+    let src = g.path().join("src");
+    fs::create_dir(&src).unwrap();
+    let link = g.path().join("link-to-src");
+    if !try_dir_link(&link, &src) {
+        return;
+    }
+    // 经符号链接父目录进入源树：词面上 link-to-src 完全在树外
+    let dst = link.join("copy-tree-destination");
+    match copy_tree(&src, &dst, SymlinkPolicy::Preserve).unwrap_err() {
+        CopyError::Prepare { path, err } => {
+            assert_eq!(path, dst);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        other => panic!("expected Prepare, got {other:?}"),
+    }
+    assert!(!src.join("copy-tree-destination").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn copy_partial_failure_reports_processed_counts() {

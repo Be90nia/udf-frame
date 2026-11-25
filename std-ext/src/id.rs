@@ -35,12 +35,15 @@
 //! - **counter 基址 = 指纹固定派生**（拍板点）：生态为防 id 预测取随机基
 //!   址；确定性变体反其道——`base = 指纹 >> 13 & 0xFFF` 纯函数，回放可复
 //!   现优先于不可预测性（id 非机密值面）；
-//! - **同指纹单权威注册表**（拍板点）：进程级 `OnceLock<Mutex<HashMap>>`
-//!   按指纹共享状态，同指纹 [`IdGen::new`] 复用同一权威——跨句柄严格递增
-//!   、零撞 id（生态文档明示多生成器同域可能撞 id，ulid monotonic；本域把
-//!   该失败类结构上消灭）。注册表项进程内常驻（指纹数量级≈进程内域数）；
-//!   后建句柄的 clock 参数只作本句柄读取面，权威状态由实际 gen 序列喂养，
-//!   停走 armor 兜任意钟错乱；
+//! - **同指纹单权威注册表**（拍板点）：进程级注册表按指纹共享状态，同指纹
+//!   [`IdGen::new`] 复用同一权威——跨句柄严格递增、零撞 id（生态文档明示多
+//!   生成器同域可能撞 id，ulid monotonic；本域把该失败类结构上消灭）。注册
+//!   表项进程内常驻、**永不淘汰**（淘汰 = 重置 counter = 重发 id，破严格单调
+//!   /零撞契约）⇒ 指纹必须来自**有界且可信的域集**（机器/部署/分片），不得
+//!   逐请求/逐租户派生；注册表 population 可读（[`process_registry`]），宿主
+//!   据此发现意外域增长。动态域/多租户自持 [`IdRegistry::bounded`]：超限是
+//!   预期的 [`RegistryFull`] 准入失败，不是静默内存增长。后建句柄的 clock 参
+//!   数只作本句柄读取面，权威状态由实际 gen 序列喂养，停走 armor 兜任意钟错乱；
 //! - **指纹取低 62 位**（拍板点）：高 2 位被 var 位占用——仅高 2 位互异的
 //!   指纹在 rand_b 面同值，自选指纹时避免（stable64 散列输出天然分散）。
 //!
@@ -265,9 +268,130 @@ impl GenState {
     }
 }
 
+/// 指纹注册表（#126）：指纹 → 单权威状态的准入面，可选**有上限**。
+///
+/// 注册表项**进程内常驻、永不淘汰**：淘汰 = 重置 counter = 重发 id，直接破坏
+/// 同指纹严格递增/零撞契约（[`IdGen::gen`]）。所以「有界」只能靠**拒绝新指
+/// 纹**（[`RegistryFull`]），不能靠回收旧项。
+///
+/// 两种用法：
+///
+/// - **进程级**：[`process_registry`] / [`IdGen::new`]，无上限。指纹必须来自
+///   有界且可信的域集（机器/部署/分片），**不得**逐请求/逐租户派生——注册表
+///   不淘汰，指纹空间无界即内存无界；
+/// - **显式自持**：[`IdRegistry::bounded`] 给动态域/多租户面——指纹空间有硬上
+///   界，超限是预期的准入失败而不是静默增长。
+///
+/// 同指纹跨句柄仍共享同一权威（[`IdRegistry::open`] 复用同一个 `Arc`）：严格
+/// 递增与确定性回放语义不变。
+pub struct IdRegistry {
+    states: Mutex<HashMap<u64, Arc<Mutex<GenState>>>>,
+    limit: Option<usize>,
+}
+
+impl IdRegistry {
+    /// 无上限注册表（条目不淘汰——指纹域集由采用方自身保证有界）。
+    pub fn new() -> Self {
+        Self {
+            states: Mutex::new(HashMap::new()),
+            limit: None,
+        }
+    }
+
+    /// 有上限注册表：最多 `max` 个指纹，新指纹超限返回 [`RegistryFull`]。
+    /// 已登记指纹**不受上限影响**（拒绝新指纹，不动既有权威）。
+    pub fn bounded(max: usize) -> Self {
+        Self {
+            states: Mutex::new(HashMap::new()),
+            limit: Some(max),
+        }
+    }
+
+    /// 取/建该指纹的权威句柄（同指纹复用同一权威：跨句柄严格递增、零撞 id）。
+    ///
+    /// `clock` 只作本句柄读取面，语义同 [`IdGen::new`]。
+    pub fn open(&self, fingerprint: u64, clock: Arc<dyn Clock>) -> Result<IdGen, RegistryFull> {
+        let state = self.admit(fingerprint)?;
+        Ok(IdGen {
+            fingerprint,
+            clock,
+            state,
+        })
+    }
+
+    /// 已登记指纹数（population 度量：宿主据此发现意外的域增长）。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.states
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// 空注册表（与 [`IdRegistry::len`] 配对）。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 准入：同指纹命中即复用；新指纹受上限约束，拒绝时不改任何既有项。
+    fn admit(&self, fingerprint: u64) -> Result<Arc<Mutex<GenState>>, RegistryFull> {
+        let mut states = self.states.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(state) = states.get(&fingerprint) {
+            return Ok(state.clone());
+        }
+        if let Some(limit) = self.limit {
+            if states.len() >= limit {
+                return Err(RegistryFull { limit });
+            }
+        }
+        let state = Arc::new(Mutex::new(GenState::new(fingerprint)));
+        states.insert(fingerprint, state.clone());
+        Ok(state)
+    }
+}
+
+impl Default for IdRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 有界注册表拒绝新指纹：`limit` = 配置的指纹数上限（拒绝时 `len == limit`）。
+///
+/// 唯一失败原因是**指纹空间超限**（见 [`IdRegistry::bounded`]）；已发行 id 的
+/// counter 状态禁止重置，故这里没有「淘汰旧指纹再准入」的路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryFull {
+    /// 注册表配置的指纹数上限。
+    pub limit: usize,
+}
+
+impl std::fmt::Display for RegistryFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "id fingerprint registry full ({} fingerprints): new fingerprint rejected \
+             (eviction would reset counters and reissue ids); use one bounded registry per \
+             trusted domain set or shard fingerprints",
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for RegistryFull {}
+
+/// 进程级注册表（[`IdGen::new`] 的权威面）：population 度量读侧 +
+/// 统一准入点。
+///
+/// 宿主可用 `process_registry().len()` 监控指纹数增长——持续增长即「指纹被
+/// 逐请求/逐租户派生」的信号，应改用自持的有界 [`IdRegistry`]（#126）。
+pub fn process_registry() -> &'static IdRegistry {
+    &REGISTRY
+}
+
 /// 进程级指纹注册表：同指纹单权威（撞 id 失败类的结构性消灭）。
-static REGISTRY: LazyLock<Mutex<HashMap<u64, Arc<Mutex<GenState>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static REGISTRY: LazyLock<IdRegistry> = LazyLock::new(IdRegistry::new);
 
 impl IdGen {
     /// 新生成器：同指纹复用进程内既有权威（跨句柄严格递增、零撞 id）。
@@ -275,6 +399,15 @@ impl IdGen {
     /// `clock` 只作本句柄读取面（推荐 [`skeleton::clock::SystemClock`] 生产 /
     /// [`skeleton::clock::MockClock`] 测试）；权威时间线由实际 gen 序列喂养，
     /// 任意钟错乱被停走 armor 兜住。
+    ///
+    /// # 指纹信任边界（#126）
+    ///
+    /// 本构造器走**无上限**的进程级注册表（[`process_registry`]），条目不淘
+    /// 汰：指纹必须是**有界且进程内可信**的域集（机器/部署/分片，见
+    /// [`crate::hash::stable64`] 派生），**不得**逐请求/逐租户/动态生成——那等于
+    /// 无界内存增长。动态域/多租户请自持 [`IdRegistry::bounded`]，把
+    /// [`RegistryFull`] 当准入失败处理；宿主可用 `process_registry().len()`
+    /// 监控指纹数增长。
     ///
     /// # Examples
     ///
@@ -290,11 +423,9 @@ impl IdGen {
     /// ```
     #[must_use]
     pub fn new(fingerprint: u64, clock: Arc<dyn Clock>) -> Self {
-        let mut reg = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
-        let state = reg
-            .entry(fingerprint)
-            .or_insert_with(|| Arc::new(Mutex::new(GenState::new(fingerprint))))
-            .clone();
+        let state = process_registry()
+            .admit(fingerprint)
+            .unwrap_or_else(|e| unreachable!("进程级注册表无上限，准入不会失败：{e}"));
         Self {
             fingerprint,
             clock,

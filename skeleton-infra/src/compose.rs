@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use skeleton::{Effect, EffectBuf, Fragment};
+use skeleton::{Effect, EffectBuf, Fragment, Infallible};
 
 /// 组合器：父子分片，协作=显式结构（字符串路由组合的封死形态）。
 ///
@@ -18,7 +18,11 @@ use skeleton::{Effect, EffectBuf, Fragment};
 ///   miss 不再纯静默：每次计入 [`Combine::route_misses`]（读侧留痕，语义不变）。
 ///   子效果里的 `Emit(CA)` 由核心经 `wrap` 自动上浮为 `Emit(PA)`——`lift_fx`
 ///   只会收到 `Run`/`Cancel` 两形（词表上提与 action 上浮分工，参数零死位）
-/// - `lift_fx`：子效果词表到父词表的显式上提（同形出参：写父 `out`）
+/// - `lift_fx`：子效果词表到父词表的显式上提（同形出参：写父 `out`）。
+///   参数**零省略**：确有子效果而写 `|_, _| {}` 即「显式丢弃」；零效果子件
+///   （`Op = Infallible`，可证明无 `Run`/`Cancel` 可丢）走 [`combine!`](crate::combine!) 省略
+///   `lift` 的形态——那条路径的子件经 [`assert_effect_free`] 在编译期钉死为
+///   `Infallible`
 ///
 /// # Examples
 ///
@@ -152,16 +156,94 @@ where
     }
 }
 
+/// 装配期闸（零开销恒等）：子件效果词表必须**可证明为空**
+/// （`C: Fragment<Op = Infallible>`）。
+///
+/// [`combine`] 的 `lift_fx` 零省略——顺手写 `|_, _| {}` 只是「显式丢弃」。本
+/// 函数把「子词表确实无效果」写成类型界：子件 `Op` 一旦从 `Infallible` 换成
+/// 任何可构造的词表（含 `()`），**装配点即 E0271**，组合不会静默退化成「子
+/// `Run`/`Cancel` 被丢掉而状态迁移照常成功」——「子件加了个效果词表，父组合
+/// 悄悄停止转发」这类装配漂移被挡在编译期（issue#124/#199）。
+///
+/// [`combine!`](crate::combine!) 省略 `lift` 的两种形态都经本函数包住子件；要丢弃非空子词表的
+/// 效果必须写 `discard_effects`（宏）或 `|_, _| {}`（[`combine`] 函数）。恒等
+/// 返回 + 纯泛型实例化：零 dyn、零装箱、零运行时分支。
+pub fn assert_effect_free<C>(child: C) -> C
+where
+    C: Fragment<Op = Infallible>,
+{
+    child
+}
+
 /// 组合宏：从切片表达式生成六闭包，收口 [`combine`] 的 12 泛型参手写。
 ///
 /// 两形态：
 ///
 /// - **变体短形态**：`枚举::变体` 一体生成 wrap/unwrap（unwrap 自 `&PA` 克隆
-///   上浮，要求子 action `Clone`）；`lift` 省略 = 零效果上提——零效果词表
-///   （`Infallible`）用短形态正合适；非零效果词表省略 `lift` = 子效果静默
-///   丢弃，组合根必须自知（显式 `|_, _| {}` 同义，本宏不另设闸）。
+///   上浮，要求子 action `Clone`）。
 /// - **显式形态**：`wrap:`/`unwrap:`/`lift:` 逐项显式给——非 Clone 词表与
 ///   复杂路由的逃生口，语义与 [`combine`] 函数逐参对应。
+///
+/// 效果词表三档，缺省档是**安全档**（issue#124/#199）：
+///
+/// | 写法 | 何时可用 | 语义 |
+/// |---|---|---|
+/// | 省略 `lift` | 子件 `Op = Infallible`（其余词表装配点编译错） | 零效果上提（可证明无 `Run`/`Cancel` 可丢） |
+/// | `lift: <闭包>` | 任意词表 | 逐条显式上提 |
+/// | `discard_effects` | 任意词表 | **显式丢弃**子 `Run`/`Cancel`：数据丢失决定写在调用点 |
+///
+/// 省略 `lift` 时子件先过 [`assert_effect_free`]（`C: Fragment<Op = Infallible>`
+/// 类型界）：子件日后换成非空效果词表，父组合在装配点编译失败，不会静默变成
+/// 丢效果的组合。两种形态的非空词表漏写效果各有一份编译期拒绝：
+///
+/// 短形态省略 `lift` + 非空子词表 = 编译错（`ChildOp` 可构造 ⇒ 无零效果证明）：
+///
+/// ```compile_fail
+/// use skeleton::{EffectBuf, Fragment};
+///
+/// struct Parent { child: u32 }
+/// enum PAction { Child(u32) }
+/// enum ChildOp { Notify }
+/// struct ChildFx;
+///
+/// impl Fragment for ChildFx {
+///     type State = u32;
+///     type Action = u32;
+///     type Op = ChildOp;
+///     fn reduce(&self, s: &u32, a: u32, _out: &mut EffectBuf<u32, ChildOp>) -> u32 { s + a }
+/// }
+///
+/// fn fragment() -> impl Fragment<State = Parent, Action = PAction, Op = ChildOp> {
+///     skeleton_infra::combine!(ChildFx, Parent.child, PAction::Child) // E0271/E0277
+/// }
+/// ```
+///
+/// 显式形态省略 `lift` + 非空子词表 = 同一个闸（不是另一条宽松路径）：
+///
+/// ```compile_fail
+/// use skeleton::{EffectBuf, Fragment};
+///
+/// struct Parent { child: u32 }
+/// enum PAction { Child(u32) }
+/// enum ChildOp { Notify }
+/// struct ChildFx;
+///
+/// impl Fragment for ChildFx {
+///     type State = u32;
+///     type Action = u32;
+///     type Op = ChildOp;
+///     fn reduce(&self, s: &u32, a: u32, _out: &mut EffectBuf<u32, ChildOp>) -> u32 { s + a }
+/// }
+///
+/// fn fragment() -> impl Fragment<State = Parent, Action = PAction, Op = ChildOp> {
+///     skeleton_infra::combine!(
+///         ChildFx,
+///         Parent.child,
+///         wrap: PAction::Child,
+///         unwrap: |a: &PAction| match a { PAction::Child(c) => Some(*c) },
+///     ) // E0271/E0277
+/// }
+/// ```
 ///
 /// 切片表达式限 `状态类型.字段名` 裸段（宏字面限制：泛型/路径状态退回
 /// [`combine`] 显式形态）。产物 `Op` 由采用方返回类型注解钉住（与
@@ -221,10 +303,9 @@ where
 /// ```
 #[macro_export]
 macro_rules! combine {
-    // 变体短形态：wrap/unwrap 由变体构造子一体生成（unwrap 克隆上浮）；
-    // lift 省略 = 零效果上提（委托显式无 lift 臂）
-    ($child:expr, $state:ident . $field:ident, $pa:ident :: $variant:ident
-        $(, lift: $lift:expr $(,)?)?) => {
+    // 变体短形态（省略 lift = 安全形态）：wrap/unwrap 由变体构造子一体生成
+    // （unwrap 克隆上浮），效果面经 assert_effect_free 的 Op=Infallible 闸
+    ($child:expr, $state:ident . $field:ident, $pa:ident :: $variant:ident $(,)?) => {
         $crate::combine!(
             $child,
             $state . $field,
@@ -233,10 +314,37 @@ macro_rules! combine {
                 $pa :: $variant(c) => Some(c.clone()),
                 _ => None,
             },
-            $(lift: $lift,)?
         )
     };
-    // 显式形态（无 lift）：六闭包全生成/收编，lift 固定零效果上提
+    // 变体短形态 + 显式 lift
+    ($child:expr, $state:ident . $field:ident, $pa:ident :: $variant:ident,
+        lift: $lift:expr $(,)?) => {
+        $crate::combine!(
+            $child,
+            $state . $field,
+            wrap: $pa :: $variant,
+            unwrap: |p: &$pa| match p {
+                $pa :: $variant(c) => Some(c.clone()),
+                _ => None,
+            },
+            lift: $lift,
+        )
+    };
+    // 变体短形态 + 显式丢弃（子效果不转发：数据丢失决定在调用点显形）
+    ($child:expr, $state:ident . $field:ident, $pa:ident :: $variant:ident,
+        discard_effects $(,)?) => {
+        $crate::combine!(
+            $child,
+            $state . $field,
+            wrap: $pa :: $variant,
+            unwrap: |p: &$pa| match p {
+                $pa :: $variant(c) => Some(c.clone()),
+                _ => None,
+            },
+            discard_effects,
+        )
+    };
+    // 显式形态（省略 lift = 安全形态）：子件经零效果闸，lift 固定空转
     ($child:expr, $state:ident . $field:ident,
         wrap: $wrap:expr, unwrap: $unwrap:expr $(,)?) => {
         $crate::compose::combine(
@@ -244,11 +352,23 @@ macro_rules! combine {
             |p: &mut $state, c| p.$field = c, // set：子切片写回（c 类型由赋值位钉死）
             $wrap,
             $unwrap,
+            $crate::compose::assert_effect_free($child),
+            |_, _| {},
+        )
+    };
+    // 显式形态 + 显式丢弃
+    ($child:expr, $state:ident . $field:ident,
+        wrap: $wrap:expr, unwrap: $unwrap:expr, discard_effects $(,)?) => {
+        $crate::compose::combine(
+            |p: &$state| &p.$field,
+            |p: &mut $state, c| p.$field = c,
+            $wrap,
+            $unwrap,
             $child,
             |_, _| {},
         )
     };
-    // 显式形态（有 lift）：与 combine 函数逐参对应
+    // 显式形态 + lift：与 combine 函数逐参对应
     ($child:expr, $state:ident . $field:ident,
         wrap: $wrap:expr, unwrap: $unwrap:expr, lift: $lift:expr $(,)?) => {
         $crate::compose::combine(

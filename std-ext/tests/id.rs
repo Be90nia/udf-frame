@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use skeleton::clock::{Clock, MockClock};
-use std_ext::id::{Id, IdGen};
+use std_ext::id::{Id, IdGen, IdRegistry, RegistryFull, process_registry};
 
 // ---- 字段抽取（RFC 9562 §5.7 布局位面）----
 
@@ -264,6 +264,66 @@ fn different_fingerprints_are_independent() {
     let id_b = b.gen();
     assert_eq!(rand_a(id_a), rand_a(id_b), "互不干扰：各自从自身基址起步");
     assert_ne!(rand_b(id_a), rand_b(id_b), "指纹面互异 → id 互异");
+}
+
+// ---- 注册表准入与 population 度量（#126）----
+
+/// 有界注册表：上限只挡**新**指纹。拒绝**不淘汰**既有项（淘汰=重置 counter=
+/// 重发 id），既有指纹重入照旧复用同一权威（跨句柄严格递增）。
+#[test]
+fn bounded_registry_rejects_new_fingerprint_without_evicting() {
+    let clock = Arc::new(MockClock::new());
+    clock.advance(Duration::from_millis(1));
+    let reg = IdRegistry::bounded(1);
+    assert!(reg.is_empty(), "初始 population = 0");
+
+    let a = reg.open(0x10_0020, clock.clone()).expect("首指纹准入");
+    assert_eq!(reg.len(), 1);
+
+    let err = reg.open(0x10_0021, clock.clone()).unwrap_err();
+    assert_eq!(err, RegistryFull { limit: 1 }, "超限 = 有因的类型化拒绝");
+    assert_eq!(reg.len(), 1, "拒绝新指纹不淘汰既有项");
+
+    let a2 = reg
+        .open(0x10_0020, clock)
+        .expect("既有指纹重入不受上限影响");
+    let x = a.gen();
+    let y = a2.gen();
+    assert!(
+        y > x,
+        "同指纹跨句柄严格递增（counter 未重置）：{x:?} -> {y:?}"
+    );
+}
+
+/// 无界注册表 population 精确：同指纹只占一项（复用权威），不同指纹各一项。
+#[test]
+fn unbounded_registry_population_counts_one_per_fingerprint() {
+    let clock = Arc::new(MockClock::new());
+    clock.advance(Duration::from_millis(1));
+    let reg = IdRegistry::new();
+    let _a = reg.open(0x10_0024, clock.clone()).unwrap();
+    let _a2 = reg.open(0x10_0024, clock.clone()).unwrap();
+    assert_eq!(reg.len(), 1, "同指纹复用同一权威，不重复入册");
+    let _b = reg.open(0x10_0025, clock).unwrap();
+    assert_eq!(reg.len(), 2);
+}
+
+/// 进程级 population 度量可读且随新指纹增长（只入册不淘汰 ⇒ 单调不减；并发
+/// 测试只会加项，故断言取下界）。
+#[test]
+fn process_registry_population_is_readable_and_grows() {
+    let clock = Arc::new(MockClock::new());
+    clock.advance(Duration::from_millis(1));
+    let before = process_registry().len();
+    let a = IdGen::new(0x10_0022, clock.clone());
+    let b = IdGen::new(0x10_0023, clock);
+    let after = process_registry().len();
+    assert!(
+        after >= before + 2,
+        "两个新指纹必须入册：{before} -> {after}"
+    );
+    assert_eq!(a.fingerprint(), 0x10_0022);
+    assert_eq!(b.fingerprint(), 0x10_0023);
 }
 
 // ---- 标准连字形式（RFC 9562 §5.1 大端）----

@@ -279,6 +279,45 @@ fn combine_macro_short_form_one_line_assembly() {
     assert!(out.is_empty() && out2.is_empty(), "零效果词表无效果可产");
 }
 
+/// 非空子词表 + `discard_effects`：显式丢弃档——装配编译通过，子 `Run` 一条不
+/// 转发，状态迁移不受影响。同一子件**省略** `lift` 的写法是编译错（见 compose.rs
+/// 宏文档的两份 compile_fail doctest）：丢效果的决定必须写在调用点。
+#[test]
+fn combine_macro_discard_effects_is_explicit_opt_in() {
+    fn discarding_fragment()
+    -> impl Fragment<State = ParentState, Action = ParentAction, Op = ParentOp> {
+        skeleton_infra::combine!(
+            ChildFeature,
+            ParentState.child,
+            ParentAction::Child,
+            discard_effects
+        )
+    }
+
+    let s0 = ParentState {
+        child: ChildState { count: 0 },
+        done: false,
+    };
+    let mut out = EffectBuf::new();
+    let s1 = discarding_fragment().reduce(&s0, ParentAction::Child(ChildAction::Inc), &mut out);
+    assert_eq!(s1.child.count, 1, "状态迁移照常");
+    assert_eq!(
+        std::iter::from_fn(|| out.pop_front()).count(),
+        0,
+        "discard_effects：子 Run 一条都不转发"
+    );
+
+    // 与显式 lift 形态对拍：丢弃只影响效果面，状态迁移必须同义
+    let mut lifted = EffectBuf::new();
+    let s2 = macro_fragment().reduce(&s0, ParentAction::Child(ChildAction::Inc), &mut lifted);
+    assert_eq!(s1, s2, "丢弃 vs 上提：状态同义");
+    assert_eq!(
+        std::iter::from_fn(|| lifted.pop_front()).count(),
+        1,
+        "lift 形态把子 Run 上提为父效果"
+    );
+}
+
 // ── TestStore 验收形状 ───────────────────────────────────────────────────
 
 /// 验收纪律 1+2：逐动作断言 + 效果回填断言（原样流程）。
