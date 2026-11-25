@@ -2216,6 +2216,7 @@ mod reservation_handoff_regressions {
             },
         )
         .expect("initial worker");
+        let _audit = pool.subscribe_audit(|_| {});
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
             pool.resize(ThreadPoolTuning::new(4, 4, 8))
@@ -2227,6 +2228,12 @@ mod reservation_handoff_regressions {
             assert_eq!(g.reservations, 0, "all batch reservations are rolled back");
             assert_eq!(g.spawn_failures, 1, "gate panic is observable");
         }
+        assert!(
+            pool.take_audit_events()
+                .iter()
+                .any(|event| event.kind == PoolAuditKind::Resized),
+            "the committed target resize is audited before the original panic resumes"
+        );
 
         pool.resize(ThreadPoolTuning::new(4, 4, 8))
             .expect("later resize can fill the target");
