@@ -174,6 +174,36 @@ fn shutdown_registry_run_outcome_report_events() {
     );
 }
 
+/// issue#149：`timeout_ms` 越过 `u64::MAX` 毫秒 ⇒ 饱和到 `u64::MAX`（裸 `as u64`
+/// 会把 2^64 ms 回绕成 0，遥测谎报「零超时」）。注册与逐组件开始两处同口径。
+#[test]
+fn shutdown_timeout_ms_saturates_at_u64_max() {
+    let cap = capture();
+    let c = ShutdownCoordinator::new();
+    let _guard = tracing::subscriber::set_default(cap.clone());
+    // 2^64 ms：恰越 u64::MAX（裸转换回绕成 0），仍远在 Instant 表示范围内。
+    let huge = Duration::from_millis(u64::MAX).saturating_add(Duration::from_millis(1));
+    let field = format!("timeout_ms={}", u64::MAX);
+
+    c.register_with_timeout("huge", || {}, huge).unwrap();
+    cap.assert_event(
+        "skeleton::shutdown::registry",
+        Level::INFO,
+        &["name=huge", field.as_str()],
+    );
+    let report = c.shutdown();
+    assert_eq!(
+        report.per_component[0].kind,
+        OutcomeKind::Stopped,
+        "饱和只改遥测值：等待仍用原 Duration（组件立即完成，不因超大超时延后）"
+    );
+    cap.assert_event(
+        "skeleton::shutdown::run",
+        Level::INFO,
+        &["name=huge", field.as_str()],
+    );
+}
+
 #[test]
 fn shutdown_timed_out_outcome_warns() {
     let cap = capture();

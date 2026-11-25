@@ -671,7 +671,7 @@ impl Scheduler {
         // 唤醒驱动线程：更早 deadline 的注册即时生效（非睡满旧锚）。
         // Telemetry must not sit before this mandatory wakeup.
         self.shared.signal.notify_all();
-        embed_event!(debug, target: "skeleton::scheduler::register", seq = seq, kind = kind_name, delay_ms = delay.as_millis() as u64);
+        embed_event!(debug, target: "skeleton::scheduler::register", seq = seq, kind = kind_name, delay_ms = crate::retry::telemetry_ms(delay));
         Ok(TaskHandle {
             cell,
             armed: true,
@@ -780,7 +780,7 @@ impl Scheduler {
                         // Publish the new heap entry before invoking the host subscriber.
                         #[cfg(feature = "log-embed")]
                         if overloaded {
-                            embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "overload_rearm", period_ms = period.as_millis() as u64);
+                            embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "overload_rearm", period_ms = crate::retry::telemetry_ms(*period));
                         }
                     }
                 }

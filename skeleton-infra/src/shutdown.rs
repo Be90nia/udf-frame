@@ -216,7 +216,7 @@ impl Component {
             info,
             target: "skeleton::shutdown::run",
             name = %name,
-            timeout_ms = timeout.map(|d| d.as_millis() as u64)
+            timeout_ms = timeout.map(saturating_ms)
         );
         let outcome = match timeout {
             None => match catch_unwind(AssertUnwindSafe(f)) {
@@ -338,6 +338,14 @@ fn await_watchdog(
         },
     };
     ComponentOutcome { name, kind }
+}
+
+/// 遥测毫秒（issue#149）：`as_millis` 是 `u128`，`as u64` 对超
+/// `u64::MAX` 毫秒的 `Duration` 会回绕成小值（遥测看起来像「零超时」）⇒
+/// 饱和到 `u64::MAX`，不回绕、不改单位（单位由函数名钉死）。
+#[cfg(feature = "log-embed")]
+fn saturating_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// panic 载荷 → 人读消息（`&'static str`/`String` 常见两形，其余如实兜底）。
@@ -487,7 +495,7 @@ impl ShutdownCoordinator {
             target: "skeleton::shutdown::registry",
             name = %event_name,
             count = count,
-            timeout_ms = timeout.map(|d| d.as_millis() as u64)
+            timeout_ms = timeout.map(saturating_ms)
         );
         Ok(())
     }

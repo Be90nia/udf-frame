@@ -22,15 +22,15 @@ use std::fmt::Write as _;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
-use skeleton::clock::{MockClock, SystemClock};
+use skeleton::clock::{Clock, MockClock, SystemClock};
 use std_ext::backoff::backoff_delay;
 use std_ext::cache::{LruCache, TtlCache};
 use std_ext::fsx::{Sort, SymlinkPolicy, TempDir, copy_tree, temp_dir_in, walk};
 use std_ext::iter::process_results;
 use std_ext::ratelimit::TokenBucket;
-use std_ext::retry::{RetryPolicy, retry_if};
+use std_ext::retry::{RetryPolicy, Sleeper, retry_if};
 use std_ext::scheduler::{AdmissionError, Scheduler};
 
 use tracing::field::{Field, Visit};
@@ -492,6 +492,42 @@ fn scheduler_overload_rearm_warns() {
     );
 }
 
+/// issue#149：`delay_ms`/`period_ms` 越过 `u64::MAX` 毫秒 ⇒ 饱和到 `u64::MAX`
+/// （裸 `as u64` 会把 2^64 ms 回绕成 0，遥测谎报「零延迟」）。
+#[test]
+fn scheduler_duration_fields_saturate_at_u64_max() {
+    let cap = capture();
+    let clock = Arc::new(MockClock::new());
+    let sched = Scheduler::new(clock.clone());
+    let _guard = tracing::subscriber::set_default(cap.clone());
+    // 2^64 ms：恰越 u64::MAX（裸转换回绕成 0），仍远在 Instant 表示范围内。
+    let huge = Duration::from_millis(u64::MAX).saturating_add(Duration::from_millis(1));
+    let delay_field = format!("delay_ms={}", u64::MAX);
+    let period_field = format!("period_ms={}", u64::MAX);
+
+    let pending = sched.after(huge, || {}).unwrap();
+    cap.assert_event(
+        "skeleton::scheduler::register",
+        Level::DEBUG,
+        &["kind=after", delay_field.as_str()],
+    );
+    assert!(pending.cancel(), "清掉堆内条目，下轮 tick 只点火周期任务");
+
+    // 超载退化重臂：回调内推进虚拟钟越过下锚 ⇒ 同一 huge 周期落进 period_ms。
+    let c2 = Arc::clone(&clock);
+    sched
+        .every(huge, move || c2.advance(huge))
+        .unwrap()
+        .detach();
+    clock.advance(huge);
+    assert_eq!(sched.tick(), 1, "周期任务首火");
+    cap.assert_event(
+        "skeleton::scheduler::fire",
+        Level::WARN,
+        &["kind=every", "reason=overload_rearm", period_field.as_str()],
+    );
+}
+
 #[test]
 fn scheduler_callback_panic_warns() {
     let cap = capture();
@@ -824,6 +860,75 @@ fn retry_attempt_start_and_retry_verdict() {
         "skeleton::retry::verdict",
         Level::WARN,
         &["attempt=2", "decision=retry", "backoff_ms=200"],
+    );
+}
+
+/// 不推进时间的 Sleeper：遥测值域断言不关心时间线（MAX 量级退避在 MockClock
+/// 上会因 `Instant` 表示范围 fail-closed panic，此处只吞掉睡眠请求）。
+struct FrozenClock(MockClock);
+
+impl Clock for FrozenClock {
+    fn now_instant(&self) -> Instant {
+        self.0.now_instant()
+    }
+    fn now_system(&self) -> SystemTime {
+        self.0.now_system()
+    }
+}
+
+impl Sleeper for FrozenClock {
+    fn sleep(&self, _d: Duration) {}
+}
+
+// issue#149：duration→u64 遥测字段饱和到 u64::MAX，不回绕成「小值/零延迟」。
+#[test]
+fn retry_telemetry_saturates_beyond_u64() {
+    const U64_MAX: u64 = u64::MAX;
+    let cap = capture();
+    // base = u64::MAX 秒（毫秒量级远超 u64::MAX）> max = 1s ⇒ 既触发截平事件，
+    // 又让 base_ms/max_ms/backoff_ms/linear_ms/capped_ms 全部走到饱和面。
+    let policy = RetryPolicy::new(2, Duration::from_secs(U64_MAX), Duration::from_secs(1))
+        .with_jitter(|d| d);
+    let _guard = tracing::subscriber::set_default(cap.clone());
+    let res = retry_if(
+        || Err::<(), &str>("x"),
+        &policy,
+        &FrozenClock(MockClock::new()),
+        |_| true,
+    );
+    assert!(res.is_err());
+    cap.assert_event(
+        "skeleton::retry::verdict",
+        Level::WARN,
+        &[
+            "decision=retry",
+            &format!("base_ms={U64_MAX}"),
+            "max_ms=1000",
+            "backoff_ms=1000",
+        ],
+    );
+    cap.assert_event(
+        "skeleton::retry::backoff",
+        Level::WARN,
+        &[&format!("linear_ms={U64_MAX}"), "capped_ms=1000"],
+    );
+}
+
+// issue#149 / #148：ratelimit 的 wait_ns 同样饱和（饱和等待 = u64::MAX 纳秒）。
+#[test]
+fn ratelimit_wait_ns_saturates() {
+    const U64_MAX: u64 = u64::MAX;
+    let cap = capture();
+    let clock = Arc::new(MockClock::new());
+    let bucket = TokenBucket::new(clock, 1.0, 1e-30);
+    let _guard = tracing::subscriber::set_default(cap.clone());
+    bucket.try_acquire(1).expect("清空满桶");
+    let err = bucket.try_acquire(1).expect_err("空桶必拒");
+    assert_eq!(err.wait(), Duration::MAX);
+    cap.assert_event(
+        "skeleton::ratelimit::try_acquire",
+        Level::WARN,
+        &["reason=insufficient", &format!("wait_ns={U64_MAX}")],
     );
 }
 
