@@ -1480,7 +1480,7 @@ mod tests {
             let handle = sched
                 .after(Duration::from_millis(1), || {})
                 .expect("未关闸注册必成");
-            let worker = sched.spawn_worker();
+            let mut worker = sched.spawn_worker();
             wait_until("worker 跑过三圈", || sched.worker_passes() >= 3);
             let calls = clock.calls.load(AtomicOrd::SeqCst);
             // Stop this worker without Scheduler::close(): close() takes the same
