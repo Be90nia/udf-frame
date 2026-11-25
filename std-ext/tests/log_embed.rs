@@ -289,26 +289,23 @@ fn fsx_copy_partial_failure_warns() {
 }
 
 #[test]
-fn fsx_tempdir_drop_cleanup_failure_warns() {
+fn fsx_tempdir_drop_cleanup_failure_does_not_call_host_subscriber() {
     let g = data_guard("tmpdrop");
     let tmp = temp_dir_in(g.path(), "victim-").unwrap();
     fs::remove_dir_all(tmp.path()).unwrap(); // 树被外部先删 → Drop 内 rm_all 必败
     let cap = capture();
     let _guard = tracing::subscriber::set_default(cap.clone());
     drop(tmp);
-    cap.assert_event(
-        "skeleton::fsx::tempdir",
-        Level::WARN,
-        // 审计 F5 token 语义下 "victim-" 是路径中段非独立 token——victim 归属
-        // 由本测试独占 scratch 根自证；"error=rm "（含空格→contains）钉 rm_all 失败语义
-        &["path=", "error=rm "],
+    assert_eq!(
+        cap.len(),
+        0,
+        "TempDir::drop must use only its fallible best-effort reporter"
     );
 
-    // 对照面：清理成功零事件（只埋失败决策点）。
+    // 对照面：清理成功同样不发事件。
     let clean = temp_dir_in(g.path(), "clean-").unwrap();
-    let before = cap.len();
     drop(clean);
-    assert_eq!(cap.len(), before, "清理成功路径零埋点事件");
+    assert_eq!(cap.len(), 0, "Drop paths never invoke the host subscriber");
 }
 
 // ---- iter 域（target skeleton::iter::process_results；首 Err 短路=异常路径

@@ -884,10 +884,10 @@ mod log_embed {
         );
     }
 
-    // 埋点「TempDir RAII 清理失败」：树被外部先删 → Drop 内 rm_all 失败 → warn
-    //（path/error 入字段；eprintln fail-visible 通道保持不变，事件是增量面）。
+    // Drop cleanup failure uses only a fallible best-effort reporter. It must not
+    // invoke the host tracing subscriber, even when log-embed is enabled.
     #[test]
-    fn tempdir_drop_cleanup_failure_emits_warn() {
+    fn tempdir_drop_cleanup_failure_does_not_emit_event() {
         let g = guard("logtmpdir");
         let tmp = temp_dir_in(g.path(), "victim-").unwrap();
         fs::remove_dir_all(tmp.path()).unwrap();
@@ -895,9 +895,9 @@ mod log_embed {
         let capture = Capture::new();
         tracing::subscriber::with_default(capture.subscriber(), || drop(tmp));
 
-        let e = log_capture::only(&capture, "skeleton::fsx::tempdir");
-        assert_eq!(e.level, Level::WARN);
-        assert!(e.field("path").unwrap().contains("victim-"));
-        assert!(!e.field("error").unwrap().is_empty());
+        assert!(
+            capture.events().is_empty(),
+            "TempDir::drop must not call an arbitrary host subscriber"
+        );
     }
 }

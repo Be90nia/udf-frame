@@ -28,6 +28,24 @@
 //! 演进预留结构位。
 
 use std::borrow::Borrow;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static POOL_AUDIT_TICKET_DROP_PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of close callbacks that panicked while being invoked by Drop.
+///
+/// Explicit [`PoolAuditTicket::close`] reports its panic to the caller and does not
+/// increment this best-effort Drop counter. The value saturates rather than wrapping.
+pub fn pool_audit_ticket_drop_panic_count() -> u64 {
+    POOL_AUDIT_TICKET_DROP_PANICS.load(Ordering::Relaxed)
+}
+
+fn record_pool_audit_ticket_drop_panic() {
+    let _ =
+        POOL_AUDIT_TICKET_DROP_PANICS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_add(1))
+        });
+}
 
 /// 池指标共享核心形（可观测契约的统一读数面）：任何 [`PoolManaged`] 实现的
 /// 指标类型都经 [`Borrow`] 可达本形——宿主对任何池取同一组核心读数，池特有
@@ -156,28 +174,43 @@ pub struct PoolAuditEvent {
     pub kind: PoolAuditKind,
 }
 
-/// 池审计订阅票据：Drop = 关闭事件流（落闸清槽，零开销恢复），`#[must_use]`
-/// 拦截裸调用——与骨架审计票据同一纪律。票据对采用方不透明，经实现方
-/// [`PoolManaged::subscribe_audit`] 取得；再次订阅 = 替换现役流，旧票据凭
-/// 实现方代次对账 inert。
+/// 池审计订阅票据：Drop 尝试关闭事件流（落闸清槽，零开销恢复），`#[must_use]`
+/// 拦截裸调用——与骨架审计票据同一纪律。Drop 捕获关闭回调 panic 并累计
+/// [`pool_audit_ticket_drop_panic_count`]，不会在现有 unwind 中触发二次 panic。
+/// 需要观察关闭回调 panic 的调用方应显式调用 [`PoolAuditTicket::close`]。
+/// 票据对采用方不透明，经实现方 [`PoolManaged::subscribe_audit`] 取得；再次
+/// 订阅 = 替换现役流，旧票据凭实现方代次对账 inert。
 #[must_use = "审计票据被丢弃即立即关闭事件流——`pool.subscribe_audit(..);` 裸调用 = 静默关闭；绑定持有才持续记录"]
 pub struct PoolAuditTicket {
     close: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl PoolAuditTicket {
-    /// 实现方构造挂点（契约即可实现）：`close` 在票据 Drop 时恰执行一次。
+    /// 实现方构造挂点（契约即可实现）：回调最多执行一次。
     pub fn new(close: impl FnOnce() + Send + 'static) -> Self {
         Self {
             close: Some(Box::new(close)),
         }
+    }
+
+    /// 显式关闭并观察回调 panic。需要感知关闭失败的调用方应使用此入口；
+    /// 返回的 panic payload 为原始 payload，不会被格式化或替换。
+    pub fn close(mut self) -> Result<(), Box<dyn std::any::Any + Send>> {
+        let Some(close) = self.close.take() else {
+            return Ok(());
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(close))
     }
 }
 
 impl Drop for PoolAuditTicket {
     fn drop(&mut self) {
         if let Some(close) = self.close.take() {
-            close();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(close)).is_err() {
+                // Drop is best-effort and non-panicking, including during an existing
+                // unwind. The bounded counter is the authoritative failure signal.
+                record_pool_audit_ticket_drop_panic();
+            }
         }
     }
 }
@@ -285,4 +318,60 @@ pub trait PoolManaged {
     /// 审计挂点（美团「事后审计」）：池域自有事件流（seq 单调 + 容量环），
     /// 票据 Drop = 关流。
     fn subscribe_audit(&self, f: impl FnMut(&PoolAuditEvent) + Send + 'static) -> PoolAuditTicket;
+}
+
+#[cfg(test)]
+mod pool_audit_ticket_drop_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn drop_contains_callback_panic_and_records_it_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let before = pool_audit_ticket_drop_panic_count();
+
+        drop(PoolAuditTicket::new(move || {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("injected close panic");
+        }));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            pool_audit_ticket_drop_panic_count() >= before.saturating_add(1),
+            "the global counter may also include concurrent tests, but this Drop must increment it"
+        );
+    }
+
+    #[test]
+    fn explicit_close_returns_original_panic_payload() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let result = PoolAuditTicket::new(move || {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("explicit close failure");
+        })
+        .close();
+
+        let payload = result.expect_err("explicit close must expose callback panic");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>(),
+            Some(&"explicit close failure")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_callback_panic_does_not_replace_existing_unwind() {
+        let result = std::panic::catch_unwind(|| {
+            let _ticket = PoolAuditTicket::new(|| panic!("secondary close panic"));
+            panic!("primary application panic");
+        });
+        let payload = result.expect_err("the primary panic must propagate");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>(),
+            Some(&"primary application panic")
+        );
+    }
 }
