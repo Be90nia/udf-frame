@@ -660,9 +660,15 @@ impl Scheduler {
     /// 返回实际点火数（惰性墓碑不计）。回调在调用线程**锁外**执行（重入
     /// 安全）；回调内推进虚拟钟（MockClock）⇒ 后续到期条目同轮继续火。
     pub fn tick(&self) -> usize {
+        self.tick_inner(true)
+    }
+
+    /// Worker mode suppresses synchronous host telemetry: a subscriber is arbitrary
+    /// synchronous code and must not be allowed to stall the bounded-progress driver.
+    fn tick_inner(&self, emit_telemetry: bool) -> usize {
         // 墓碑清扫（#52）：取消密集时把堆内已取消条目提前回收（不等原
         // deadline）；阈值未达 ⇒ O(1) 早退。
-        self.reclaim_cancelled();
+        self.reclaim_cancelled_with_telemetry(emit_telemetry);
         let mut fired = 0;
         loop {
             // 每轮重读 now：回调内推进虚拟钟（MockClock）⇒ 后续到期条目同轮续火。
@@ -676,7 +682,7 @@ impl Scheduler {
                     _ => return fired,
                 }
             };
-            if self.fire(entry, now) {
+            if self.fire(entry, now, emit_telemetry) {
                 fired += 1;
             }
         }
@@ -684,15 +690,16 @@ impl Scheduler {
 
     /// 点火单条目（调用方已出堆）：锁外执行回调，锁内做终态/重臂裁决。
     /// 返回是否实际执行（出堆前已 cancel 的惰性墓碑=静默丢弃不执行）。
-    fn fire(&self, entry: Entry, _now: Instant) -> bool {
+    fn fire(&self, entry: Entry, _now: Instant, emit_telemetry: bool) -> bool {
         // 惰性墓碑：出堆前已 cancel（state 终态）⇒ 静默丢弃不执行。
         if entry.task.state.load(AtomicOrd::SeqCst) != PENDING {
-            embed_event!(debug, target: "skeleton::scheduler::fire", seq = entry.seq, skipped = true);
+            if emit_telemetry {
+                embed_event!(debug, target: "skeleton::scheduler::fire", seq = entry.seq, skipped = true);
+            }
             return false;
         }
         #[cfg(feature = "log-embed")]
         let kind_name = task_kind_name(&entry.task.kind);
-        embed_event!(debug, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name);
         match &entry.task.kind {
             TaskKind::Once(run) => {
                 // take 后锁外执行：回调体已消费，双执行结构性排除。
@@ -713,7 +720,9 @@ impl Scheduler {
                 self.shared.retire(&entry.task, DONE);
                 if callback_panicked {
                     // The live slot is released before invoking the host subscriber.
-                    embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "panic");
+                    if emit_telemetry {
+                        embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "panic");
+                    }
                 }
                 // CAS 失败=检查-执行窗口内被 cancel：本次照跑（文档化语义）。
             }
@@ -757,10 +766,15 @@ impl Scheduler {
                 // 不 notify：重臂只会把 deadline 推后，park 锚提前无害。
                 // Publish the new heap entry before invoking the host subscriber.
                 #[cfg(feature = "log-embed")]
-                if overloaded {
+                if emit_telemetry && overloaded {
                     embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "overload_rearm", period_ms = period.as_millis() as u64);
                 }
             }
+        }
+        // Emit only after callback execution and its terminal/rearm transition. Worker
+        // mode passes false and never invokes the host subscriber from the driver loop.
+        if emit_telemetry {
+            embed_event!(debug, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name);
         }
         true
     }
@@ -844,7 +858,7 @@ impl Scheduler {
     ///
     /// 清扫在状态锁内重建堆（只保留 PENDING 条目），被摘条目**移出锁外**
     /// 析构（回调捕获的析构不得在堆锁内跑）。返回被回收的条目数。
-    fn reclaim_cancelled(&self) -> usize {
+    fn reclaim_cancelled_with_telemetry(&self, emit_telemetry: bool) -> usize {
         let removed = {
             let mut s = lock(&self.shared.state);
             let tombstones = self.shared.tombstones.load(AtomicOrd::SeqCst);
@@ -875,7 +889,9 @@ impl Scheduler {
         if reclaimed > 0 {
             // 唤醒驱动线程：park 锚（堆顶 deadline）可能提前 ⇒ 重算。
             self.shared.signal.notify_all();
-            embed_event!(debug, target: "skeleton::scheduler::fire", reclaimed = reclaimed as u64);
+            if emit_telemetry {
+                embed_event!(debug, target: "skeleton::scheduler::fire", reclaimed = reclaimed as u64);
+            }
         }
         reclaimed
     }
@@ -1103,7 +1119,7 @@ fn worker_loop(sched: Arc<Scheduler>, stop: Arc<AtomicBool>) {
             return;
         }
         // 墓碑清扫（#52）：取消后尽快回收，避免驱动为墓碑多醒一拍。
-        sched.reclaim_cancelled();
+        sched.reclaim_cancelled_with_telemetry(false);
         // park 锚 = 最近**有效** deadline（跳过堆顶墓碑——墓碑不是有效
         // deadline，驱动不该为它多醒一拍，#52）。
         let park_until = sched.next_pending_deadline();
@@ -1114,7 +1130,7 @@ fn worker_loop(sched: Arc<Scheduler>, stop: Arc<AtomicBool>) {
                 // 循环体兜底 catch：正常零命中（回调 panic 已被 fire 层
                 // catch_unwind 摘除）；命中 = 框架自身 bug，留痕后退出
                 // （不静默带病续跑）。
-                if catch_unwind(AssertUnwindSafe(|| sched.tick())).is_err() {
+                if catch_unwind(AssertUnwindSafe(|| sched.tick_inner(false))).is_err() {
                     sched.shared.panics.fetch_add(1, AtomicOrd::SeqCst);
                     // 异常路径（驱动内部 panic）：留痕后退出，不静默带病续跑。
                     // Do not invoke a synchronous host subscriber while terminating the worker.
@@ -1543,6 +1559,7 @@ mod tests {
         struct ReentrantClock {
             mock: Arc<MockClock>,
             target: Mutex<Weak<Scheduler>>,
+            in_call: AtomicBool,
         }
 
         impl ReentrantClock {
@@ -1550,12 +1567,14 @@ mod tests {
                 Arc::new(Self {
                     mock,
                     target: Mutex::new(Weak::new()),
+                    in_call: AtomicBool::new(false),
                 })
             }
         }
 
         impl Clock for ReentrantClock {
             fn now_instant(&self) -> Instant {
+                self.in_call.store(true, AtomicOrd::SeqCst);
                 let weak = self.target.lock().expect("probe 目标调度器锁").clone();
                 if let Some(sched) = weak.upgrade() {
                     if let Err(TryLockError::WouldBlock) = sched.shared.state.try_lock() {
@@ -1566,7 +1585,9 @@ mod tests {
                     let _ = sched.is_closed();
                     let _ = sched.next_deadline();
                 }
-                self.mock.now_instant()
+                let now = self.mock.now_instant();
+                self.in_call.store(false, AtomicOrd::SeqCst);
+                now
             }
 
             fn now_system(&self) -> SystemTime {
@@ -1585,16 +1606,34 @@ mod tests {
                 .after(Duration::from_millis(1), || {})
                 .expect("注册必成")
                 .detach();
-            let worker = sched.spawn_worker();
+            let mut worker = sched.spawn_worker();
             let deadline = Instant::now() + Duration::from_secs(2);
             while sched.worker_passes() < 2 && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            worker.join(); // worker 侧 panic 原样重抛（fail-visible）
             assert!(
                 sched.worker_passes() >= 2,
                 "worker 应在取样处不自锁地跑过两圈"
             );
+
+            // Stop without close(): close() can briefly hold state from the test
+            // thread while the worker samples the clock, which the try_lock probe
+            // would misclassify as a same-thread lock regression.
+            worker.stop.store(true, AtomicOrd::SeqCst);
+            let idle_deadline = Instant::now() + Duration::from_secs(2);
+            while clock.in_call.load(AtomicOrd::SeqCst) && Instant::now() < idle_deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                !clock.in_call.load(AtomicOrd::SeqCst),
+                "clock probe must leave its sampling window before stop synchronization"
+            );
+            let state = lock(&sched.shared.state);
+            drop(state);
+            sched.shared.signal.notify_all();
+            if let Some(thread) = worker.thread.take() {
+                thread.join().expect("worker exits after stop signal");
+            }
         }
 
         /// 闸钟：委托 `MockClock`；`armed` 时在取样处闸住 worker 并通知测试，由
@@ -1783,6 +1822,132 @@ mod tests {
             assert!(
                 joined.is_err(),
                 "worker 侧 clock panic 原样传播（join 重抛）"
+            );
+        }
+    }
+
+    #[cfg(feature = "log-embed")]
+    mod telemetry_boundary_tests {
+        use super::*;
+        use skeleton::clock::MockClock;
+        use std::sync::atomic::AtomicUsize;
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata};
+
+        struct PanicSubscriber;
+
+        struct CountingSubscriber(Arc<AtomicUsize>);
+
+        impl tracing::Subscriber for CountingSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+            fn event(&self, _: &Event<'_>) {
+                self.0.fetch_add(1, AtomicOrd::SeqCst);
+            }
+
+            fn enter(&self, _: &Id) {}
+
+            fn exit(&self, _: &Id) {}
+        }
+
+        impl tracing::Subscriber for PanicSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+            fn event(&self, _: &Event<'_>) {
+                panic!("injected scheduler telemetry panic");
+            }
+
+            fn enter(&self, _: &Id) {}
+
+            fn exit(&self, _: &Id) {}
+        }
+
+        #[test]
+        fn cancel_returns_actual_cas_result_when_subscriber_panics() {
+            let sched = Scheduler::new(Arc::new(MockClock::new()));
+            let handle = sched
+                .after(Duration::from_secs(60), || {})
+                .expect("register");
+            let before = crate::embedded_event_panic_count();
+
+            tracing::subscriber::with_default(PanicSubscriber, || {
+                assert!(handle.cancel(), "first cancellation wins");
+                assert!(!handle.cancel(), "second cancellation loses");
+            });
+
+            assert!(
+                crate::embedded_event_panic_count() >= before.saturating_add(2),
+                "both subscriber panics are contained and counted"
+            );
+        }
+
+        #[test]
+        fn manual_tick_finishes_callback_before_subscriber_panic_is_contained() {
+            let sched = Scheduler::new(Arc::new(MockClock::new()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&calls);
+            sched
+                .after(Duration::ZERO, move || {
+                    callback_calls.fetch_add(1, AtomicOrd::SeqCst);
+                })
+                .expect("register")
+                .detach();
+            let before = crate::embedded_event_panic_count();
+
+            tracing::subscriber::with_default(PanicSubscriber, || {
+                assert_eq!(sched.tick(), 1);
+            });
+
+            assert_eq!(calls.load(AtomicOrd::SeqCst), 1);
+            assert!(
+                crate::embedded_event_panic_count() >= before.saturating_add(1),
+                "fire telemetry runs only after the callback and terminal transition"
+            );
+        }
+
+        #[test]
+        fn worker_mode_tick_never_invokes_synchronous_subscriber() {
+            let sched = Scheduler::new(Arc::new(MockClock::new()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&calls);
+            sched
+                .after(Duration::ZERO, move || {
+                    callback_calls.fetch_add(1, AtomicOrd::SeqCst);
+                })
+                .expect("register")
+                .detach();
+            let events = Arc::new(AtomicUsize::new(0));
+            let subscriber_events = Arc::clone(&events);
+
+            tracing::subscriber::with_default(CountingSubscriber(subscriber_events), || {
+                assert_eq!(sched.tick_inner(false), 1);
+            });
+
+            assert_eq!(calls.load(AtomicOrd::SeqCst), 1);
+            assert_eq!(
+                events.load(AtomicOrd::SeqCst),
+                0,
+                "bounded worker-mode execution emits no synchronous host events"
             );
         }
     }
