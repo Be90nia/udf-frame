@@ -659,9 +659,15 @@ impl Scheduler {
     /// 返回实际点火数（惰性墓碑不计）。回调在调用线程**锁外**执行（重入
     /// 安全）；回调内推进虚拟钟（MockClock）⇒ 后续到期条目同轮继续火。
     pub fn tick(&self) -> usize {
+        self.tick_inner(true)
+    }
+
+    /// Worker mode suppresses synchronous host telemetry: a subscriber is arbitrary
+    /// synchronous code and must not be allowed to stall the bounded-progress driver.
+    fn tick_inner(&self, emit_telemetry: bool) -> usize {
         // 墓碑清扫（#52）：取消密集时把堆内已取消条目提前回收（不等原
         // deadline）；阈值未达 ⇒ O(1) 早退。
-        self.reclaim_cancelled();
+        self.reclaim_cancelled_with_telemetry(emit_telemetry);
         let mut fired = 0;
         loop {
             // 每轮重读 now：回调内推进虚拟钟（MockClock）⇒ 后续到期条目同轮续火。
@@ -675,7 +681,7 @@ impl Scheduler {
                     _ => return fired,
                 }
             };
-            if self.fire(entry, now) {
+            if self.fire(entry, now, emit_telemetry) {
                 fired += 1;
             }
         }
@@ -683,15 +689,16 @@ impl Scheduler {
 
     /// 点火单条目（调用方已出堆）：锁外执行回调，锁内做终态/重臂裁决。
     /// 返回是否实际执行（出堆前已 cancel 的惰性墓碑=静默丢弃不执行）。
-    fn fire(&self, entry: Entry, _now: Instant) -> bool {
+    fn fire(&self, entry: Entry, _now: Instant, emit_telemetry: bool) -> bool {
         // 惰性墓碑：出堆前已 cancel（state 终态）⇒ 静默丢弃不执行。
         if entry.task.state.load(AtomicOrd::SeqCst) != PENDING {
-            embed_event!(debug, target: "skeleton::scheduler::fire", seq = entry.seq, skipped = true);
+            if emit_telemetry {
+                embed_event!(debug, target: "skeleton::scheduler::fire", seq = entry.seq, skipped = true);
+            }
             return false;
         }
         #[cfg(feature = "log-embed")]
         let kind_name = task_kind_name(&entry.task.kind);
-        embed_event!(debug, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name);
         match &entry.task.kind {
             TaskKind::Once(run) => {
                 // take 后锁外执行：回调体已消费，双执行结构性排除。
@@ -699,7 +706,11 @@ impl Scheduler {
                 if let Some(run) = taken {
                     if catch_unwind(AssertUnwindSafe(run)).is_err() {
                         self.shared.panics.fetch_add(1, AtomicOrd::SeqCst);
+                        if emit_telemetry {
+                        if emit_telemetry {
                         embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "panic");
+                    }
+                    }
                     }
                 }
                 // 终态 DONE：此后 cancel 返 false（测试 cancel_after_fire）。
@@ -750,6 +761,11 @@ impl Scheduler {
                 drop(s);
                 // 不 notify：重臂只会把 deadline 推后，park 锚提前无害。
             }
+        }
+        // Emit only after callback execution and its terminal/rearm transition. Worker
+        // mode passes false and never invokes the host subscriber from the driver loop.
+        if emit_telemetry {
+            embed_event!(debug, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name);
         }
         true
     }
@@ -834,6 +850,10 @@ impl Scheduler {
     /// 清扫在状态锁内重建堆（只保留 PENDING 条目），被摘条目**移出锁外**
     /// 析构（回调捕获的析构不得在堆锁内跑）。返回被回收的条目数。
     fn reclaim_cancelled(&self) -> usize {
+        self.reclaim_cancelled_with_telemetry(true)
+    }
+
+    fn reclaim_cancelled_with_telemetry(&self, emit_telemetry: bool) -> usize {
         let removed = {
             let mut s = lock(&self.shared.state);
             let tombstones = self.shared.tombstones.load(AtomicOrd::SeqCst);
@@ -862,7 +882,9 @@ impl Scheduler {
         // 堆内已无墓碑 ⇒ 计数归零（清扫期间落地的那次取消可能漂移，良性）。
         self.shared.tombstones.store(0, AtomicOrd::SeqCst);
         if reclaimed > 0 {
-            embed_event!(debug, target: "skeleton::scheduler::fire", reclaimed = reclaimed as u64);
+            if emit_telemetry {
+                embed_event!(debug, target: "skeleton::scheduler::fire", reclaimed = reclaimed as u64);
+            }
             // 唤醒驱动线程：park 锚（堆顶 deadline）可能提前 ⇒ 重算。
             self.shared.signal.notify_all();
         }
@@ -1093,7 +1115,7 @@ fn worker_loop(sched: Arc<Scheduler>, stop: Arc<AtomicBool>) {
             return;
         }
         // 墓碑清扫（#52）：取消后尽快回收，避免驱动为墓碑多醒一拍。
-        sched.reclaim_cancelled();
+        sched.reclaim_cancelled_with_telemetry(false);
         // park 锚 = 最近**有效** deadline（跳过堆顶墓碑——墓碑不是有效
         // deadline，驱动不该为它多醒一拍，#52）。
         let park_until = sched.next_pending_deadline();
@@ -1104,7 +1126,7 @@ fn worker_loop(sched: Arc<Scheduler>, stop: Arc<AtomicBool>) {
                 // 循环体兜底 catch：正常零命中（回调 panic 已被 fire 层
                 // catch_unwind 摘除）；命中 = 框架自身 bug，留痕后退出
                 // （不静默带病续跑）。
-                if catch_unwind(AssertUnwindSafe(|| sched.tick())).is_err() {
+                if catch_unwind(AssertUnwindSafe(|| sched.tick_inner(false))).is_err() {
                     sched.shared.panics.fetch_add(1, AtomicOrd::SeqCst);
                     // 异常路径（驱动内部 panic）：留痕后退出，不静默带病续跑。
                     embed_event!(warn, target: "skeleton::scheduler::worker", reason = "internal_panic");
