@@ -2328,6 +2328,26 @@ mod reservation_handoff_regressions {
             joined_tx.send(()).expect("join result receiver alive");
         });
 
+        // Wait until the pre-existing worker has retired. The outstanding reservation
+        // must still keep join blocked and preserve workers >= reservations.
+        let deadline = std::time::Instant::now() + HANDOFF;
+        loop {
+            let g = lock(&pool.shared.inner);
+            if g.workers == 1 && g.reservations == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown did not retire the original worker while preserving reservation"
+            );
+            drop(g);
+            thread::yield_now();
+        }
+        assert!(
+            joined_rx.try_recv().is_err(),
+            "join must not return while the reservation is still outstanding"
+        );
+
         release_tx.send(()).expect("release startup handoff");
         resize
             .join()
