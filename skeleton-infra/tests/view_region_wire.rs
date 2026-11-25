@@ -1064,6 +1064,33 @@ fn decode_batch_enforces_version_and_kind_vocabulary() {
     assert!(!read.unsupported_version);
 }
 
+/// #135/#166：缺失 / 负数 / 浮点 / 越界别名（`65536 ⇒ 0`）的 kind 一律**逐项跳过**
+/// 并置 resync；显式 `kind: 0`（未声明形状）仍是合法词表值。
+#[test]
+fn decode_batch_rejects_missing_negative_float_and_aliased_kind() {
+    let decls = decls();
+    let read = decode_batch(
+        &json!({"protocol_version": PROTOCOL_VERSION, "patches": [
+            {"path": PATH, "value": 1},                  // kind 缺失
+            {"path": PATH, "kind": -1, "value": 1},      // 负数
+            {"path": PATH, "kind": 1.5, "value": 1},     // 浮点
+            {"path": PATH, "kind": 65536, "value": 1},   // 旧实现 `as u16` 会截成 0（别名）
+            {"path": PATH, "kind": 0, "value": 3}        // 显式 0 = 未声明形状，合法
+        ]}),
+        &decls,
+    );
+    assert_eq!(
+        read.patches.len(),
+        1,
+        "只有显式 kind 0 通过：{:?}",
+        read.patches
+    );
+    assert_eq!(read.patches[0].value, json!(3));
+    assert_eq!(read.unknown_tags_skipped, 4);
+    assert!(read.needs_resync, "降级必须显形");
+    assert!(!read.unsupported_version);
+}
+
 // ── 初始区域全量发布（#155 / #190）：封板即可用，且未变的绑定也一定有值 ──────
 
 /// 双绑定：`/n`（随状态变）+ `/fixed`（恒定 7，后续拍永不进 diff 集）。
