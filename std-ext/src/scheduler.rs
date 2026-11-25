@@ -58,10 +58,14 @@
 //!   插入、禁静默丢回调）；额度随注册退役（点火/取消/关闸/panic）**恰好
 //!   一次**释放；既有 `after`/`every` 触顶时 panic（fail-visible），typed
 //!   拒绝面走 `try_after`/`try_every`；
-//! - **惰性墓碑 + 阈值清扫**（#52）：cancel 不摘堆（O(1)），死亡条目到点
-//!   弹出时摘除；驱动 park 锚跳过堆顶墓碑（墓碑不是有效 deadline ⇒ 驱动
-//!   不为它多醒一拍）；墓碑数越过「绝对下限 + 比例阈值」时清扫堆（只留
-//!   PENDING 条目，被摘条目移出锁外析构）⇒ 已取消的远期条目在原 deadline
+//! - **惰性墓碑 + 阈值清扫**（#52 阈值；#109/#123 触发面 =「取消代数 +
+//!   扫描纪元」）：cancel 不摘堆（O(1)，只递增单调取消代数），死亡条目到点
+//!   弹出时摘除且**不递减**任何计数（下次扫描按堆内实况重算）；驱动 park
+//!   锚跳过堆顶墓碑（墓碑不是有效 deadline ⇒ 驱动不为它多醒一拍）；
+//!   「上次扫描以来的取消数」达绝对下限时锁内扫堆统计**真实**墓碑数，真实
+//!   数同时过绝对下限与比例阈值才重建堆（只留 PENDING 条目，被摘条目移出
+//!   锁外析构）；扫描纪元在锁内发布 ⇒ 扫描期间落地的取消仍比已发布扫描新，
+//!   必然促成下次再扫（不会被归零抹掉）⇒ 已取消的远期条目在原 deadline
 //!   之前回收；执行语义不变（已出堆检查-执行窗口内落地的取消仍不可撤、
 //!   仍照跑）。
 //!
@@ -165,12 +169,12 @@ impl fmt::Display for AdmissionError {
 
 impl std::error::Error for AdmissionError {}
 
-/// 墓碑清扫阈值（#52）——绝对下限：墓碑数达此值才可能触发清扫（少量取消
-/// 不触发 O(n) 堆重建）。
+/// 墓碑清扫阈值（#52）——绝对下限：**上次扫描以来**的取消次数与堆内**真实**
+/// 墓碑数都须达此值才可能触发重建（少量取消不触发 O(n) 扫堆/重建）。
 const TOMBSTONE_FLOOR: usize = 16;
 
-/// 墓碑清扫阈值（#52）——比例阈值：墓碑数 × 此值 ≥ 堆条目数 ⇒ 触发清扫
-/// （大堆里的少量墓碑不长期滞留，也不频繁重建）。
+/// 墓碑清扫阈值（#52）——比例阈值：真实墓碑数 × 此值 ≥ 堆条目数 ⇒ 才值得
+/// 重建（大堆里的少量墓碑不长期滞留，也不频繁重建）。
 const TOMBSTONE_RATIO: usize = 4;
 /// 任务胞：状态词 + 任务体（cancel 的线性化点就是 `state` 上的 CAS）。
 struct TaskCell {
@@ -224,6 +228,12 @@ struct HeapState {
     heap: BinaryHeap<Reverse<Entry>>,
     closed: bool,
     next_seq: u64,
+    /// 清扫已计账到的取消代数（#109；只在状态锁内读写）。
+    ///
+    /// `Shared::cancel_epoch - scanned_epoch` = 上次扫描以来落地的取消次数，
+    /// 是**扫描触发**（不是堆内墓碑精确数）。扫描时在锁内发布为当时快照 ⇒
+    /// 落后于已发布扫描的取消必然促成下一次扫描，不会被归零抹掉。
+    scanned_epoch: u64,
 }
 
 /// 驱动线程名（诊断面：线程列表可归因谁在跑；多 worker 共用同名——worker
@@ -245,11 +255,12 @@ fn spawn_worker_thread(
     thread::Builder::new().name(name.to_owned()).spawn(body)
 }
 
-/// 容量发布窗口停车闸（**仅 `cfg(test)` 构建存在**，issue#95）：把 `register`
-/// 停在「已按旧 cap 裁决、尚未入堆」的状态锁内窗口里，供 `set_capacity` 交错的
-/// 确定性测试。生产构建无本类型、热路径无任何检查。
+/// 状态锁窗口停车闸（**仅 `cfg(test)` 构建存在**）：把状态机停在「已裁决、
+/// 未提交」的锁内窗口里，供确定性交错测试——issue#95 的容量发布窗口
+/// （`register_gate`）、#109 的清扫扫描窗口（`reclaim_gate`）。生产构建无本
+/// 类型、热路径无任何检查。
 #[cfg(test)]
-struct CapacitySettle {
+struct SettleGate {
     state: Mutex<SettleState>,
     cv: Condvar,
 }
@@ -261,7 +272,7 @@ struct SettleState {
 }
 
 #[cfg(test)]
-impl CapacitySettle {
+impl SettleGate {
     fn new() -> Self {
         Self {
             state: Mutex::new(SettleState {
@@ -344,10 +355,17 @@ struct Shared {
     /// 注册停靠闸（**仅 `cfg(test)`**，issue#95）：`register` 在「已按旧 cap
     /// 裁决、尚未入堆」的状态锁窗口停靠——`set_capacity` 此刻必被同一把锁挡住。
     #[cfg(test)]
-    register_gate: CapacitySettle,
-    /// 已取消但可能仍在堆内的条目数（#52，近似计数）：取消 O(1) 递增，
-    /// 清扫后归零——漂移至多「清扫期间落地的那次取消」，良性。
-    tombstones: AtomicUsize,
+    register_gate: SettleGate,
+    /// 清扫停靠闸（**仅 `cfg(test)`**，#109）：`reclaim_cancelled` 在「扫描已
+    /// 定稿、纪元已发布、尚未解锁」的状态锁窗口停靠——此时落地的取消只能靠
+    /// 代数留痕促成下次再扫。
+    #[cfg(test)]
+    reclaim_gate: SettleGate,
+    /// 取消代数（#109/#123）：每次**成功**取消 +1（O(1)，不摘堆、不取状态锁、
+    /// 不扫堆）。单调不减、永不归零——清扫按它相对 `HeapState::scanned_epoch`
+    /// 的增量决定是否扫堆；落在扫描快照之后的取消仍比已发布的扫描新，因而
+    /// 必然促成下一次扫描（不会被归零抹掉）；自然弹出也无须递减。
+    cancel_epoch: AtomicU64,
     /// OS 线程创建注入缝（issue#87）：生产恒 [`spawn_worker_thread`]，测试换
     /// 成失败桩以确定性模拟创建失败。`fn` 指针 ⇒ 只在起 worker 时一次间接
     /// 调用（热路径零成本）。
@@ -430,6 +448,7 @@ impl Scheduler {
                     heap: BinaryHeap::new(),
                     closed: false,
                     next_seq: 0,
+                    scanned_epoch: 0,
                 }),
                 signal: Condvar::new(),
                 panics: AtomicU64::new(0),
@@ -438,8 +457,10 @@ impl Scheduler {
                 capacity: AtomicUsize::new(0), // 0 = 无界（默认）
                 rejected: AtomicU64::new(0),
                 #[cfg(test)]
-                register_gate: CapacitySettle::new(),
-                tombstones: AtomicUsize::new(0),
+                register_gate: SettleGate::new(),
+                #[cfg(test)]
+                reclaim_gate: SettleGate::new(),
+                cancel_epoch: AtomicU64::new(0),
                 spawn,
             }),
         }
@@ -694,7 +715,8 @@ impl Scheduler {
         }
         #[cfg(feature = "log-embed")]
         let kind_name = task_kind_name(&entry.task.kind);
-        embed_event!(debug, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name);
+        // 点火事件在终态/重臂裁决**之后**发（#221 §3.1：pop 与回调执行之间
+        // 不发事件）——时序订阅方不得插进出堆与回调之间。
         match &entry.task.kind {
             TaskKind::Once(run) => {
                 // take 后锁外执行：回调体已消费，双执行结构性排除。
@@ -726,44 +748,45 @@ impl Scheduler {
                     // 退役（不再臂）⇒ 释放额度（#58，恰好一次）。
                     self.shared.retire(&entry.task, DONE);
                     embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "panic");
-                    return true;
-                }
-                // 重臂锚取回调完成后的当前时刻：超载（完成时已越下锚）⇒
-                // 改锚退化固定延迟，无补发（D14 防线）。
-                let now = self.shared.clock.now_instant();
-                let next = rearm_deadline(entry.deadline, *period, now);
-                // 异常路径（超载退化重臂）：下锚已被完成时刻越过（或锚溢出）
-                // ⇒ 周期语义降级为固定延迟，留痕。
-                #[cfg(feature = "log-embed")]
-                let overloaded = entry
-                    .deadline
-                    .checked_add(*period)
-                    .is_none_or(|anchor| anchor <= now);
-                // 锁内裁决重臂：close 或执行中 cancel 赢了 ⇒ 摘除。
-                // 残余窗口（裁决后 cancel 落地）由惰性墓碑兜底：取消成功，
-                // 该条目到点被墓碑逻辑吃掉。
-                let mut s = lock(&self.shared.state);
-                if s.closed || entry.task.state.load(AtomicOrd::SeqCst) != PENDING {
-                    drop(s);
-                    // 退役（关闸或执行中取消 ⇒ 不再重臂）⇒ 释放额度（#58）：
-                    // CAS 赢家释放（取消已赢 ⇒ 额度已由取消方释放）。
-                    self.shared.retire(&entry.task, DONE);
-                    return true;
-                }
-                s.heap.push(Reverse(Entry {
-                    deadline: next,
-                    seq: entry.seq,
-                    task: Arc::clone(&entry.task),
-                }));
-                drop(s);
-                // 不 notify：重臂只会把 deadline 推后，park 锚提前无害。
-                // Publish the new heap entry before invoking the host subscriber.
-                #[cfg(feature = "log-embed")]
-                if overloaded {
-                    embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "overload_rearm", period_ms = period.as_millis() as u64);
+                } else {
+                    // 重臂锚取回调完成后的当前时刻：超载（完成时已越下锚）⇒
+                    // 改锚退化固定延迟，无补发（D14 防线）。
+                    let now = self.shared.clock.now_instant();
+                    let next = rearm_deadline(entry.deadline, *period, now);
+                    // 异常路径（超载退化重臂）：下锚已被完成时刻越过（或锚溢出）
+                    // ⇒ 周期语义降级为固定延迟，留痕。
+                    #[cfg(feature = "log-embed")]
+                    let overloaded = entry
+                        .deadline
+                        .checked_add(*period)
+                        .is_none_or(|anchor| anchor <= now);
+                    // 锁内裁决重臂：close 或执行中 cancel 赢了 ⇒ 摘除。
+                    // 残余窗口（裁决后 cancel 落地）由惰性墓碑兜底：取消成功，
+                    // 该条目到点被墓碑逻辑吃掉。
+                    let mut s = lock(&self.shared.state);
+                    if s.closed || entry.task.state.load(AtomicOrd::SeqCst) != PENDING {
+                        drop(s);
+                        // 退役（关闸或执行中取消 ⇒ 不再重臂）⇒ 释放额度（#58）：
+                        // CAS 赢家释放（取消已赢 ⇒ 额度已由取消方释放）。
+                        self.shared.retire(&entry.task, DONE);
+                    } else {
+                        s.heap.push(Reverse(Entry {
+                            deadline: next,
+                            seq: entry.seq,
+                            task: Arc::clone(&entry.task),
+                        }));
+                        drop(s);
+                        // 不 notify：重臂只会把 deadline 推后，park 锚提前无害。
+                        // Publish the new heap entry before invoking the host subscriber.
+                        #[cfg(feature = "log-embed")]
+                        if overloaded {
+                            embed_event!(warn, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name, reason = "overload_rearm", period_ms = period.as_millis() as u64);
+                        }
+                    }
                 }
             }
         }
+        embed_event!(debug, target: "skeleton::scheduler::fire", seq = entry.seq, kind = kind_name);
         true
     }
 
@@ -822,8 +845,9 @@ impl Scheduler {
             // 清 pending：堆内全部标 Cancelled（句柄侧可见）；已出堆在途条目
             // 不在堆里，回调跑完为止（同步代码无中断面）。
             let drained = std::mem::take(&mut s.heap);
-            // 堆已清空 ⇒ 无墓碑残留（#52 计数归零）。
-            self.shared.tombstones.store(0, AtomicOrd::SeqCst);
+            // 堆已清空：扫描纪元推进到当前取消代数（同一临界区内发布 ⇒
+            // 关闸后没有残留墓碑可扫，也不为关闸前的取消白扫空堆）。
+            s.scanned_epoch = self.shared.cancel_epoch.load(AtomicOrd::SeqCst);
             drained
         };
         #[cfg(feature = "log-embed")]
@@ -838,22 +862,44 @@ impl Scheduler {
         // 终态（close）：清 pending 计数留痕；幂等重入（已 closed 早退）不发。
         embed_event!(info, target: "skeleton::scheduler::close", cleared = cleared);
     }
-    /// 墓碑清扫（#52）：已取消但仍在堆内的条目在原 deadline 之前被回收。
+    /// 墓碑清扫（#52 阈值策略；#109/#123 触发面 =「取消代数 + 扫描纪元」）：
+    /// 已取消但仍在堆内的条目在原 deadline 之前被回收。
     ///
-    /// 触发条件：墓碑计数同时越过**绝对下限**（[`TOMBSTONE_FLOOR`]）与
-    /// **比例阈值**（墓碑数 × [`TOMBSTONE_RATIO`] ≥ 堆条目数）——少量取消
-    /// 不触发 O(n) 堆重建；大堆里的少量墓碑也不长期滞留。
+    /// 触发面不看计数器，看**上次扫描以来落地的取消次数**：锁内取
+    /// `cancel_epoch` 快照，`快照 - scanned_epoch` 达绝对下限
+    /// [`TOMBSTONE_FLOOR`] 才扫一遍堆，统计**真实**仍在堆内的墓碑数；
+    /// 真实数同时满足绝对下限与比例阈值（墓碑数 × [`TOMBSTONE_RATIO`] ≥ 堆
+    /// 条目数）才重建堆。自然弹出不递减任何计数——下次扫描按堆内实况重算
+    /// （#123）。
+    ///
+    /// 扫描纪元在**锁内**发布（`scanned_epoch = 快照`）：落在快照之后的取消
+    /// 推进了 `cancel_epoch`，仍比已发布的扫描新 ⇒ 强制下次再扫，绝不被归零
+    /// 抹掉（#109）。取消本身仍 O(1)：只递增原子代数，不取状态锁、不扫堆。
     ///
     /// 清扫在状态锁内重建堆（只保留 PENDING 条目），被摘条目**移出锁外**
     /// 析构（回调捕获的析构不得在堆锁内跑）。返回被回收的条目数。
     fn reclaim_cancelled(&self) -> usize {
         let removed = {
             let mut s = lock(&self.shared.state);
-            let tombstones = self.shared.tombstones.load(AtomicOrd::SeqCst);
-            if tombstones < TOMBSTONE_FLOOR
-                || tombstones.saturating_mul(TOMBSTONE_RATIO) < s.heap.len()
-            {
-                return 0;
+            // 快照在锁内取：其后落地的取消会推进 cancel_epoch ⇒ 比本快照新。
+            let snapshot = self.shared.cancel_epoch.load(AtomicOrd::SeqCst);
+            // wrapping_sub：单调代数只会在 u64 回绕（不可达）时倒挂，且方向是
+            // 「多扫一次」而非漏扫——fail-safe 侧。
+            if snapshot.wrapping_sub(s.scanned_epoch) < TOMBSTONE_FLOOR as u64 {
+                return 0; // O(1) 早退：上次扫描以来新取消未达下限
+            }
+            // 锁内只读扫描：堆内容在本临界区内稳定（自然弹出同样持此锁）。
+            // 谓词取 != PENDING（终态即墓碑），不依赖取消代数是否精确。
+            let resident = s
+                .heap
+                .iter()
+                .filter(|Reverse(e)| e.task.state.load(AtomicOrd::SeqCst) != PENDING)
+                .count();
+            // 扫描纪元在锁内发布：本次扫描已计入快照之前的全部取消。
+            s.scanned_epoch = snapshot;
+            let total = s.heap.len();
+            if resident < TOMBSTONE_FLOOR || resident.saturating_mul(TOMBSTONE_RATIO) < total {
+                return 0; // 真实墓碑不足以抵消 O(n) 重建成本
             }
             // 重建堆：只保留 PENDING 条目（取消/终态条目即刻回收）。
             let old = std::mem::take(&mut s.heap);
@@ -867,13 +913,15 @@ impl Scheduler {
                 }
             }
             s.heap = BinaryHeap::from(kept);
+            // 测试停靠点（#109）：重建已定稿、纪元已发布、尚未解锁——此刻
+            // 落地的取消会被本次扫描漏计，只能靠代数留痕促成下次再扫。
+            #[cfg(test)]
+            self.shared.reclaim_gate.park();
             removed
         };
         let reclaimed = removed.len();
         // 锁外析构：捕获闭包的析构不得持堆锁（issue#52 硬要求）。
         drop(removed);
-        // 堆内已无墓碑 ⇒ 计数归零（清扫期间落地的那次取消可能漂移，良性）。
-        self.shared.tombstones.store(0, AtomicOrd::SeqCst);
         if reclaimed > 0 {
             // 唤醒驱动线程：park 锚（堆顶 deadline）可能提前 ⇒ 重算。
             self.shared.signal.notify_all();
@@ -1004,8 +1052,9 @@ impl TaskHandle {
                 // 退役（PENDING→CANCELLED）：CAS 赢家释放额度（#58，恰好一次）。
                 let won = shared.retire(&self.cell, CANCELLED);
                 if won {
-                    // 墓碑计数（#52）：取消 O(1) 递增（不摘堆、不扫堆）。
-                    shared.tombstones.fetch_add(1, AtomicOrd::SeqCst);
+                    // 取消代数（#109/#123）：O(1) 递增（不摘堆、不取状态锁、
+                    // 不扫堆）——清扫按「代数差 + 扫描纪元」决定是否扫堆。
+                    shared.cancel_epoch.fetch_add(1, AtomicOrd::SeqCst);
                     // 唤醒驱动线程：park 锚可能需重算（墓碑被清扫后锚提前）。
                     shared.signal.notify_all();
                 }
@@ -1205,7 +1254,7 @@ mod tests {
 
     // ── 容量 setter 与注册共锁线性化（issue#95）──────────────────────────
     //
-    // `set_capacity` 与 `register` 共用 `shared.state`；本区用 `CapacitySettle`
+    // `set_capacity` 与 `register` 共用 `shared.state`；本区用 `SettleGate`
     // 把注册线程停在「已按旧 cap 裁决、尚未入堆」的状态锁窗口里，确定性构造
     // setter 想插在裁决与提交之间的交错。禁 sleep 竞速。
 
@@ -1314,6 +1363,105 @@ mod tests {
         second.detach();
         third.detach();
         sched.close();
+    }
+    // ── 清扫触发面：取消代数 + 扫描纪元（#109/#123）──────────────────────
+    //
+    // 取消只递增单调代数（O(1)、不取状态锁）；清扫在锁内取代数快照、扫堆
+    // 统计真实墓碑数、锁内发布扫描纪元。落在快照之后的取消仍比已发布纪元
+    // 新 ⇒ 促成下次扫描，绝不被归零抹掉。
+
+    /// 探针：闭包被丢弃（条目已离开堆且句柄已释放）时计数一次。
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, AtomicOrd::SeqCst);
+        }
+    }
+
+    /// #109：清扫扫描定稿后落地的取消不得被「扫描纪元归零」抹掉——它比已
+    /// 发布的纪元新，必须促成下一次扫描并最终回收该墓碑。
+    ///
+    /// 变异判别：把锁内发布改成「扫描后无条件对齐当前代数」（旧实现
+    /// `tombstones.store(0)` 的等价形态）⇒ 停靠期间落地的取消被吞，后续 15
+    /// 次取消凑不满下限 ⇒ 探针永不被回收，本测试红。
+    #[test]
+    fn cancellation_racing_compaction_scan_forces_next_scan() {
+        let sched = Scheduler::new(Arc::new(MockClock::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        // 16 条待清扫墓碑（1h 后到期）+ 16 条存活条目（2h）+ 1 个探针（0.5h，
+        // 堆顶）：堆 33 条、真实墓碑 16 × 4 ≥ 33 ⇒ 首个清扫必重建。
+        let mut cancelled = Vec::new();
+        for _ in 0..16 {
+            let handle = sched
+                .try_after(Duration::from_secs(3600), || {})
+                .expect("未关闸注册必成");
+            assert!(handle.cancel(), "墓碑条目取消成功");
+            cancelled.push(handle);
+        }
+        let mut live = Vec::new();
+        for _ in 0..16 {
+            live.push(
+                sched
+                    .try_after(Duration::from_secs(7200), || {})
+                    .expect("未关闸注册必成"),
+            );
+        }
+        let probe = DropProbe(Arc::clone(&drops));
+        let probe_handle = sched
+            .try_after(Duration::from_secs(1800), move || drop(probe))
+            .expect("未关闸注册必成");
+        // 墓碑句柄先释放：重建摘除条目即回收其任务胞（与探针计数无关）。
+        drop(cancelled);
+        assert_eq!(sched.live_registrations(), 17, "16 条存活 + 探针");
+
+        sched.shared.reclaim_gate.arm();
+        let scanner = {
+            let sched = sched.clone();
+            thread::spawn(move || sched.tick())
+        };
+        let entered = sched
+            .shared
+            .reclaim_gate
+            .wait_entered(Duration::from_secs(10));
+        // 无论停靠是否成功都先做完再断言：失败时也不得把扫描线程留在闸里。
+        let raced = probe_handle.cancel(); // 停靠窗口内落地（不取状态锁）
+        drop(probe_handle); // 只剩堆条目持任务胞 ⇒ 探针随条目回收
+        sched.shared.reclaim_gate.release();
+        let fired = scanner.join().expect("扫描线程无 panic");
+
+        assert!(
+            entered,
+            "清扫必须停靠在「重建定稿、纪元已发布、尚未解锁」的窗口里"
+        );
+        assert!(raced, "停靠窗口内的取消必须成功（CAS 线性化点不变）");
+        assert_eq!(fired, 0, "无到期条目");
+        assert_eq!(
+            drops.load(AtomicOrd::SeqCst),
+            0,
+            "停靠窗口内的取消晚于本次分区 ⇒ 条目留堆（本次快照漏计）"
+        );
+        assert_eq!(
+            sched.next_deadline(),
+            Some(sched.shared.clock.now_instant() + Duration::from_secs(1800)),
+            "公共面口径不变：堆顶仍可见该惰性墓碑"
+        );
+
+        // 补齐下限：停靠窗口那次 + 15 次 = 16 ⇒ 下次清扫按真实堆内墓碑数
+        // （16 墓碑 / 17 条）重建并回收探针条目。
+        for handle in live.drain(..15) {
+            assert!(handle.cancel(), "补齐下限的取消成功");
+        }
+        assert_eq!(sched.tick(), 0, "无到期条目");
+        assert_eq!(
+            drops.load(AtomicOrd::SeqCst),
+            1,
+            "扫描纪元未被归零 ⇒ 下一次扫描回收该墓碑（#109）"
+        );
+        assert_eq!(sched.live_registrations(), 1, "只剩一条存活注册");
+        sched.close();
+        assert_eq!(sched.live_registrations(), 0, "关闸后零残留（无容量滞留）");
     }
 
     /// #55：detach 抑制 cancel 但**不得**泄漏 TaskCell 分配——句柄释放后

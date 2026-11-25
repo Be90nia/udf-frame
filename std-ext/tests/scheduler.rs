@@ -307,6 +307,80 @@ fn cancel_far_future_leaves_lazy_tombstone_semantics_pinned() {
     assert!(sched.next_deadline().is_some());
     assert_eq!(sched.tick(), 0);
 }
+/// 探针：闭包被丢弃（条目离开堆且句柄已释放）时计数一次。
+struct DropProbe(Arc<AtomicU64>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// #123：清扫阈值按**堆内真实墓碑数**判定，不按历史累计取消数——自然弹出的
+/// 僵尸条目不得在日后把一次新取消放大成整堆重建。
+///
+/// 变异判别：触发/裁决改回「累计取消数」形态（忽略真实堆内墓碑）⇒ 本例阶段 3
+/// 的单次取消会在大堆里触发冗余重建，探针条目被提前回收 ⇒ 本测试红。
+#[test]
+fn compaction_threshold_uses_resident_tombstones_not_lifetime_cancels() {
+    let clock = Arc::new(MockClock::new());
+    let sched = Scheduler::new(clock.clone());
+    let drops = Arc::new(AtomicU64::new(0));
+
+    // 阶段 1：15 次取消 + 自然弹出（未达清扫下限 ⇒ 全程不重建）。旧实现把这些
+    // 历史取消累进计数器，新实现只推进取消代数（自然弹出无须递减）。
+    for _ in 0..15 {
+        sched
+            .after(ms(100), || {})
+            .expect("未关闸注册必成")
+            .cancel();
+    }
+    clock.advance(ms(100));
+    assert_eq!(sched.tick(), 0, "出堆前已取消：墓碑静默丢弃（不点火）");
+    assert_eq!(sched.live_registrations(), 0, "自然弹出后无存活注册");
+
+    // 阶段 2：大存活堆（40 条）+ 1 条带探针的远期墓碑（堆顶最早 deadline）。
+    let mut live = Vec::new();
+    for _ in 0..40 {
+        live.push(
+            sched
+                .after(Duration::from_secs(3600), || {})
+                .expect("未关闸注册必成"),
+        );
+    }
+    let probe = DropProbe(Arc::clone(&drops));
+    let probe_handle = sched
+        .after(Duration::from_secs(1800), move || drop(probe))
+        .expect("未关闸注册必成");
+    assert!(probe_handle.cancel(), "探针条目取消成功");
+    drop(probe_handle);
+
+    // 阶段 3：清扫窗口内真实墓碑 = 1（1 × 4 < 41）⇒ 不得重建。
+    assert_eq!(sched.tick(), 0, "无到期条目");
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "历史取消不得把一次新取消放大成整堆重建（#123）"
+    );
+    assert_eq!(
+        sched.next_deadline(),
+        Some(clock.now_instant() + Duration::from_secs(1800)),
+        "公共面口径不变：该惰性墓碑仍是堆顶"
+    );
+
+    // 阶段 4：补齐「上次扫描以来 16 次取消」+ 真实墓碑数到下限 ⇒ 下一次扫描
+    // 真正回收它（扫描纪元发布有效，不是永久搁置）。
+    for handle in live.drain(..16) {
+        assert!(handle.cancel(), "补齐下限的取消成功");
+    }
+    assert_eq!(sched.tick(), 0, "无到期条目");
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "真实墓碑达阈值 ⇒ 重建回收（而非继续滞留）"
+    );
+    sched.close();
+}
 
 // ---- close：关闸 + 清 pending + 在途跑完 ----
 

@@ -1,5 +1,6 @@
 //! log-embed 埋点验收（std-ext 域切片：backoff/fsx/iter + 批 5-2 scheduler/
-//! ratelimit/retry/cache，共七域 48 调用点（口径=`embed_event!` 宏调用点，
+//! ratelimit/retry/cache，共七域 47 调用点（口径=`embed_event!` 宏调用点；
+//! issue#202 把 backoff 的原 1 处移到 retry 编排层——纯算术件零调用点，
 //! 见仓库根 `docs/reference.md` 的 log-embed 段）；`--features log-embed`
 //! 开跑。shutdown 一域留在 skeleton-infra/tests/log_embed.rs，两文件捕获
 //! 订阅器同款各一份）：
@@ -19,6 +20,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,7 +31,7 @@ use std_ext::fsx::{Sort, SymlinkPolicy, TempDir, copy_tree, temp_dir_in, walk};
 use std_ext::iter::process_results;
 use std_ext::ratelimit::TokenBucket;
 use std_ext::retry::{RetryPolicy, retry_if};
-use std_ext::scheduler::Scheduler;
+use std_ext::scheduler::{AdmissionError, Scheduler};
 
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Record};
@@ -42,6 +44,9 @@ struct Captured {
     target: &'static str,
     level: Level,
     fields: String,
+    /// 发射线程名（`None` = 无名线程）：worker 收尾路径不得同步调用宿主订阅器
+    /// ——#221 §2.5 只能按线程归因断言（进程级/线程级捕获面都与他测共享）。
+    thread: Option<String>,
 }
 
 #[derive(Default)]
@@ -79,6 +84,30 @@ impl Capture {
 
     fn len(&self) -> usize {
         self.events.lock().expect("capture mutex").len()
+    }
+
+    /// 只数 target+level 精确匹配的事件。
+    ///
+    /// 本文件那个 `set_global_default` 的捕获面是**进程级**的（同二进制其它
+    /// 测试/线程的事件也会进来）⇒ 断言精确条数时必须先按 target/level 收敛，
+    /// 裸 `len()` 会被无关事件污染（`worker_teardown_*` 曾因此偶红）。
+    fn count_target(&self, target: &str, level: Level) -> usize {
+        self.events
+            .lock()
+            .expect("capture mutex")
+            .iter()
+            .filter(|e| e.target == target && e.level == level)
+            .count()
+    }
+
+    /// 按发射线程名计数（worker 收尾路径的归因判据）。
+    fn count_from_thread(&self, thread_name: &str) -> usize {
+        self.events
+            .lock()
+            .expect("capture mutex")
+            .iter()
+            .filter(|e| e.thread.as_deref() == Some(thread_name))
+            .count()
     }
 }
 
@@ -118,6 +147,7 @@ impl Subscriber for Capture {
             target: event.metadata().target(),
             level: *event.metadata().level(),
             fields: writer.0,
+            thread: std::thread::current().name().map(str::to_owned),
         });
     }
     fn enter(&self, _: &Id) {}
@@ -130,19 +160,15 @@ fn capture() -> SharedCapture {
     Arc::new(Capture::default())
 }
 
-// ---- backoff 域（target skeleton::backoff，契约显式点：计算入参 debug 级）----
+// ---- backoff 域（issue#202：纯算术件零事件；计算入参的观测面移到 retry 调用点）----
 
 #[test]
-fn backoff_calc_inputs_debug() {
+fn backoff_delay_emits_no_event() {
     let cap = capture();
     let _guard = tracing::subscriber::set_default(cap.clone());
     let d = backoff_delay(3, Duration::from_millis(100), Duration::from_millis(250));
     assert_eq!(d, Duration::from_millis(250), "线性 300ms 截平到上限");
-    cap.assert_event(
-        "skeleton::backoff",
-        Level::DEBUG,
-        &["attempt=3", "base_ms=100", "max_ms=250", "delay_ms=250"],
-    );
+    assert_eq!(cap.len(), 0, "纯算术件不得调用宿主订阅者（issue#202）");
 }
 
 // ---- 数据域 scratch 守卫（同 tests/fsx.rs：dogfood temp_dir_in，工作区
@@ -417,9 +443,11 @@ fn scheduler_drop_cancel_is_silent() {
 #[test]
 fn scheduler_register_after_close_warns() {
     let cap = capture();
+    // 订阅器先装再动调度器：本文件另有一处 `set_global_default`（跨线程捕获
+    // 用），先发事件会漏进那个全局捕获面并污染它的精确条数断言。
+    let _guard = tracing::subscriber::set_default(cap.clone());
     let sched = Scheduler::new(Arc::new(MockClock::new()));
     sched.close();
-    let _guard = tracing::subscriber::set_default(cap.clone());
     assert!(sched.after(Duration::from_millis(1), || {}).is_err());
     cap.assert_event(
         "skeleton::scheduler::register",
@@ -485,14 +513,190 @@ fn scheduler_callback_panic_warns() {
 #[test]
 fn scheduler_close_is_info_with_cleared_count() {
     let cap = capture();
+    // 订阅器先装再动调度器：先发事件会漏进另一处 `set_global_default` 的
+    // 全局捕获面（同 `scheduler_register_after_close_warns`）。
+    let _guard = tracing::subscriber::set_default(cap.clone());
     let sched = Scheduler::new(Arc::new(SystemClock));
     sched
         .after(Duration::from_secs(3600), || {})
         .unwrap()
         .detach();
-    let _guard = tracing::subscriber::set_default(cap.clone());
     sched.close();
     cap.assert_event("skeleton::scheduler::close", Level::INFO, &["cleared=1"]);
+}
+
+// ---- scheduler 域：宿主订阅器 panic 不得打断状态机（#194 / #221 §3.1）----
+
+/// 命中指定 target 的订阅器：`event` 直接 panic，模拟宿主遥测故障。
+struct PanicOnTarget {
+    targets: &'static [&'static str],
+    panicked: Arc<AtomicUsize>,
+}
+
+impl Subscriber for PanicOnTarget {
+    fn enabled(&self, _: &Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+    fn event(&self, event: &Event<'_>) {
+        if self.targets.contains(&event.metadata().target()) {
+            self.panicked.fetch_add(1, Ordering::SeqCst);
+            panic!(
+                "injected host subscriber panic on {}",
+                event.metadata().target()
+            );
+        }
+    }
+    fn enter(&self, _: &Id) {}
+    fn exit(&self, _: &Id) {}
+}
+
+/// #194 item 5：装一个在 register/fire/close/cancel 事件上 panic 的订阅器，
+/// 断言任务回调/退役/重臂/取消结果/唤醒前提（额度释放）语义全不变——
+/// 遥测只许是观测面，不得成为状态转移的权威。
+#[test]
+fn scheduler_state_machine_survives_panicking_subscriber() {
+    let clock = Arc::new(MockClock::new());
+    let sched = Scheduler::new(clock.clone());
+    sched.set_capacity(1); // 有界准入：额度账目同时被本测试钉住
+    let panicked = Arc::new(AtomicUsize::new(0));
+    let before = std_ext::embedded_event_panic_count();
+    let _guard = tracing::subscriber::set_default(PanicOnTarget {
+        targets: &[
+            "skeleton::scheduler::register",
+            "skeleton::scheduler::fire",
+            "skeleton::scheduler::close",
+            "skeleton::scheduler::cancel",
+        ],
+        panicked: Arc::clone(&panicked),
+    });
+
+    // register：事件 panic 不得把已提交的注册变成错误，也不得吞掉句柄。
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits2 = Arc::clone(&hits);
+    let handle = sched
+        .after(Duration::from_millis(10), move || {
+            hits2.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect("订阅器 panic 不得把已受理的注册变成错误");
+    assert_eq!(sched.live_registrations(), 1, "注册已提交且额度恰占一条");
+    assert_eq!(
+        sched.try_after(Duration::from_millis(10), || {}).err(),
+        Some(AdmissionError::Full),
+        "触顶判定不受订阅器 panic 影响"
+    );
+
+    // fire：事件不得插进出堆与回调之间 ⇒ 回调照跑、终态照落、额度恰好一次。
+    clock.advance(Duration::from_millis(10));
+    assert_eq!(sched.tick(), 1, "被弹出的任务必须照常点火");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(sched.live_registrations(), 0, "退役后额度恰好释放一次");
+    assert_eq!(
+        sched.panic_count(),
+        0,
+        "回调没 panic：计数只记真实回调 panic"
+    );
+    assert!(!handle.cancel(), "已点火（DONE 终态）取消无效");
+    drop(handle);
+
+    // 周期重臂：超载 warn 的订阅器 panic 不得阻止重臂（下锚已先发布）。
+    let c2 = Arc::clone(&clock);
+    let every = sched
+        .every(Duration::from_millis(100), move || {
+            c2.advance(Duration::from_millis(250));
+        })
+        .expect("额度已释放 ⇒ cap=1 仍可接纳（无容量滞留）");
+    clock.advance(Duration::from_millis(100));
+    assert_eq!(sched.tick(), 1, "周期首火");
+    clock.advance(Duration::from_millis(250));
+    assert_eq!(sched.tick(), 1, "订阅器 panic 后周期任务仍已重臂");
+    assert_eq!(sched.live_registrations(), 1, "重臂只占原有一条注册");
+
+    // cancel：事件 panic 不得替换返回的取消结果与幂等语义。
+    assert!(every.cancel(), "取消必须返回真实结果");
+    assert!(!every.cancel(), "幂等语义不变");
+    assert_eq!(sched.live_registrations(), 0);
+    drop(every);
+
+    // close：事件 panic 不得跳过退役/唤醒 —— 关闸仍清空 pending 并释放额度。
+    sched.close();
+    assert!(sched.is_closed());
+    assert_eq!(sched.live_registrations(), 0, "关闸后零残留");
+    assert!(
+        sched.after(Duration::from_millis(1), || {}).is_err(),
+        "关闸后注册显式拒绝"
+    );
+
+    let hits_of_panic = panicked.load(Ordering::SeqCst);
+    assert!(
+        hits_of_panic >= 5,
+        "订阅器确实在五类事件上 panic 过（实际 {hits_of_panic} 次）"
+    );
+    let after = std_ext::embedded_event_panic_count();
+    assert!(
+        after > before,
+        "containment 计数器必须前进（{before} → {after}）"
+    );
+}
+/// #194 item 2 / #221 §3.1：fire 事件不得插在出堆与回调执行之间——事件到达
+/// 时回调必须已经跑完（时序订阅方据此推断状态，不能看到"已出堆未执行"）。
+#[test]
+fn scheduler_fire_event_arrives_after_callback() {
+    struct FireOrderProbe {
+        hits: Arc<AtomicUsize>,
+        seen_at_hits: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Subscriber for FireOrderProbe {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            if event.metadata().target() == "skeleton::scheduler::fire"
+                && *event.metadata().level() == Level::DEBUG
+            {
+                self.seen_at_hits
+                    .lock()
+                    .expect("probe mutex")
+                    .push(self.hits.load(Ordering::SeqCst));
+            }
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    let clock = Arc::new(MockClock::new());
+    let sched = Scheduler::new(clock.clone());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(FireOrderProbe {
+        hits: Arc::clone(&hits),
+        seen_at_hits: Arc::clone(&seen),
+    });
+    let hits2 = Arc::clone(&hits);
+    sched
+        .after(Duration::from_millis(10), move || {
+            hits2.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect("未关闸注册必成")
+        .detach();
+
+    clock.advance(Duration::from_millis(10));
+    assert_eq!(sched.tick(), 1);
+    assert_eq!(
+        *seen.lock().expect("probe mutex"),
+        vec![1],
+        "fire 事件到达时回调必已跑完（否则事件插在出堆与执行之间）"
+    );
 }
 
 #[test]
@@ -504,9 +708,18 @@ fn worker_teardown_does_not_emit_synchronous_host_event() {
     let worker = sched.spawn_worker();
     worker.join();
     cap.assert_event("skeleton::scheduler::close", Level::INFO, &["cleared=0"]);
+    // 断言面**不能**用进程级 `len()`：全局订阅器会收到同二进制其它测试/线程的
+    // 事件（曾因此偶红 left:2）。收敛到本测试关心的事件（target+level 恰一条
+    // = 调用方 close），再按发射线程归因判「worker 收尾零事件」——后者才是
+    // #221 §2.5 的原意，且对任何 target 的新增事件都有效。
     assert_eq!(
-        cap.len(),
+        cap.count_target("skeleton::scheduler::close", Level::INFO),
         1,
+        "只应有调用方 close 一条事件（worker 收尾零事件）"
+    );
+    assert_eq!(
+        cap.count_from_thread("scheduler-worker"),
+        0,
         "worker teardown must not synchronously invoke the host subscriber"
     );
 }
@@ -595,10 +808,17 @@ fn retry_attempt_start_and_retry_verdict() {
     assert_eq!(res.expect("两次失败后成功"), 7);
     cap.assert_event("skeleton::retry::attempt", Level::DEBUG, &["attempt=1"]);
     cap.assert_event("skeleton::retry::attempt", Level::DEBUG, &["attempt=3"]);
+    // 原 `skeleton::backoff` 的计算入参在这里可观测（issue#202：观测面移到调用点）。
     cap.assert_event(
         "skeleton::retry::verdict",
         Level::WARN,
-        &["attempt=1", "decision=retry", "backoff_ms=100"],
+        &[
+            "attempt=1",
+            "decision=retry",
+            "base_ms=100",
+            "max_ms=10000",
+            "backoff_ms=100",
+        ],
     );
     cap.assert_event(
         "skeleton::retry::verdict",
