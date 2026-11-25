@@ -1485,20 +1485,19 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
     /// 被回收条目的键值所有权在**解锁之后**才析构（issue#71）。
     pub fn purge_expired(&self) -> usize {
         let now = self.clock.now_instant();
-        let (n, retired) = {
+        let (n, retired, len_after) = {
             let mut g = self.lock_core();
             let (n, retired) = g.retain(|_, e| e.expires > now);
             self.expired.fetch_add(n as u64, Ordering::Relaxed);
-            // 埋点「purge」：显式清扫动作 info（回收数/残留）。
-            embed_event!(
-                info,
-                target: "skeleton::cache::purge",
-                purged = n as u64,
-                len_after = g.len() as u64
-            );
-            (n, retired)
+            (n, retired, g.len() as u64)
         };
         drop(retired);
+        embed_event!(
+            info,
+            target: "skeleton::cache::purge",
+            purged = n as u64,
+            len_after = len_after
+        );
         n
     }
 
