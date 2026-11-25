@@ -175,10 +175,12 @@ pub struct PoolAuditEvent {
     pub kind: PoolAuditKind,
 }
 
-/// 池审计订阅票据：Drop = 关闭事件流（落闸清槽，零开销恢复），`#[must_use]`
-/// 拦截裸调用——与骨架审计票据同一纪律。票据对采用方不透明，经实现方
-/// [`PoolManaged::subscribe_audit`] 取得；再次订阅 = 替换现役流，旧票据凭
-/// 实现方代次对账 inert。
+/// 池审计订阅票据：Drop 尝试关闭事件流（落闸清槽，零开销恢复），`#[must_use]`
+/// 拦截裸调用——与骨架审计票据同一纪律。Drop 捕获关闭回调 panic 并累计
+/// [`pool_audit_ticket_drop_panic_count`]，不会在现有 unwind 中触发二次 panic。
+/// 需要观察关闭回调 panic 的调用方应显式调用 [`PoolAuditTicket::close`]。
+/// 票据对采用方不透明，经实现方 [`PoolManaged::subscribe_audit`] 取得；再次
+/// 订阅 = 替换现役流，旧票据凭实现方代次对账 inert。
 #[must_use = "审计票据被丢弃即立即关闭事件流——`pool.subscribe_audit(..);` 裸调用 = 静默关闭；绑定持有才持续记录"]
 pub struct PoolAuditTicket {
     close: Option<Box<dyn FnOnce() + Send>>,
