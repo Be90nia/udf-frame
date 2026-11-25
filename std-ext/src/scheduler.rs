@@ -858,10 +858,6 @@ impl Scheduler {
     ///
     /// 清扫在状态锁内重建堆（只保留 PENDING 条目），被摘条目**移出锁外**
     /// 析构（回调捕获的析构不得在堆锁内跑）。返回被回收的条目数。
-    fn reclaim_cancelled(&self) -> usize {
-        self.reclaim_cancelled_with_telemetry(true)
-    }
-
     fn reclaim_cancelled_with_telemetry(&self, emit_telemetry: bool) -> usize {
         let removed = {
             let mut s = lock(&self.shared.state);
@@ -1811,6 +1807,7 @@ mod tests {
 #[cfg(all(test, feature = "log-embed"))]
 mod telemetry_boundary_tests {
     use super::*;
+    use crate::clock::MockClock;
     use std::sync::atomic::AtomicUsize;
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Metadata};
@@ -1842,7 +1839,9 @@ mod telemetry_boundary_tests {
     #[test]
     fn cancel_returns_actual_cas_result_when_subscriber_panics() {
         let sched = Scheduler::new(Arc::new(MockClock::new()));
-        let handle = sched.after(Duration::from_secs(60), || {}).expect("register");
+        let handle = sched
+            .after(Duration::from_secs(60), || {})
+            .expect("register");
         let before = crate::embedded_event_panic_count();
 
         tracing::subscriber::with_default(PanicSubscriber, || {
