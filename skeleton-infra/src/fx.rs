@@ -777,8 +777,14 @@ pub struct FxScope {
     /// `max_tracked` 上界（`usize::MAX` = 不限；默认不限 ⇒ 兼容既有消费方）。
     max_tracked: usize,
     in_flight: Arc<AtomicUsize>,
+    /// 取消源：`new()` 建**内部源**（首次进入停机与 Drop 时由 scope 自己触发
+    /// 取消，issue#119），`with_source` 换成**外部源**（取消权归外部 owner）。
     source: CancelSource,
     token: CancelToken,
+    /// 内部源所有权（issue#119）：`true` = `new()` 自建（停机首转与 Drop 调
+    /// `cancel()` 让克隆出去的 token 观察到取消）；`false` = `with_source` 注入
+    /// 的外部源（scope 生命周期**不**改写其取消态）。
+    owns_source: bool,
     /// scope 身份（issue#133）：任务体 poll 期把它挂进线程局部标记，供停机口判定
     /// 「调用者是否本 scope 的托管任务」。进程内唯一即可（不跨进程比较）。
     id: usize,
@@ -789,6 +795,11 @@ pub struct FxScope {
 
 impl FxScope {
     /// 新建即 accepting（可 spawn）；并发闸与外接取消源经 builder 链显式加挂。
+    ///
+    /// 本构造建**内部取消源**（issue#119）：[`Self::token`] 取出的令牌在首次
+    /// 进入停机（`shutdown` / `shutdown_timeout`）或 scope `Drop` 时转为已取消。
+    /// 要让取消权留在外部，用 [`Self::with_source`] 注入（此后 scope 的停机与
+    /// Drop 都不改写该源的取消态）。
     pub fn new() -> Self {
         let (source, token) = cancel_pair();
         // 初始接收者即刻丢弃：`send_replace` / `send_if_modified` 无接收者也写入值
@@ -804,6 +815,7 @@ impl FxScope {
             in_flight: Arc::new(AtomicUsize::new(0)),
             source,
             token,
+            owns_source: true,
             id: NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             drain,
         }
@@ -865,10 +877,21 @@ impl FxScope {
             rx: src.tx.subscribe(),
         };
         self.source = src;
+        // 外部源：取消权归外部 owner，scope 停机/Drop 不改写它（issue#119）。
+        self.owns_source = false;
         self
     }
 
     /// 取观察面令牌（Clone=同一取消态；任务内携带判停）。
+    ///
+    /// **默认 scope（`new()`）的 token 生命周期（issue#119）**：首次进入停机
+    /// （[`Self::shutdown`] / [`Self::shutdown_timeout`] 赢得 `Open → Draining`
+    /// 的那一次）与 scope **Drop** 时，scope 触发内部源的粘性取消 ⇒ 此前取出
+    /// 的 token 全部观察到 `true`。`close()` **不算**停机（只关接受闸，不取消
+    /// ——同 `conformance_lifecycle` 的「close 不是 cancel」契约）。
+    ///
+    /// **注入外部源（[`Self::with_source`]）时**取消态由外部源决定（含取消先于
+    /// 接线，issue#68）；scope 的停机与 Drop 都不改写它。
     pub fn token(&self) -> CancelToken {
         self.token.clone()
     }
@@ -1172,6 +1195,15 @@ impl FxScope {
         );
     }
 
+    /// 内部取消源的一次性取消（issue#119）：只在**首次进入停机**（`Open →
+    /// Draining` 的唯一赢家）与 Drop 时触发；`with_source` 注入的外部源不动
+    /// （取消权归外部 owner）。取消是粘性 + 幂等，重复调用无副作用。
+    fn cancel_owned_source(&self) {
+        if self.owns_source {
+            self.source.cancel();
+        }
+    }
+
     /// 尝试成为排空 owner（issue#70）：`Open → Draining` 的原子转换**先于**取走
     /// JoinSet——否则并发调用者会把「集合已被取走」误读成「排空已完成」。
     ///
@@ -1186,6 +1218,9 @@ impl FxScope {
             _ => false,
         });
         if won {
+            // 停机首转的唯一赢家：一次性取消内部源（issue#119）。协作取消通知
+            // 与随后的 abort_all **同批**下发，不给「协作任务先反应」的宽限期。
+            self.cancel_owned_source();
             return DrainSlot::Owner;
         }
         // 未赢：**一次** borrow 同时取状态与载荷（线性化点 = 本次调用）。旧实现是
@@ -1200,10 +1235,19 @@ impl FxScope {
     }
 
     /// fx 域停机三段一次收拢：① close（accepting 闸关，拒新 spawn）→
-    /// ② abort_all（在途任务收 abort——[`CancelSource`] 协作取消面；未到 await 点
-    /// 的任务在下一次让渡时才终止）→ ③ 等净（join_next 循环至任务集清空）。锁内
-    /// abort_all + mem::take(JoinSet)，take 后的 set 在锁外 await join_next 循环
-    /// （禁持 std 锁跨 await）。
+    /// ② 取消 + abort_all（**先**触发内部取消源的粘性取消——[`CancelSource`]
+    /// 协作取消通知面，issue#119；**同批**随即 abort_all）→ ③ 等净（join_next
+    /// 循环至任务集清空）。锁内取消 + abort_all + mem::take(JoinSet)，take 后的
+    /// set 在锁外 await join_next 循环（禁持 std 锁跨 await）。
+    ///
+    /// **取消只是通知，不是宽限期**（issue#119）：`token` 变 `true` 与 abort 请求
+    /// 同批下发——协作任务若想在停机时做收尾，必须**自己**在 `cancelled()` 之后
+    /// 立刻完成，不能指望「cancel 之后还有时间等 abort」。
+    ///
+    /// **取消的一次性**：取消挂在 `Open → Draining` 的唯一赢家上（[`Self::shutdown`]
+    /// 与 [`Self::shutdown_timeout`] 共用同一转换），重复/并发停机不再重复触发
+    /// （取消本身亦幂等）；`with_source` 注入的外部源不在此列（取消权归外部
+    /// owner，scope 停机不改写它）。`close()` 不是停机、不取消。
     ///
     /// 排空即收割（issue#13）：终局按 [`ShutdownReport`] 五桶归集（panic 载荷入
     /// 清单，不静默丢弃）；正常等净至空集 ⇒ `timed_out` / `still_running` 恒 0。
@@ -1459,6 +1503,18 @@ impl FxScope {
 impl Default for FxScope {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for FxScope {
+    /// scope 消失 = 本域生命周期的终点：**先**触发内部源的粘性取消（issue#119）
+    /// ——早已克隆出去的 token 随之观察到 `true`，禁让默认 token 成为永久 `false`
+    /// 的假观察面；随后字段 drop 让 `JoinSet` 请求 abort 全部托管任务（既有
+    /// 「scope drop ⇒ 全组 abort」语义不变，本 impl 不 join、不等）。
+    ///
+    /// **注入外部源（`with_source`）时不动它**：取消权在外部 owner。
+    fn drop(&mut self) {
+        self.cancel_owned_source();
     }
 }
 

@@ -687,11 +687,23 @@ mod memory_pool {
         /// 工厂闭包 panic 时原样传播：席位已先回滚（`created` 下降）并唤醒一个
         /// 等待者，池不留半死态。
         ///
+        /// # 超时的表示范围与溢出语义（issue#116）
+        ///
+        /// 期限由 `Instant::checked_add` 计算：`timeout` 超出平台单调时钟可表示
+        /// 范围（如 [`Duration::MAX`]）时**不 panic、不截短**，按「无实际期限」
+        /// 处理——等待侧不做超时判定，只随 notify / 伪唤醒复判谓词，直到有空闲件
+        /// 或可新建为止（超大值语义 = 永不超时，如实兑现调用方意图）。可表示范围
+        /// 内的期限照旧单调计时：每轮以 `Instant::now()` 对比**同一个**绝对期限。
+        ///
+        /// 因此「空闲件直取 / 工厂新建 / 扩容唤醒」路径与超时大小完全无关，超大
+        /// `timeout` 不会在这些路径上产生任何副作用。
+        ///
         /// # Errors
         ///
         /// [`PoolAcquireTimeout`]：期限窗内无件可借。
         pub fn acquire(&self, timeout: Duration) -> Result<PoolGuard<'_, T>, PoolAcquireTimeout> {
-            let deadline = Instant::now() + timeout;
+            // `None` = 期限不可表示 ⇒ 实际无限期（见上「溢出语义」）。
+            let deadline = Instant::now().checked_add(timeout);
             let mut inner = lock(&self.inner);
             loop {
                 if let Some(obj) = inner.idle.pop() {
@@ -715,6 +727,14 @@ mod memory_pool {
                     self.base.note_borrow();
                     return Ok(self.guard(obj));
                 }
+                let Some(deadline) = deadline else {
+                    // 期限不可表示：无超时等待（notify / 伪唤醒回环复判同一谓词）。
+                    inner = self
+                        .cv
+                        .wait(inner)
+                        .expect("memgov pool lock poisoned (prior holder panicked)");
+                    continue;
+                };
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(PoolAcquireTimeout);

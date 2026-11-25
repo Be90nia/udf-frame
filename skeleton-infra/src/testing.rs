@@ -300,6 +300,43 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Te
         );
     }
 
+    /// 未消费效果数（只读诊断面：队列锁内取长度，不暴露可变访问）。
+    pub fn pending_effects(&self) -> usize {
+        lock(&self.effects).len()
+    }
+
+    /// 收尾断言（issue#210）：断言**没有未预期**的残留效果——多出的一条也不允许。
+    ///
+    /// `receive` 只能证明「期望的效果都在」；reducer 除了期望效果还多发一条时，
+    /// 只 receive 一次的老写法会静默通过（残留条目随 `TestStore` 析构消失）。
+    /// 本方法补上「没有多余的」那一半，测试应在每个场景末尾显式调用。
+    ///
+    /// 显式调用而非在 `Drop` 里 panic——失败定位落在测试自己的调用点。
+    ///
+    /// # Panics
+    ///
+    /// 队列非空：报文含剩余总数与**队列位置 0**（= 下一次 `receive` 会弹出的
+    /// 那条）的效果内容。断言在锁外 panic（锁内 panic 会毒化队列锁，掩盖后续
+    /// 诊断）。
+    #[track_caller]
+    pub fn finish(&mut self)
+    where
+        A: std::fmt::Debug,
+        Op: std::fmt::Debug,
+    {
+        let queue = lock(&self.effects);
+        if queue.is_empty() {
+            return; // 成功路径零分配
+        }
+        let pending = queue.len();
+        let first = format!(
+            "{:?}",
+            queue.front().expect("non-empty queue has a front effect")
+        );
+        drop(queue);
+        panic!("finish: {pending} unexpected effect(s) remain; first at position 0: {first}");
+    }
+
     /// 逐动作断言读侧：最近一次 `dispatch` 后的 idle 状态。
     pub fn state(&self) -> &S {
         &self.current
@@ -511,5 +548,99 @@ mod tests {
         assert_eq!(*store.snapshot(), 0, "透传零回灌：store 不动");
         wait_idle(&fxscope_scope).await;
         fxscope_scope.expect_body_idle();
+    }
+
+    // ── issue#210：`finish()` 补上「没有多余效果」那一半断言 ──────────────────
+
+    /// 一条或多条 Run 效果（第二变体故意多发一条）。
+    #[derive(Debug)]
+    enum Emit {
+        One,
+        Two,
+    }
+
+    struct MultiEmitter;
+
+    impl Reducer for MultiEmitter {
+        type State = ();
+        type Action = Emit;
+        type Op = u8;
+        fn initial(&self) {}
+        fn reduce(&self, _: &(), action: Emit, out: &mut EffectBuf<Emit, u8>) {
+            match action {
+                Emit::One => out.push(Effect::Run {
+                    id: EffectId::new(0),
+                    op: 1,
+                }),
+                Emit::Two => {
+                    out.push(Effect::Run {
+                        id: EffectId::new(0),
+                        op: 1,
+                    });
+                    out.push(Effect::Run {
+                        id: EffectId::new(1),
+                        op: 2,
+                    });
+                }
+            }
+        }
+    }
+
+    fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default()
+    }
+
+    /// ① reducer 多发一条：只 receive 期望的那条时，`finish` 必须报出残留效果
+    /// （修复前没有任何断言面——残留条目随 TestStore 析构静默消失）。
+    #[test]
+    fn finish_rejects_unexpected_remaining_effect() {
+        let mut store = TestStore::<(), Emit, u8>::new(MultiEmitter);
+        store.dispatch(Emit::Two);
+        store.receive(ExpectedEffect::Run {
+            id: Some(EffectId::new(0)),
+            op: 1,
+        });
+        assert_eq!(store.pending_effects(), 1, "多发的第二条仍可观测");
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.finish()))
+            .expect_err("未预期的残留效果必须让 finish 失败");
+        let message = panic_text(payload.as_ref());
+        assert!(
+            message.contains("1 unexpected effect"),
+            "报文含剩余总数：{message}"
+        );
+        assert!(message.contains("position 0"), "报文含位置：{message}");
+        assert!(
+            message.contains("op: 2"),
+            "报文含第一条残留效果内容：{message}"
+        );
+    }
+
+    /// ② 全消费路径必须通过——断言不得在正确输入上误报。
+    #[test]
+    fn finish_accepts_fully_consumed_effects() {
+        let mut store = TestStore::<(), Emit, u8>::new(MultiEmitter);
+        store.dispatch(Emit::One);
+        store.receive(ExpectedEffect::Run {
+            id: Some(EffectId::new(0)),
+            op: 1,
+        });
+        store.finish(); // 单条恰好消费完
+
+        store.dispatch(Emit::Two);
+        store.receive(ExpectedEffect::Run {
+            id: Some(EffectId::new(0)),
+            op: 1,
+        });
+        store.receive(ExpectedEffect::Run {
+            id: Some(EffectId::new(1)),
+            op: 2,
+        });
+        assert_eq!(store.pending_effects(), 0);
+        store.finish();
     }
 }

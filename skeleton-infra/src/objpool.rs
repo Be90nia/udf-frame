@@ -194,9 +194,11 @@
 //! 时做一次**（issue#35）：weight 钩子在归还/插入路径（片锁外）调用一次，值随
 //! 槽存档；借出/prune/resize/池析构的回卷一律用存储值，**不再对已记账对象调
 //! 用户代码**（钩子在移出后 panic 曾让字节永久漏记 + 计数悬挂）。**weight 钩子
-//! 体内仍不得 acquire/insert 同一池**（重入 = 递归面——插入路径会再次触发计量）
-//! ——debug 构建在片锁取锁点 fail-fast 检出重入（release 零开销仍禁，见
-//! `WeightHook`）。
+//! 体内仍不得 acquire/insert 同一池**（重入 = 递归面——插入路径会再次触发计量）。
+//! 该红线**按池身份**判定（issue#117）：debug 构建在片锁取锁点比较本线程在途
+//! 钩子的池身份，只有**同池**重入 fail-fast；钩子内访问**另一个池**的
+//! `acquire` / `metrics` / `insert` 是合法组合（release 零开销，同池重入仍禁，
+//! 见 `WeightHook`）。
 //!
 //! # 强制清零（缺口：reset 钩子可选，忘配 = 明文驻留）
 //!
@@ -349,11 +351,15 @@ impl Borrow<PoolMetrics> for ObjectPoolMetrics {
 type ResetHook<T> = Box<dyn Fn(&mut T) + Send + Sync>;
 
 /// 单件字节计量钩子：`Fn(&T) -> usize`——调用点仅**入池计量**（归还/插入路径、
-/// 片锁外；issue#35 起一次计量随 `IdleSlot` 存槽，释放路径不再调用）。钩子体内
-/// 不得 acquire/insert 同一池（重入 = 递归面——插入路径会再次触发计量）；debug
-/// 构建在片锁取锁点 fail-fast 检出重入（`acquire` / `insert` / `metrics` /
-/// `prune_idle` / `resize` 任一取片锁即 panic，release 零开销仍禁）；返回值按
-/// **对象当前真实驻留字节**计（`Vec` 类 = `capacity()`，不是 `size_of`）。
+/// 片锁外；issue#35 起一次计量随 `IdleSlot` 存槽，释放路径不再调用）。
+///
+/// **重入契约按池身份判定**（issue#117）：钩子体内不得 acquire/insert **同一池**
+/// （重入 = 递归面——插入路径会再次触发计量）；debug 构建在片锁取锁点比较在途
+/// 钩子的池身份，同池即 fail-fast panic（release 零开销仍禁）。**跨池组合合法**：
+/// 钩子内调用另一个池的 `acquire` / `metrics` / `insert` 不被拦（旧实现用线程级
+/// 布尔标志，把任何池的取锁都判成重入 = debug/release 语义分叉）。
+///
+/// 返回值按**对象当前真实驻留字节**计（`Vec` 类 = `capacity()`，不是 `size_of`）。
 type WeightHook<T> = Box<dyn Fn(&T) -> usize + Send + Sync>;
 
 /// 进程级共享字节预算仲裁器：多池共用一个内存上限的原语（bd jovl4 缺口 1）。
@@ -546,41 +552,43 @@ thread_local! {
     static RESET_IN_FLIGHT: Cell<bool> = const { Cell::new(false) };
 }
 
-// weight 钩子执行中标志（**仅 debug 构建**，release 零开销）：钩子可能在片锁
-// 内执行（归还/借出/裁剪路径的计量点），体内再取片锁（`acquire` / `insert` /
-// `metrics` / `prune_idle` / `resize` 任一）= 同线程双重加锁死锁面——`lock`
-// 取锁点 `debug_assert` fail-fast 检出（issue#21：红线从 doc 升级为防呆）。
+// weight 钩子在途的**池身份**（仅 debug 构建，release 零开销）：issue#35 起计量
+// 在片锁**外**执行，剩余红线只有**同池**重入（插入路径会再次触发计量 = 递归面）。
+// `lock` 取锁点按池身份判重入（issue#117）——跨池组合（钩子内访问另一个池的
+// `acquire` / `metrics`）是合法用法，不再被旧实现的线程级布尔标志一律拦下。
 #[cfg(debug_assertions)]
 thread_local! {
-    static WEIGHT_IN_FLIGHT: Cell<bool> = const { Cell::new(false) };
+    static WEIGHT_HOOK_POOL: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-/// weight 钩子执行窗（RAII：钩子 panic 时 unwind 路径恢复标志，不留脏状态）。
+/// weight 钩子执行窗（RAII：钩子 panic 时 unwind 路径恢复上一层身份，不留脏状态）。
 #[cfg(debug_assertions)]
-struct WeightInFlightGuard(bool);
+struct WeightInFlightGuard(Option<usize>);
 
 #[cfg(debug_assertions)]
 impl WeightInFlightGuard {
-    fn enter() -> Self {
-        Self(WEIGHT_IN_FLIGHT.with(|c| c.replace(true)))
+    /// 标记「本线程正在 `pool` 的 weight 钩子体内」，返回上一层身份供 Drop 还原
+    /// （钩子嵌套时逐层还原，跨池嵌套退出内层后仍指向外层池）。
+    fn enter(pool: usize) -> Self {
+        Self(WEIGHT_HOOK_POOL.with(|c| c.replace(Some(pool))))
     }
 }
 
 #[cfg(debug_assertions)]
 impl Drop for WeightInFlightGuard {
     fn drop(&mut self) {
-        WEIGHT_IN_FLIGHT.with(|c| c.set(self.0));
+        WEIGHT_HOOK_POOL.with(|c| c.set(self.0));
     }
 }
 
 /// std Mutex 取锁（**片锁口径**：全部分片锁必经此口）：中毒 = 持锁方已
-/// panic——fail-fast 传播（同 `pool::lock` 纪律）。debug 构建额外检出 weight
-/// 钩子重入（钩子在片锁内执行时体内再取片锁 = 死锁面，issue#21）。
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+/// panic——fail-fast 传播（同 `pool::lock` 纪律）。debug 构建额外检出**同池**
+/// weight 钩子重入（`pool` = 该片所属池身份；跨池取锁合法，issue#117）。
+fn lock<T>(pool: usize, mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     #[cfg(debug_assertions)]
     debug_assert!(
-        !WEIGHT_IN_FLIGHT.with(Cell::get),
-        "ObjectPool: weight hook must not re-enter the pool (deadlock face: hook re-locks a shard)"
+        WEIGHT_HOOK_POOL.with(Cell::get) != Some(pool),
+        "ObjectPool: weight hook must not re-enter the same pool (recursion face: insert re-triggers the hook)"
     );
     mutex
         .lock()
@@ -1009,7 +1017,7 @@ impl<T> ObjectPool<T> {
         let start = self.home_shard();
         for i in 0..shards {
             let idx = (start + i) % shards;
-            let mut shard = lock(&self.slots[idx]);
+            let mut shard = self.shard_lock(idx);
             // 双配额在片锁内读（同 `return_to_shard` 的 resize 收敛论证）；
             // 字节预算 `try_take` 原子 check+act（失败无副作用，逐片重试无害）。
             let idle_cap = self.idle_cap.load(Ordering::Relaxed);
@@ -1096,8 +1104,8 @@ impl<T> ObjectPool<T> {
         let mut idle = 0;
         let mut borrowed = 0;
         let mut reused = 0u64;
-        for shard in &self.slots {
-            let guard = lock(shard);
+        for idx in 0..self.slots.len() {
+            let guard = self.shard_lock(idx);
             idle += guard.idle.len();
             borrowed += guard.borrowed;
             reused += guard.reused;
@@ -1177,8 +1185,8 @@ impl<T> ObjectPool<T> {
         let zero_sweep = max_idle_age == Duration::ZERO;
         let mut doomed: Vec<T> = Vec::new();
         let mut doomed_bytes = 0usize;
-        for shard_mutex in &self.slots {
-            let mut shard = lock(shard_mutex);
+        for idx in 0..self.slots.len() {
+            let mut shard = self.shard_lock(idx);
             let mut i = 0;
             while i < shard.idle.len() {
                 // saturating：时钟单调下 last_used 恒 ≤ now；非单调入参如实按
@@ -1243,9 +1251,9 @@ impl<T> ObjectPool<T> {
         let shards = self.slots.len();
         let mut doomed: Vec<T> = Vec::new();
         let mut doomed_bytes = 0usize;
-        for (idx, shard_mutex) in self.slots.iter().enumerate() {
+        for idx in 0..shards {
             let cap = share(tuning.idle_cap, shards, idx);
-            let mut shard = lock(shard_mutex);
+            let mut shard = self.shard_lock(idx);
             if shard.idle.len() > cap {
                 let excess = shard.idle.len() - cap;
                 for slot in shard.idle.drain(0..excess) {
@@ -1301,7 +1309,7 @@ impl<T> ObjectPool<T> {
     fn pop_idle(&self, start: usize) -> Option<(T, usize)> {
         for i in 0..self.slots.len() {
             let idx = (start + i) % self.slots.len();
-            let mut shard = lock(&self.slots[idx]);
+            let mut shard = self.shard_lock(idx);
             if let Some(slot) = shard.idle.pop() {
                 shard.borrowed += 1;
                 shard.reused += 1;
@@ -1326,7 +1334,7 @@ impl<T> ObjectPool<T> {
         let shards = self.slots.len();
         for i in 0..shards {
             let idx = (start + i) % shards;
-            let mut shard = lock(&self.slots[idx]);
+            let mut shard = self.shard_lock(idx);
             let max = self.max.load(Ordering::Relaxed);
             if shard.alive < share(max, shards, idx) {
                 shard.alive += 1;
@@ -1339,7 +1347,7 @@ impl<T> ObjectPool<T> {
     /// 配额回滚（工厂 panic，尚未交出对象）：只退宇宙存活数——`borrowed` 从未
     /// 记（`record_borrow` 只在工厂返回后调用），不得混账。
     fn unclaim_growth(&self, home: usize) {
-        let mut shard = lock(&self.slots[home]);
+        let mut shard = self.shard_lock(home);
         take(&mut shard.alive, 1, "universe alive");
     }
 
@@ -1364,7 +1372,7 @@ impl<T> ObjectPool<T> {
     /// idle 永久顶在新上界之外（无任何再裁剪路径）。
     fn return_to_shard(&self, home: usize, obj: T, weight: usize) -> Option<T> {
         let shards = self.slots.len();
-        let mut shard = lock(&self.slots[home]);
+        let mut shard = self.shard_lock(home);
         take(&mut shard.borrowed, 1, "borrowed");
         let idle_cap = self.idle_cap.load(Ordering::Relaxed);
         // 字节裁决与片配额同一临界区：`try_take` 原子 check+act（失败无副作用
@@ -1380,7 +1388,7 @@ impl<T> ObjectPool<T> {
         drop(shard); // 迁片前先放锁：逐片取锁、锁不嵌套
         for i in 1..shards {
             let idx = (home + i) % shards;
-            let mut candidate = lock(&self.slots[idx]);
+            let mut candidate = self.shard_lock(idx);
             // 迁入判定同样在候选片锁内读配额（同一收敛论证）。
             let idle_cap = self.idle_cap.load(Ordering::Relaxed);
             let max = self.max.load(Ordering::Relaxed);
@@ -1397,17 +1405,17 @@ impl<T> ObjectPool<T> {
             });
             candidate.alive += 1;
             drop(candidate);
-            take(&mut lock(&self.slots[home]).alive, 1, "universe alive");
+            take(&mut self.shard_lock(home).alive, 1, "universe alive");
             return None;
         }
-        take(&mut lock(&self.slots[home]).alive, 1, "universe alive");
+        take(&mut self.shard_lock(home).alive, 1, "universe alive");
         Some(obj)
     }
 
     /// 对象离开池（销毁 / `detach` 移交 / 配额回滚）：锁 home 片回卷借出数；宇宙
     /// 内对象连同宇宙存活数一并回卷（降级对象不入宇宙——两条记账路径，不得混账）。
     fn release(&self, home: usize, in_universe: bool) {
-        let mut shard = lock(&self.slots[home]);
+        let mut shard = self.shard_lock(home);
         take(&mut shard.borrowed, 1, "borrowed");
         if in_universe {
             take(&mut shard.alive, 1, "universe alive");
@@ -1417,8 +1425,20 @@ impl<T> ObjectPool<T> {
     /// 借出记账（工厂返回后调用）：`borrowed` 只数**真实交出**的对象——工厂 panic
     /// 的在途配额走 [`Self::release`] 回滚，不虚增借出数。
     fn record_borrow(&self, home: usize) {
-        let mut shard = lock(&self.slots[home]);
+        let mut shard = self.shard_lock(home);
         shard.borrowed += 1;
+    }
+
+    /// 片锁入口（**唯一取片锁口**）：debug 构建下携带本池身份做 weight 钩子
+    /// 重入防呆——同池 = 递归面，跨池取锁合法（issue#117）。
+    fn shard_lock(&self, idx: usize) -> MutexGuard<'_, Shard<T>> {
+        lock(self.identity(), &self.slots[idx])
+    }
+
+    /// 池身份（重入防呆的比较键）：池存活期内地址唯一，且只在「钩子在场 +
+    /// 片锁取锁」同一线程窗口内比较，足以区分不同池实例。
+    fn identity(&self) -> usize {
+        self as *const Self as usize
     }
 
     /// 单件字节计量（未启用字节配额的池恒 0——`weight`/`budget` 成对出现，
@@ -1426,14 +1446,14 @@ impl<T> ObjectPool<T> {
     /// [`Self::drop_handle`]（归还计量，panic ⇒ 账目回卷后传播）与
     /// [`Self::push_inserted`]（插入计量）——值随 [`IdleSlot`] 存槽，释放路径
     /// （`pop_idle` / prune / resize / 池析构）一律用存储值，不再对已记账对象
-    /// 调用户代码（issue#35）。钩子体内仍禁 acquire/insert 同一池（重入递归面，
-    /// 见 `WeightHook`）。
+    /// 调用户代码（issue#35）。钩子体内仍禁 acquire/insert **同一池**（重入递归
+    /// 面）；跨池组合合法（issue#117，见 `WeightHook`）。
     fn weight_of(&self, obj: &T) -> usize {
         let Some(w) = self.weight.as_ref() else {
             return 0;
         };
         #[cfg(debug_assertions)]
-        let _in_flight = WeightInFlightGuard::enter();
+        let _in_flight = WeightInFlightGuard::enter(self.identity());
         w(obj)
     }
 

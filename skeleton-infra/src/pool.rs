@@ -81,6 +81,28 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .expect("pool lock poisoned (prior holder panicked)")
 }
 
+// 本线程所属线程池身份（`Arc::as_ptr(&Shared)`，issue#132）：自 join 检测用。
+// 只回答「本线程是不是**本池**的 worker」——不靠线程名/逻辑 worker id 推断
+// （二者都可与线程身份脱钩），也不影响其他池的 worker。
+thread_local! {
+    static WORKER_POOL: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// worker 身份标记窗（RAII：全部退出路径还原，禁把池外线程误判成 worker）。
+struct WorkerIdentity(Option<usize>);
+
+impl WorkerIdentity {
+    fn enter(pool: usize) -> Self {
+        Self(WORKER_POOL.with(|c| c.replace(Some(pool))))
+    }
+}
+
+impl Drop for WorkerIdentity {
+    fn drop(&mut self) {
+        WORKER_POOL.with(|c| c.set(self.0));
+    }
+}
+
 /// 闸翻转（issue#89 线性化点的机械锚）：**必须在订阅槽锁内调用**——槽摘除/
 /// 替换与 gate 翻转是一次状态变更。debug 构建用 `try_lock` 断言调用点确实持锁：
 /// 若有人把翻转挪出临界区（#89 的缺陷形状），任何订阅/退订测试立刻红，鉴别力
@@ -848,8 +870,15 @@ impl PoolHandle {
     }
 
     /// 弃最旧（FIFO 队头）：[`DiscardOldestPolicy`] 的积木，自定义策略可复用。
+    ///
+    /// **shutdown 后恒 `None`**（issue#118）：停机后队列里的条目是**已接收**、
+    /// 仍待 graceful drain 的任务，拒绝路径不得取走它们（取走即静默消灭既有工作）。
     pub fn pop_oldest(&self) -> Option<Task> {
-        lock(&self.shared.inner).queue.pop_front()
+        let mut g = lock(&self.shared.inner);
+        if g.shutdown {
+            return None;
+        }
+        g.queue.pop_front()
     }
 
     /// 补入队（有位且未 shutdown 才收）：[`DiscardOldestPolicy`] 的积木。
@@ -863,13 +892,46 @@ impl PoolHandle {
         self.shared.work.notify_one();
         true
     }
+
+    /// 换血入队（**单临界区原子**，[`DiscardOldestPolicy`] 的实现面，issue#118）：
+    ///
+    /// - 池已 shutdown ⇒ `Err(task)`：停机后已接收的队列条目归 graceful drain，
+    ///   本方法**不 pop、不替换**，新任务原样退还调用方；
+    /// - 队列有位 ⇒ 直接入队（不弃任何已接收任务）；
+    /// - 队列满 ⇒ 弃 FIFO 队头、补入本任务，并计入
+    ///   [`ThreadPoolMetrics::discarded`]——「策略主动丢弃的**已接收**任务」与
+    ///   `rejected`（新提交被拒）分账，禁用成功形态掩盖丢件。
+    ///
+    /// 「判 shutdown / 判满 / pop / push」在同一次锁内完成：拆成
+    /// `pop_oldest()` + `offer()` 两步会留下「判完未停机、pop 后停机」的窗（旧
+    /// 实现的缺陷形状 = 已接收任务被 pop 之后 offer 因停机失败 ⇒ 两边都丢）。
+    ///
+    /// # Errors
+    ///
+    /// `task` 原样退还：池已 shutdown（拒绝时不动队列）。
+    pub fn replace_oldest(&self, task: Task) -> Result<(), Task> {
+        let mut g = lock(&self.shared.inner);
+        if g.shutdown {
+            return Err(task);
+        }
+        if g.queue.len() >= g.queue_cap {
+            // `queue_cap ≥ 1`（构造期校验）⇒ 满队列必非空。
+            g.queue.pop_front();
+            g.discarded += 1;
+        }
+        g.queue.push_back(task);
+        drop(g);
+        self.shared.work.notify_one();
+        Ok(())
+    }
 }
 
 /// 默认拒绝四件套（Java TPE 同名语义）：
 /// Abort 退还调用方；CallerRuns 提交线程内联执行（任务 panic 按普通调用
 /// 传播——调用方自己的线程，自然语义）；Discard 静默丢弃（计数留痕）；
-/// DiscardOldest 弃队头换本任务入队（pop 与 offer 之间的并发空位被抢时
-/// 弃新任务——不循环重试，见 [`PoolHandle::offer`]）。
+/// DiscardOldest 弃队头换本任务入队（**仅队列满且未 shutdown**；判满与换血
+/// 同临界区原子完成，见 [`PoolHandle::replace_oldest`]）。停机后提交一律退还
+/// 调用方（issue#118）——已接收任务的 graceful drain 不被拒绝路径破坏。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AbortPolicy;
 
@@ -903,9 +965,8 @@ impl RejectPolicy for DiscardPolicy {
 
 impl RejectPolicy for DiscardOldestPolicy {
     fn on_reject(&self, task: Task, pool: &PoolHandle) -> Result<(), Task> {
-        let _ = pool.pop_oldest();
-        let _ = pool.offer(task);
-        Ok(())
+        // 停机拒绝不吃已接收任务：`replace_oldest` 单临界区内判定（issue#118）。
+        pool.replace_oldest(task)
     }
 }
 
@@ -953,6 +1014,10 @@ struct Inner {
     reservations: usize,
     completed: u64,
     rejected: u64,
+    /// 拒绝策略**主动丢弃的已接收任务**累计（issue#118：DiscardOldest 换血）。
+    /// 与 `rejected`（新提交被拒）分账——后者任务退还调用方，前者是既有工作
+    /// 被策略消灭，禁用同一个数字掩盖两种后果。
+    discarded: u64,
     task_panics: u64,
     /// worker 创建失败累计（fail-visible：环境故障留痕；与策略拒绝 `rejected`
     /// 分账——两者恢复语义不同，禁混账）。
@@ -1013,6 +1078,12 @@ pub struct ThreadPoolMetrics {
     pub completed: u64,
     /// 拒绝策略触发累计（含 CallerRuns 内联）。
     pub rejected: u64,
+    /// 拒绝策略**主动丢弃的已接收任务**累计（issue#118：DiscardOldest 在队列
+    /// 满时换血）。与 `rejected` 分账：`rejected` 数「策略触发次数」（可能已
+    /// 消化——内联执行 / 换入），本字段数「既有排队工作被策略消灭」——两者后果
+    /// 不同，禁用同一个数字互相掩盖。停机后的提交**不**增加本字段（已接收
+    /// 任务原样保留给 graceful drain）。
+    pub discarded: u64,
     /// 任务 panic 摘除累计（fail-visible：worker 存活但 panic 禁静默）。
     pub task_panics: u64,
     /// worker 创建失败累计（fail-visible：环境故障留痕；与策略拒绝 `rejected`
@@ -1029,6 +1100,23 @@ impl Borrow<PoolMetrics> for ThreadPoolMetrics {
         &self.shape
     }
 }
+
+/// 自 join 拒绝（[`ThreadPool::try_join`] 的 `Err` 面，issue#132）：调用线程是
+/// **同一池**的 worker——它自己的退役计数要等它从当前任务返回才递减，等自己就是
+/// 永久死锁。显式拒绝而非挂起，也不 detach 工人来伪装成功。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfJoinError;
+
+impl std::fmt::Display for SelfJoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "ThreadPool join rejected: caller is a worker of the same pool (self-join deadlocks); \
+             join from the external owner or use the cancellation token to stop task-locally",
+        )
+    }
+}
+
+impl std::error::Error for SelfJoinError {}
 
 /// 动态线程池：[`PoolManaged`] 的 worker 调度特化实现（管理面委托
 /// [`PoolBase`]，任务面自有计数——切分理由见模块文档）。
@@ -1197,6 +1285,7 @@ impl<G: SpawnGate> ThreadPool<G> {
                 reservations: 0,
                 completed: 0,
                 rejected: 0,
+                discarded: 0,
                 task_panics: 0,
                 spawn_failures: 0,
                 next_id: 0,
@@ -1484,6 +1573,7 @@ impl<G: SpawnGate> ThreadPool<G> {
             queue_cap: g.queue_cap,
             completed: g.completed,
             rejected: g.rejected,
+            discarded: g.discarded,
             task_panics: g.task_panics,
             spawn_failures: g.spawn_failures,
             shape: PoolMetrics {
@@ -1539,7 +1629,41 @@ impl<G: SpawnGate> ThreadPool<G> {
     ///
     /// 存活计数只含**真实存在**的 worker（创建失败不留幻影）——本方法不会因
     /// 创建失败而永久等待。
+    ///
+    /// # 谁可以等待（issue#132）
+    ///
+    /// 只能由**外部所有者 / 协调者**调用：本池 worker 的任务体内调用就是自 join
+    /// ——该 worker 的退役计数要等它从当前任务返回才递减，等自己 = 永久死锁。
+    /// 需要可判定的结果用 [`Self::try_join`]；本口按「既有调用点签名不变」保留，
+    /// 自 join 时 fail-fast panic（见 `# Panics`）。
+    ///
+    /// `Drop` 只发优雅关闭信号、**不 join**：确定性收尾点永远是外部所有者
+    /// `shutdown(); join();`（或 `try_join()`）。任务内只想停止接收新提交可以直接
+    /// 调 [`Self::shutdown`]（不阻塞），**但不要**在任务内 join。
+    ///
+    /// # Panics
+    ///
+    /// 本池 worker 的任务体内调用（自 join 死锁面）。panic 由 worker 循环摘除并
+    /// 计入 [`ThreadPoolMetrics::task_panics`]——池不砖、不 detach、不伪装成功。
     pub fn join(&self) {
+        self.try_join().expect(
+            "ThreadPool::join called from one of this pool's own workers: self-join deadlocks \
+             (the worker cannot retire while it is blocked waiting for retirement); \
+             use try_join() or join from the external owner",
+        );
+    }
+
+    /// [`Self::join`] 的可判定版本：自 join 返回 [`SelfJoinError`] 而不是 panic
+    /// （issue#132）。
+    ///
+    /// # Errors
+    ///
+    /// [`SelfJoinError`]：调用线程是**本池**的 worker（自 join = 永久死锁面；
+    /// 显式拒绝，不挂起、不伪装成功）。其他池的 worker 调用不受影响。
+    pub fn try_join(&self) -> Result<(), SelfJoinError> {
+        if WORKER_POOL.with(Cell::get) == Some(self.identity()) {
+            return Err(SelfJoinError);
+        }
         let mut g = lock(&self.shared.inner);
         while g.workers > 0 {
             g = self
@@ -1548,6 +1672,12 @@ impl<G: SpawnGate> ThreadPool<G> {
                 .wait(g)
                 .expect("thread pool lock poisoned (prior holder panicked)");
         }
+        Ok(())
+    }
+
+    /// 池身份（worker 身份标记与自 join 判定的比较键）：池存活期内地址唯一。
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
     }
 
     /// 开审计流（委托 [`PoolBase::subscribe_audit`]：容量环/seq/票据/重入封死
@@ -1732,6 +1862,9 @@ impl<G: SpawnGate> Drop for ThreadPool<G> {
 /// 处理完当前任务即退；真实存活跌破 core 前禁认领令牌——issue#34）；
 /// first-task 交接先跑再入环。
 fn worker_loop(shared: Arc<Shared>, mut first: Option<Task>) {
+    // 身份标记：本线程属于该池（自 join 检测的比较键，issue#132）。RAII 还原，
+    // 退出循环后该线程不再是任何池的 worker。
+    let _identity = WorkerIdentity::enter(Arc::as_ptr(&shared) as usize);
     #[cfg(test)]
     shared.worker_loop_entries.fetch_add(1, Ordering::SeqCst);
     let mut g = lock(&shared.inner);
