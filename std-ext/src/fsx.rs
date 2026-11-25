@@ -48,7 +48,7 @@
 //! 采集器 `examples/fsx_multidim.rs`，报告：fsx 域性能锚（本地留存，未入库）。
 
 use std::fs::{self, FileType, Metadata};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -776,6 +776,7 @@ fn unique_temp_name(prefix: &str) -> String {
 #[derive(Debug)]
 pub struct TempDir {
     path: PathBuf,
+    armed: bool,
 }
 
 impl TempDir {
@@ -785,10 +786,11 @@ impl TempDir {
     }
 
     /// 显式清理（消费 self，删除结果可见）；Drop 为兜底（错误只记录）。
-    pub fn close(self) -> io::Result<()> {
-        let path = self.path.clone();
-        std::mem::forget(self); // 清理结果由本函数申报，不再走 Drop 兜底
-        rm_all(&path).map_err(|e| e.err)
+    pub fn close(mut self) -> io::Result<()> {
+        // Disarm the fallback before performing the explicit, fallible cleanup.
+        // No mem::forget: ownership and the PathBuf allocation are released normally.
+        self.armed = false;
+        rm_all(&self.path).map_err(|e| e.err)
     }
 }
 
@@ -813,19 +815,38 @@ pub fn temp_dir_in(root: impl AsRef<Path>, prefix: &str) -> io::Result<TempDir> 
     // create_dir 独占语义：存在即 AlreadyExists 显式上浮（同名撞车被进程内
     // 原子序号根除，重试环属死代码；跨进程由 pid 段隔离）
     fs::create_dir(&path)?;
-    Ok(TempDir { path })
+    Ok(TempDir { path, armed: true })
+}
+
+fn report_tempdir_cleanup_failure_to(
+    writer: &mut impl Write,
+    path: &Path,
+    err: &io::Error,
+) {
+    // Formatting and writing are both fallible. Never let a diagnostic turn Drop
+    // into a panic, especially while another panic is already unwinding.
+    let _ = writeln!(
+        writer,
+        "fsx: TempDir cleanup failed at {}: {err}",
+        path.display()
+    );
+}
+
+fn report_tempdir_cleanup_failure(path: &Path, err: &io::Error) {
+    let stderr = io::stderr();
+    let mut writer = stderr.lock();
+    report_tempdir_cleanup_failure_to(&mut writer, path, err);
 }
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         if let Err(err) = rm_all(&self.path) {
-            // 埋点「清理失败」：RAII 收尾失败留痕（eprintln fail-visible 通道
-            // 保持不变，事件是宿主可订阅的增量面）。
-            embed_event!(warn, target: "skeleton::fsx::tempdir", path = %self.path.display(), error = %err);
-            eprintln!(
-                "fsx: TempDir cleanup failed at {}: {err}",
-                self.path.display()
-            );
+            // Drop is strictly best-effort: no host tracing subscriber and no
+            // infallible stderr macro. Explicit close() remains error-reporting.
+            report_tempdir_cleanup_failure(&self.path, &err);
         }
     }
 }
