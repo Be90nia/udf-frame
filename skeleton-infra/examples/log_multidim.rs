@@ -5,6 +5,9 @@
 //! Mutex park 结构性 n/a（本域无自旋循环可测，竞争面形状由③留痕）；⑦伪共享
 //! n/a=单权威单缓冲结构（无 per-线程热点计数可 pad）；④运行时调参=每行
 //! flush 为拍板语义、BufWriter 容量未暴露（升级面见 logx.rs ponytail 注）。
+//! #164 口径：一个 `FileSinkWriter` = 一个逻辑事件，提交在 `flush`/`Drop`——
+//! 故所有「一行一测」的循环都是 `write_all` + `flush`（不复用 writer 跨行
+//! 攒批，否则整批会被当成一个超限事件丢弃）。
 //!
 //! 跑法（仓库根）：
 //! ```text
@@ -66,7 +69,9 @@ fn main() {
 
     // 预热：首行走首开分支（与换日同分支），create_dir_all/open/BufWriter
     // 容量分配挪出热窗；stdout LineWriter 缓冲同步预热。
+    // #164：一个 writer 一个事件——测得落盘路径必须每行 flush（Drop 才提交）。
     w.write_all(&line).expect("warm line");
+    w.flush().expect("warm flush");
     init_with_file(&FixedRoot(root.join("fmt")), log::LevelFilter::Info).expect("collector init");
     tracing::info!(target: "profile::fmt", seq = 0u64, "format path warmup");
 
@@ -74,6 +79,7 @@ fn main() {
     let before = CountingAllocator::live_allocs();
     for _ in 0..10_000 {
         w.write_all(&line).expect("line");
+        w.flush().expect("flush");
     }
     let delta = CountingAllocator::live_allocs() - before;
     println!("①a steady-state line write: {delta} allocs per 10k lines (expect 0)");
@@ -82,6 +88,7 @@ fn main() {
     CountingAllocator::reset_peak();
     for _ in 0..1_000 {
         w.write_all(&line).expect("line");
+        w.flush().expect("flush");
     }
     println!(
         "①a' steady-state window peak delta: {}B (expect 0 = zero allocation events)",
@@ -96,6 +103,7 @@ fn main() {
     let before = CountingAllocator::live_allocs();
     let bytes_before = CountingAllocator::live_bytes();
     cold.write_all(&line).expect("cold line");
+    cold.flush().expect("cold flush");
     let delta = CountingAllocator::live_allocs() - before;
     let net = CountingAllocator::live_bytes() as isize - bytes_before as isize;
     println!(
@@ -129,6 +137,7 @@ fn main() {
     let t0 = Instant::now();
     for _ in 0..n {
         w.write_all(&line).expect("line");
+        w.flush().expect("flush");
     }
     let wall = t0.elapsed();
     let secs = wall.as_secs_f64();
@@ -145,6 +154,7 @@ fn main() {
     for _ in 0..n5 {
         let t = Instant::now();
         w.write_all(&line).expect("line");
+        w.flush().expect("flush");
         lat.push(t.elapsed().as_nanos() as u64);
     }
     lat.sort_unstable();
@@ -187,6 +197,7 @@ fn main() {
                 let mut ops = 0u64;
                 while stop.load(Ordering::Relaxed) == 0 {
                     w.write_all(&line).expect("line");
+                    w.flush().expect("flush");
                     ops += 1;
                 }
                 total.fetch_add(ops, Ordering::Relaxed);

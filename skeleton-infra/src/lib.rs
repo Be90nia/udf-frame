@@ -195,12 +195,14 @@ pub use parse_mock::{MockJson, MockMarkdown, MockParseError, MockSqlDialect};
 pub use journal::{Journal, JournalError, JsonlJournal, Replay, ReplayError};
 
 #[cfg(feature = "log-fs")]
-pub use logx::{DefaultPathResolver, FileSink, HomeDirUnresolvable, mask_secrets};
+pub use logx::{
+    DEFAULT_MAX_LOG_EVENT_BYTES, DefaultPathResolver, FileSink, HomeDirUnresolvable, mask_secrets,
+};
 
 #[cfg(feature = "log")]
 pub use logx::{
     AlreadyInit, FileSinkWriter, LogInitError, init_tracing_default, init_tracing_from_env,
-    init_with_file,
+    init_with_file, init_with_file_with_secrets,
 };
 
 #[cfg(feature = "log")]

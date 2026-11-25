@@ -43,8 +43,12 @@
 //!（框架自身开发态，零运行时猜测；采方开发态请注入自有 resolver，见
 //! `skeleton::logpath` trait 文档示例），release 构建=
 //! `home_dir()/.<project_name>/log/`，home 不可解析=构造期显式 Err（禁静默
-//! 落 cwd）。[`FileSink`] 按日滚动 `log-YYYY-MM-DD.log` 纯追加（跨进程按行
-//! 交错安全，永不改名/截断），每行 flush；写失败=计数+一次告警+继续（禁
+//! 落 cwd）。[`FileSink`] 按日滚动 `log-YYYY-MM-DD.log` 纯追加（永不改名/
+//! 截断），每个逻辑记录一次 `write_all`+`flush`；记录完整性只在**同进程内
+//! 共享同一 sink 实例**的写者之间保证（#219：`O_APPEND` 只保护单次 OS write
+//! 的追加位置，不宣称跨进程整记录原子性）。tracing 事件经
+//! `FileSinkWriter`（`log` feature）每事件本地缓冲、`Drop` 时一次提交（#164），
+//! 单事件上限 [`DEFAULT_MAX_LOG_EVENT_BYTES`]。写失败/超限=计数+一次告警+继续（禁
 //! panic 拖垮业务、禁纯吞）。告警走 [`SoftFailureReporter`]（默认
 //! [`StderrReporter`]，best-effort、禁 `eprintln!`——stderr 不可写时它会
 //! panic 或阻塞）；写/刷失败后当日落点按 [`FileSink`] 失败面阶梯降级
@@ -165,29 +169,117 @@ fn to_tracing_filter(level: log::LevelFilter) -> tracing::level_filters::LevelFi
     }
 }
 
-/// E 类：密钥掩码。命中子串→`"***"`；
-/// 按长度降序替换（最长优先防半掩）；空串项跳过；空表/空串原样返回；
-/// 恒分配一次新 String。
+/// 掩码替换标记（唯一常量）。
+const REDACTION_MARKER: &str = "***";
+
+/// 预编译掩码表（#176）：`set_secrets` 时一次性剔空 + 长→短排序，emit 热路径
+/// 只克隆 `Arc`，**不再每事件 clone/sort 规则表**。
 ///
-/// 性能锚（2026-10-16 批 C 定性，release/std Instant 粗测，详见
-/// 批 C 性能锚（本地留存，未入库））：无命中纯扫描近线性 O(n×m)——4KiB×
-/// 1/8/64 规则 ~0.6/4/85µs，64KiB ~14/67/1175µs（四轮中位）；规则轴 8 条
-/// ~6×、64 条 ~50-156×（分配/缓存压力放大），文本轴 16× 输入比值 ~10-37×
-///（终轮 13.8-15.6 ≈ 线性）——双轴同向增长、无平方爆点；命中另计每规则
-/// 一次 String 重建（8 命中@4KiB ~1.5µs vs 无命中 ~0.6µs；~0.6µs=1 规则
-/// 口径，8 规则无命中见前 ~4µs，reference 跨机区间 2.9-4µs 同源）。数字供判级：
-/// 高频日志路径宜上游过滤先行再掩码。
-pub fn mask_secrets(input: &str, secrets: &[&str]) -> String {
-    let mut sorted: Vec<&str> = secrets.to_vec();
-    sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    let mut out = input.to_string();
-    for secret in sorted {
-        if secret.is_empty() {
-            continue; // 空串 pattern 会在每个字符位注入 "***"
+/// 只有 `log` 门面（通道 registry / `FileSinkWriter`）需要这份预编译形态；
+/// `log-fs` 单开时用 [`mask_secrets`] 的即用即排版（[`mask_longest`] 共用同一
+/// 扫描核心，故两者语义恒一致）。
+#[cfg(feature = "log")]
+#[derive(Debug, Default)]
+struct SecretMask {
+    /// 长→短（最长优先防半掩）；空串已在编译期剔除。
+    secrets: Vec<String>,
+}
+
+#[cfg(feature = "log")]
+impl SecretMask {
+    fn new(secrets: Vec<String>) -> Self {
+        let mut secrets: Vec<String> = secrets.into_iter().filter(|s| !s.is_empty()).collect();
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        Self { secrets }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.secrets.is_empty()
+    }
+
+    /// 掩码整段字节（#176 单遍路径）。
+    fn mask(&self, input: &[u8]) -> Vec<u8> {
+        mask_longest(input, &self.secrets)
+    }
+
+    /// `&str` 便捷面（通道 emit 与预编译配置共用）。
+    fn mask_str(&self, input: &str) -> String {
+        bytes_to_string(self.mask(input.as_bytes()))
+    }
+}
+
+/// 掩码核心：按规则长度降序做**单遍**最长匹配 / 非重叠替换（#176）。
+///
+/// 语义与旧的逐条 `String::replace` 逐值一致（最长优先防半掩、非重叠、`***`
+/// 标记），差别只在两处：① 输出一次性成型，不为每条规则重建 String；② 标记
+/// 不会被后续规则二次命中（旧版在规则含 `*` 时会把已写入的 `***` 再掩一遍）。
+///
+/// 首字节位图（#176 实测驱动）：规则首字节建一张 256 项表，不是候选首字节的
+/// 位置只做一次查表就跳过——常见文本里绝大多数字节都落在这一支，单遍扫描因此
+/// 快于旧的「按条数 N 遍搜索」。文本恰好全是某条规则首字节时仍退化为 O(n×m)
+/// （无三方 Aho-Corasick 的取舍；敏感日志通常走上游过滤先行）。
+///
+/// 字节级匹配对 UTF-8 输入等价于码点级：规则都是合法 UTF-8，其首字节只可能是
+/// ASCII 或前导字节（`0b11xxxxxx`），因此命中起点必落在码点边界。
+///
+/// 前置条件：`secrets` 已剔空并按长度降序（见 [`SecretMask::new`]）。
+fn mask_longest<A: AsRef<[u8]>>(input: &[u8], secrets: &[A]) -> Vec<u8> {
+    let mut leads = [false; 256];
+    for secret in secrets {
+        if let Some(first) = secret.as_ref().first() {
+            leads[*first as usize] = true;
         }
-        out = out.replace(secret, "***");
+    }
+
+    let mut out = Vec::with_capacity(input.len());
+    let mut cursor = 0;
+    while cursor < input.len() {
+        let byte = input[cursor];
+        if !leads[byte as usize] {
+            out.push(byte);
+            cursor += 1;
+            continue;
+        }
+        match secrets
+            .iter()
+            .find(|secret| input[cursor..].starts_with(secret.as_ref()))
+        {
+            Some(secret) => {
+                out.extend_from_slice(REDACTION_MARKER.as_bytes());
+                cursor += secret.as_ref().len();
+            }
+            None => {
+                out.push(byte);
+                cursor += 1;
+            }
+        }
     }
     out
+}
+
+/// 掩码输出回 `String`：输入合法 UTF-8 + 命中都在码点边界 + 标记是 ASCII
+/// ⇒ 输出必合法（论据见 [`mask_longest`]），失败不可达。
+fn bytes_to_string(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).expect("masked UTF-8 stays valid (matches are code-point aligned)")
+}
+
+/// E 类：密钥掩码便捷面。命中子串→`"***"`；按长度降序替换（最长优先防半掩）；
+/// 空串项跳过；空表/空串原样返回；恒分配一次新 String。
+///
+/// **热路径请用预编译配置**：本函数每次调用都要剔空+排序规则表+#176 的重建。
+/// `ChannelRegistry::set_secrets`（`log` feature）已把同一算法预编译成
+/// `Arc<SecretMask>`（每事件只克隆 Arc），`FileSinkWriter::with_secrets` 同理。
+///
+/// 性能锚（2026-10-16 批 C 定性，release/std Instant 粗测，详见批 C 性能锚
+/// （本地留存，未入库）；数字测于 #176 前的逐条 `replace` 版本，形态判级仍适用）：
+/// 无命中纯扫描近线性 O(n×m)——4KiB×1/8/64 规则 ~0.6/4/85µs，64KiB
+/// ~14/67/1175µs（四轮中位）；规则轴 8 条 ~6×、64 条 ~50-156×；文本轴 16×
+/// 输入比值 ~10-37×——双轴同向增长、无平方爆点。高频日志路径宜上游过滤先行
+/// 再掩码。
+pub fn mask_secrets(input: &str, secrets: &[&str]) -> String {
+    let mut sorted: Vec<&str> = secrets.iter().copied().filter(|s| !s.is_empty()).collect();
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    bytes_to_string(mask_longest(input.as_bytes(), &sorted))
 }
 
 // ── 文件落盘面：路径解析实现 + 按日滚动 FileSink + 双 sink 初始化 ──
@@ -367,13 +459,20 @@ impl LogPathResolver for DefaultPathResolver {
     }
 }
 
-/// [`init_with_file`] 的失败面：全局 logger 已被占用，或日志根目录创建失败
-/// （fail-visible：目录建不出来就不装订阅者，禁半初始化静默）。
+/// [`init_with_file`] 的失败面：全局 logger 已被占用、注入 resolver 的根不是
+/// 绝对路径，或日志根目录创建失败（fail-visible：根不合法/建不出来就不装
+/// 订阅者、不建目录，禁半初始化静默）。
 #[cfg(feature = "log")]
 #[derive(Debug)]
 pub enum LogInitError {
     /// 全局订阅者（或 log→tracing 桥）已被占用。
     AlreadyInit,
+    /// 注入的 [`LogPathResolver`] 返回了**非绝对**根（#218）。原路径原样回传，
+    /// **未创建任何目录或文件**。相对根会把日志锚到进程 cwd（禁静默回退）。
+    RelativeRoot {
+        /// resolver 原样返回的根。
+        root: std::path::PathBuf,
+    },
     /// 日志根目录 `create_dir_all` 失败。
     RootCreate {
         root: std::path::PathBuf,
@@ -386,6 +485,12 @@ impl std::fmt::Display for LogInitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AlreadyInit => write!(f, "global logger already initialized"),
+            Self::RelativeRoot { root } => write!(
+                f,
+                "log root {:?} is not absolute; the resolver must return an absolute path \
+                 (relative roots would anchor logs to the process cwd)",
+                root
+            ),
             Self::RootCreate { root, source } => {
                 write!(f, "cannot create log root {}: {source}", root.display())
             }
@@ -397,7 +502,7 @@ impl std::fmt::Display for LogInitError {
 impl std::error::Error for LogInitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::AlreadyInit => None,
+            Self::AlreadyInit | Self::RelativeRoot { .. } => None,
             Self::RootCreate { source, .. } => Some(source),
         }
     }
@@ -444,13 +549,34 @@ impl SoftFailureReporter for StderrReporter {
     }
 }
 
+/// 单个逻辑日志事件/记录的默认字节上限（#164 Round 2 拍板：1 MiB）。超限事件
+/// **整段丢弃**（不落半条记录、不触发上游 formatter 的 stderr 回退），丢弃计数
+/// 恰好 +1。已证明需要更大记录的调用方用 [`FileSink::with_max_event_bytes`]
+/// 显式放开，禁把这条默认当成可调热路径开关。
+pub const DEFAULT_MAX_LOG_EVENT_BYTES: usize = 1024 * 1024;
+
 /// 按日滚动的追加式文件日志汇（诊断面）。
 ///
-/// 跨进程并发安全（armor，std 文档逐条对表）：纯追加**永不改名/截断**——
-/// 换日只是打开新文件，无 rotation 改名交接面；`OpenOptions::append` 在
-/// Unix=O_APPEND、Windows=FILE_APPEND_DATA，均按次 write() 原子追加到 EOF；
-/// std 默认以 FILE_SHARE_READ|WRITE|DELETE 打开，不挡并发打开者。每次
-/// `write` 调用=一个落盘单元（fmt 层经 `format_line` 保证整行单调用）。
+/// **记录完整性（#219，收窄后的诚实声明）**：一个「逻辑记录」= 一次
+/// `try_write_line` / `write_line_soft` 调用（经 `log` 门面时 =
+/// `FileSinkWriter` 缓冲的一个完整事件）。同一进程内共享同一 `FileSink`
+/// 实例的所有写者之间，记录**不会相互穿插**——本实例的 `Mutex` 串行 + 整段
+/// `write_all`+`flush` 一次提交。
+///
+/// **不保证跨进程整记录原子性**：多个进程追加同一每日文件时，`O_APPEND`
+/// （Unix）/`FILE_APPEND_DATA`（Windows）只保护**单次 OS write** 的追加位置；
+/// 记录大于一次 OS write（或 `write_all` 被拆成多次）时别的进程可能插进记录
+/// 中间。需要跨进程整记录请自带进程间锁 + framing/校验。纯追加仍**永不改名/
+/// 截断**——换日只是打开新文件，无 rotation 改名交接面；std 默认以
+/// FILE_SHARE_READ|WRITE|DELETE 打开（Windows），不挡并发打开者。
+///
+/// **持久化等级（#164）**：正常写入成功 = 记录已写出且 `BufWriter::flush`
+/// 到 OS——是**诊断尽力而为**，不是 `sync_all` 级崩溃持久化。
+///
+/// **直接 `Write` 面（#164 条 5）**：`impl Write for FileSink` 只是字节流适配，
+/// 每次 `write()` 调用即一条记录（该调用之前/之后不与其他调用合帧）——它
+/// 不能假设调用方一次写一行，也不按换行拆分。需要「一事件一记录」的分帧语义
+/// 请用 `FileSinkWriter`（`log` feature），不要复用本适配器拼行。
 ///
 /// 失败面（拍板 2026-10-17；#112/#184/#198 收紧）：写失败**不 panic、不上抛**
 /// ——计数 + 首行一次告警 + 继续（日志失败拖垮业务是反模式；纯吞禁——
@@ -512,6 +638,8 @@ pub struct FileSink {
     dropped: std::sync::atomic::AtomicU64,
     warned: std::sync::atomic::AtomicBool,
     reporter: std::sync::Arc<dyn SoftFailureReporter>,
+    /// 单事件/单记录字节上限（[`DEFAULT_MAX_LOG_EVENT_BYTES`] 或显式覆盖）。
+    max_event_bytes: usize,
 }
 
 /// 当日落点的降级阶梯（#198：写/刷失败后禁用当前文件，禁原地续写）。
@@ -744,31 +872,59 @@ impl FileSink {
             dropped: std::sync::atomic::AtomicU64::new(0),
             warned: std::sync::atomic::AtomicBool::new(false),
             reporter,
+            max_event_bytes: DEFAULT_MAX_LOG_EVENT_BYTES,
         })
     }
 
-    /// 累计丢弃行数（写失败即丢一行；静默吞的解毒剂，测试与宿主可观测面）。
+    /// 覆盖单事件/单记录字节上限（#164：默认 [`DEFAULT_MAX_LOG_EVENT_BYTES`]）。
+    /// 只在已有实测记录证明必要时放开；生产日志禁把上限当调参面。
+    pub fn with_max_event_bytes(mut self, max: usize) -> Self {
+        self.max_event_bytes = max;
+        self
+    }
+
+    /// 当前单事件/单记录字节上限（`FileSinkWriter` 据此定缓冲上限）。
+    pub fn max_event_bytes(&self) -> usize {
+        self.max_event_bytes
+    }
+
+    /// 累计丢弃**记录**数（写/刷失败或超限即丢一条记录；静默吞的解毒剂，测试
+    /// 与宿主可观测面）。
     pub fn dropped_lines(&self) -> u64 {
         self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 落盘一行（软失败面，见类型文档）。
+    /// 记一次逻辑记录丢弃 + 至多一次告警；返回累计丢弃数。只在失败面分配。
+    fn record_dropped(&self, detail: &str) -> u64 {
+        let dropped = self
+            .dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.reporter.report(&format!(
+                "skeleton-infra::logx: log record dropped (root={}, {detail}); \
+                 dropped records so far: {dropped} — application keeps running",
+                self.root.display(),
+            ));
+        }
+        dropped
+    }
+
+    /// 落盘一条逻辑记录（软失败面，见类型文档）：上限判定在拷贝/落盘**之前**
+    /// ——超限事件整段丢弃（禁落半条记录），丢弃计数恰好 +1。
     fn write_line_soft(&self, buf: &[u8]) -> usize {
+        if buf.len() > self.max_event_bytes {
+            self.record_dropped(&format!(
+                "event of {} bytes exceeds the {} byte logical event limit",
+                buf.len(),
+                self.max_event_bytes
+            ));
+            return buf.len();
+        }
         match self.try_write_line(std::time::SystemTime::now(), buf) {
             Ok(()) => buf.len(),
             Err(err) => {
-                let dropped = self
-                    .dropped
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
-                if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    self.reporter.report(&format!(
-                        "skeleton-infra::logx: log file write failed (root={}, \
-                         error={err}); dropped lines so far: {dropped} — \
-                         application keeps running",
-                        self.root.display(),
-                    ));
-                }
+                self.record_dropped(&format!("write failed: {err}"));
                 buf.len()
             }
         }
@@ -861,6 +1017,9 @@ impl FileSink {
     }
 }
 
+/// 直接 `Write` 面：**字节流适配，不承担行/事件分帧**（#164 条 5）。每次
+/// `write()` 调用即一条记录——本适配器不会假设「一次调用 = 一行」，也不按
+/// 换行拆分或拼接；需要事件级分帧请用 `log` feature 下的 `FileSinkWriter`。
 impl std::io::Write for FileSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         // 软失败面：恒 Ok（丢弃走计数 + reporter 告警；io 层 Err 会被 fmt 层
@@ -869,34 +1028,169 @@ impl std::io::Write for FileSink {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(()) // 每行已即时 flush
+        Ok(()) // 每次 write 已即时 flush
     }
 }
 
-/// [`tracing_subscriber::fmt::MakeWriter`] 适配壳：orphan 规则下
-/// `Arc<LocalType>` 不得直接 impl 外部 trait（Arc 非本地/非 fundamental），
-/// 以本地新类型承载 Arc。
+/// [`tracing_subscriber::fmt::MakeWriter`] 适配壳（#164：**一个 writer 同时只承载
+/// 一个逻辑事件**）。orphan 规则下 `Arc<LocalType>` 不得直接 impl 外部 trait，故以
+/// 本地新类型承载 Arc 与缓冲。
+///
+/// 事件在 writer 本地缓冲，**在最终化时一次提交**：一次 `FileSink` 临界区写整段
+/// 字节 = 一条记录。formatter 的多次 `write()` 片段因此永不各自落盘，并发事件
+/// 也不会片间交错。最终化边界按本次锁定版本实测（tracing-subscriber 0.3.23 的
+/// `fmt::Layer::on_event` 只做一次 `write_all` 且**不调 `flush`**，随后 writer
+/// 离开作用域）⇒ **`Drop` 是 tracing 路径的正常提交点**。
+/// 升级 tracing-subscriber 前必须重新核实该生命周期。
+///
+/// `flush()` 提交**当前事件**并把 writer 复位为可累积状态——同一 writer 可跨多个
+/// 事件复用（逐行 `write_all` + `flush` 是合法用法，post-flush 写入绝不静默
+/// 丢弃）；`Drop` 提交尚未提交的剩余部分，故一次提交只发生一次。
+///
+/// 上限（#164）：单个事件上限取 [`FileSink::max_event_bytes`]（默认
+/// [`DEFAULT_MAX_LOG_EVENT_BYTES`]）。超限事件整段丢弃、`write` 仍返回
+/// `Ok(len)`（禁触发上游 formatter 的 stderr 回退）、其后续片段不再增长缓冲，
+/// 最终化时丢弃计数**恰好 +1**，下一条记录照常接收。
+///
+/// 缓冲内容原样提交（**不按换行拆分**）：写入多个换行分隔片段时它们作为一条
+/// 记录落盘（字节逐字保留，不追加也不合并换行；缺结尾换行也不补）。一次都没
+/// 写入的 writer 不算事件（不落盘、不计数）。
 #[cfg(feature = "log")]
-#[derive(Clone, Debug)]
-pub struct FileSinkWriter(std::sync::Arc<FileSink>);
+pub struct FileSinkWriter {
+    sink: std::sync::Arc<FileSink>,
+    /// 本事件已接受字节（提交或丢弃后清空）。
+    buffer: Vec<u8>,
+    /// 缓冲上限快照（构造期取自 sink）。
+    max: usize,
+    /// 提交前的整段掩码配置（空 = 原样透传，零分配）。
+    mask: std::sync::Arc<SecretMask>,
+    state: WriterState,
+}
+
+/// writer 的提交状态（#164：`flush`/`Drop` 提交**当前事件恰好一次**，之后 writer
+/// 可继续累积下一条记录——post-flush 写入绝不静默丢弃）。
+#[cfg(feature = "log")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterState {
+    /// 正在累积当前事件字节。
+    Buffering,
+    /// 当前事件已超上限：忽略其后续片段，最终化时计一次丢弃（下一条记录照常收）。
+    Oversize,
+}
 
 #[cfg(feature = "log")]
 impl FileSinkWriter {
-    /// 包装共享汇（同一 sink 可多壳并行写，内部锁串行）。
+    /// 包装共享汇（同一 sink 可多壳并行写，内部锁串行）。**原样不掩码**——
+    /// [`ChannelRegistry::set_secrets`] 只作用于通道事件，不保护本裸 writer。
     pub fn new(sink: std::sync::Arc<FileSink>) -> Self {
-        Self(sink)
+        Self::with_mask(sink, std::sync::Arc::new(SecretMask::default()))
+    }
+
+    /// 显式掩码变体（#164 Round 2）：整段事件缓冲完成后统一过掩码契约（精确
+    /// 配置子串匹配；编码/语义等价的密钥不在保证内），因此被 formatter 片段
+    /// 拆开的密钥同样命中。掩码表构造期编译一次（不可变），掩码在 `FileSink`
+    /// 锁**外**执行。
+    pub fn with_secrets(sink: std::sync::Arc<FileSink>, secrets: Vec<String>) -> Self {
+        Self::with_mask(sink, std::sync::Arc::new(SecretMask::new(secrets)))
+    }
+
+    fn with_mask(sink: std::sync::Arc<FileSink>, mask: std::sync::Arc<SecretMask>) -> Self {
+        let max = sink.max_event_bytes();
+        Self {
+            sink,
+            buffer: Vec::new(),
+            max,
+            mask,
+            state: WriterState::Buffering,
+        }
+    }
+
+    /// 最终化当前事件（`flush` 与 `Drop` 共用，永不 panic）：缓冲字节一次提交；
+    /// 超限事件计一次丢弃。之后状态回到 [`WriterState::Buffering`]，同一 writer
+    /// 可继续累积下一条记录——post-flush 写入**不静默丢弃**（只有 `Drop` 之后的
+    /// 写入才随 writer 一起消失，这在 `io::Write` 语义之外且不可达）。
+    fn finish(&mut self) {
+        match self.state {
+            WriterState::Oversize => {
+                self.state = WriterState::Buffering;
+                self.sink.record_dropped(&format!(
+                    "event exceeds the {} byte logical event limit",
+                    self.max
+                ));
+            }
+            WriterState::Buffering => {
+                if self.buffer.is_empty() {
+                    return; // 空事件：不落盘、不计数
+                }
+                if self.mask.is_empty() {
+                    self.sink.write_line_soft(&self.buffer);
+                } else {
+                    let masked = self.mask.mask(&self.buffer);
+                    self.sink.write_line_soft(&masked);
+                }
+                self.buffer.clear();
+            }
+        }
     }
 }
 
 #[cfg(feature = "log")]
 impl std::io::Write for FileSinkWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // 软失败面直连（与 FileSink 的 io::Write 同一语义：恒 Ok，丢弃走计数）。
-        Ok(self.0.write_line_soft(buf))
+        if self.state == WriterState::Buffering {
+            // 上限判定在拷贝/扩容之前（#164）：超限只切状态，不再增长缓冲。
+            if buf.len() > self.max.saturating_sub(self.buffer.len()) {
+                self.state = WriterState::Oversize;
+                self.buffer = Vec::new(); // 禁部分输出
+            } else {
+                self.buffer.extend_from_slice(buf);
+            }
+        }
+        // 软失败面：恒 Ok(len)——io::Err 会让上游 formatter 走自己的 stderr
+        // 回退，绕过本件的丢弃计数。
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(()) // 每行已即时 flush
+        self.finish();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "log")]
+impl Drop for FileSinkWriter {
+    /// tracing-subscriber 0.3.23 的事件路径不调 `flush`：**这里才是它的正常提交点**。
+    /// `finish` 软失败、有界、只提交尚未提交的字节，不会在 Drop 中 panic（唯一
+    /// 不可能性前提是 reporter 守 [`SoftFailureReporter`] 契约）。
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+#[cfg(feature = "log")]
+impl Clone for FileSinkWriter {
+    /// 克隆 = **新事件的空缓冲**（`MakeWriter::make_writer` 语义）。未提交片段
+    /// 留在原 writer 随其最终化提交——不复制到新 writer（否则同一事件提交两次）。
+    fn clone(&self) -> Self {
+        Self {
+            sink: std::sync::Arc::clone(&self.sink),
+            buffer: Vec::new(),
+            max: self.max,
+            mask: std::sync::Arc::clone(&self.mask),
+            state: WriterState::Buffering,
+        }
+    }
+}
+
+#[cfg(feature = "log")]
+impl std::fmt::Debug for FileSinkWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 缓冲字节可能是未掩码的密钥：只报长度，不打印内容。
+        f.debug_struct("FileSinkWriter")
+            .field("sink", &self.sink)
+            .field("buffered", &self.buffer.len())
+            .field("state", &self.state)
+            .finish()
     }
 }
 
@@ -917,9 +1211,10 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileSinkWriter {
 // 扇出热路径零堆分配论证：通道查找=枚举判别式数组索引（无 HashMap、无开放
 // 字符串键），命中后 `Arc::clone` 只是引用计数增量（非堆分配），message 以
 // `&str` 直传 sink——掩码表未配置（默认）时 emit 全程零堆分配。配置掩码后
-// 写前统一过 [`mask_secrets`]（唯一布点，坑约束 11：掩码是机制面不是调用方
-// 自觉），掩码本身按其既有语义分配（性能锚见其文档：高频路径宜上游过滤先
-// 行再掩码）——这是掩码的安全成本，不在零分配契约内。
+// 写前统一过掩码契约（唯一布点，坑约束 11：掩码是机制面不是调用方自觉）：
+// 规则表在 [`ChannelRegistry::set_secrets`] 预编译（#176：剔空+长→短排序一次），
+// 每事件只克隆 `Arc` + 一次输出分配（不再是每事件 clone/sort 整表）——这仍是
+// 掩码的安全成本，不在零分配契约内（高频路径宜上游过滤先行）。
 
 /// 日志通道：固定三枚（框架级命名；Xray 侧映射 general/access/dns 由主仓
 /// 负责）。封闭枚举=非法通道名在类型层不可能，「注册 fail-visible」只剩
@@ -1028,8 +1323,15 @@ fn level_rank(level: log::Level) -> u8 {
 ///
 /// 并发面：每槽位独立 `RwLock`——register 只锁一个槽（互不阻塞），emit 读锁 +
 /// `Arc` 克隆后锁外写 sink（锁内无 IO）。级别面无锁：每槽位独立 `AtomicU8`，
-/// `set_level` 原子写、emit 原子读比较，不参与槽位 `RwLock`。毒锁复用
-/// [`FileSink`] 纪律
+/// `set_level` 原子写、emit 原子读比较，不参与槽位 `RwLock`。
+///
+/// **锁边界（#129）：`ChannelSink` 的每个 trait 方法都在槽位锁外调用**——它们是
+/// 消费方代码，不是类型层可证的纯 getter，重入 `register`/`set_level` 或 panic
+/// 都会在锁内变成死锁/毒锁。因此 `register` 先取 `channel()`/`level()` 再进写锁，
+/// `dropped`/`dropped_total` 只锁内克隆 `Arc`、锁外调 `dropped_lines()`，emit 的
+/// `write()` 同样锁外。回调里跑消费方代码 ⇒ 锁内只做状态读取与 `Arc` 克隆。
+///
+/// 毒锁复用 [`FileSink`] 纪律
 ///（`into_inner` 继续：日志面禁毒锁放大业务故障）。无注销面——注册表面向
 /// 进程生命期的装配期使用（同全局 logger 单次初始化纪律）。
 ///
@@ -1065,8 +1367,8 @@ pub struct ChannelRegistry {
     /// None 即静默）；`set_level` 运行期原子改写；emit 写路径直接 load
     /// 比较（不经 sink、不经 tracing 层）。
     levels: [std::sync::atomic::AtomicU8; 3],
-    /// 密钥掩码表（空=透传零分配）；Arc 快照读，emit 锁外掩码。
-    secrets: std::sync::RwLock<std::sync::Arc<Vec<String>>>,
+    /// 预编译掩码表（空=透传零分配，#176）；Arc 快照读，emit 锁外掩码。
+    mask: std::sync::RwLock<std::sync::Arc<SecretMask>>,
 }
 
 #[cfg(feature = "log")]
@@ -1076,7 +1378,7 @@ impl ChannelRegistry {
         Self {
             slots: std::array::from_fn(|_| std::sync::RwLock::new(None)),
             levels: std::array::from_fn(|_| std::sync::atomic::AtomicU8::new(0)),
-            secrets: std::sync::RwLock::new(std::sync::Arc::new(Vec::new())),
+            mask: std::sync::RwLock::new(std::sync::Arc::new(SecretMask::default())),
         }
     }
 
@@ -1084,8 +1386,12 @@ impl ChannelRegistry {
     /// sink=`Err`（fail-visible，原 sink 不动）。槽位级别以 `sink.level()`
     /// 初始化（构造期 level 配置入口）——装配顺序=先 register 后
     /// [`ChannelRegistry::set_level`]（register 会以 sink 初值覆盖槽位级）。
+    ///
+    /// 锁边界（#129）：`channel()`/`level()` 都是消费方代码，**在槽位写锁之前**
+    /// 求值——重入 `register` 的 `level()` 实现不再死锁在写锁上。
     pub fn register(&self, sink: std::sync::Arc<dyn ChannelSink>) -> Result<(), ChannelError> {
         let channel = sink.channel();
+        let level = sink.level();
         let slot = &self.slots[channel as usize];
         let mut guard = slot
             .write()
@@ -1094,7 +1400,7 @@ impl ChannelRegistry {
             return Err(ChannelError::AlreadyRegistered { channel });
         }
         self.levels[channel as usize].store(
-            level_filter_rank(sink.level()),
+            level_filter_rank(level),
             std::sync::atomic::Ordering::Relaxed,
         );
         *guard = Some(sink);
@@ -1113,13 +1419,17 @@ impl ChannelRegistry {
         );
     }
 
-    /// 配置密钥掩码表：此后所有通道写前统一过 [`mask_secrets`]（唯一布点，
-    /// 可 grep）。空表（默认）=透传零分配；替换语义（非累加）。
+    /// 配置密钥掩码表：此后所有通道写前统一过掩码（唯一布点，可 grep）。
+    /// 空表（默认）=透传零分配；替换语义（非累加）。
+    ///
+    /// #176：表在**此处**一次性剔空 + 长→短排序（`SecretMask`），emit 热路径
+    /// 只克隆 `Arc`——不再每事件 clone/sort 规则表。
     pub fn set_secrets(&self, secrets: Vec<String>) {
         *self
-            .secrets
+            .mask
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = std::sync::Arc::new(secrets);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            std::sync::Arc::new(SecretMask::new(secrets));
     }
 
     /// 扇出一条：未注册通道=静默返回（不输出/不 panic/不分配/不计数）；
@@ -1142,36 +1452,50 @@ impl ChannelRegistry {
                 }
             }
         };
-        let secrets = self
-            .secrets
+        // #176：只克隆预编译表的 Arc（引用计数增量，非堆分配）；掩码在
+        // FileSink/通道锁之外执行。
+        let mask = self
+            .mask
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if secrets.is_empty() {
+        if mask.is_empty() {
             sink.write(level, target, message);
         } else {
-            let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
-            let masked = mask_secrets(message, &refs);
+            let masked = mask.mask_str(message);
             sink.write(level, target, &masked);
         }
     }
 
     /// 单通道丢弃计数（写失败口径；级别过滤/未注册静默不在内）。未注册
     /// 通道=`None`（无 sink 即无记账方，不伪造 0）。
+    ///
+    /// 锁边界（#129）：读锁内只克隆 `Arc`，`dropped_lines()`（消费方代码）在
+    /// 锁外调用——重入注册/改级不会死锁在槽位读锁上。
     pub fn dropped(&self, channel: Channel) -> Option<u64> {
-        let guard = self.slots[channel as usize]
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.as_ref().map(|sink| sink.dropped_lines())
+        let sink = {
+            let guard = self.slots[channel as usize]
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.as_ref().map(std::sync::Arc::clone)
+        };
+        sink.map(|sink| sink.dropped_lines())
     }
 
     /// 全部通道丢弃计数总和（写失败口径；级别过滤/未注册静默不在内；=
-    /// [`Self::dropped`] 三通道之和）。
+    /// [`Self::dropped`] 三通道之和）。锁边界同 [`Self::dropped`]：逐槽读锁内
+    /// 只克隆 `Arc`，`dropped_lines()` 锁外调用。
     pub fn dropped_total(&self) -> u64 {
-        self.slots.iter().fold(0u64, |acc, slot| {
-            let guard = slot.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-            acc + guard.as_ref().map(|s| s.dropped_lines()).unwrap_or(0)
-        })
+        self.slots
+            .iter()
+            .map(|slot| {
+                let sink = {
+                    let guard = slot.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.as_ref().map(std::sync::Arc::clone)
+                };
+                sink.map_or(0, |sink| sink.dropped_lines())
+            })
+            .sum()
     }
 }
 
@@ -1182,14 +1506,14 @@ impl Default for ChannelRegistry {
     }
 }
 
-/// 通道文件落盘 sink：[`FileSink`]（按日滚动/软失败自计数/跨进程追加语义，
-/// 见其类型文档）+ 通道 + 独立级别的组合件——宿主「每通道一个文件汇」的
-/// 现成形态，亦可自定义 [`ChannelSink`] 替代（终端/网络面等）。
+/// 通道文件落盘 sink：[`FileSink`]（按日滚动/软失败自计数/**进程内**记录完整性，
+/// 见其类型文档——不保证跨进程整记录原子性）+ 通道 + 独立级别的组合件——宿主
+/// 「每通道一个文件汇」的现成形态，亦可自定义 [`ChannelSink`] 替代（终端/网络面等）。
 ///
 /// 行格式与 LineFormat 默认行格式同形：`[UTC 时间 LEVEL target] message`
-///（整行单写，行完整性同 [`FileSink`] 单落盘单元前提）。行合成每行分配一次
+///（一条记录一次写，记录边界由 [`FileSink`] 串行保证）。行合成每条记录分配一次
 /// String——零分配契约在 [`ChannelRegistry::emit`] 扇出面，sink 内行合成是
-/// 写入方固有成本，非扇出分配。
+/// 写入方固有成本，非扇出分配。单记录上限同 [`FileSink`]（[`DEFAULT_MAX_LOG_EVENT_BYTES`]）。
 #[cfg(feature = "log")]
 pub struct ChannelFileSink {
     channel: Channel,
@@ -1202,11 +1526,26 @@ impl ChannelFileSink {
     /// 建通道文件汇：`root` 通常取 [`PerChannelPathResolver::channel_root`]
     /// （每通道独立子目录）。根目录立即递归创建（配置错误构造期显式失败，
     /// 同 [`FileSink::new`]）。
+    ///
+    /// #218：本入口同样吃 resolver 结果——**相对根在创建任何目录之前被拒**
+    /// （`InvalidInput`，原路径保留在错误里）。相对根会把通道日志锚到进程 cwd，
+    /// 与「resolver 必须给绝对根」的契约冲突；本函数不做任何 cwd 解析/回退。
     pub fn new(
         channel: Channel,
         level: log::LevelFilter,
         root: impl Into<std::path::PathBuf>,
     ) -> std::io::Result<Self> {
+        let root = root.into();
+        if !root.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "channel log root {} is not absolute; the resolver must return an \
+                     absolute path (relative roots would anchor logs to the process cwd)",
+                    root.display()
+                ),
+            ));
+        }
         Ok(Self {
             channel,
             level,
@@ -1226,6 +1565,22 @@ impl ChannelSink for ChannelFileSink {
     }
 
     fn write(&self, level: log::Level, target: &str, message: &str) {
+        // #164：超限事件的粗筛在**构造格式化 String 之前**（省掉大块分配）；
+        // 精确上限由 FileSink 按实际记录字节判定（同一计数面，只计一次）。
+        const FORMAT_OVERHEAD_MAX: usize = 64;
+        if message.len()
+            > self
+                .sink
+                .max_event_bytes()
+                .saturating_sub(FORMAT_OVERHEAD_MAX)
+        {
+            self.sink.record_dropped(&format!(
+                "channel `{}` record exceeds the {} byte logical event limit",
+                self.channel.as_str(),
+                self.sink.max_event_bytes()
+            ));
+            return;
+        }
         let ts = format_utc_timestamp(std::time::SystemTime::now());
         let line = format!("[{ts} {level} {target}] {message}\n");
         self.sink.write_line_soft(line.as_bytes());
@@ -1389,6 +1744,14 @@ impl tracing::field::Visit for LineFields<'_> {
 /// 重复调用或与其它 init 系并存=Err（禁静默覆盖）。两路 fmt 层各自取
 /// `now()` 打行时间戳，同一行的 console/文件副本可差毫秒（cosmetic 上限）。
 ///
+/// **文件面是原样不掩码路径**（#164 Round 2）：[`ChannelRegistry::set_secrets`]
+/// 只作用于通道事件，**不保护本函数的文件 sink**。需要掩码用
+/// [`init_with_file_with_secrets`]。
+///
+/// #218：注入的 `LogPathResolver` 是信任边界——返回的根必须是绝对路径，
+/// 否则 `Err(RelativeRoot { root })`，**在任何目录创建/全局状态触碰之前**返回
+/// （相对根会静默把日志锚到进程 cwd）。
+///
 /// log→tracing 桥：`SubscriberInitExt::try_init` 在 tracing-subscriber 的
 /// `tracing-log` feature（默认开）下内建——先装订阅者再装桥（带全局 max
 /// level hint），与 `fmt().try_init()` 同机制；本件**不得**再显式调
@@ -1417,10 +1780,38 @@ pub fn init_with_file(
     resolver: &dyn LogPathResolver,
     default_level: log::LevelFilter,
 ) -> Result<(), LogInitError> {
+    init_with_file_inner(resolver, default_level, None)
+}
+
+/// 同 [`init_with_file`]，但**文件面显式掩码**（#164 Round 2）：每个事件先整段
+/// 缓冲、再统一过掩码契约（精确配置子串匹配；编码/语义等价的密钥不在保证内），
+/// 因此被 formatter 片段拆开的密钥同样命中。掩码表在装配期编译一次（不可变）。
+/// 控制台层保持原样；通道日志仍由 [`ChannelRegistry::set_secrets`] 单点掩码，
+/// 不会与本面双重掩码。
+#[cfg(feature = "log")]
+pub fn init_with_file_with_secrets(
+    resolver: &dyn LogPathResolver,
+    default_level: log::LevelFilter,
+    secrets: Vec<String>,
+) -> Result<(), LogInitError> {
+    init_with_file_inner(resolver, default_level, Some(secrets))
+}
+
+#[cfg(feature = "log")]
+fn init_with_file_inner(
+    resolver: &dyn LogPathResolver,
+    default_level: log::LevelFilter,
+    secrets: Option<Vec<String>>,
+) -> Result<(), LogInitError> {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
 
     let root = resolver.log_root();
+    // #218：注入 resolver 的结果是信任边界——相对根会让日志静默锚到进程 cwd，
+    // 必须在建任何目录/碰全局订阅者之前拒绝（原路径留在错误里，便于诊断）。
+    if !root.is_absolute() {
+        return Err(LogInitError::RelativeRoot { root });
+    }
     // #130：归属回执——只有本调用**新建**的根才允许在 init 失败时回收。
     let root_created_here = create_root(&root).map_err(|source| LogInitError::RootCreate {
         root: root.clone(),
@@ -1432,6 +1823,10 @@ pub fn init_with_file(
             source,
         }
     })?);
+    let file_writer = match secrets {
+        Some(secrets) => FileSinkWriter::with_secrets(sink, secrets),
+        None => FileSinkWriter::new(sink),
+    };
 
     tracing_subscriber::registry()
         .with(env_filter_or(default_level))
@@ -1442,7 +1837,7 @@ pub fn init_with_file(
         )
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(FileSinkWriter(sink))
+                .with_writer(file_writer)
                 .event_format(LineFormat),
         )
         .try_init()
@@ -1878,6 +2273,7 @@ mod file_sink_tests {
             }),
             dropped: std::sync::atomic::AtomicU64::new(0),
             warned: std::sync::atomic::AtomicBool::new(false),
+            max_event_bytes: DEFAULT_MAX_LOG_EVENT_BYTES,
             reporter: reporter.clone(),
         };
 
@@ -1920,6 +2316,7 @@ mod file_sink_tests {
             }),
             dropped: std::sync::atomic::AtomicU64::new(0),
             warned: std::sync::atomic::AtomicBool::new(false),
+            max_event_bytes: DEFAULT_MAX_LOG_EVENT_BYTES,
             reporter: std::sync::Arc::new(SilentReporter),
         };
 
@@ -2092,9 +2489,9 @@ mod file_sink_tests {
         );
     }
 
-    // #184 Round 2：sink 失败时 MakeWriter 壳仍返回 Ok(len)——tracing-subscriber
-    // 0.3 只在 writer 返回 Err 时走自己的 stderr fallback，那会绕过本件的软失败
-    // 面（重抛日志 IO 错误到业务）。
+    // #184 Round 2 + #164：sink 失败时 MakeWriter 壳仍返回 Ok(len)（tracing-subscriber
+    // 0.3 只在 writer 返回 Err 时走自己的 stderr fallback，那会绕过本件的软失败面）。
+    // 事件在 writer 本地缓冲、Drop 时一次提交，故丢弃计数在最终化后才 +1。
     #[cfg(feature = "log")]
     #[test]
     fn file_sink_writer_keeps_full_length_on_sink_failure() {
@@ -2119,6 +2516,8 @@ mod file_sink_tests {
             5,
             "壳不得把 sink 失败变成 io::Error"
         );
-        assert_eq!(sink.dropped_lines(), 1);
+        assert_eq!(sink.dropped_lines(), 0, "提交前不计数（缓冲未最终化）");
+        drop(writer);
+        assert_eq!(sink.dropped_lines(), 1, "最终化时整事件计一次丢弃");
     }
 }
