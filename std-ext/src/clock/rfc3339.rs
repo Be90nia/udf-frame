@@ -524,14 +524,19 @@ mod tests {
     }
 
     // R6 下界：0000-01-01T00:00:00Z（-62_167_219_200s）。
-    // Windows armor：std SystemTime 内部 FILETIME（100ns tick，无符号，
-    // 1601-01-01 起）——1601 前的时刻 std 表示层即不可达（checked_sub None，
-    // 构造期 panic），fail-closed 拒绝；year 0 完整 roundtrip 仅非 Windows。
+    // Windows：std SystemTime 的 FILETIME 表示域**跨版本不同**——1.87 能表示
+    // 1601 前的时刻（parse 返回 Ok），1.96 起拒绝（OutOfRange）。两个端都是
+    // 该 std 版本的如实行为，禁的是「Ok 却值不对」或 panic；非 Windows 恒可
+    // 表示，year 0 完整 roundtrip。
     #[test]
     fn r6_lower_bound_year_zero() {
         let parsed = parse_rfc3339("0000-01-01T00:00:00Z");
         #[cfg(target_os = "windows")]
-        assert_eq!(parsed, Err(TimeParseError::OutOfRange { at: 19 }));
+        match parsed {
+            Ok(v) => assert_eq!(format_rfc3339(v), "0000-01-01T00:00:00Z"),
+            Err(TimeParseError::OutOfRange { at: 19 }) => {}
+            other => panic!("下界解析只允许（代表域内）Ok 或 OutOfRange{{at:19}}，实得 {other:?}"),
+        }
         #[cfg(not(target_os = "windows"))]
         {
             assert_eq!(parsed, Ok(t(-62_167_219_200, 0)));

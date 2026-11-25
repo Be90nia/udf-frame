@@ -1644,8 +1644,9 @@ mod tests {
             }
         }
 
-        /// #101：worker 的 park 路径（含注册/关闸唤醒后的重算）每次时钟取样都在
-        /// `state` mutex 之外。
+        /// #101：worker 的 park 路径每次时钟取样都在 `state` mutex 之外。
+        /// 判定窗口 = worker 稳定运行到停信标置位之前（停止协议本身要由测试线程
+        /// 持 `state`，那段时间不属被测行为）。
         #[test]
         fn worker_park_reads_clock_outside_state_mutex() {
             let mock = Arc::new(MockClock::new());
@@ -1661,6 +1662,11 @@ mod tests {
             let mut worker = sched.spawn_worker();
             wait_until("worker 跑过三圈", || sched.worker_passes() >= 3);
             let calls = clock.calls.load(AtomicOrd::SeqCst);
+            // 判定窗口在此封口：下面的停止协议必须由**测试线程**持 `state`
+            // （同 `WorkerHandle::drop`），而 worker 退出那一圈仍会在锁外取样
+            // （`worker_loop` 的 `now` 在 `lock(state)` 之前）——停止之后再读
+            // 计数，就会把「测试自己持锁」记成「worker 锁内取样」。
+            let under_lock = clock.under_lock.load(AtomicOrd::SeqCst);
             // Stop this worker without Scheduler::close(): close() takes the same
             // state mutex from the test thread and can make the probe's try_lock
             // observe unrelated cross-thread contention as a false "clock under
@@ -1678,9 +1684,8 @@ mod tests {
 
             assert!(calls >= 3, "park 路径确实取过样（实际 {calls} 次）");
             assert_eq!(
-                clock.under_lock.load(AtomicOrd::SeqCst),
-                0,
-                "worker 的 Clock 取样不得在 state mutex 内"
+                under_lock, 0,
+                "worker 的 Clock 取样不得在 state mutex 内（稳定窗口内的 {calls} 次取样）"
             );
         }
 
