@@ -409,17 +409,8 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
         let mut evicted = false;
         let mut retired = Retired::empty();
         if self.map.len() >= self.cap {
-            // 埋点「容量淘汰」：被逐者恒 LRU 尾（order 字段=选择策略留痕）。
             retired = self.evict_tail();
             evicted = true;
-            embed_event!(
-                debug,
-                target: "skeleton::cache::evict",
-                kind = "capacity",
-                key_hash = retired.slot_key.as_ref().map(|k| key_fingerprint(k)),
-                order = "lru_tail",
-                len_at_evict = self.map.len() as u64
-            );
         }
         let idx = match self.free.pop() {
             Some(i) => i,
@@ -625,8 +616,17 @@ impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
     /// 插入/覆盖。已存在键=更新值+touch（len 不变，不触发淘汰）；
     /// 新键满=先逐 LRU 尾再插（被逐者静默丢弃，需要看见用 [`Self::pop_lru`]）。
     pub fn insert(&mut self, k: K, v: V) {
-        let (_, retired) = self.core.insert(k, v);
+        let (evicted, retired) = self.core.insert(k, v);
         retired.retire();
+        if evicted {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "capacity",
+                order = "lru_tail",
+                len_at_evict = self.core.len().saturating_sub(1) as u64
+            );
+        }
     }
 
     /// 读（**touch**：命中刷新 recency，故需 `&mut self`）。只读共享场景用
@@ -1047,6 +1047,15 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
         retired.retire();
         if evicted {
             self.evictions.fetch_add(1, Ordering::Relaxed);
+            // No key fingerprint here: invoking user Hash for diagnostics would
+            // add another arbitrary callback after the state transition.
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "capacity",
+                order = "lru_tail",
+                len_at_evict = self.capacity().saturating_sub(1) as u64
+            );
         }
     }
 
