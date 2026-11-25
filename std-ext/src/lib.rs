@@ -141,3 +141,48 @@ pub mod ratelimit;
 pub mod retry;
 pub mod scheduler;
 pub mod text;
+
+
+#[cfg(all(test, feature = "log-embed"))]
+mod embedded_event_panic_tests {
+    use super::*;
+    use tracing::{Event, Metadata};
+    use tracing::span::{Attributes, Id, Record};
+
+    struct PanicSubscriber;
+
+    impl tracing::Subscriber for PanicSubscriber {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, _: &Event<'_>) {
+            panic!("injected host tracing subscriber panic");
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test]
+    fn embedded_event_contains_subscriber_panic_and_counts_it() {
+        let before = embedded_event_panic_count();
+        tracing::subscriber::with_default(PanicSubscriber, || {
+            embed_event!(debug, target: "skeleton::telemetry_test", marker = 1);
+        });
+        assert_eq!(
+            embedded_event_panic_count(),
+            before.saturating_add(1),
+            "subscriber panic is counted without escaping the emitting call"
+        );
+    }
+}
