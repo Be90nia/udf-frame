@@ -41,11 +41,10 @@ pub fn pool_audit_ticket_drop_panic_count() -> u64 {
 }
 
 fn record_pool_audit_ticket_drop_panic() {
-    let _ = POOL_AUDIT_TICKET_DROP_PANICS.fetch_update(
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-        |count| Some(count.saturating_add(1)),
-    );
+    let _ =
+        POOL_AUDIT_TICKET_DROP_PANICS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_add(1))
+        });
 }
 
 /// 池指标共享核心形（可观测契约的统一读数面）：任何 [`PoolManaged`] 实现的
@@ -219,8 +218,8 @@ impl Drop for PoolAuditTicket {
 #[cfg(test)]
 mod pool_audit_ticket_drop_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn drop_contains_callback_panic_and_records_it_once() {
