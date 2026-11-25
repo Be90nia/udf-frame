@@ -55,6 +55,11 @@
 //! （主文件 → 恢复文件 → 当日停写）。时间戳与文件名恒 UTC（std 无本地时区
 //! API，chrono 依赖判否）。
 //!
+//! 保留策略（#128）**默认不删任何文件**（零窗口，历史行为不变）；opt-in
+//! [`FileSink::with_retention`] 才按 age / 总字节有界保留，触发点=换日开新
+//! 文件（或显式 [`FileSink::prune`]）。当日文件永不参与淘汰，删除在状态锁外
+//! 进行，失败只计数 + 一次聚合告警（不 panic、不拖累写入）。
+//!
 //! 多通道扇出面（P1-10-a 前置件，拍板 2026-10-23；`log` feature）：固定三
 //! 通道 `Channel`（general/access/dns，封闭枚举=非法通道名在类型层不可
 //! 能）→ 每通道独立 sink（一通道一 sink 禁串扰）+ 独立 level（槽位
@@ -555,6 +560,66 @@ impl SoftFailureReporter for StderrReporter {
 /// 显式放开，禁把这条默认当成可调热路径开关。
 pub const DEFAULT_MAX_LOG_EVENT_BYTES: usize = 1024 * 1024;
 
+/// opt-in 保留策略（#128）：**默认零窗口 = 不删任何文件**，只有显式
+/// [`FileSink::with_retention`] 才生效（不静默加任意保留窗口——审计日志被
+/// 自动删除是采用方决策，不是本件默认）。
+///
+/// 两个轴可单用可并用，执行顺序恒为 **先 age 再 byte**：
+///
+/// - [`RetentionPolicy::max_age`]：按**文件名里的 UTC 日**（不是 mtime——mtime
+///   会被外部工具改写，文件名日期才是滚动语义的权威）保留
+///   `floor(max_age / 1 天)` 个历史日 + 当日，更早的每日文件删除；
+///   `Duration::ZERO`（或任何亚日窗口）=「只留当日」。
+/// - [`RetentionPolicy::max_total_bytes`]：删完过期文件后若根下总字节仍超限，
+///   按**最旧优先**继续删，直到不超限或用尽可删文件。
+///
+/// **不可删集恒非空**：当日（及日期晚于当日的）每日文件永不参与淘汰——正在
+/// 写的文件不删。因此预算可能在「只剩当日文件」时无法达成：此时不 panic、不
+/// 越权删除，只经 [`SoftFailureReporter`] 通告一次（下次换日再试）。
+///
+/// **只管本件命名的文件**：根下其余条目（宿主的其它文件、子目录）既不计数也
+/// 不删——保留策略不是「清空目录」。
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use skeleton_infra::logx::RetentionPolicy;
+///
+/// // 保留 7 天且总量不超过 512 MiB；两者并用时先按 age、再按 byte。
+/// let _bounded = RetentionPolicy::new()
+///     .max_age(Duration::from_secs(7 * 86_400))
+///     .max_total_bytes(512 * 1024 * 1024);
+/// // 不装策略 = 零窗口 = 不删任何文件（装配见 FileSink::with_retention）。
+/// let _unbounded = RetentionPolicy::new();
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct RetentionPolicy {
+    max_age: Option<std::time::Duration>,
+    max_total_bytes: Option<u64>,
+}
+
+impl RetentionPolicy {
+    /// 零窗口策略：两个轴都不设 = 不删任何文件（与不装策略等价）。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 设保留窗口（消费自身，便于链式装配）。按 UTC 日截断：不足一天的部分
+    /// 不进窗口，故 `Duration::ZERO` = 只留当日。
+    pub fn max_age(mut self, age: std::time::Duration) -> Self {
+        self.max_age = Some(age);
+        self
+    }
+
+    /// 设根下每日文件总字节上限（消费自身，便于链式装配）。只淘汰早于当日的
+    /// 文件，当日文件即使自身就超限也保留。
+    pub fn max_total_bytes(mut self, bytes: u64) -> Self {
+        self.max_total_bytes = Some(bytes);
+        self
+    }
+}
+
 /// 按日滚动的追加式文件日志汇（诊断面）。
 ///
 /// **记录完整性（#219，收窄后的诚实声明）**：一个「逻辑记录」= 一次
@@ -607,6 +672,21 @@ pub const DEFAULT_MAX_LOG_EVENT_BYTES: usize = 1024 * 1024;
 ///
 /// 时间戳/文件名恒 UTC（std 无本地时区 API，chrono 依赖判否）。
 ///
+/// **保留策略（#128）**：默认**不删任何文件**（零窗口 = 历史行为不变）。装
+/// [`FileSink::with_retention`] 后，每次**换日打开新文件**（含进程首次落盘）
+/// 与每次显式 [`FileSink::prune`] 都按 age → byte 顺序淘汰早于当日的旧文件；
+/// 当日文件永不删。删除在状态锁**外**进行（慢 IO 不占写路径的串行区），
+/// 并发写入不受影响。经 `init_with_file` 装配的 sink 不带保留策略——需要保留
+/// 的宿主自行构造 [`FileSink`] 装配（默认面即「不删」）。
+///
+/// 与 [`FileSink::dropped_lines`] / 磁盘写满的关系：两者互不混算——
+/// `dropped_lines` 只计**记录**丢弃（写/刷失败或超限），保留策略回收的是
+/// **文件**，删除量单列 [`FileSink::pruned_files`]。磁盘写满后仍走既有软失败
+/// 面：逐行计数 + 首行一次告警，进程照常运行但该行日志丢失；保留策略是唯一的
+/// 体积治理面，它腾出空间后落盘自然恢复，但**不**让已丢的行复活、也不回退
+/// `dropped_lines`。删除失败（权限/被占用/条目被替换成目录）只计数 + 每轮一条
+/// 聚合告警，不阻断启动与写入，下轮换日重试。
+///
 /// **隐私策略**（#180，显式而非隐含）：
 ///
 /// - **Unix**：新建根 `0700`、每日文件 `0600`，用 `mode` 直接给（独立于进程
@@ -640,6 +720,12 @@ pub struct FileSink {
     reporter: std::sync::Arc<dyn SoftFailureReporter>,
     /// 单事件/单记录字节上限（[`DEFAULT_MAX_LOG_EVENT_BYTES`] 或显式覆盖）。
     max_event_bytes: usize,
+    /// 保留策略（#128）；默认零窗口 = 从不删文件。
+    retention: RetentionPolicy,
+    /// 保留清理的串行闸（独立于状态锁：并发 prune 会重复删同一路径、计数虚高）。
+    prune_gate: std::sync::Mutex<()>,
+    /// 累计被保留策略删除的每日文件数（`dropped_lines` 只计记录，两者不混算）。
+    pruned: std::sync::atomic::AtomicU64,
 }
 
 /// 当日落点的降级阶梯（#198：写/刷失败后禁用当前文件，禁原地续写）。
@@ -873,6 +959,9 @@ impl FileSink {
             warned: std::sync::atomic::AtomicBool::new(false),
             reporter,
             max_event_bytes: DEFAULT_MAX_LOG_EVENT_BYTES,
+            retention: RetentionPolicy::default(),
+            prune_gate: std::sync::Mutex::new(()),
+            pruned: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -886,6 +975,31 @@ impl FileSink {
     /// 当前单事件/单记录字节上限（`FileSinkWriter` 据此定缓冲上限）。
     pub fn max_event_bytes(&self) -> usize {
         self.max_event_bytes
+    }
+
+    /// 装配 opt-in 保留策略（#128）：装后每次换日开新文件（含进程首次落盘）
+    /// 会清一次过期文件，也可显式 [`FileSink::prune`]。默认不装 = 不删任何
+    /// 文件（兼容默认不变）。
+    pub fn with_retention(mut self, policy: RetentionPolicy) -> Self {
+        self.retention = policy;
+        self
+    }
+
+    /// 显式清理一次（#128 条 2 的「或显式调用」面）：按 [`RetentionPolicy`] 的
+    /// age → byte 顺序淘汰早于当日的每日文件；未装策略时是空操作。删除在状态
+    /// 锁外进行，失败只通告不 panic。
+    ///
+    /// **同步**：一次目录扫描 + 若干 `remove_file` 都在调用线程上完成（换日触发
+    /// 时是那一次写入的线程）。目录里累积到成千文件时，宿主应自行在后台线程调
+    /// 本方法，而不是让换日那一行承担扫描开销。
+    pub fn prune(&self) {
+        self.prune_round(utc_epoch_days(std::time::SystemTime::now()));
+    }
+
+    /// 累计被保留策略删除的每日文件数（诊断面；记录丢弃看
+    /// [`FileSink::dropped_lines`]，两者互不混算）。
+    pub fn pruned_files(&self) -> u64 {
+        self.pruned.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 累计丢弃**记录**数（写/刷失败或超限即丢一条记录；静默吞的解毒剂，测试
@@ -908,6 +1022,137 @@ impl FileSink {
             ));
         }
         dropped
+    }
+
+    /// 一次保留清理（#128）：只从状态锁**外**调用——删除是慢 IO，禁占写路径的
+    /// 串行区。只碰本件命名的每日文件、只删早于 `current_day` 的日期（当日与
+    /// 日期更晚的文件恒不删）。任何 IO 失败只计数 + 一条聚合告警，绝不上抛。
+    fn prune_round(&self, current_day: i64) {
+        let (max_age, max_bytes) = match (self.retention.max_age, self.retention.max_total_bytes) {
+            (None, None) => return,
+            bounds => bounds,
+        };
+        // 一轮一锁（独立于状态锁）：并发 prune（换日 + 显式调用）会重复枚举同一
+        // 批文件，实测 Windows 上两个线程可对**同一名字各删成功一次**，删除计数
+        // 因此虚高。报告一律在锁外做——reporter 是消费方代码，锁内调用有重入
+        // 死锁面（同 #129 纪律）。
+        let gate = self
+            .prune_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // (日期段, 路径, 字节)：日期段定宽零填充 ⇒ 字典序=时间序。
+        let mut files = Vec::new();
+        let mut failed = 0u64;
+        match std::fs::read_dir(&self.root) {
+            Ok(entries) => {
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        failed += 1;
+                        continue;
+                    };
+                    let name = entry.file_name();
+                    let Some(date) = name.to_str().and_then(log_file_date) else {
+                        continue;
+                    };
+                    // 按路径重查一次而不是 `DirEntry::metadata()`：Windows 的枚举元数据
+                    // 是枚举时快照，对**本进程正持句柄**的当日文件会读到陈旧大小（刚
+                    // 写的行不计入），字节预算会因此算错。
+                    let path = entry.path();
+                    let len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                    files.push((date.to_string(), path, len));
+                }
+            }
+            Err(err) => {
+                drop(gate);
+                self.reporter.report(&format!(
+                    "skeleton-infra::logx: retention scan of {} failed ({err}); \
+                     no log files were deleted",
+                    self.root.display(),
+                ));
+                return;
+            }
+        }
+        // 同日主/恢复文件按路径定序；去重是必需的：Windows 的目录枚举**不保证
+        // 每个条目恰好出现一次**（枚举期间有并发删除时可能重复），重复条目会让
+        // 同一文件被算两次字节。
+        files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        files.dedup_by(|a, b| a.1 == b.1);
+        let today = day_date(current_day);
+        let mut total: u64 = files.iter().map(|file| file.2).sum();
+
+        // 先 age：窗口外的整日文件淘汰。
+        let cutoff = max_age.map(|age| {
+            let keep_days = (age.as_secs() / 86_400).min(i64::MAX as u64) as i64;
+            day_date(current_day.saturating_sub(keep_days))
+        });
+        let mut doomed = Vec::new();
+        let mut kept = Vec::new();
+        for file in files {
+            if cutoff.as_ref().is_some_and(|cutoff| file.0 < *cutoff) {
+                total -= file.2;
+                doomed.push(file);
+            } else {
+                kept.push(file);
+            }
+        }
+
+        // 再 byte：仍超限则最旧优先删。kept 已按日期升序——先遇到「日期 ≥ 当日」
+        // 的位置就是不可删边界（当日及更晚日期的文件永不参与淘汰）。
+        let mut shortfall = None;
+        if let Some(budget) = max_bytes {
+            for file in kept {
+                if total <= budget || file.0 >= today {
+                    break;
+                }
+                total -= file.2;
+                doomed.push(file);
+            }
+            if total > budget {
+                shortfall = Some(budget);
+            }
+        }
+
+        let mut deleted = 0u64;
+        let mut first_failure = None;
+        for (_, path, _) in &doomed {
+            match std::fs::remove_file(path) {
+                Ok(()) => deleted += 1,
+                // 已被别处删掉（并发清理）：这一支不是本实例删的，不计入；也不算失败。
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    failed += 1;
+                    if first_failure.is_none() {
+                        first_failure = Some(format!("{}: {err}", path.display()));
+                    }
+                }
+            }
+        }
+        drop(gate);
+        if deleted > 0 {
+            self.pruned
+                .fetch_add(deleted, std::sync::atomic::Ordering::Relaxed);
+        }
+        if failed > 0 {
+            self.report_prune_failures(failed, first_failure.as_deref());
+        }
+        if let Some(budget) = shortfall {
+            self.reporter.report(&format!(
+                "skeleton-infra::logx: retention budget of {budget} bytes cannot be met under {} \
+                 without removing current-day log files (kept per contract); \
+                 pruning is retried on the next rollover",
+                self.root.display(),
+            ));
+        }
+    }
+
+    /// 聚合通告一次清理失败（每轮至多一条，禁逐文件刷屏）。
+    fn report_prune_failures(&self, failed: u64, first: Option<&str>) {
+        self.reporter.report(&format!(
+            "skeleton-infra::logx: retention could not remove {failed} entry(ies) under {} ({}); \
+             the files stay and the next rollover retries",
+            self.root.display(),
+            first.unwrap_or("no detail"),
+        ));
     }
 
     /// 落盘一条逻辑记录（软失败面，见类型文档）：上限判定在拷贝/落盘**之前**
@@ -940,6 +1185,8 @@ impl FileSink {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 换日判定在锁内取一次（write_locked 随后把 state.day 改写成本次 day）。
+        let rolled = state.day != day;
         // 每次调用至多退役「换日旧句柄」与「失败句柄」；Vec 不 push 即不分配，
         // 故热路径（成功写入）零分配。
         let mut retired: Vec<Box<dyn std::io::Write + Send>> = Vec::new();
@@ -947,6 +1194,11 @@ impl FileSink {
         let result = self.write_locked(&mut state, day, buf, &mut retired, &mut notice);
         drop(state);
         drop(retired);
+        if rolled {
+            // #128：换日/首次开文件触发保留清理——在状态锁外（旧句柄已析构，
+            // Windows 上删得更干净），且在诊断之前（删不掉的文件本轮即通告）。
+            self.prune_round(day);
+        }
         if let Some(message) = notice {
             self.reporter.report(&message);
         }
@@ -1673,16 +1925,40 @@ fn format_utc_timestamp(t: std::time::SystemTime) -> String {
     )
 }
 
-fn day_file_name(day: i64) -> String {
+/// UTC 日期段 `YYYY-MM-DD`（文件名与保留窗截断的唯一来源；定宽零填充
+/// ⇒ 字典序=时间序）。
+fn day_date(day: i64) -> String {
     let (y, m, d) = civil_from_days(day);
-    format!("log-{y:04}-{m:02}-{d:02}.log")
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn day_file_name(day: i64) -> String {
+    format!("log-{}.log", day_date(day))
 }
 
 /// 恢复文件名：主文件写/刷失败后接管的同日文件（#198）。新文件而非续写主
 /// 文件——主文件尾部可能留半行前缀，续写会把新行接在半行后面。
 fn recovery_file_name(day: i64) -> String {
-    let (y, m, d) = civil_from_days(day);
-    format!("log-{y:04}-{m:02}-{d:02}.recovery.log")
+    format!("log-{}.recovery.log", day_date(day))
+}
+
+/// 每日文件名 → 日期段（`YYYY-MM-DD`）。只认本件命名的两种形态
+/// （`log-YYYY-MM-DD.log` / `log-YYYY-MM-DD.recovery.log`），其余名字返回
+/// `None`——保留策略只碰自己的文件，根下宿主的其它条目一律不动。
+fn log_file_date(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("log-")?;
+    let date = rest
+        .strip_suffix(".recovery.log")
+        .or_else(|| rest.strip_suffix(".log"))?;
+    let bytes = date.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let date_shaped = bytes
+        .iter()
+        .enumerate()
+        .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+    date_shaped.then_some(date)
 }
 
 /// 默认行格式（拍板）：`[UTC 时间 LEVEL target] message key=value ...`。
@@ -2274,6 +2550,9 @@ mod file_sink_tests {
             dropped: std::sync::atomic::AtomicU64::new(0),
             warned: std::sync::atomic::AtomicBool::new(false),
             max_event_bytes: DEFAULT_MAX_LOG_EVENT_BYTES,
+            retention: RetentionPolicy::default(),
+            prune_gate: std::sync::Mutex::new(()),
+            pruned: std::sync::atomic::AtomicU64::new(0),
             reporter: reporter.clone(),
         };
 
@@ -2317,6 +2596,9 @@ mod file_sink_tests {
             dropped: std::sync::atomic::AtomicU64::new(0),
             warned: std::sync::atomic::AtomicBool::new(false),
             max_event_bytes: DEFAULT_MAX_LOG_EVENT_BYTES,
+            retention: RetentionPolicy::default(),
+            prune_gate: std::sync::Mutex::new(()),
+            pruned: std::sync::atomic::AtomicU64::new(0),
             reporter: std::sync::Arc::new(SilentReporter),
         };
 
@@ -2519,5 +2801,117 @@ mod file_sink_tests {
         assert_eq!(sink.dropped_lines(), 0, "提交前不计数（缓冲未最终化）");
         drop(writer);
         assert_eq!(sink.dropped_lines(), 1, "最终化时整事件计一次丢弃");
+    }
+
+    // #128：文件名解析只认本件命名的两种形态——保留策略不碰根下宿主的其它条目。
+    #[test]
+    fn log_file_date_only_accepts_own_file_names() {
+        assert_eq!(log_file_date("log-2026-10-17.log"), Some("2026-10-17"));
+        assert_eq!(
+            log_file_date("log-2026-10-17.recovery.log"),
+            Some("2026-10-17")
+        );
+        for foreign in [
+            "app.log",
+            "log.log",
+            "log-2026-10-17.log.bak",
+            "log-2026-1-7.log",
+            "log-2026-10-17.txt",
+            "log-20261-017.log",
+            "log-2026-10-17.recovery",
+            "logx-2026-10-17.log",
+        ] {
+            assert_eq!(
+                log_file_date(foreign),
+                None,
+                "非本件命名不得进候选集: {foreign}"
+            );
+        }
+    }
+
+    // #128 条 2：换日开新文件即触发清理——窗口外的旧日删除、窗口内历史日与
+    // 当日文件保留；删除量单列 pruned_files，与 dropped_lines 不混算。
+    #[test]
+    fn rollover_prunes_expired_days_and_keeps_window_and_today() {
+        let scratch = scratch("prune-rollover");
+        let root = scratch.path().join("logs");
+        let sink = FileSink::new(&root)
+            .expect("root creatable")
+            .with_retention(RetentionPolicy::new().max_age(Duration::from_secs(86_400)));
+        let at =
+            |day: i64| SystemTime::UNIX_EPOCH + Duration::from_secs(day as u64 * 86_400 + 3_600);
+        let d0 = 20_743; // 2026-10-17
+        let d1 = d0 + 1;
+
+        sink.try_write_line(at(d0), b"day0\n").expect("day0 line");
+        let expired = root.join(day_file_name(d0 - 5));
+        std::fs::write(&expired, b"ancient\n").expect("seed expired day");
+        assert_eq!(sink.pruned_files(), 0, "换日前不清理");
+
+        sink.try_write_line(at(d1), b"day1\n").expect("day1 line");
+        assert!(!expired.exists(), "窗口外（d0-5）应被删除");
+        assert_eq!(
+            std::fs::read_to_string(root.join(day_file_name(d0))).expect("day0 file"),
+            "day0\n",
+            "窗口内历史日（d0）保留"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(day_file_name(d1))).expect("day1 file"),
+            "day1\n",
+            "当日文件保留"
+        );
+        assert_eq!(sink.pruned_files(), 1, "删除量单列");
+        assert_eq!(sink.dropped_lines(), 0, "清理不影响记录丢弃计数");
+    }
+
+    // #128 验收「并发写入期间清理不破坏当日文件」：清理在状态锁外、只碰早于
+    // 当日的文件——4 写者 + 1 清理者并发下当日行一行不少、记录零丢弃。
+    #[test]
+    fn pruning_concurrently_with_writes_keeps_today_file_intact() {
+        let scratch = scratch("prune-concurrent");
+        let root = scratch.path().join("logs");
+        let sink = std::sync::Arc::new(
+            FileSink::with_reporter(&root, std::sync::Arc::new(SilentReporter))
+                .expect("root creatable")
+                .with_retention(RetentionPolicy::new().max_age(Duration::ZERO)),
+        );
+        let day = utc_epoch_days(SystemTime::now());
+        for offset in 1..=8 {
+            std::fs::write(root.join(day_file_name(day - offset)), b"old\n").expect("seed old day");
+        }
+
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let sink = std::sync::Arc::clone(&sink);
+                std::thread::spawn(move || {
+                    for line in 0..50 {
+                        sink.write_line_soft(format!("w{w}-{line}\n").as_bytes());
+                    }
+                })
+            })
+            .collect();
+        let pruner = {
+            let sink = std::sync::Arc::clone(&sink);
+            std::thread::spawn(move || {
+                for _ in 0..50 {
+                    sink.prune();
+                }
+            })
+        };
+        for writer in writers {
+            writer.join().expect("writer thread");
+        }
+        pruner.join().expect("pruner thread");
+
+        assert_eq!(sink.dropped_lines(), 0, "清理不得让当日写入失败");
+        let today = std::fs::read_to_string(root.join(day_file_name(day))).expect("today file");
+        assert_eq!(today.lines().count(), 200, "当日 200 行一行不丢");
+        for offset in 1..=8 {
+            assert!(
+                !root.join(day_file_name(day - offset)).exists(),
+                "旧日文件应被清理（day-{offset}）"
+            );
+        }
+        assert_eq!(sink.pruned_files(), 8, "每个旧文件只被计入一次");
     }
 }
