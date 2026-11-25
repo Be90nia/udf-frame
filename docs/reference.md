@@ -1840,9 +1840,9 @@ pub fn decode_slice(s: &[u8], mode: JsonMode) -> Result<serde_json::Value, JsonP
 ```
 
 - `JsonMode::Strict`：serde_json 原生严格解析（RFC 8259）——注释即语法错。
-- `JsonMode::Tolerant`：先剥离 `//` 行注释与 `/* */` 块注释再解析；**字符串字面量内的注释标记保留**（含转义引号后的内容）；未闭合块注释容忍至输入末尾（剥离到末尾后解析）。
+- `JsonMode::Tolerant`：先剥离 `//` 行注释与 `/* */` 块注释再解析；**注释=词法空白**——块注释内换行保留、其余内容换成一个分隔符，`1/*c*/.5`、`1/*c*/e3`、`1/*c*/2` 一类 token 拼接必须报错而不是变成另一个合法值；**字符串字面量内的注释标记保留**（含转义引号后的内容）；**未闭合块注释报错**（`JsonParseError` 带原始开注行列）。剥离走单次字节扫描（非 ASCII UTF-8 原样拷贝，无 `Vec<char>` 4x 放大），输出容量不超输入上限。
 - `MAX_INPUT_BYTES`（64 MiB）：读满即停——reader 路径最多读 `MAX_INPUT_BYTES + 1` 字节即判超限，**超限报错而非截断成功**；`decode_str`/`decode_slice` 超限同样报错。
-- 错误位置：`line`/`column` 1 起（提取自 serde_json）；**无位置语义的失败（读取失败 / 输入超限 / 非 UTF-8）为 0**。
+- 错误位置：`line`/`column` 1 起（提取自 serde_json 错误；未闭合块注释的位置由本域按原始输入自算）。**行号与原始输入一致（换行全保留），列号按注释剥离后的文本计**；无位置语义的失败（读取失败 / 输入超限 / 非 UTF-8）为 0。
 
 ```rust
 use std_ext::json::{decode_str, JsonMode};
@@ -1855,7 +1855,7 @@ let v = decode_str("// c\n{ \"a\": 1 }", JsonMode::Tolerant).unwrap();
 assert_eq!(v["a"], 1);
 ```
 
-行为断言见 `std-ext/tests/json.rs`（严格拒注释 / 容忍收注释 / 字符串内标记保留 / 转义引号 / 未闭合块注释 / 超限报错非截断 / 行列与 serde_json 一致 / slice 与 reader 一致 / 非法 UTF-8 报无位置错误）。
+行为断言见 `std-ext/tests/json.rs`（严格拒注释 / 容忍收注释 / 字符串内标记保留 / 转义引号 / 未闭合块注释**报错** / 注释不拼接 token（4 例）/ 多行注释换行保留 / 超限报错非截断 / 行列口径 / slice 与 reader 一致 / 非法 UTF-8 报无位置错误）与 `std-ext/tests/json_strip_bounded.rs`（64 MiB ASCII 与多字节等价 / 剥离峰值分配上界）。
 
 ---
 
@@ -1922,6 +1922,7 @@ impl<C> ConfigFile<C> {
     pub fn default_layer(self, value: &C) -> Result<Self, ConfigError>
     where C: serde::Serialize;                                      // 链图第 1 层
     pub fn file_layer(self, path: impl AsRef<Path>) -> Result<Self, ConfigError>;  // 第 2 层
+    pub fn max_file_bytes(mut self, limit: usize) -> Self;          // 文件层读入上限（默认 8 MiB）
     pub fn load(self) -> Result<C, ConfigError> where C: serde::de::DeserializeOwned;
     pub fn save(value: &C, path: impl AsRef<Path>) -> Result<(), ConfigError>
     where C: serde::Serialize;                                      // Pretty + 原子写
@@ -1932,6 +1933,8 @@ impl<C> Default for ConfigFile<C> { /* new() */ }
 分层链四层：`default（代码构造）→ file（文件底座）→ env（ConfigPort 已有段）→ explicit（代码后覆盖）`。default/file/explicit 原始值层归本面；**env 层不进本面**（字符串 env 值 → 字段类型的解析是类型化职责——原始值面代劳会把 `"8080"` 串进数字字段）。装配姿势：`file` 层产物作底座喂采用方 ConfigPort 实现。
 
 合并语义（折叠序=层序）：对象∩对象递归合并（高层键覆盖/新增，同层内后键赢）；高层非对象（标量/数组/null）整体替换——数组不按下标合并、null 是显式值（config-rs 式魔法判否，fail-visible）。
+
+**读入上限（#197/#127）**：`file_layer`/`file_layer_toml`/`load_toml` 三入口的读入受 `DEFAULT_MAX_FILE_BYTES`（8 MiB）约束，`ConfigFile::max_file_bytes` 逐实例覆盖（`load_toml` 是单文件自由函数，恒默认）；实现按「最多读 limit+1 字节」强制（metadata 只作提前拒绝优化），超限报 `ConfigError::File`（`source` 为 `ConfigFileTooLarge { limit, observed }`，路径在 `path`），**不截断、不部分接受**；上限只管读入字节，不约束解析后的值树规模与 `.layer()` 合并深度。
 
 `save` = Pretty 序列化 + [`fsx::atomic_write`](#fsx--文件系统受控子集)（崩溃安全）。**保存=全量重序列化**：注释与键序不保留（前置声明）；并发保存最后赢。serde_json 序列化语义如实声明：整数键映射被静默字符串化、非有限浮点被静默写 null——需挡这两类值的采用方自理。
 
@@ -2247,10 +2250,14 @@ where A: Serialize + DeserializeOwned
 
 pub type DynJournal<A, S> = dyn Journal<A, State = S>;   // (A, S) 焊接别名（trait-object 面）
 
+pub const DEFAULT_MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;  // 单条记录编码上限（含终止换行）
+
 pub struct JsonlJournal<A, S> { /* … */ }
 impl<A, S> JsonlJournal<A, S> {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, JournalError>;  // 已存在=Err(AlreadyExists)
+    pub fn create_with_limit(path: impl AsRef<Path>, max_record_bytes: usize) -> Result<Self, JournalError>;
     pub fn open(path: impl AsRef<Path>, expected_version: u32) -> Result<Self, JournalError>;
+    pub fn open_with_limit(path: impl AsRef<Path>, expected_version: u32, max_record_bytes: usize) -> Result<Self, JournalError>;
     pub fn flush(&mut self) -> Result<(), JournalError>;   // 宿主停机序的 flush 位
     pub fn with_snapshot_every(mut self, n: u64) -> Self;  // 每 n 次 append 自动 flush；0/None=关
 }
@@ -2260,23 +2267,31 @@ pub enum JournalError {
     Serialize(serde_json::Error),
     Corrupt { line: u64, source: serde_json::Error },
     VersionMismatch { found: u32, expected: u32 },
+    RecordTooLarge { line: Option<u64>, limit: usize },   // 读侧带物理行号；写侧 None
+    HeaderUnterminated,                                    // 头行缺终止换行
+    InsecurePermissions { path: PathBuf, mode: u32 },      // Unix 已有文件含 group/other 位
+    Poisoned { path: PathBuf },                            // 写/刷失败后 fail-stop
 }
 
 pub struct Replay<'j, A> { /* Iterator<Item = Result<A, ReplayError>> */ }
 impl<'j, A> Replay<'j, A> {
-    pub fn skipped_unknown(&self) -> u64;   // 未知变体/快照行跳过计数（fail-visible）
+    pub fn skipped_unknown(&self) -> u64;   // 未知字符串 tag/快照行跳过计数（头行不计入）
 }
 
 pub enum ReplayError {
     Io(std::io::Error),
     Corrupt { line: u64, source: serde_json::Error },
+    RecordTooLarge { line: u64, limit: usize },
 }
 ```
 
 - 实现层 `Journal` 与契约 `skeleton::JournalPort` 分工：实现层方法名带实现层词形（`append_action`/`restore_stream`/`append_snapshot`，`replay` 独有），端口独占契约词表（`append`/`restore`/`persist_snapshot`，返回三态 `Restore<A, S>` 物化）——两 trait 同屏 import 直呼无歧义（旧三同名双候选拒编译已结构性消灭，批 2A）。状态面为关联类型 `State`（批 6A）：被 `Self` 钉死，构造一次定型（`JsonlJournal::<A, S>::create(..)`）后方法调用零 turbofish 零绑定标注；dyn 焊接面走 [`DynJournal`] 别名（`State =` 短形）。宿主要增量流式恢复用实现层 `Journal`，要端口可换性面向 `skeleton::JournalPort` 编程。
-- `open`：末行无 `\n` 结尾=崩溃残行 → 截断到上一完整行边界并计数留痕（残行必未越过 flush 点=非持久，截断不丢任何已持久 action）。
+- `open`：末行无 `\n` 结尾=崩溃残行 → 截断到上一完整行边界并计数留痕（残行必未越过 flush 点=非持久，截断不丢任何已持久 action）。头行必须带终止换行（否则 `HeaderUnterminated`）；`create` 经同目录独占临时文件 + `hard_link` 原子发布（目标已存在=EEXIST，绝不覆盖），失败只清本次临时文件——`shortcut:` 依赖文件系统支持硬链接（FAT/exFAT 不支持时报底层 IO 错误）。
+- **记录上限（#217）**：`DEFAULT_MAX_RECORD_BYTES`=16 MiB（含终止换行），`create_with_limit`/`open_with_limit` 覆盖；写侧经有界 sink 序列化（超限零落盘、writer 保持健康），读侧（头行/回放/快照扫描）读满 `limit` 未见换行即报 `RecordTooLarge`（带物理行号）并吞掉该行余量；超大行处理完回收行缓冲容量。
+- **权限（#181）**：Unix 新建 0600（独立于 umask）；`open` 校验已有文件，含 group/other 位报 `InsecurePermissions`（**不隐式 chmod**）；Windows 隐私靠父目录 ACL 继承（不声称自动加固）。
+- **写侧 fail-stop（#106 ③）**：任一 write/flush/sync 失败置 poisoned，后续 append 直接 Err 直到重开/恢复；`create` 的头行写后 flush + `sync_all`。
 - `restore_stream`：自最新 "s" 行起播（快照探测=字节前缀短路，非 "s" 形行零 JSON 解析）；快照行之前的行跳过不解析；无快照行=`None`（调用方回退 initial 全量回放）。端口侧 `restore` 同扫描，物化为 `Restore` 三态。
-- `replay`/`Replay`：未知 "t" tag 行与快照行跳过+计数（schema 演化 add-only——payload 缺字段走 schema default）；畸形 JSON 行 fail-closed Err 禁静默跳过。
+- `replay`/`Replay`：先消费并校验头行（不计数，首条 action 仍报物理行 2）；每条记录必须是 JSON object 且顶层 `t` 为字符串——`"a"` 反序列化（payload 缺字段走 schema default）、`"s"` 与未知字符串 tag 跳过+计数；非对象/缺 tag/非字符串 tag/畸形 JSON 一律 `Corrupt`（带行号），不计入 `skipped_unknown`。
 - 自动快照注记：`snapshot_every` 命中时自动 **flush**（重开后可见）；快照节奏（写快照行）归调用方（端口 `persist_snapshot` / 实现层 `append_snapshot`）。
 
 ```rust,no_run
@@ -2425,10 +2440,21 @@ pub struct HomeDirUnresolvable;
 
 pub struct FileSink { /* … */ }
 impl FileSink {
-    pub fn new(root: impl Into<std::path::PathBuf>) -> std::io::Result<Self>;
+    pub fn new(root: impl Into<std::path::PathBuf>) -> std::io::Result<Self>;   // 诊断走默认 StderrReporter
+    pub fn with_reporter(
+        root: impl Into<std::path::PathBuf>,
+        reporter: std::sync::Arc<dyn SoftFailureReporter>,
+    ) -> std::io::Result<Self>;
     pub fn dropped_lines(&self) -> u64;
 }
 impl std::io::Write for FileSink { /* 软失败面：恒 Ok，丢弃走计数 */ }
+
+/// 软失败诊断出口：best-effort、不 panic、单次尝试；实现方自守不阻塞契约
+pub trait SoftFailureReporter: std::fmt::Debug + Send + Sync {
+    fn report(&self, message: &str);
+}
+/// 默认实现：忽略错误的 `writeln!(stderr)`（禁 `eprintln!`——stderr 不可写会 panic）
+pub struct StderrReporter;
 
 // ── 契约面（skeleton::logpath，零 feature）──
 pub trait LogPathResolver: Send + Sync {
@@ -2454,7 +2480,7 @@ pub struct AlreadyInit;
 - **桥接语义知情声明**：log 门面经 tracing-log 桥后事件 target="log"、原 target 降为 `log.target` 字段——`RUST_LOG=skeleton=debug` 不路由 log 门面行。初始化组合注记：只调 `try_init()`（其内部已含桥初始化），不得再显式 `LogTracer::init`（撞 log 单例恒 Err）。
 - `mask_secrets`：命中子串→`"***"`；按长度降序替换（最长优先防半掩）；空串项跳过；恒分配一次新 String。
 - **`DefaultPathResolver` 双构建默认根**：debug=编译期 `CARGO_MANIFEST_DIR`/log（框架自身开发态，零运行时猜测；采方开发态请注入自有 resolver）；release=`home_dir()/.<project_name>/log/`——release 恒不引用 CARGO_MANIFEST_DIR（开发者机器路径烧进发布物=隐私面）。home 构造期一次性解析，失败显式 Err（禁静默落 cwd）。
-- **`FileSink`**：按日滚动 `log-YYYY-MM-DD.log` 纯追加（跨进程按行交错安全，永不改名/截断），每行 flush；写失败=计数+stderr 一次告警+继续（禁 panic 拖垮业务、禁纯吞——`dropped_lines` 可观测）。时间戳与文件名恒 UTC（std 无本地时区 API，chrono 判否）。`new` 立即递归创建根目录（配置错误显式失败，禁等到首行才爆）；文件按日懒开（无事件不落空文件）。默认行格式：`[UTC 时间 LEVEL target] message key=value ...`（整行先合成单 String 再一次写出=行完整性前提）。
+- **`FileSink`**：按日滚动 `log-YYYY-MM-DD.log` 纯追加（跨进程按行交错安全，永不改名/截断），每行 flush。失败面（#112/#184/#198）：**打开失败**=落点不变、下一行重试（只重试新行，不追认上一行）；**写/刷失败**=句柄在锁内摘除、锁外析构，当日落点降级 `主文件 → log-YYYY-MM-DD.recovery.log → 当日停写（fail-stop）`，绝不原地续写可能带半行前缀的文件；`dropped_lines` 是权威计数面，告警走可注入的 `SoftFailureReporter`（默认 `StderrReporter`，best-effort、禁 `eprintln!`、首次一条）。**恢复 ≠ 记录原子性**：不截断、不自动修复半行（日志跨进程共享，回截会删掉别的进程已追加的行）。时间戳与文件名恒 UTC（std 无本地时区 API，chrono 判否）。`new` 立即递归创建根目录（配置错误显式失败，禁等到首行才爆）；文件按日懒开（无事件不落空文件）。默认行格式：`[UTC 时间 LEVEL target] message key=value ...`（整行先合成单 String 再一次写出=行完整性前提）。
 - **`init_with_file(resolver, default_level)`**：console+file 双 sink（同一默认行格式）；过滤语义同 `init_tracing_from_env`（恒含 `skeleton=off` 兜底）；本地资源（日志根目录）先建，任何配置错误在任何全局被触碰之前显式失败（`LogInitError::RootCreate`）。签名：
 
 ```rust

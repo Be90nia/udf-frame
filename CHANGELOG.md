@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+### Fix(journal): 记录上限/权限/初始化原子发布/回放形状 fail-closed（issue#217/#212/#181/#178/#177/#106）
+- **记录上限**：新增 `DEFAULT_MAX_RECORD_BYTES`（16 MiB，含终止换行）与 `create_with_limit`/`open_with_limit`；写侧经有界 sink 序列化（超限零落盘、writer 保持健康），读侧（头行/回放/快照扫描）读满上限未见换行即报 `JournalError::RecordTooLarge`/`ReplayError::RecordTooLarge`（带物理行号），超大行处理完回收行缓冲容量。
+- **初始化不留半成品**：`create` 改「同目录独占临时文件 → 写头 + flush + `sync_all` → `hard_link` 原子发布」，失败只清本次临时文件并保留原始 IO 错误；`create_new` 语义不变（目标存在即失败，绝不覆盖）。
+- **权限**：Unix 新建 0600（独立于 umask）；`open` 校验已有文件，含 group/other 位报 `JournalError::InsecurePermissions`（不隐式 chmod）。**迁移**：旧版本创建的 0644 账本需先 `chmod 600`；Windows 隐私靠父目录 ACL（文档声明）。
+- **回放形状 fail-closed**：记录必须是 JSON object 且顶层 `t` 为字符串；非对象/缺 tag/非字符串 tag 一律 `Corrupt`（不再计为未知变体）；完整回放先消费头行（`skipped_unknown` 不再计入头行，首条 action 仍报物理行 2）。
+- **写侧 fail-stop**：write/flush/sync 失败后置 poisoned，后续 append 直接 `Err(Poisoned)` 直到重开/恢复；`open` 要求头行带终止换行（否则 `HeaderUnterminated`）。
+- **兼容性**：`JournalError` 新增 4 个变体（additive；枚举未标 `#[non_exhaustive]`，下游穷尽 `match` 需补臂）。
+
+### Fix(logx): 软失败诊断改可注入 reporter + 写失败退役并降级恢复文件（issue#112/#184/#198/#143）
+- `FileSink` 软失败告警不再走 `eprintln!`（stderr 不可写会 panic）：改走可注入的 `SoftFailureReporter`（默认 `StderrReporter` = 忽略错误的 `writeln!(stderr)`），新增 `FileSink::with_reporter`；`env_filter_or` 的两处 `eprintln!` 同策略。
+- 写/刷失败即退役当前 writer（锁内摘除、锁外析构），当日落点降级 `主文件 → log-YYYY-MM-DD.recovery.log → 当日停写`；打开失败仍只重试新行。`dropped_lines` 保持权威计数，一次告警语义不变。
+- 文档写明「恢复 ≠ 记录原子性」：不截断、不自动修复半行（跨进程 append 回截会删掉别的进程已写的行）。
+
+### Fix(config/json): 配置读入上限 + tolerant 注释按空白处理（issue#197/#127/#196/#125/#195）
+- config：`file_layer`/`file_layer_toml`/`load_toml` 读入上限 `DEFAULT_MAX_FILE_BYTES`（8 MiB，`ConfigFile::max_file_bytes` 覆盖）；按「最多读 limit+1 字节」强制，超限报 `ConfigError::File`（`source` 为 `ConfigFileTooLarge{limit, observed}`），不截断不部分接受。
+- tolerant JSON：注释按词法空白处理（块注释内换行保留、其余补分隔符），`1/*c*/.5`、`1/*c*/e3`、`1/*c*/2` 一类 token 拼接现在报错；**未闭合块注释由「容忍到末尾」改为报错**（带原始开注行列）；剥离改单次字节扫描，去掉 `Vec<char>` 的 4x 放大。**行为变更**：未闭合块注释的输入以前可能解析成功，现在报错。
+
 ### Perf(bench): `alloc_atomics/relaxed_rmw` micro 臂 + `state_layout` 基准方差定性（issue#103）
 - bench 新增 micro 臂 `alloc_atomics/relaxed_rmw`（一次 `fetch_add(1, Relaxed)` 的 ns/op），作为 `CountingAllocator` instrumentation 干扰的**上界估计量**；`perf.yml` 期望清单同步登记该 ID。既有 `state_layout_*` 臂零改动，公共 API 零变化。
 - `state_layout_*` 相对 11-23 参考的 +8%~+14% 漂移定性：**跨会话/机器状态水平差，非代码回归**。同会话 OLD（`e5cbf26`）↔NEW（HEAD）二进制交替配对 8 轮：同一份旧代码隔两日差 −16.8%…+21.6%（20 个可比臂中 11 个区间不重叠），而 OLD→NEW 的配对比值有 28 臂落在 ±1–4% 配对噪声内；代码效应只有 4 臂达到或触及判据且幅度 ≤2.4%（`state_layout_update_scope/sharded_256parts_1k_all_{noretain,retain}` +1.7%/+1.6% 变慢、`state_layout_update/mono_16m_retain` −2.4% 变快、`state_layout_retention/sharded_window16` +1.3% 为边缘件），方向不一、未 bisect。
