@@ -215,61 +215,7 @@ impl Drop for PoolAuditTicket {
     }
 }
 
-#[cfg(test)]
-mod pool_audit_ticket_drop_tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn drop_contains_callback_panic_and_records_it_once() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let callback_calls = Arc::clone(&calls);
-        let before = pool_audit_ticket_drop_panic_count();
-
-        drop(PoolAuditTicket::new(move || {
-            callback_calls.fetch_add(1, Ordering::SeqCst);
-            panic!("injected close panic");
-        }));
-
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(
-            pool_audit_ticket_drop_panic_count() >= before.saturating_add(1),
-            "the global counter may also include concurrent tests, but this Drop must increment it"
-        );
-    }
-
-    #[test]
-    fn explicit_close_returns_original_panic_payload() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let callback_calls = Arc::clone(&calls);
-        let result = PoolAuditTicket::new(move || {
-            callback_calls.fetch_add(1, Ordering::SeqCst);
-            panic!("explicit close failure");
-        })
-        .close();
-
-        let payload = result.expect_err("explicit close must expose callback panic");
-        assert_eq!(
-            payload.downcast_ref::<&'static str>(),
-            Some(&"explicit close failure")
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn drop_callback_panic_does_not_replace_existing_unwind() {
-        let result = std::panic::catch_unwind(|| {
-            let _ticket = PoolAuditTicket::new(|| panic!("secondary close panic"));
-            panic!("primary application panic");
-        });
-        let payload = result.expect_err("the primary panic must propagate");
-        assert_eq!(
-            payload.downcast_ref::<&'static str>(),
-            Some(&"primary application panic")
-        );
-    }
-}
 
 /// 池化管理基座 trait：动态内存池/线程池/任何池的**管理面**契约——「约束后面
 /// 代码长法」的池化版：后面任何人写的池都不会乱（美团理念全套自动到手）。
@@ -374,4 +320,60 @@ pub trait PoolManaged {
     /// 审计挂点（美团「事后审计」）：池域自有事件流（seq 单调 + 容量环），
     /// 票据 Drop = 关流。
     fn subscribe_audit(&self, f: impl FnMut(&PoolAuditEvent) + Send + 'static) -> PoolAuditTicket;
+}
+
+#[cfg(test)]
+mod pool_audit_ticket_drop_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn drop_contains_callback_panic_and_records_it_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let before = pool_audit_ticket_drop_panic_count();
+
+        drop(PoolAuditTicket::new(move || {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("injected close panic");
+        }));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            pool_audit_ticket_drop_panic_count() >= before.saturating_add(1),
+            "the global counter may also include concurrent tests, but this Drop must increment it"
+        );
+    }
+
+    #[test]
+    fn explicit_close_returns_original_panic_payload() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let result = PoolAuditTicket::new(move || {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("explicit close failure");
+        })
+        .close();
+
+        let payload = result.expect_err("explicit close must expose callback panic");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>(),
+            Some(&"explicit close failure")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_callback_panic_does_not_replace_existing_unwind() {
+        let result = std::panic::catch_unwind(|| {
+            let _ticket = PoolAuditTicket::new(|| panic!("secondary close panic"));
+            panic!("primary application panic");
+        });
+        let payload = result.expect_err("the primary panic must propagate");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>(),
+            Some(&"primary application panic")
+        );
+    }
 }
