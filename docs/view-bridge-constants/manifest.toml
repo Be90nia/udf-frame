@@ -4,9 +4,31 @@
 # CI 一致性断言（只比对不写，diff 非空 = 红）：
 #   cargo run -p udf-skeleton-infra --example view_constants_gen -- --check
 # 常量值与清单逐字一致（不做大小写变换——变换正是漂移来源）。
-# 清单只覆盖绑定路径 + 载荷字段名 + kind 编号；嵌套层级由采用方自定。
+# 清单只覆盖绑定路径 + 载荷字段名 + kind 编号 + 区域头布局；嵌套层级由采用方自定。
 
 protocol_version = 1
+
+# 区域头 v1 布局（#222 §B 冻结）：跨语言读器一律引生成物，禁手写偏移字面量。
+[header]
+header_len = 32
+entry_len = 24
+seg_align = 8
+tlv_header_len = 5
+initial_seq = 2
+seq_step = 2
+offset_magic = 0
+offset_protocol = 4
+offset_flags = 6
+offset_publish_seq = 8
+offset_region_id = 16
+offset_binding_count = 20
+offset_index_offset = 24
+index_offset_v1 = 32
+entry_offset_binding_id = 0
+entry_offset_kind = 4
+entry_offset_offset = 8
+entry_offset_len = 16
+entry_offset_gen = 20
 
 [[binding]]
 path = "/count"

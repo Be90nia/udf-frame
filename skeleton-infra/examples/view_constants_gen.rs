@@ -20,6 +20,8 @@ const MANIFEST: &str = concat!(
 #[derive(Default)]
 struct Manifest {
     protocol_version: u8,
+    /// `[header]` 段：区域头/索引/TLV 布局常量（键序即生成序）。
+    header: Vec<(String, u64)>,
     bindings: Vec<Binding>,
 }
 
@@ -38,14 +40,21 @@ fn parse_unquote(v: &str) -> String {
 fn parse_manifest(text: &str) -> Result<Manifest, String> {
     let mut m = Manifest::default();
     let mut in_binding = false;
+    let mut in_header = false;
     for (n, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
+        if line == "[header]" {
+            in_header = true;
+            in_binding = false;
+            continue;
+        }
         if line == "[[binding]]" {
             m.bindings.push(Binding::default());
             in_binding = true;
+            in_header = false;
             continue;
         }
         let Some((k, v)) = line.split_once('=') else {
@@ -55,21 +64,27 @@ fn parse_manifest(text: &str) -> Result<Manifest, String> {
             ));
         };
         let (k, v) = (k.trim(), v.trim());
-        match (in_binding, k) {
-            (false, "protocol_version") => {
+        match (in_header, in_binding, k) {
+            (true, _, k) if !k.is_empty() => {
+                let v: u64 = v
+                    .parse()
+                    .map_err(|_| format!("manifest line {}: bad {k}", n + 1))?;
+                m.header.push((k.to_string(), v));
+            }
+            (false, false, "protocol_version") => {
                 m.protocol_version = v
                     .parse()
                     .map_err(|_| format!("manifest line {}: bad protocol_version", n + 1))?
             }
-            (true, "path") => {
+            (false, true, "path") => {
                 m.bindings.last_mut().expect("binding opened").path = parse_unquote(v)
             }
-            (true, "kind") => {
+            (false, true, "kind") => {
                 m.bindings.last_mut().expect("binding opened").kind = v
                     .parse()
                     .map_err(|_| format!("manifest line {}: bad kind", n + 1))?
             }
-            (true, "fields") => {
+            (false, true, "fields") => {
                 let inner = v.trim_start_matches('[').trim_end_matches(']');
                 let fields = inner
                     .split(',')
@@ -119,6 +134,13 @@ fn render(m: &Manifest) -> (String, String, String) {
         "/* 由 view_constants_gen 自 manifest.toml 生成（ADR 0006 M3）——禁手改；清单为唯一真源。 */\n#define UVBR_PROTOCOL_VERSION {}\n",
         m.protocol_version
     );
+    // 区域头布局：跨语言读器只引生成物（禁手写偏移字面量）。
+    for (key, value) in &m.header {
+        let upper = key.to_uppercase();
+        ts.push_str(&format!("export const {upper} = {value} as const;\n"));
+        py.push_str(&format!("{upper} = {value}\n"));
+        c.push_str(&format!("#define UVBR_{upper} {value}\n"));
+    }
     for b in &m.bindings {
         let tail = const_tail(&b.path);
         ts.push_str(&format!(

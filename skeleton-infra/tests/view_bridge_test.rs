@@ -12,7 +12,8 @@ use skeleton::view::{BindingDecl, IntentMap, PayloadTag, ViewMap};
 use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
 use skeleton_infra::runtime::SyncStore;
 use skeleton_infra::view::{
-    Coverage, Encoders, IntentError, JsonEncoder, RegionEncoder, RegionWriter, Sentinel, ViewBridge,
+    BindingId, Coverage, Encoders, IntentError, JsonEncoder, RegionBacking, RegionEncoder,
+    RegionWriter, Sentinel, VecBacking, ViewBridge, read::RegionReader,
 };
 
 #[derive(Clone, Default)]
@@ -130,7 +131,7 @@ fn poison_resync_cycle() {
     // ② 次批携带 resync == true（完整性事实必达 UI）
     let batch = bridge.take_patches();
     assert!(batch.resync, "毒化必须经返回值显形");
-    assert_eq!(batch.to_version, 2);
+    assert_eq!(batch.to_version, 6, "封板 2 + 两拍 ×2");
     // ③ snapshot_doc 现态全量重投影（哨兵旁路）且毒化复位
     arm.store(false, Ordering::SeqCst);
     let snap = bridge.snapshot_doc();
@@ -167,7 +168,7 @@ fn cross_thread_pull() {
     let snapshot = bridge.snapshot_doc();
     std::thread::spawn(move || {
         let batch = bridge.take_patches();
-        assert_eq!(batch.to_version, 1);
+        assert_eq!(batch.to_version, 4, "封板 2 + 一拍 ×2");
         assert_eq!(
             snapshot.version, batch.from_version,
             "N2：快照重同步后 from == snapshot.version"
@@ -372,7 +373,7 @@ fn narrow_input_leaks_stale_and_is_detectable() {
     let cover = bump_b_with(Sentinel::new(|s: &Pair| (s.a, s.b)));
     assert_eq!(
         (cover.patches, cover.runs, cover.to_version),
-        (1, 2, 2),
+        (1, 2, 6),
         "覆盖实读：b 变更必须被哨兵看见"
     );
     assert_eq!(cover.doc.pointer("/sum"), Some(&json!(2)));
@@ -385,11 +386,91 @@ fn narrow_input_leaks_stale_and_is_detectable() {
         "签名①：projection_runs 停在 1（第 2 拍没投影）"
     );
     // 签名②：水位照常推进（2）而补丁为空——UI 侧唯一可见的「状态变了」信号。
-    assert_eq!(leak.to_version, 2, "版本推进与投影解耦：空批也推进水位");
+    assert_eq!(leak.to_version, 6, "版本推进与投影解耦：空批也推进水位");
     // 签名③：快照真值 = 2，而最后交付的补丁值仍是 1 ⇒ 不一致可被检出。
     assert_eq!(
         leak.doc.pointer("/sum"),
         Some(&json!(2)),
         "实读宽于声明 In：真值只在哨兵旁路的面（快照）上可见"
     );
+}
+
+// ── 区域通道挂载缺口（#171）：真实 `VecBacking` 跑 RegionChannel → publish → 读器 ──
+//
+// 旧版 `build()` 一律 `region: None`，region 行为只由 example（CI 不跑 main）承载。
+// 本组把「区段编码 → 索引/头发布 → 规范读器回读」放进 integration test。
+
+/// `V` 的区域编码（一绑定恰一段非空完整 TLV）。
+struct RegionEnc;
+
+impl RegionEncoder for RegionEnc {
+    type View = V;
+    fn covers(&self) -> Coverage {
+        Coverage::All
+    }
+    fn encode(&self, v: &V, w: &mut RegionWriter) {
+        match v {
+            V::C(n) => w.u64(u64::from(*n)),
+        }
+    }
+}
+
+fn decls() -> Vec<BindingDecl> {
+    BoomMap {
+        arm: Arc::new(AtomicBool::new(false)),
+    }
+    .bindings()
+    .to_vec()
+}
+
+/// 背衬整读拷贝 → 规范快照读器（不可变快照入口，普通 load）。
+fn read_backing(
+    backing: &VecBacking,
+    decls: &[BindingDecl],
+) -> skeleton_infra::view::read::RegionRead {
+    let mut slot = None;
+    backing.with_bytes(&mut |bytes| {
+        slot = Some(RegionReader::read_snapshot(bytes, decls).expect("self-written region parses"));
+    });
+    slot.expect("with_bytes invoked exactly once")
+}
+
+#[test]
+fn region_mount_publishes_and_round_trips() {
+    use skeleton::view::region_layout::{INITIAL_SEQ, SEQ_STEP};
+
+    let backing = Arc::new(VecBacking::new(4096));
+    let store = SyncStore::new(AppReducer, NoFx);
+    let bridge: ViewBridge<App, u32, BoomMap, Intent, Json, RegionEnc> = ViewBridge::mount(
+        store,
+        BoomMap {
+            arm: Arc::new(AtomicBool::new(false)),
+        },
+        Intent,
+        Encoders {
+            json: Some(Json),
+            region: Some((RegionEnc, Arc::clone(&backing) as Arc<dyn RegionBacking>)),
+        },
+    );
+    bridge.bind("/count").unwrap();
+    assert_eq!(bridge.region_failure(), None, "装配期无失败");
+
+    // 首次快照即封板：区域初始 even 水位已发布（不是等首条变更）。
+    let snap = bridge.snapshot_doc();
+    assert_eq!(snap.version, INITIAL_SEQ);
+    assert_eq!(bridge.region_version(), INITIAL_SEQ);
+    let decls = decls();
+    let sealed = read_backing(&backing, &decls);
+    assert_eq!(sealed.sequence, INITIAL_SEQ);
+    assert!(sealed.values.is_empty(), "封板态 = 全条目未发布（len 0）");
+
+    // 一拍：区域 eager 发布 → 回读 == JSON 语义（双编码一致性）。
+    assert!(bridge.send_intent(json!(2)).unwrap());
+    assert_eq!(bridge.region_version(), snap.version + SEQ_STEP);
+    let read = read_backing(&backing, &decls);
+    assert_eq!(read.sequence, bridge.region_version(), "区域头 == 桥水位");
+    assert_eq!(read.region_id, bridge.region_id());
+    assert_eq!(read.values, vec![(BindingId(0), json!(2))]);
+    assert!(!read.needs_resync);
+    assert_eq!(bridge.region_failure(), None);
 }

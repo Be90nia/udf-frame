@@ -23,9 +23,79 @@
 pub struct PayloadTag(pub u16);
 
 /// 出站协议版本：信封级，两通道共用（区域头 / JSON 批各一份）。读者据此判定
-/// 格式代次；**未知版本不整条失败**——逐项按标签跳过（计数 + resync 提示，禁
-/// panic 禁整批 Err）。信封骨架布局（字段序/宽度/字节序）跨版本冻结。
+/// **bootstrap 布局代次**：`protocol_version` 不是「可跳过的未知标签」而是布局
+/// 闸——本机只支持等值 major；不等值 = 协商/重同步边界，读者**不得**解释任何
+/// v1 偏移/计数/条目（#187）。条目级未知 `kind`/`tag` 跳过只在 major 已支持后
+/// 适用。
 pub const PROTOCOL_VERSION: u16 = 1;
+
+/// 区域线格式 v1 布局常量（**跨语言唯一真源**）。规范原文 =
+/// `docs/view-region-spec.md`；TS/Python/C 侧经
+/// `docs/view-bridge-constants/manifest.toml` + `view_constants_gen` 生成同一组
+/// 数字（`--check` 只比对不写，漂移即红）。Rust 写/读端一律引用本模块，禁在
+/// 别处手写偏移字面量。
+///
+/// Header 32B 冻结布局（#222 §B）：
+///
+/// | 字节 | 字段 | 说明 |
+/// |---|---|---|
+/// | 0..4 | magic | ASCII `UVBR` |
+/// | 4..6 | protocol major | LE `u16` |
+/// | 6..8 | flags | v1 恒 0（非 0 = 布局不确定，读侧拒收） |
+/// | 8..16 | publication sequence | LE `u64`，**8 字节对齐**，SAB 原子访问 |
+/// | 16..20 | region_id | LE `u32` |
+/// | 20..24 | binding_count | LE `u32` |
+/// | 24..32 | index_offset | LE `u64`，v1 恒 32 |
+///
+/// 序列语义：**只有 even 值是被提交的水位**，与 JSON `PatchBatch.from/to_version`
+/// 及 `Snapshot.version` 严格同源同值；odd 只表示「写事务进行中」，永不作已提交
+/// 版本对外。初始封板水位 = [`region_layout::INITIAL_SEQ`]，每条通知
+/// +[`region_layout::SEQ_STEP`]。
+pub mod region_layout {
+    /// magic 四字节。
+    pub const MAGIC: [u8; 4] = *b"UVBR";
+    /// Header 固定长度。
+    pub const HEADER_LEN: usize = 32;
+    /// Index 条目固定长度。
+    pub const ENTRY_LEN: usize = 24;
+    /// 段起始 8 字节对齐（填充 0，读侧免对齐陷阱）。
+    pub const SEG_ALIGN: usize = 8;
+    /// TLV 头长度：`tag:u8 | len:u32(LE)`。
+    pub const TLV_HEADER_LEN: usize = 5;
+    /// 初始封板水位（首个 committed even 序列）。
+    pub const INITIAL_SEQ: u64 = 2;
+    /// 每次提交的序列推进量（奇数值被 in-progress 占用）。
+    pub const SEQ_STEP: u64 = 2;
+
+    // Header 字段偏移。
+    pub const OFFSET_MAGIC: usize = 0;
+    pub const OFFSET_PROTOCOL: usize = 4;
+    pub const OFFSET_FLAGS: usize = 6;
+    /// 发布序列偏移——**8 字节对齐是硬前提**（JS `BigUint64Array` 原子视图）。
+    pub const OFFSET_PUBLISH_SEQ: usize = 8;
+    pub const OFFSET_REGION_ID: usize = 16;
+    pub const OFFSET_BINDING_COUNT: usize = 20;
+    pub const OFFSET_INDEX_OFFSET: usize = 24;
+    /// v1 `index_offset` 恒值（索引区紧随头）。
+    pub const INDEX_OFFSET_V1: u64 = 32;
+
+    // Index 条目字段偏移（24B 固定）。
+    pub const ENTRY_OFFSET_BINDING_ID: usize = 0;
+    pub const ENTRY_OFFSET_KIND: usize = 4;
+    pub const ENTRY_OFFSET_OFFSET: usize = 8;
+    pub const ENTRY_OFFSET_LEN: usize = 16;
+    pub const ENTRY_OFFSET_GEN: usize = 20;
+
+    // TLV 值类型 tag 空间（只增不改、退役号不复用；与 `PayloadTag` 是两张
+    // 不同的空间——本表判「字节怎么读」，`PayloadTag` 判「形状变没变」）。
+    pub const TAG_U64: u8 = 0;
+    pub const TAG_I64: u8 = 1;
+    pub const TAG_F64: u8 = 2;
+    pub const TAG_UTF8: u8 = 3;
+    pub const TAG_BYTES: u8 = 4;
+    pub const TAG_JSON: u8 = 5;
+    pub const TAG_NULL: u8 = 6;
+}
 
 /// 绑定声明：纯数据。路径是**生产方发布的协议常量**，UI 只读消费。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

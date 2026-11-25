@@ -3,9 +3,18 @@
 //! 换区握手 + 水位自洽 + 未知标签跳过 + manifest `include_str!` 逐字对表。
 //! 断言内嵌，红即退出码非 0；语言无关性：断言全程只经 `serde_json::Value`
 //! 与 `&str` 进出（无任何 UI 栈类型参与）。
+//!
+//! 版本语义（v1 冻结）：桥水位 = 区域头 **even publish-sequence**。封板即
+//! [`INITIAL_SEQ`]（=2），每条通知 +[`SEQ_STEP`]（=2）；odd 只表示写事务进行中。
+//! CI 不跑 `main()`——同一批行为断言另见 `tests/view_region_wire.rs`。
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use skeleton::view::region_layout::{
+    ENTRY_OFFSET_BINDING_ID, ENTRY_OFFSET_KIND, ENTRY_OFFSET_LEN, ENTRY_OFFSET_OFFSET, HEADER_LEN,
+    INDEX_OFFSET_V1, INITIAL_SEQ, MAGIC, OFFSET_BINDING_COUNT, OFFSET_INDEX_OFFSET, OFFSET_MAGIC,
+    OFFSET_PROTOCOL, OFFSET_PUBLISH_SEQ, OFFSET_REGION_ID, SEQ_STEP,
+};
 use skeleton::view::{BindingDecl, IntentMap, PROTOCOL_VERSION, PayloadTag, ViewMap};
 use skeleton::{EffectBuf, Infallible, NoFx, Reducer};
 use skeleton_infra::runtime::SyncStore;
@@ -163,6 +172,7 @@ impl RegionEncoder for DemoRegion {
         Coverage::All
     }
     fn encode(&self, v: &DemoView, w: &mut RegionWriter) {
+        // 契约：一绑定恰一段非空完整 TLV（#168/#185）。
         match v {
             DemoView::Count(n) => w.u64(*n as u64),
             DemoView::Remaining(r) => w.json_blob(&json!({ FIELD_REMAINING: r })),
@@ -214,6 +224,7 @@ fn assert_manifest_matches_literals() {
         &format!("path = \"{PATH_REMAINING}\""),
         &format!("kind = {KIND_REMAINING}"),
         &format!("fields = [\"{FIELD_REMAINING}\"]"),
+        &format!("offset_publish_seq = {OFFSET_PUBLISH_SEQ}"),
     ] {
         assert!(
             MANIFEST.contains(needle),
@@ -225,16 +236,20 @@ fn assert_manifest_matches_literals() {
 fn main() {
     assert_manifest_matches_literals();
     assert_eq!(PROTOCOL_VERSION, 1);
+    // Header 布局冻结断言：序列 8 字节对齐（SAB 原子视图硬前提）+ index 紧随头。
+    assert_eq!(OFFSET_PUBLISH_SEQ % 8, 0);
+    assert_eq!(INDEX_OFFSET_V1 as usize, HEADER_LEN);
 
     // ── 都开：水位自洽（断言链①）+ latest-wins + Touch 零补丁 + 跨通道同源 ──
     let store = SyncStore::new(AppReducer, NoFx);
+    let backing = Arc::new(VecBacking::new(8192));
     let bridge: ViewBridge<App, Msg, DemoMap, DemoIntent, DemoJson, DemoRegion> = ViewBridge::mount(
         store,
         DemoMap::new(),
         DemoIntent,
         Encoders {
             json: Some(DemoJson),
-            region: Some((DemoRegion, Arc::new(VecBacking::new(8192)))),
+            region: Some((DemoRegion, Arc::clone(&backing) as Arc<dyn RegionBacking>)),
         },
     );
     assert!(bridge.bind("/nope").is_err(), "unknown path must Err");
@@ -244,14 +259,21 @@ fn main() {
     );
     bridge.bind(PATH_REMAINING).unwrap();
 
-    // 首挂快照：全量 + 投影数 == 绑定数 + version == 桥内消费代数（0 拍）。
+    // 首挂快照：全量 + 投影数 == 绑定数 + 封板水位 == INITIAL_SEQ（even）。
     let snap = bridge.snapshot_doc();
-    assert_eq!(snap.version, 0);
+    assert_eq!(snap.version, INITIAL_SEQ);
     assert_eq!(snap.doc.pointer(PATH_COUNT), Some(&json!(0)));
     assert_eq!(
         snap.doc.pointer(PATH_REMAINING),
         Some(&json!({ FIELD_REMAINING: 0 }))
     );
+    assert_eq!(
+        bridge.region_version(),
+        INITIAL_SEQ,
+        "封板即发布初始 even 水位"
+    );
+    assert_eq!(bridge.region_id(), 1);
+    assert_eq!(bridge.region_failure(), None);
 
     // 语言边界入站：Value 进（未知意图 Err 显形）。
     assert!(bridge.send_intent(json!({"op": "nope"})).is_err());
@@ -262,35 +284,31 @@ fn main() {
     bridge.send_intent(json!({"op": "push_todo"})).unwrap();
     bridge.send_intent(json!({"op": "flip", "i": 0})).unwrap();
 
-    // 折叠首取：5 拍未拉取 ⇒ latest-wins 一次交付两绑定现值。
+    // 折叠首取：5 拍未拉取 ⇒ latest-wins 一次交付两绑定现值；水位 +5×SEQ_STEP。
     {
         let batch = bridge.take_patches();
-        assert_eq!(batch.from_version, 0, "from == 上一批 to（首次 0）");
-        assert_eq!(batch.to_version, 5);
+        assert_eq!(batch.from_version, INITIAL_SEQ, "from == 上一交付点");
+        assert_eq!(batch.to_version, INITIAL_SEQ + 5 * SEQ_STEP);
         assert_eq!(batch.patches.len(), 2, "折叠：每脏绑定一条现值");
         assert_eq!(batch.patches[0].value, json!(2));
         assert_eq!(batch.patches[1].value, json!({ FIELD_REMAINING: 1 }));
         assert_eq!(bridge.region_version(), batch.to_version, "跨通道同源");
     }
 
-    // 逐拍水位：to_version 逐拍 +1、from == 上一批 to、区域头 == 同拍 to_version。
-    let mut applied = 5u64;
+    // 逐拍水位：to_version 逐拍 +SEQ_STEP、from == 上一批 to、区域头 == 同拍 to。
+    let mut applied = INITIAL_SEQ + 5 * SEQ_STEP;
     for i in 1..=3u64 {
         bridge.send_intent(json!({"op": "add", "n": 1})).unwrap();
         let batch = bridge.take_patches();
         assert_eq!(batch.protocol_version, PROTOCOL_VERSION);
         assert_eq!(batch.from_version, applied, "from == 上一批 to");
-        assert_eq!(batch.to_version, applied + 1, "to_version 逐拍 +1");
+        assert_eq!(batch.to_version, applied + SEQ_STEP, "水位逐拍 +2");
         assert_eq!(batch.patches.len(), 1, "latest-wins：仅 /count 现值");
         assert_eq!(batch.patches[0].value, json!(2 + i));
         assert_eq!(bridge.region_version(), batch.to_version, "跨通道同源");
         applied = batch.to_version;
     }
-    assert_eq!(
-        bridge.snapshot_doc().version,
-        applied,
-        "快照版本 == 桥内消费代数"
-    );
+    assert_eq!(bridge.snapshot_doc().version, applied, "快照版本 == 桥水位");
 
     // 人为倒退（UI applied 落后）⇒ 缺段判定 ⇒ snapshot_doc 重同步（路径被走到）。
     applied = 1;
@@ -344,7 +362,7 @@ fn main() {
             DemoIntent,
             Encoders {
                 json: None,
-                region: Some((DemoRegion, backing.clone())),
+                region: Some((DemoRegion, Arc::clone(&backing) as Arc<dyn RegionBacking>)),
             },
         );
     only_region.bind(PATH_COUNT).unwrap();
@@ -356,18 +374,24 @@ fn main() {
         only_region.take_patches().patches.is_empty(),
         "只开 Region：JSON 批空"
     );
-    assert_eq!(only_region.region_version(), 1);
+    assert_eq!(only_region.region_version(), INITIAL_SEQ + SEQ_STEP);
     let rid = only_region.region_id();
 
     // 镜像读取器回读 + 双编码一致性（区域段回读 == to_json 语义）。
-    let mut values = read_region(&backing);
+    let decls = DemoMap::new().bindings().to_vec();
+    let read = read_region(&backing, &decls);
     assert_eq!(
-        values.remove(&skeleton_infra::view::BindingId(0)),
-        Some(json!(7))
+        read.sequence,
+        only_region.region_version(),
+        "区域头 == 桥水位"
     );
     assert_eq!(
-        values.remove(&skeleton_infra::view::BindingId(1)),
-        Some(json!({ FIELD_REMAINING: 0 })),
+        value_of(&read.values, skeleton_infra::view::BindingId(0)),
+        Some(&json!(7))
+    );
+    assert_eq!(
+        value_of(&read.values, skeleton_infra::view::BindingId(1)),
+        Some(&json!({ FIELD_REMAINING: 0 })),
         "json_blob 与 to_json 同源"
     );
 
@@ -381,7 +405,7 @@ fn main() {
             DemoIntent,
             Encoders {
                 json: None,
-                region: Some((DemoRegion, small.clone())),
+                region: Some((DemoRegion, Arc::clone(&small) as Arc<dyn RegionBacking>)),
             },
         );
     swapper.bind(PATH_COUNT).unwrap();
@@ -389,22 +413,28 @@ fn main() {
     for _ in 0..8 {
         swapper.send_intent(json!({"op": "add", "n": 1})).unwrap();
     }
-    assert!(swapper.region_id() != rid, "换区握手：region_id 变化");
-    assert_eq!(swapper.region_version(), 8, "版本延续（单调不回退）");
-    let values = read_region(&small);
+    assert!(swapper.region_id() > rid, "换区握手：region_id 变化");
     assert_eq!(
-        values.get(&skeleton_infra::view::BindingId(0)),
+        swapper.region_version(),
+        INITIAL_SEQ + 8 * SEQ_STEP,
+        "版本延续（单调不回退）"
+    );
+    let read = read_region(&small, &decls);
+    assert_eq!(
+        value_of(&read.values, skeleton_infra::view::BindingId(0)),
         Some(&json!(8)),
         "重映射后可读现值"
     );
 
     // ── 未知标签跳过（断言链②）：手造含 tag=0x7F 的区域字节 ──
-    let mut bytes = vec![0u8; 32 + 24 * 2];
-    bytes[0..4].copy_from_slice(b"UVBR");
-    bytes[4..6].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    bytes[18..22].copy_from_slice(&2u32.to_le_bytes());
-    bytes[22..30].copy_from_slice(&32u64.to_le_bytes()); // index_offset = 索引起始（紧随头）
-    let arena_at = 32 + 48;
+    let mut bytes = vec![0u8; HEADER_LEN + 24 * 2];
+    bytes[OFFSET_MAGIC..OFFSET_PROTOCOL].copy_from_slice(&MAGIC);
+    bytes[OFFSET_PROTOCOL..OFFSET_PROTOCOL + 2].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    bytes[OFFSET_PUBLISH_SEQ..OFFSET_REGION_ID].copy_from_slice(&INITIAL_SEQ.to_le_bytes());
+    bytes[OFFSET_REGION_ID..OFFSET_BINDING_COUNT].copy_from_slice(&1u32.to_le_bytes());
+    bytes[OFFSET_BINDING_COUNT..OFFSET_INDEX_OFFSET].copy_from_slice(&2u32.to_le_bytes());
+    bytes[OFFSET_INDEX_OFFSET..HEADER_LEN].copy_from_slice(&INDEX_OFFSET_V1.to_le_bytes());
+    let arena_at = HEADER_LEN + 24 * 2;
     let mut arena: Vec<u8> = Vec::new();
     let known_at = arena_at;
     arena.push(0); // tag 0 = u64
@@ -415,16 +445,16 @@ fn main() {
     arena.extend_from_slice(&[0x7F, 4, 0, 0, 0, b'j', b'u', b'n', b'k']); // 未知 tag + len 前缀
     let entry = |id: u32, kind: u16, off: u64, len: u32| {
         let mut e = [0u8; 24];
-        e[0..4].copy_from_slice(&id.to_le_bytes());
-        e[4..6].copy_from_slice(&kind.to_le_bytes());
-        e[8..16].copy_from_slice(&off.to_le_bytes());
-        e[16..20].copy_from_slice(&len.to_le_bytes());
+        e[ENTRY_OFFSET_BINDING_ID..ENTRY_OFFSET_KIND].copy_from_slice(&id.to_le_bytes());
+        e[ENTRY_OFFSET_KIND..ENTRY_OFFSET_KIND + 2].copy_from_slice(&kind.to_le_bytes());
+        e[ENTRY_OFFSET_OFFSET..ENTRY_OFFSET_LEN].copy_from_slice(&off.to_le_bytes());
+        e[ENTRY_OFFSET_LEN..ENTRY_OFFSET_LEN + 4].copy_from_slice(&len.to_le_bytes());
         e
     };
-    bytes[32..56].copy_from_slice(&entry(0, 1, known_at as u64, 13));
-    bytes[56..80].copy_from_slice(&entry(1, 2, unknown_at as u64, 9));
+    bytes[HEADER_LEN..HEADER_LEN + 24].copy_from_slice(&entry(0, 1, known_at as u64, 13));
+    bytes[HEADER_LEN + 24..HEADER_LEN + 48].copy_from_slice(&entry(1, 2, unknown_at as u64, 9));
     bytes.extend_from_slice(&arena);
-    let read = RegionReader::read(&bytes).expect("结构字节必须可解");
+    let read = RegionReader::read_snapshot(&bytes, &decls).expect("结构字节必须可解");
     assert_eq!(read.values.len(), 1, "已知段照常解出");
     assert_eq!(
         read.values[0],
@@ -434,7 +464,6 @@ fn main() {
     assert!(read.needs_resync, "resync 提示置位（禁整区失败、禁 panic）");
 
     // JSON 通道同款：未知 kind 项跳过 + 计数，其余项照常。
-    let decls = DemoMap::new().bindings().to_vec();
     let batch_json = json!({
         "protocol_version": PROTOCOL_VERSION,
         "patches": [
@@ -446,20 +475,28 @@ fn main() {
     assert_eq!(decoded.patches.len(), 1);
     assert_eq!(decoded.unknown_tags_skipped, 1);
     assert!(decoded.needs_resync);
+    assert!(!decoded.unsupported_version);
 
     println!("view_bridge_demo: all assertions passed");
 }
 
-/// 镜像读取器：背衬整读 → 规范读器 → BindingId → Value 映射。
+fn value_of(
+    values: &[(skeleton_infra::view::BindingId, Value)],
+    id: skeleton_infra::view::BindingId,
+) -> Option<&Value> {
+    values.iter().find(|(got, _)| *got == id).map(|(_, v)| v)
+}
+
+/// 镜像读取器：背衬整读拷贝 → 规范快照读器 → 结果（声明词表由调用方给）。
 fn read_region(
     backing: &Arc<VecBacking>,
-) -> std::collections::HashMap<skeleton_infra::view::BindingId, Value> {
-    let mut map = std::collections::HashMap::new();
+    decls: &[BindingDecl],
+) -> skeleton_infra::view::read::RegionRead {
+    let mut slot: Option<skeleton_infra::view::read::RegionRead> = None;
     backing.with_bytes(&mut |bytes| {
-        let read = RegionReader::read(bytes).expect("self-written region must parse");
-        for (id, v) in read.values {
-            map.insert(id, v);
-        }
+        slot = Some(
+            RegionReader::read_snapshot(bytes, decls).expect("self-written region must parse"),
+        );
     });
-    map
+    slot.expect("with_bytes invoked exactly once")
 }
