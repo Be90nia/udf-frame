@@ -1483,7 +1483,19 @@ mod tests {
             let worker = sched.spawn_worker();
             wait_until("worker 跑过三圈", || sched.worker_passes() >= 3);
             let calls = clock.calls.load(AtomicOrd::SeqCst);
-            worker.join();
+            // Stop this worker without Scheduler::close(): close() takes the same
+            // state mutex from the test thread and can make the probe's try_lock
+            // observe unrelated cross-thread contention as a false "clock under
+            // lock" positive. Mirror WorkerHandle::drop's lock/flag/wakeup protocol,
+            // then join explicitly so the test still proves worker termination.
+            let state = lock(&sched.shared.state);
+            worker.stop.store(true, AtomicOrd::SeqCst);
+            drop(state);
+            sched.shared.signal.notify_all();
+            if let Some(thread) = worker.thread.take() {
+                thread.join().expect("worker exits after stop signal");
+            }
+            drop(worker);
             handle.detach();
 
             assert!(calls >= 3, "park 路径确实取过样（实际 {calls} 次）");
