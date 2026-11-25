@@ -13,8 +13,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use std_ext::fsx::{
-    CopyError, CopyReport, Sort, SymlinkPolicy, TempDir, WalkError, atomic_write, copy_tree,
-    rm_all, temp_dir_in, walk,
+    AtomicWritePolicy, CopyError, CopyReport, Sort, SymlinkPolicy, TempDir, TempDirError,
+    WalkError, atomic_write, atomic_write_with, copy_tree, rm_all, temp_dir_in, walk,
 };
 
 // ── 守卫与助手 ──
@@ -331,6 +331,31 @@ fn copy_src_not_dir_is_prepare_error() {
     }
 }
 
+#[test]
+fn copy_symlink_dir_root_is_prepare_error_for_both_policies() {
+    let g = guard("symlinkroot");
+    let real = g.path().join("real");
+    fs::create_dir(&real).unwrap();
+    write_file(real.join("a.txt"), b"a");
+    let link = g.path().join("link-root");
+    if !try_dir_link(&link, &real) {
+        return;
+    }
+    // 根链接不许「静默空复制」：两策略同面显式 Prepare(InvalidInput)，且
+    // dst 未被创建（Prepare=零中间态）。
+    for policy in [SymlinkPolicy::Preserve, SymlinkPolicy::Follow] {
+        let dst = g.path().join(format!("dst-{policy:?}"));
+        match copy_tree(&link, &dst, policy).unwrap_err() {
+            CopyError::Prepare { path, err } => {
+                assert_eq!(path, link);
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{policy:?}");
+            }
+            other => panic!("expected Prepare, got {other:?} ({policy:?})"),
+        }
+        assert!(!dst.exists(), "Prepare=零中间态，不得创建 dst ({policy:?})");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn copy_partial_failure_reports_processed_counts() {
@@ -638,6 +663,79 @@ fn temp_dir_concurrent_uniqueness_under_same_pid() {
     assert_dir_empty(g.path());
 }
 
+// 前缀面（#182）：`Path::join` 语义下会改层级/根锚的形式必须显式拒绝。
+#[test]
+fn temp_dir_rejects_path_like_prefixes() {
+    let g = guard("tprefix");
+    for bad in ["../escape-", "a/b-", "a\\b-", "/abs-", ".", "..", "x/../y"] {
+        match temp_dir_in(g.path(), bad).unwrap_err() {
+            TempDirError::InvalidPrefix { prefix, .. } => assert_eq!(prefix, bad),
+            TempDirError::Io(err) => panic!("前缀 {bad:?} 应被拒绝而非 IO 失败: {err}"),
+        }
+    }
+    assert_dir_empty(g.path()); // 拒绝路径零残留
+    // 空前缀合法（拼接结果仍是 root 下的一个普通名字）
+    let t = temp_dir_in(g.path(), "").unwrap();
+    assert_eq!(t.path().parent().unwrap(), g.path());
+    t.close().unwrap();
+}
+
+#[test]
+fn temp_dir_rejects_absolute_and_verbatim_prefixes() {
+    let g = guard("tabsprefix");
+    for bad in ["C:\\Windows\\", "C:\\", "\\\\?\\C:\\x", "/etc"] {
+        assert!(
+            matches!(
+                temp_dir_in(g.path(), bad),
+                Err(TempDirError::InvalidPrefix { .. })
+            ),
+            "前缀 {bad:?} 必须被拒绝"
+        );
+    }
+    assert_dir_empty(g.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn temp_dir_is_private_0700_on_unix() {
+    use std::os::unix::fs::PermissionsExt;
+    let g = guard("tperm");
+    let t = temp_dir_in(g.path(), "priv-").unwrap();
+    let mode = fs::metadata(t.path()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "临时目录必须私有（组/其他零权限）: {mode:o}");
+    t.close().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn rm_all_clears_deep_readonly_tree() {
+    // 逐层只读目录：`remove_dir_all` 首轮必败（只读属性拒删目录项），触发只读
+    // 装甲的**迭代式**清理；64 层链证明每层不占调用帧（递归版会随深度吃栈）。
+    let g = guard("rodeep");
+    let tree = g.path().join("tree");
+    let mut deep = tree.clone();
+    fs::create_dir(&deep).unwrap();
+    for i in 0..64 {
+        deep.push(format!("d{i:02}"));
+        fs::create_dir(&deep).unwrap();
+    }
+    write_file(deep.join("leaf.txt"), b"x");
+    // 自深向浅全链置只读（含 tree 自身；guard 根保持可写）
+    let mut cur = deep;
+    loop {
+        let p = cur;
+        let mut perm = fs::metadata(&p).unwrap().permissions();
+        perm.set_readonly(true);
+        fs::set_permissions(&p, perm).unwrap();
+        if p == tree {
+            break;
+        }
+        cur = p.parent().unwrap().to_path_buf();
+    }
+    rm_all(&tree).unwrap();
+    assert!(!tree.exists());
+}
+
 // ── atomic_write：崩溃安全原子写（语义 armor 见 src/fsx/atomic.rs 头注）──
 
 /// 断言目录内无 `atomic-*` 临时件残留（错误/成功路径自清纪律的可观测面）。
@@ -725,6 +823,174 @@ fn atomic_write_concurrent_same_target_last_wins_never_torn() {
         "终值必为完整载荷（无撕裂）: {final_bytes:?}"
     );
     assert_no_atomic_residue(g.path());
+}
+
+// ── atomic_write 权限策略（#215：原子性与隐私分离，显式选择）──
+
+#[cfg(unix)]
+#[test]
+fn atomic_private_keeps_group_and_other_bits_zero() {
+    use std::os::unix::fs::PermissionsExt;
+    let g = guard("privmode");
+    let cfg = g.path().join("cfg.json");
+    atomic_write_with(&cfg, b"v1", AtomicWritePolicy::Private).unwrap();
+    let mode = fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode & 0o077, 0, "组/其他位必须为零: {mode:o}");
+    // 替换既有件同面（新 inode 同策略），不放宽
+    atomic_write_with(&cfg, b"v2", AtomicWritePolicy::Private).unwrap();
+    let mode = fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode & 0o077, 0, "替换后不放大: {mode:o}");
+    assert_eq!(fs::read(&cfg).unwrap(), b"v2");
+    assert_no_atomic_residue(g.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_preserve_existing_keeps_target_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let g = guard("preservemode");
+    let cfg = g.path().join("cfg.json");
+    fs::write(&cfg, b"old").unwrap();
+    fs::set_permissions(&cfg, fs::Permissions::from_mode(0o600)).unwrap();
+    atomic_write_with(&cfg, b"new", AtomicWritePolicy::PreserveExisting).unwrap();
+    assert_eq!(fs::read(&cfg).unwrap(), b"new");
+    assert_eq!(
+        fs::metadata(&cfg).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "既有 0600 不得被放宽"
+    );
+    assert_no_atomic_residue(g.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_preserve_existing_rejects_non_file_destination() {
+    let g = guard("preservedst");
+    // 目录目标：保权无意义 ⇒ 显式 InvalidInput，且零残留（建件之前失败）
+    let dir_target = g.path().join("d");
+    fs::create_dir(&dir_target).unwrap();
+    let err =
+        atomic_write_with(&dir_target, b"x", AtomicWritePolicy::PreserveExisting).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    assert_no_atomic_residue(g.path());
+    // 符号链接目标：不穿链接读 mode、也不把链接静默换成常规文件
+    let real = g.path().join("real.json");
+    fs::write(&real, b"old").unwrap();
+    let link = g.path().join("link.json");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let err = atomic_write_with(&link, b"x", AtomicWritePolicy::PreserveExisting).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    assert_eq!(fs::read(&real).unwrap(), b"old", "链接目标不得被写");
+    assert_no_atomic_residue(g.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_preserve_existing_missing_target_falls_back_to_inherit() {
+    use std::os::unix::fs::PermissionsExt;
+    let g = guard("preservemissing");
+    let target = g.path().join("new.json");
+    atomic_write_with(&target, b"x", AtomicWritePolicy::PreserveExisting).unwrap();
+    let plain = g.path().join("plain.json");
+    fs::write(&plain, b"x").unwrap();
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        fs::metadata(&plain).unwrap().permissions().mode() & 0o777,
+        "无可保时回落 umask 继承语义（与普通新建件同面）"
+    );
+}
+
+/// `umask 000` 下的真实断言（std 无 umask 接口，且 umask 是进程级状态——改它
+/// 会污染同进程并行测试）：本测试在子进程里用 `sh -c 'umask 000; exec <本 exe>'`
+/// 重跑自己，只跑自身一条用例。
+#[cfg(unix)]
+#[test]
+fn atomic_and_tempdir_modes_under_umask_000() {
+    const CHILD: &str = "FSX_UMASK000_CHILD";
+    const SELF: &str = "atomic_and_tempdir_modes_under_umask_000";
+    if std::env::var_os(CHILD).is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let g = guard("umask0");
+        let cfg = g.path().join("cfg.json");
+        // 私有：建件即 0600（umask 000 也不许落到 0644）
+        atomic_write_with(&cfg, b"v1", AtomicWritePolicy::Private).unwrap();
+        assert_eq!(mode(&cfg), 0o600, "private 新件");
+        // 替换既有 0600 不放宽
+        atomic_write_with(&cfg, b"v2", AtomicWritePolicy::PreserveExisting).unwrap();
+        assert_eq!(mode(&cfg), 0o600, "保权替换不放宽");
+        // 兼容面：Inherit 仍等于 umask 语义（000 ⇒ 0666）
+        let plain = g.path().join("plain.json");
+        atomic_write_with(&plain, b"x", AtomicWritePolicy::Inherit).unwrap();
+        assert_eq!(mode(&plain), 0o666, "Inherit 保留 umask 兼容语义");
+        // 私有临时目录 0700（umask 000 下也不得 0777）
+        let t = temp_dir_in(g.path(), "priv-").unwrap();
+        assert_eq!(mode(t.path()), 0o700, "临时目录私有");
+        t.close().unwrap();
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    let script = format!("umask 000; exec '{}' --exact '{}'", exe.display(), SELF);
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .env(CHILD, "1")
+        .output()
+        .expect("spawn sh 跑 umask 000 子进程");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "umask 000 子进程必须真跑一条用例:\nstdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn atomic_preserve_existing_is_unsupported_on_windows() {
+    let g = guard("preservew");
+    let cfg = g.path().join("cfg.json");
+    fs::write(&cfg, b"old").unwrap();
+    let err = atomic_write_with(&cfg, b"new", AtomicWritePolicy::PreserveExisting).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
+    assert_eq!(fs::read(&cfg).unwrap(), b"old", "失败路径零触碰目标");
+    assert_no_atomic_residue(g.path());
+}
+
+#[cfg(windows)]
+#[test]
+fn atomic_private_inherits_parent_acl_like_plain_create() {
+    // Windows 无 mode/显式 ACL 通道：`Private` = 父目录继承 ACL（如实声明，不谎称
+    // 私有）。断言=原子写产物与同目录 `fs::write` 新建件的 ACL 一致（继承同源）。
+    let g = guard("aclp");
+    let written = g.path().join("atomic.json");
+    atomic_write_with(&written, b"x", AtomicWritePolicy::Private).unwrap();
+    let plain = g.path().join("plain.json");
+    fs::write(&plain, b"x").unwrap();
+    let (Ok(a), Ok(b)) = (acl_of(&written), acl_of(&plain)) else {
+        eprintln!("SKIP（icacls 不可用）: Windows ACL 继承面未断言");
+        return;
+    };
+    assert_eq!(a, b, "私有策略在 Windows 上=父目录继承 ACL");
+}
+
+/// `icacls` 的 ACE 行（去缩进——icacls 按路径长度补空格对齐；只留含 `(` 的
+/// ACE 行，丢掉路径头与末尾摘要）。
+#[cfg(windows)]
+fn acl_of(path: &Path) -> std::io::Result<String> {
+    let out = std::process::Command::new("icacls").arg(path).output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other("icacls failed"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // 首行是「路径 + 首条 ACE」同排：先抹掉路径再去缩进比较 ACE 集
+    let text = text.replace(&path.display().to_string(), "");
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains('('))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 // ── log-embed 埋点（fsx 事件点红绿；断言基建见 common/log_capture.rs）──
@@ -899,5 +1165,129 @@ mod log_embed {
             capture.events().is_empty(),
             "TempDir::drop must not call an arbitrary host subscriber"
         );
+    }
+
+    /// 事件回调必 panic 的订阅方（埋点 panic 只许计吞，不许替换结果面）。
+    struct PanicSubscriber;
+
+    impl tracing::Subscriber for PanicSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {
+            panic!("injected subscriber panic");
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    // 帧推进 debug 事件 panic 不得让 walk 迭代器 panic 或截断。
+    #[test]
+    fn walk_survives_panicking_subscriber() {
+        let g = guard("panicwalk");
+        let src = g.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        write_file(src.join("sub").join("f"), b"x");
+
+        let before = std_ext::embedded_event_panic_count();
+        let got = tracing::subscriber::with_default(PanicSubscriber, || {
+            walk(&src).sort(Sort::ByName).collect::<Result<Vec<_>, _>>()
+        });
+        let got = got.expect("埋点 panic 不得替换 WalkError");
+        assert_eq!(got.len(), 3, "根+sub+f");
+        assert!(
+            std_ext::embedded_event_panic_count() > before,
+            "panic 必须被边界计吞（否则说明边界未覆盖本路径）"
+        );
+    }
+
+    // 逐项 debug panic 不得替换复制结果与计数。
+    #[test]
+    fn copy_tree_survives_panicking_subscriber() {
+        let g = guard("paniccopy");
+        let src = g.path().join("src");
+        fs::create_dir(&src).unwrap();
+        write_file(src.join("a.txt"), b"aa");
+        write_file(src.join("b.txt"), b"b");
+        let dst = g.path().join("dst");
+
+        let before = std_ext::embedded_event_panic_count();
+        let report = tracing::subscriber::with_default(PanicSubscriber, || {
+            copy_tree(&src, &dst, SymlinkPolicy::Preserve)
+        })
+        .expect("逐项埋点 panic 不得替换复制结果");
+        assert_eq!((report.files, report.bytes), (2, 3));
+        assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"aa");
+        assert!(std_ext::embedded_event_panic_count() > before);
+    }
+
+    // 部分失败 warn panic 不得替换 CopyError::Partial 与其已复制计数。
+    #[cfg(unix)]
+    #[test]
+    fn copy_partial_failure_survives_panicking_subscriber() {
+        use std::os::unix::fs::PermissionsExt;
+        let g = guard("panicpartialu");
+        let src = g.path().join("src");
+        fs::create_dir(&src).unwrap();
+        write_file(src.join("a-ok.txt"), b"good");
+        write_file(src.join("b-noperm.txt"), b"secret");
+        fs::set_permissions(src.join("b-noperm.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        let before = std_ext::embedded_event_panic_count();
+        let err = tracing::subscriber::with_default(PanicSubscriber, || {
+            copy_tree(&src, g.path().join("dst"), SymlinkPolicy::Preserve)
+        })
+        .expect_err("首错即停必须返回 Partial");
+        match err {
+            CopyError::Partial { report, path, .. } => {
+                assert_eq!(report.files, 1, "已复制计数原样保留");
+                assert!(path.ends_with("b-noperm.txt"));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        assert!(std_ext::embedded_event_panic_count() > before);
+        fs::set_permissions(src.join("b-noperm.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    // Windows 同款：排他句柄致 sharing violation → Partial（warn panic 面）。
+    #[cfg(windows)]
+    #[test]
+    fn copy_partial_failure_survives_panicking_subscriber() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let g = guard("panicpartialw");
+        let src = g.path().join("src");
+        fs::create_dir(&src).unwrap();
+        write_file(src.join("a-ok.txt"), b"good");
+        write_file(src.join("b-locked.txt"), b"locked");
+        let _held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(src.join("b-locked.txt"))
+            .unwrap();
+
+        let before = std_ext::embedded_event_panic_count();
+        let err = tracing::subscriber::with_default(PanicSubscriber, || {
+            copy_tree(&src, g.path().join("dst"), SymlinkPolicy::Preserve)
+        })
+        .expect_err("首错即停必须返回 Partial");
+        match err {
+            CopyError::Partial { report, path, .. } => {
+                assert_eq!(report.files, 1, "已复制计数原样保留");
+                assert!(path.ends_with("b-locked.txt"));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        assert!(std_ext::embedded_event_panic_count() > before);
     }
 }

@@ -174,8 +174,11 @@ fn read_bounded(reader: impl Read, path: &Path, limit: usize) -> Result<Vec<u8>,
 ///
 /// # 保存面
 ///
-/// [`ConfigFile::save`] = Pretty 序列化 + [`fsx::atomic_write`](std_ext::fsx)
-/// 原子落盘（同目录临时件+fsync+rename，崩溃安全语义见 fsx 域）。**保存=
+/// [`ConfigFile::save`] = Pretty 序列化 + 原子落盘（同目录临时件+fsync+rename，
+/// 崩溃安全语义见 fsx 域）；落盘走 fsx 的**私有**权限策略
+/// （[`atomic_write_with`](std_ext::fsx::atomic_write_with) + `Private`：Unix
+/// 建件即 0600，替换既有配置不放宽；Windows 沿用父目录继承 ACL——父目录非本
+/// 用户独占 ACL 时不构成私有），敏感配置的保密性不再依赖调用方 umask。**保存=
 /// 全量重序列化**：注释与键序不保留（fail-visible 前置声明；注释保真是
 /// toml_edit 类采用方面，框架不代劳）；并发保存经 rename 原子性线性化=
 /// 最后赢。serde_json 序列化语义如实声明（实测 2026-10-17）：整数键映射
@@ -304,6 +307,13 @@ impl<C> ConfigFile<C> {
         Ok(self.layer(v))
     }
 
+    /// 保存：Pretty JSON + 原子落盘（同目录临时件+fsync+rename；并发保存经
+    /// rename 原子性线性化=最后赢）。
+    ///
+    /// 权限：走 fsx 的**私有**策略——Unix 临时件建时即 0600，替换既有文件也
+    /// 不放宽（umask 只能收窄）；Windows 沿用父目录继承 ACL（父目录非本用户
+    /// 独占 ACL 时**不构成私有**，如实声明）。要别的权限策略请自行用
+    /// [`atomic_write_with`](std_ext::fsx::atomic_write_with) 落盘。
     pub fn save(value: &C, path: impl AsRef<Path>) -> Result<(), ConfigError>
     where
         C: serde::Serialize,
@@ -313,7 +323,12 @@ impl<C> ConfigFile<C> {
             serde_json::to_string_pretty(value).map_err(|source| ConfigError::Serialize {
                 source: Box::new(source),
             })?;
-        std_ext::fsx::atomic_write(path, text.as_bytes()).map_err(|source| ConfigError::File {
+        std_ext::fsx::atomic_write_with(
+            path,
+            text.as_bytes(),
+            std_ext::fsx::AtomicWritePolicy::Private,
+        )
+        .map_err(|source| ConfigError::File {
             path: path.to_path_buf(),
             source,
         })
@@ -359,6 +374,7 @@ pub fn load_toml<C: serde::de::DeserializeOwned>(path: impl AsRef<Path>) -> Resu
 
 /// 保存：Pretty TOML + 原子写（语义见 [`ConfigFile`] 文档保存面；TOML 文档
 /// 须为表根，标量根序列化失败报 [`ConfigError::Serialize`]，fail-visible）。
+/// 权限走**私有**策略（Unix 建件即 0600，语义同 [`ConfigFile::save`] 的权限段）。
 #[cfg(feature = "config-toml")]
 pub fn save_toml<C: serde::Serialize>(
     value: &C,
@@ -368,7 +384,12 @@ pub fn save_toml<C: serde::Serialize>(
     let text = toml::to_string_pretty(value).map_err(|source| ConfigError::Serialize {
         source: Box::new(source),
     })?;
-    std_ext::fsx::atomic_write(path, text.as_bytes()).map_err(|source| ConfigError::File {
+    std_ext::fsx::atomic_write_with(
+        path,
+        text.as_bytes(),
+        std_ext::fsx::AtomicWritePolicy::Private,
+    )
+    .map_err(|source| ConfigError::File {
         path: path.to_path_buf(),
         source,
     })

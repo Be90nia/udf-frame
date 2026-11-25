@@ -28,14 +28,24 @@
 //!   `PermissionDenied` 时清只读属性后重试原语恰一轮，仍败以原错误显式上浮。
 //!   Unix 只读目录删除 EACCES 属 OS 语义，不自动 chmod（如实上浮，声明上限）。
 //! - **临时目录同 pid 并发竞态**：命名=前缀+pid+进程内原子序号+挂钟纳秒（同
-//!   进程不撞/跨进程 pid 隔离/pid 回收由纳秒兜底），创建走 `create_dir` 独占
-//!   语义（存在即 AlreadyExists 显式上浮，瞬时竞态由原子序号根除）。
+//!   进程不撞/跨进程 pid 隔离/pid 回收由纳秒兜底），创建走独占语义（Unix
+//!   `DirBuilder::mode(0o700)` / Windows `create_dir`；存在即 AlreadyExists 显式
+//!   上浮，瞬时竞态由原子序号根除）。**权限**：Unix 建目录即 0700（umask 只能
+//!   收窄），Windows 继承 `root` 的 ACL（非用户独占 ACL 时不构成私有，如实
+//!   声明）。**前缀面**：只接受安全的单文件名前缀——分隔符/`..`/`.`/绝对与前缀
+//!   形式一律 `TempDirError::InvalidPrefix` 显式失败（禁静默改写），空串合法。
 //!
 //! log-embed 埋点（级别规范：正常流转=debug / 异常路径=warn；target
 //! `skeleton::fsx[::phase]`，字段化/零调用点分配纪律见 lib.rs `embed_event!`
 //! 注）：walk 帧=帧推进 debug（depth/排序模式）；copy 树=逐项 debug
 //!（kind/items/bytes 累计）+ 部分失败 warn（copied/path/error）；tempdir=
-//! Drop 清理失败 warn（path/error）。
+//! Drop 清理失败走 stderr 记录（不经订阅方——Drop 不 panic 且不调任意宿主代码）。
+//!
+//! **埋点不影响结果**（#207）：`embed_event!` 的 panic 边界把订阅方 panic 吞成
+//! 计数（`embedded_event_panic_count`），walk 迭代与 `copy_tree` 的返回值（含
+//! `CopyError::Partial` 的已复制计数）不因订阅方 panic 改变。声明上限：订阅方
+//! 仍在遍历/复制线程上**同步**执行（宏文档同款约束），阻塞型订阅方会拖慢操作
+//! ——本域不为此另造异步/丢弃通道。
 //!
 //! 常驻零依赖件：纯 std，无 feature 门；错误手写同形 `Display`/`Error`
 //! （text/encode 域同门风格）。
@@ -534,6 +544,12 @@ impl std::error::Error for CopyError {
 /// 时间戳不承诺）；元数据面不额外保留（声明上限，需要时调用方后续补）。
 /// 遍历按文件名排序（`Sort::ByName`）——部分失败的报错点确定可复现。
 ///
+/// 根语义（#120）：`src` 必须是真实目录——**符号链接根一律
+/// `Prepare(InvalidInput)`**（两策略同面）。理由：`Preserve` 下 walker 把根当
+/// 链接、`min_depth(1)` 把整棵树丢掉 ⇒ 假成功的空复制；`Follow` 下「根即目录」
+/// 也会与穿透语义混淆。需要穿链接请先 `canonicalize` 出真实目录再传。根非目录
+/// （常规文件等）同为 `Prepare(InvalidInput)`。
+///
 /// # Examples
 ///
 /// ```no_run
@@ -565,10 +581,23 @@ pub fn copy_tree(
 
 /// [`copy_tree`] 本体（包装层只挂部分失败埋点；路径零二次分配）。
 fn copy_tree_inner(src: &Path, dst: &Path, links: SymlinkPolicy) -> Result<CopyReport, CopyError> {
-    let src_md = fs::metadata(src).map_err(|err| CopyError::Prepare {
+    // 根符号链接显式拒绝（两策略同面）：Preserve 下 walk 把根当链接、min_depth(1)
+    // 把整棵树丢光 ⇒ 假成功的空复制；Follow 下「根即目录」契约被穿透语义混同。
+    // 根解析归一由调用方先 canonicalize。lstat 与 walk 之间的根替换属固有权衡
+    // （模块 TOCTOU 声明项）。
+    let src_md = fs::symlink_metadata(src).map_err(|err| CopyError::Prepare {
         path: src.to_path_buf(),
         err,
     })?;
+    if src_md.file_type().is_symlink() {
+        return Err(CopyError::Prepare {
+            path: src.to_path_buf(),
+            err: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source is a symlink; copy_tree requires a real directory",
+            ),
+        });
+    }
     if !src_md.is_dir() {
         return Err(CopyError::Prepare {
             path: src.to_path_buf(),
@@ -730,23 +759,31 @@ pub fn rm_all(path: impl AsRef<Path>) -> Result<(), RmError> {
 }
 
 /// 清除 `path` 自身及树内后代的只读属性（`symlink_metadata` 判类型：不穿
-/// symlink，递归环安全——symlink 目录不展开）。
+/// symlink，故环不可达）。
+///
+/// 迭代式（显式工作栈，**每层不占一个 Rust 调用帧**）：深树触发本装甲时不会
+/// 以栈溢出代替清理失败；`read_dir` 迭代器只在单轮内持有，不跨深度累积打开的
+/// 目录句柄。首个遍历/元数据/权限错误原样上浮（遍历序按 LIFO 工作栈，不承诺与
+/// 递归版同序）。
 #[cfg(windows)]
 fn clear_readonly_tree(path: &Path) -> io::Result<()> {
-    let md = fs::symlink_metadata(path)?;
-    if md.file_type().is_dir() {
-        for entry in fs::read_dir(path)? {
-            clear_readonly_tree(&entry?.path())?;
+    let mut pending: Vec<PathBuf> = vec![path.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let md = fs::symlink_metadata(&current)?;
+        if md.file_type().is_dir() {
+            for entry in fs::read_dir(&current)? {
+                pending.push(entry?.path());
+            }
         }
-    }
-    if md.permissions().readonly() {
-        // 只清只读位、其余权限位保持（装甲本意；clippy 建议的整模式重写会
-        // 连带改写其他属性位，非本函数语义）
-        #[allow(clippy::permissions_set_readonly_false)]
-        {
-            let mut perm = md.permissions();
-            perm.set_readonly(false);
-            fs::set_permissions(path, perm)?;
+        if md.permissions().readonly() {
+            // 只清只读位、其余权限位保持（装甲本意；clippy 建议的整模式重写会
+            // 连带改写其他属性位，非本函数语义）
+            #[allow(clippy::permissions_set_readonly_false)]
+            {
+                let mut perm = md.permissions();
+                perm.set_readonly(false);
+                fs::set_permissions(&current, perm)?;
+            }
         }
     }
     Ok(())
@@ -767,6 +804,76 @@ fn unique_temp_name(prefix: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{prefix}{}-{seq:012x}{nanos:x}", std::process::id())
+}
+/// 临时目录创建失败（#182）：前缀非法与 IO 失败显式分立（前缀错误可诊断，不被
+/// IO 噪音吞掉）。
+#[derive(Debug)]
+pub enum TempDirError {
+    /// `prefix` 不是安全的单文件名前缀（`Path::join` 语义下会改变目录层级或根锚）。
+    InvalidPrefix {
+        /// 原始前缀（诊断用）。
+        prefix: String,
+        /// 拒绝原因（静态串，错误面不再分配）。
+        reason: &'static str,
+    },
+    /// 目录创建 IO 失败（原错误透传）。
+    Io(io::Error),
+}
+
+impl std::fmt::Display for TempDirError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TempDirError::InvalidPrefix { prefix, reason } => {
+                write!(f, "invalid temp dir prefix {prefix:?}: {reason}")
+            }
+            TempDirError::Io(err) => write!(f, "temp dir create failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for TempDirError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TempDirError::Io(err) => Some(err),
+            TempDirError::InvalidPrefix { .. } => None,
+        }
+    }
+}
+
+impl From<io::Error> for TempDirError {
+    fn from(err: io::Error) -> Self {
+        TempDirError::Io(err)
+    }
+}
+
+/// 类型化错误 → `io::Error`：既有 `io::Result` 调用点的 `?` 零改动；前缀错误
+/// kind=`InvalidInput` 且原错误可 `downcast_ref` 回去（不丢类型）。
+impl From<TempDirError> for io::Error {
+    fn from(err: TempDirError) -> io::Error {
+        match err {
+            TempDirError::Io(err) => err,
+            other => io::Error::new(io::ErrorKind::InvalidInput, other),
+        }
+    }
+}
+
+/// 前缀校验：拼接结果必须恰是 `root` 下的**一个普通名字**（`Path::components`
+/// 单 `Normal` 分量），故 `..`/`.`/分隔符/绝对与前缀形式全部拒绝；空串合法
+/// （拼接结果仍是单个名字）。
+fn validate_prefix(prefix: &str) -> Result<(), TempDirError> {
+    let invalid = |reason| TempDirError::InvalidPrefix {
+        prefix: prefix.to_owned(),
+        reason,
+    };
+    // 反斜杠在 Unix 是合法文件名字符，但前缀面跨平台一致更可预测：一并拒绝
+    if prefix.contains('/') || prefix.contains('\\') {
+        return Err(invalid("contains a path separator"));
+    }
+    let mut components = Path::new(prefix).components();
+    match (components.next(), components.next()) {
+        (None, None) | (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => Err(invalid("is not a single filename component")),
+    }
 }
 
 /// RAII 临时目录：Drop 即删树（删除失败 fail-visible 记录到 stderr 而非
@@ -794,8 +901,17 @@ impl TempDir {
     }
 }
 
-/// 在 `root` 下以 `prefix` 命名创建唯一临时目录（调研档 §4.6 拍板 API 形；
-/// 命名/竞态语义见模块头注）。
+/// 在 `root` 下以 `prefix` 命名创建唯一的**私有**临时目录（调研档 §4.6 拍板
+/// API 形；命名/竞态/权限语义见模块头注）。
+///
+/// `prefix` 必须是安全的单文件名前缀：含路径分隔符（`/`、`\`）、父/当前目录
+/// 组件（`..`、`.`）、绝对或 Windows 前缀形式一律
+/// [`TempDirError::InvalidPrefix`] 显式失败（禁静默改写——改写会造出撞名）；
+/// 空前缀合法（拼接结果仍是 `root` 下的一个普通名字）。要拼任意路径面请直接
+/// 用 [`Path::join`]。
+///
+/// 权限：Unix 建目录即 `0700`（umask 只能收窄）；Windows 沿用 `root` 的 ACL
+/// 继承——`root` 非本用户独占 ACL 时不构成私有（如实声明）。
 ///
 /// # Examples
 ///
@@ -806,14 +922,17 @@ impl TempDir {
 /// std::fs::write(tmp.path().join("scratch.txt"), b"x").unwrap();
 /// drop(tmp); // RAII：Drop 即删树
 /// ```
-///
-/// `prefix` 按 `Path::join` 语义拼接：含 `..` 的 prefix 可越出 `root`
-/// （与 tempfile `TempDir::new_in` 同行为）——调用方对 prefix 内容自负其责，
-/// 本函数不消毒。
-pub fn temp_dir_in(root: impl AsRef<Path>, prefix: &str) -> io::Result<TempDir> {
+pub fn temp_dir_in(root: impl AsRef<Path>, prefix: &str) -> Result<TempDir, TempDirError> {
+    validate_prefix(prefix)?;
     let path = root.as_ref().join(unique_temp_name(prefix));
-    // create_dir 独占语义：存在即 AlreadyExists 显式上浮（同名撞车被进程内
-    // 原子序号根除，重试环属死代码；跨进程由 pid 段隔离）
+    // 独占创建（不打存在性预检=无 TOCTOU 窗口）：存在即 AlreadyExists 显式
+    // 上浮（同名撞车被进程内原子序号根除，重试环属死代码；跨进程由 pid 段隔离）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+    }
+    #[cfg(not(unix))]
     fs::create_dir(&path)?;
     Ok(TempDir { path, armed: true })
 }
@@ -894,7 +1013,7 @@ mod tempdir_drop_reporting_tests {
 // ── atomic_write：崩溃安全原子写（子模块自带 armor 头注）──
 
 mod atomic;
-pub use atomic::atomic_write;
+pub use atomic::{AtomicWritePolicy, atomic_write, atomic_write_with};
 
 #[cfg(test)]
 mod tests;
