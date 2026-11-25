@@ -1373,8 +1373,7 @@ impl<G: SpawnGate> ThreadPool<G> {
                     // concurrent resizes cannot reserve the same missing seats.
                     let before = g.workers;
                     let deficit = g.core.saturating_sub(g.workers);
-                    let ids: Vec<u64> =
-                        (0..deficit).map(|_| reserve_worker(&mut g)).collect();
+                    let ids: Vec<u64> = (0..deficit).map(|_| reserve_worker(&mut g)).collect();
                     debug_assert!(
                         g.workers <= before.max(g.core),
                         "growth must not push committed population above max"
