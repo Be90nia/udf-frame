@@ -851,6 +851,44 @@ impl Drop for TempDir {
     }
 }
 
+#[cfg(test)]
+mod tempdir_drop_reporting_tests {
+    use super::*;
+    use std::io;
+
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected stderr failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected stderr failure"))
+        }
+    }
+
+    #[test]
+    fn cleanup_diagnostic_write_failure_does_not_replace_unwind() {
+        let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut writer = BrokenWriter;
+            report_tempdir_cleanup_failure_to(
+                &mut writer,
+                Path::new("injected-tempdir"),
+                &io::Error::other("injected cleanup failure"),
+            );
+            panic!("primary application panic");
+        }));
+
+        let payload = primary.expect_err("the original application panic must propagate");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>(),
+            Some(&"primary application panic"),
+            "diagnostic I/O failure must not trigger a second panic"
+        );
+    }
+}
+
 // ── atomic_write：崩溃安全原子写（子模块自带 armor 头注）──
 
 mod atomic;
