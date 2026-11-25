@@ -82,6 +82,13 @@
 //! 路径「拒因」）=warn（available/wait_ns/capacity 字段带拒因细节）；阻塞
 //! 等待分段与醒后重查（正常流转）=debug，round 字段（第几轮等待）+deficit/
 //! wait_ns 承载分段与跨事件关联；成功扣减零事件（只埋决策点）。
+//!
+//! **埋点不参与语义（issue#205）**：typed 结果先成形、注入钟的 `sleep` 先落，
+//! 事件才发——订阅者 panic 被宏边界吞掉并计数，阻塞只能推迟后续而不能改写
+//! `Err(ExceedsCapacity)` / `Err(Insufficient)` 或跳过一轮等待。等待时长恒由
+//! 注入 [`Sleeper`] 决定：遥测耗时不在 sleep 之内（事件在其后），因此不会被
+//! 当作限流器语义的一部分。剩余限制：订阅者在事件点仍占用调用线程（只影响该
+//! 轮之后的时间线，不影响结果）。
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -232,22 +239,26 @@ impl TokenBucket {
         }
         let n = f64::from(permits);
         if n > self.capacity {
-            embed_event!(warn, target: "skeleton::ratelimit::try_acquire", permits = permits, capacity = self.capacity, reason = "exceeds_capacity");
-            return Err(TryAcquireError::ExceedsCapacity(ExceedsCapacity {
+            let err = TryAcquireError::ExceedsCapacity(ExceedsCapacity {
                 requested: permits,
                 capacity: self.capacity,
-            }));
+            });
+            // typed 拒绝先成形，诊断在其后：订阅者失败不得顶替返回值（issue#205）。
+            embed_event!(warn, target: "skeleton::ratelimit::try_acquire", permits = permits, capacity = self.capacity, reason = "exceeds_capacity");
+            return Err(err);
         }
         let available = self.settle_and_take(n);
         match available {
             Ok(()) => Ok(()),
             Err(tokens) => {
                 let wait = Self::wait_for(n - tokens, self.refill_rate);
-                embed_event!(warn, target: "skeleton::ratelimit::try_acquire", permits = permits, available = tokens, wait_ns = wait.as_nanos() as u64, reason = "insufficient");
-                Err(TryAcquireError::Insufficient {
+                // 桶状态已在锁内结算完毕；拒绝值先成形再发事件（issue#205）。
+                let err = TryAcquireError::Insufficient {
                     available: tokens,
                     wait,
-                })
+                };
+                embed_event!(warn, target: "skeleton::ratelimit::try_acquire", permits = permits, available = tokens, wait_ns = wait.as_nanos() as u64, reason = "insufficient");
+                Err(err)
             }
         }
     }
@@ -267,11 +278,13 @@ impl TokenBucket {
         }
         let n = f64::from(permits);
         if n > self.capacity {
-            embed_event!(warn, target: "skeleton::ratelimit::acquire", permits = permits, capacity = self.capacity, reason = "exceeds_capacity");
-            return Err(ExceedsCapacity {
+            let err = ExceedsCapacity {
                 requested: permits,
                 capacity: self.capacity,
-            });
+            };
+            // 拒绝值先成形，诊断在其后（issue#205）。
+            embed_event!(warn, target: "skeleton::ratelimit::acquire", permits = permits, capacity = self.capacity, reason = "exceeds_capacity");
+            return Err(err);
         }
         // 睡到再查：缺口单调收敛（无归还语义下令牌只增不减，减只发生在
         // 自己扣减），每轮睡满自身缺口，有限 acquirer 集合内必终止。
@@ -284,14 +297,14 @@ impl TokenBucket {
             };
             // guard 已 drop：睡眠在锁外。
             let wait = Self::wait_for(deficit, self.refill_rate);
+            self.clock.sleep(wait);
             // 阻塞等待分段（正常流转 debug）：round=第几轮等待，deficit/
-            // wait_ns 带缺口与睡眠时长（醒后重查即下一段的唤醒留痕）。
+            // wait_ns 带缺口与刚完成的睡眠时长（醒后重查即下一段的唤醒留痕）。
             #[cfg(feature = "log-embed")]
             {
                 round += 1;
                 embed_event!(debug, target: "skeleton::ratelimit::acquire", permits = permits, round = round, deficit = deficit, wait_ns = wait.as_nanos() as u64);
             }
-            self.clock.sleep(wait);
         }
     }
 

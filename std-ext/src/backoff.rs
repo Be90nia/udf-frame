@@ -4,9 +4,12 @@
 //!（fx 侧 `tokio::time` / sync 侧 `std::thread::sleep`）；耗尽语义的标准形
 //!（`RetryExhausted{attempts, last}` 回灌）归调用方，本件只算延迟不做重试循环。
 //!
-//! log-embed 埋点（`log-embed` feature，默认关=宏消除零开销）：target
-//! `skeleton::backoff`——计算入参/结果（attempt/base_ms/max_ms/delay_ms），
-//! debug 级（派单契约显式点：纯函数域唯一埋点，勿在其上加事件）。
+//! **零可观测副作用（issue#202）**：本件不调用宿主回调——`log-embed` 也不在这里
+//! 发事件。原先 target `skeleton::backoff` 的计算入参事件已上移到编排层调用点
+//! （[`crate::retry`] 的 `skeleton::retry::verdict` / `skeleton::retry::backoff`，
+//! 字段含 attempt/base_ms/max_ms/backoff_ms），因为「纯算术件」的契约是零时钟
+//! 零随机零分配**零回调**：订阅者 panic/阻塞不得让一次有效计算变成一次外部调用，
+//! 也不得改变结果的可用性。
 
 use std::time::Duration;
 
@@ -14,6 +17,9 @@ use std::time::Duration;
 ///
 /// `attempt` 从 1 起（0 视为未重试，返回 [`Duration::ZERO`]）；饱和乘法防溢出；
 /// 结果截到 `max`。禁 jitter（确定性回放要求）。
+///
+/// **无副作用**：不读钟、不分配、不调用宿主订阅者（`log-embed` 也不在此发事件，
+/// issue#202）——订阅者 panic/阻塞与计算结果完全无关。
 ///
 /// 性能锚（2026-10-16 批 D 定性，release/std Instant 粗测，详见
 /// 批 D 性能锚（本地留存，未入库））：纯算术常数级，~3ns/次
@@ -30,16 +36,8 @@ use std::time::Duration;
 /// assert_eq!(backoff_delay(3, base, Duration::from_millis(250)), Duration::from_millis(250));
 /// ```
 pub fn backoff_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
-    let delay = base.saturating_mul(attempt).min(max);
-    embed_event!(
-        debug,
-        target: "skeleton::backoff",
-        attempt = attempt,
-        base_ms = base.as_millis() as u64,
-        max_ms = max.as_millis() as u64,
-        delay_ms = delay.as_millis() as u64
-    );
-    delay
+    // 纯算术：不读钟、不分配、不碰宿主订阅者（issue#202——埋点在编排层）。
+    base.saturating_mul(attempt).min(max)
 }
 
 #[cfg(test)]
@@ -81,5 +79,51 @@ mod tests {
     fn u32_max_attempt_saturates_without_panic() {
         let saturated = backoff_delay(u32::MAX, Duration::from_secs(1 << 33), Duration::MAX);
         assert_eq!(saturated, Duration::MAX);
+    }
+}
+
+// issue#202：纯算术件零事件路径——退回到「计算里发事件」时本测试红
+//（计数非 0）。用计数而非 panic 订阅者：宏的 catch_unwind 边界会把 panic 吞成
+// 计数增量，panic 形式在此测不出「有没有调过订阅者」。
+#[cfg(all(test, feature = "log-embed"))]
+mod purity {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Default)]
+    struct Counting(std::sync::Arc<AtomicUsize>);
+
+    impl Subscriber for Counting {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, _: &Event<'_>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test]
+    fn backoff_delay_never_calls_host_subscriber() {
+        let counter = Counting::default();
+        let tally = std::sync::Arc::clone(&counter.0);
+        let base = Duration::from_millis(100);
+        let delay = tracing::subscriber::with_default(counter, || {
+            backoff_delay(3, base, Duration::from_millis(250))
+        });
+        assert_eq!(delay, Duration::from_millis(250), "计算结果不因遥测面改变");
+        assert_eq!(
+            tally.load(Ordering::Relaxed),
+            0,
+            "纯算术件不得调用宿主订阅者（issue#202）"
+        );
     }
 }

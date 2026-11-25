@@ -10,13 +10,17 @@
 //!
 //! 兜底层级（issue#102）：独立 OS 线程按 OS 截止时间等 → 到期 `fire`（唤醒
 //! `bounded` 的 `select!`）→ 最多 [`ABORT_GRACE`] 宽限轮询完成位 → 仍未完成则
-//! stderr 具名诊断 + `std::process::abort()`。完成位由活在**被守护线程栈上**的
+//! stderr 具名诊断 + `std::process::abort()`。**诊断是 best-effort 且与终止解耦
+//! （issue#200）**：写出走 `writeln!`（返回 `io::Result`，写失败不 panic）且整段
+//! 诊断在 `catch_unwind` 之内，abort 无条件执行——stderr 关闭/破管道都不能把
+//! 「挂死」变成「看门狗自己 panic 后挂死」。完成位由活在**被守护线程栈上**的
 //! drop 守卫置位：正常返回、断言 panic 展开、future 被弃置三条路径都置位 ⇒ 零误杀。
 //! 该兜底只存在于测试面（`cfg(test)` / 集成测试模块），库内无 watchdog 线程。
 
 #![allow(dead_code)]
 
 use std::future::Future;
+use std::io::Write;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -31,8 +35,30 @@ const CALL_LIMIT: Duration = Duration::from_secs(10);
 /// 截止后的宽限：给「刚好走在收尾路径上」的测试留出置完成位的时间，仍不完成才 abort。
 const ABORT_GRACE: Duration = Duration::from_secs(2);
 
+/// 诊断写出面：返回写结果。**调用方不得据此决定是否终止**——`Err` 只表示诊断丢了。
+///
+/// 可注入是 issue#200 的确定性 seam：测试用恒返回 `Err` 的 writer 证明写完失败后
+/// 仍然走到 `abort`。
+pub type DiagnosticWriter = fn(&str) -> std::io::Result<()>;
+
+/// 默认写出面：stderr 锁内 best-effort 写。与 `eprintln!` 的差别是本条要的差别——
+/// `writeln!` 返回 `io::Result`，`eprintln!` 在写失败时 **panic**（stderr 关闭/
+/// 管道破裂的 CI 里正好命中），panic 的看门狗线程就到不了 `abort()`。
+fn write_stderr(diag: &str) -> std::io::Result<()> {
+    writeln!(std::io::stderr().lock(), "{diag}")
+}
+
+/// 兜底动作：诊断生成与写出都在 `catch_unwind` 之内、结果一律丢弃，随后**无条件**
+/// `abort()`——格式化或写出失败都不得绕过进程级终止（issue#200）。
+fn abort_with_diagnostic(write: DiagnosticWriter, diagnose: impl FnOnce() -> String) -> ! {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = write(&diagnose());
+    }));
+    std::process::abort()
+}
+
 /// 可取消的 OS 截止线程 + 进程级兜底：目标完成时立即唤醒并 join，不让它白睡满期限。
-struct DeadlineGuard {
+pub struct DeadlineGuard {
     worker: Option<JoinHandle<()>>,
     finished: Arc<AtomicBool>,
 }
@@ -42,9 +68,15 @@ impl Drop for DeadlineGuard {
         self.finished.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             worker.thread().unpark();
-            // 线程只做截止等待与兜底；置位后立即退出，join 确保不遗留线程。
-            // 结果无需传播：该线程不产生错误（出口只有 break / fire / abort）。
-            let _ = worker.join();
+            // 线程正常出口只有 break / fire（随后 abort 终止进程）⇒ `JoinError` 只可能
+            // 来自兜底自身故障。禁在 Drop 里展开（会顶替被测断言），但也不静默吞
+            //（issue#200 §4）：best-effort 报告——「进程级兜底已失效」必须可见。
+            if worker.join().is_err() {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[udf-test-guard] 截止线程 panic ⇒ 进程级兜底已失效（panic 详情见上方 panic hook 输出）"
+                );
+            }
         }
     }
 }
@@ -57,11 +89,21 @@ fn describe_current_thread() -> String {
 }
 
 /// 起 OS 截止线程：`limit` 到期后 `fire`（`bounded` 的唤醒面），再宽限
-/// [`ABORT_GRACE`] 等完成位；仍未完成 ⇒ 具名诊断 + 进程 abort。
+/// [`ABORT_GRACE`] 等完成位；仍未完成 ⇒ 具名诊断 + **无条件**进程 abort。
 fn spawn_deadline(
     what: &str,
     limit: Duration,
     fire: Option<tokio::sync::oneshot::Sender<()>>,
+) -> DeadlineGuard {
+    spawn_deadline_with(what, limit, fire, write_stderr)
+}
+
+/// 同 [`spawn_deadline`]，诊断写出面可注入（issue#200 的确定性 seam）。
+pub fn spawn_deadline_with(
+    what: &str,
+    limit: Duration,
+    fire: Option<tokio::sync::oneshot::Sender<()>>,
+    writer: DiagnosticWriter,
 ) -> DeadlineGuard {
     let finished = Arc::new(AtomicBool::new(false));
     let worker_finished = Arc::clone(&finished);
@@ -100,17 +142,19 @@ fn spawn_deadline(
             if worker_finished.load(Ordering::Acquire) {
                 return;
             }
-            // ③ 仍未完成：具名诊断（本线程的 stderr 不被 libtest 捕获）后终止进程。
-            eprintln!(
-                "\n[udf-test-guard] 有界护栏超时：{what}\n  \
-                 上限: {limit:?}  宽限: {ABORT_GRACE:?}  已耗时: {:?}\n  \
-                 被守护线程: {guarded_thread}\n  \
-                 诊断: 截止后仍未完成 ⇒ 运行时线程可能被同步阻塞，或全部 worker 被占满；\n        tokio 时间驱动/调度无法推进，故护栏本身也拿不到 poll 机会。\n  \
-                 处置: 进程 abort（把 job 级 20 分钟超时变成 ≈{:?} 的具名失败）。\n",
-                started.elapsed(),
-                limit + ABORT_GRACE,
-            );
-            std::process::abort();
+            // ③ 仍未完成：具名诊断（本线程的 stderr 不被 libtest 捕获）+ 无条件
+            // abort——诊断写出失败（stderr 已关/破管道）不得绕过终止（issue#200）。
+            abort_with_diagnostic(writer, || {
+                format!(
+                    "\n[udf-test-guard] 有界护栏超时：{what}\n  \
+                     上限: {limit:?}  宽限: {ABORT_GRACE:?}  已耗时: {:?}\n  \
+                     被守护线程: {guarded_thread}\n  \
+                     诊断: 截止后仍未完成 ⇒ 运行时线程可能被同步阻塞，或全部 worker 被占满；\n        tokio 时间驱动/调度无法推进，故护栏本身也拿不到 poll 机会。\n  \
+                     处置: 进程 abort（把 job 级 20 分钟超时变成 ≈{:?} 的具名失败）。\n",
+                    started.elapsed(),
+                    limit + ABORT_GRACE,
+                )
+            });
         })
         .expect("创建 OS 截止线程失败");
     DeadlineGuard {

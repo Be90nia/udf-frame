@@ -12,6 +12,15 @@
 //! log-embed 埋点（级别规范：异常路径=warn）：任务 panic 且句柄已被丢
 //! （结果无处投递）=warn 一行，target `skeleton::fx`。宏无订阅者时 no-op
 //! ——不 panic/不锁/不阻塞，logx 未初始化即静默退让（tracing 语义）。
+//! **成因不可被遥测顶替（issue#201）**：事件在 panic 结果已成、投递已定之后才发；
+//! 订阅者 panic 被宏的 catch_unwind 边界吞掉并计入 `embedded_event_panic_count`，
+//! 生命周期集收到的仍是原任务的 panic，而非订阅者的。
+//!
+//! 自停机禁令（issue#133）：本 scope 的托管任务**不得**调用本 scope 的
+//! `shutdown`/`shutdown_timeout`——它自身就在待 abort 的生命周期集里。任务体 poll
+//! 期挂 scope 标记（RAII 还原，见 `ScopeScoped`），停机口在赢 `Open → Draining`
+//! **之前**判定并 fail-fast panic（不关闸、不改排空状态）；外部调用者语义不变。
+//! 详见 [`FxScope::shutdown`] 的「谁可以调用」。
 //!
 //! 增量收割面（issue#13）：完成条目滞留集合到 [`FxScope::try_reap`] 显式收割；
 //! `shutdown`/`shutdown_timeout` 排空产出 [`ShutdownReport`]（终局五桶 completed/
@@ -288,6 +297,57 @@ impl Drop for FlightGuard {
     }
 }
 
+/// scope 身份发号器（issue#133）：只用于「本 scope 的托管任务 vs 外部调用者」判定，
+/// 进程内唯一即可（不跨进程比较、不进任何对外契约）。
+static NEXT_SCOPE_ID: AtomicUsize = AtomicUsize::new(1);
+
+thread_local! {
+    /// 当前 poll 段里正在跑的托管任务所属 scope（issue#133 自证面）。
+    ///
+    /// **只在 poll 段内可见**：await 让出即恢复前值 ⇒ 同线程随后轮转 poll 的其他
+    /// 任务不会被误标。存前值（RAII 还原）而非布尔 ⇒ 嵌套 poll（任务里 `block_on`）
+    /// 也按 LIFO 正确还原。
+    static ACTIVE_SCOPE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// 标记守卫：装/还原 [`ACTIVE_SCOPE`]（panic 展开路径同样还原）。
+struct ScopeMark(Option<usize>);
+
+impl ScopeMark {
+    fn install(scope: usize) -> Self {
+        Self(ACTIVE_SCOPE.with(|cell| cell.replace(Some(scope))))
+    }
+}
+
+impl Drop for ScopeMark {
+    fn drop(&mut self) {
+        ACTIVE_SCOPE.with(|cell| cell.set(self.0));
+    }
+}
+
+/// 当前 poll 段是否属于 `scope` 的托管任务（[`FxScope::shutdown`] 的自停机判定）。
+fn polling_in_scope(scope: usize) -> bool {
+    ACTIVE_SCOPE.with(|cell| cell.get() == Some(scope))
+}
+
+/// 任务体 poll 面标记（issue#133）：把「此刻在跑哪个 scope 的托管任务」挂在线程
+/// 局部，供停机口在赢 `Open → Draining` **之前**拒绝自停机。零分配，每 poll 一次
+/// TLS 读写；标记在 [`CatchUnwind`] 之内 ⇒ 用户 panic 不影响还原。
+struct ScopeScoped<'a, F> {
+    fut: Pin<&'a mut F>,
+    scope: usize,
+}
+
+impl<F: Future> Future for ScopeScoped<'_, F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut(); // Self: Unpin（字段是 Pin<&mut F>）
+        let _mark = ScopeMark::install(this.scope);
+        this.fut.as_mut().poll(cx)
+    }
+}
+
 /// future 轮询面 catch_unwind（std 版只包同步段）：panic payload 旁路给 task_body
 /// 归一成 TaskError::Panicked。包 `Pin<&mut F>`（Unpin）——投影全走
 /// 安全 API，零 unsafe。
@@ -316,15 +376,20 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
     }
 }
 
-/// 任务包装体：permit-in-future（abort 连带回收 permit）→ catch_unwind 归一
-/// → oneshot 发送。接收端已亡（Spawned drop/abort）= 结果无处投递即弃（panic
-/// 结果留一行 warn 痕防静默丢失，见模块头注），任务本体仍归生命周期集托管。
+/// 任务包装体：permit-in-future（abort 连带回收 permit）→ 本 scope 标记 →
+/// catch_unwind 归一 → oneshot 发送。接收端已亡（Spawned drop/abort）= 结果无处
+/// 投递即弃（panic 结果留一行 warn 痕防静默丢失，见模块头注），任务本体仍归生命
+/// 周期集托管。
+///
+/// `scope` = 本 scope 身份（issue#133）：每次 poll 用户 future 期间挂进线程局部
+/// 标记，[`FxScope::shutdown`] / [`FxScope::shutdown_timeout`] 据此拒绝自停机。
 ///
 /// 返回值 = 生命周期集条目载荷（issue#13）：panic 归一为 `Err(Panicked)` 进集合
 /// ——句柄被丢也不丢 panic；[`Spawned::join`] 与 [`FxScope::try_reap`] 双重可见
 /// （同一 panic 两条路都可能报出，诊断面语义非 exactly-once）。其余结局集合面
 /// 统一 `Ok(())`——真实值只走 oneshot 旁路，集合条目仅承载生命周期与 panic 面。
 async fn task_body<T, F>(
+    scope: usize,
     sem: Option<Arc<Semaphore>>,
     permit: Option<OwnedSemaphorePermit>,
     fut: F,
@@ -355,8 +420,12 @@ where
             },
         },
     };
-    let fut = std::pin::pin!(fut);
-    let result = match CatchUnwind(fut).await {
+    let mut fut = std::pin::pin!(fut);
+    let mut marked = ScopeScoped {
+        fut: fut.as_mut(),
+        scope,
+    };
+    let result = match CatchUnwind(Pin::new(&mut marked)).await {
         Ok(value) => Ok(value),
         Err(payload) => Err(TaskError::Panicked(panic_message(payload))),
     };
@@ -367,18 +436,19 @@ where
     // 订阅者 no-op；宏关=默认，零增量）。clone 只在 panic 异常路径付一次。
     match result {
         Err(te @ TaskError::Panicked(_)) => {
-            let send_outcome = tx.send(Err(te.clone()));
+            let send_failed = tx.send(Err(te.clone())).is_err();
+            // 结果已成（`te` 在栈上、投递已定），诊断才发：订阅者 panic 只被宏的
+            // catch_unwind 边界吞掉并计数，顶不掉下面返回给生命周期集的原 panic
+            // 成因（issue#201）。
             #[cfg(feature = "log-embed")]
-            if send_outcome.is_err() {
+            if send_failed {
                 if let TaskError::Panicked(msg) = &te {
                     embed_event!(warn, target: "skeleton::fx", msg = msg.as_str(),
                         "managed task panicked; handle dropped before join");
                 }
             }
             #[cfg(not(feature = "log-embed"))]
-            {
-                let _ = send_outcome;
-            }
+            let _ = send_failed;
             Err(te)
         }
         result => {
@@ -709,6 +779,9 @@ pub struct FxScope {
     in_flight: Arc<AtomicUsize>,
     source: CancelSource,
     token: CancelToken,
+    /// scope 身份（issue#133）：任务体 poll 期把它挂进线程局部标记，供停机口判定
+    /// 「调用者是否本 scope 的托管任务」。进程内唯一即可（不跨进程比较）。
+    id: usize,
     /// 排空共享状态（issue#70）：`Open`/`Draining`/`Settled`——watch 值为唯一真源，
     /// 并发停机共享同一次排空。
     drain: watch::Sender<DrainState>,
@@ -731,6 +804,7 @@ impl FxScope {
             in_flight: Arc::new(AtomicUsize::new(0)),
             source,
             token,
+            id: NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             drain,
         }
     }
@@ -1026,6 +1100,8 @@ impl FxScope {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let sem = self.sem.clone();
+        // 身份按值取（future 须 'static，不能捕获 &self；issue#133）。
+        let scope_id = self.id;
         let flight = FlightGuard(Arc::clone(&self.in_flight));
         // tokio ≥1.53：`JoinSet::spawn_on` 用显式 Handle 入集，同样返回 AbortHandle。
         //
@@ -1035,7 +1111,7 @@ impl FxScope {
         let abort = set.spawn_on(
             async move {
                 let _flight = flight; // abort/panic/完成三路必经 drop——归零契约的落点
-                task_body(sem, permit, fut, tx, slot).await
+                task_body(scope_id, sem, permit, fut, tx, slot).await
             },
             rt,
         );
@@ -1078,6 +1154,22 @@ impl FxScope {
         // 已无必要，显式句柄把「用哪个 runtime」摆在调用点。`tokio::spawn` 的
         // clippy.toml 禁令仍拦其它直调点（本函数本就是命名闸内唯一脱管口）。
         Ok(rt.spawn(fut))
+    }
+
+    /// 自停机检测（issue#133）：**本 scope 的托管任务不得发起本 scope 的停机**。
+    ///
+    /// 判定必须早于 [`Self::begin_drain`]——命中即 fail-fast panic（签名/返回面保持
+    /// 不变，typed 结果留待 API 演进），**不关 accepting 闸、不改排空状态**。
+    /// 状态无关：owner 已存在时同样是 panic，不会退化成「成为等待者再被 owner 的
+    /// abort 掉」。
+    fn reject_self_shutdown(&self, op: &str) {
+        assert!(
+            !polling_in_scope(self.id),
+            "FxScope::{op} 由本 scope 的托管任务发起（issue#133）：该任务就在待 abort 的 \
+             生命周期集里，自任 owner 时会被自己的 abort 取消 ⇒ 排空记为中断、调用方拿不到 \
+             报告。停机须由外部 owner/协调者发起；任务内请用 CancelToken 自停，或让外部 \
+             调用方 await 它。"
+        );
     }
 
     /// 尝试成为排空 owner（issue#70）：`Open → Draining` 的原子转换**先于**取走
@@ -1133,8 +1225,28 @@ impl FxScope {
     /// 保留 `still_running` 读数。排空完成后再次调用仍走顺序语义，但**返回的是该次
     /// 排空的 canonical 报告副本**（非默认报告）——并发与顺序调用者的可见面一致
     /// （审计 F3 修正；`ShutdownReport: Clone`，代价一次浅拷贝）。
+    ///
+    /// # 谁可以调用（issue#133）
+    ///
+    /// **本 scope 的托管任务不得调用本 scope 的 `shutdown` / `shutdown_timeout`**
+    /// （自停机）：它本身就在待 abort 的生命周期集里，成为 owner 后会被自己的
+    /// `abort_all` 取消 ⇒ 共享排空被记成中断、调用方永远拿不到 canonical 报告。
+    /// 任务体 poll 期挂着 scope 标记（RAII），停机口在赢 `Open → Draining` **之前**
+    /// 判定，命中即 fail-fast panic（签名与返回面保持不变）——本判定**不关
+    /// accepting 闸、不改排空状态**，scope 之后仍可被外部正常停机。该判定与排空
+    /// 状态无关：owner 已在时也 panic，不会退化成「成为等待者再被 owner 的 abort
+    /// 掉」。
+    ///
+    /// 外部调用者语义完全不变（owner/等待者/已结算三角色照旧）：协调者任务、本
+    /// scope 的 detached 任务、**其他** scope 的托管任务都可以调用。任务内想停机
+    /// 请改用 [`CancelToken`] 自停，或让外部调用方 await 它。
+    ///
+    /// # Panics
+    ///
+    /// 本 scope 的托管任务内调用（见上「谁可以调用」）。
     #[must_use = "shutdown 报告含终局归集与 panic 载荷清单，丢弃即静默丢失（纯收尾用 `let _ =` 显式让渡）"]
     pub async fn shutdown(&self) -> ShutdownReport {
+        self.reject_self_shutdown("shutdown");
         match self.begin_drain() {
             DrainSlot::Owner => {
                 let mut owner = DrainOwner::new(self);
@@ -1185,12 +1297,14 @@ impl FxScope {
     ///
     /// # Panics
     ///
-    /// 需要**启用 time driver 的 Tokio runtime 上下文**（issue#92）：`tokio::time::timeout`
+    /// 本 scope 的托管任务内调用（自停机，同 [`Self::shutdown`] 的「谁可以调用」）；
+    /// 另需**启用 time driver 的 Tokio runtime 上下文**（issue#92）：`tokio::time::timeout`
     /// 的截止句柄在构造时向当前 runtime 的 time driver 注册。用没开 `.enable_time()`
     /// 的合法 runtime（如 `Builder::new_current_thread().build()`）调用即 panic，而不是
     /// 返回结构化的超时结果；完全没有 runtime 时同样 panic。这属环境前置条件、不是
     /// 可恢复错误面——签名与返回面（[`ShutdownReport`]）按 #92 取舍保持不变。
     pub async fn shutdown_timeout(&self, d: Duration) -> ShutdownReport {
+        self.reject_self_shutdown("shutdown_timeout");
         match self.begin_drain() {
             DrainSlot::Owner => {
                 let mut owner = DrainOwner::new(self);
@@ -2158,6 +2272,10 @@ mod tests {
             "每次准入尝试要么成功要么 typed 拒绝（结果守恒）"
         );
         assert!(admitted > 0, "至少有一次准入成功");
+        // 先等任务体全部终局：`report_terminal`（completed_unreaped += 1）**先于**
+        // JoinSet 条目可收割 ⇒ 只等「收割返回空」会与在途终局记账竞速（满载下偶发
+        // 1 ≠ 0）。in_flight 归零 ⇒ 所有终局记账已落，断言才是确定性的。
+        wait_until("托管任务体全部终局", || scope.in_flight() == 0).await;
         wait_until("集合收割净", || scope.try_reap().is_empty()).await;
         assert_eq!(
             scope.counts().completed_unreaped,
@@ -2403,5 +2521,42 @@ mod tests {
             Ok(5),
             "time driver 就位 ⇒ 正常直传结果（分类不变）"
         );
+    }
+
+    /// issue#133：自停机拒绝与排空状态**无关**——别人已是 owner（`Draining`）时，
+    /// 本 scope 的托管任务调用仍 fail-fast，不会退化成「成为等待者再被 owner 的
+    /// abort 掉」；且拒绝路径不动闸、不改排空状态。
+    #[test]
+    fn self_shutdown_rejection_is_independent_of_drain_state() {
+        let scope = FxScope::new();
+        assert!(
+            matches!(scope.begin_drain(), DrainSlot::Owner),
+            "本测试需先让 scope 进入 Draining"
+        );
+        let rejected = catch_unwind(AssertUnwindSafe(|| {
+            let _mark = ScopeMark::install(scope.id);
+            scope.reject_self_shutdown("shutdown");
+        }));
+        assert!(rejected.is_err(), "Draining 下自停机仍必须 fail-fast");
+        assert!(
+            matches!(&*scope.drain.borrow(), DrainState::Draining),
+            "拒绝不得改排空状态（仍是 Draining，未被结算）"
+        );
+        assert!(!scope.is_closed(), "拒绝不得关 accepting 闸");
+    }
+
+    /// 对照：标记不在本 scope 身份上（外部调用者 / 其他 scope 的任务）时不拒。
+    #[test]
+    fn self_shutdown_rejection_only_matches_own_scope_marker() {
+        let scope = FxScope::new();
+        let other = FxScope::new();
+        let external = catch_unwind(AssertUnwindSafe(|| scope.reject_self_shutdown("shutdown")));
+        assert!(external.is_ok(), "无标记（外部调用者）必须放行");
+        let sibling = catch_unwind(AssertUnwindSafe(|| {
+            let _mark = ScopeMark::install(other.id);
+            scope.reject_self_shutdown("shutdown");
+        }));
+        assert!(sibling.is_ok(), "其他 scope 的托管任务必须放行");
+        assert!(!scope.is_closed(), "未被拒绝 ⇒ 状态未变");
     }
 }

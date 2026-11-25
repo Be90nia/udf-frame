@@ -69,9 +69,13 @@
 //! 次分配如实）。性能锚见各函数 doc 与 iter 域性能锚（本地留存，未入库）。
 //!
 //! log-embed 埋点（收窄声明：**纯函数域，只埋 [`process_results`] 首 Err
-//! 短路点**——warn，首 Err 位置 `pos`（0 起）入字段；next/fold 双通路各一
+//! 短路点**——warn，首 Err 位置 `pos`（0 起）入字段，next/fold 双通路同一
 //! 事件点。其余组合子为纯计算无行为决策面，零埋点。target
 //! `skeleton::iter::process_results`，字段化纪律见 lib.rs `embed_event!` 注）。
+//!
+//! **迭代器内部零宿主调用（issue#206）**：next/fold 只置错误位与计数，事件由
+//! [`process_results`] 在 `Result` 成形之后发——订阅者 panic 被宏边界吞掉并计数，
+//! 阻塞只能推迟返回而不能把首 Err 短路结果换成 panic，也不会丢 fold 交回的累加器。
 
 use std::iter::Fuse;
 
@@ -549,13 +553,23 @@ where
     F: FnOnce(ProcessResults<I::IntoIter, E>) -> R,
 {
     let mut error = Ok(());
+    // 已产出 Ok 数（首 Err 位置）：迭代器只计数，不发事件。
+    #[cfg(feature = "log-embed")]
+    let pos = std::cell::Cell::new(0u64);
     let result = processor(ProcessResults {
         error: &mut error,
         iter: iterable.into_iter(),
         #[cfg(feature = "log-embed")]
-        pos: 0,
+        pos: &pos,
     });
-    error.map(|_| result)
+    // 结果先在调用边界成形，诊断其后：订阅者失败不得顶替首 Err 短路结果
+    //（issue#206——迭代器内部不再是任意宿主代码的调用点）。
+    let outcome = error.map(|_| result);
+    #[cfg(feature = "log-embed")]
+    if outcome.is_err() {
+        embed_event!(warn, target: "skeleton::iter::process_results", pos = pos.get());
+    }
+    outcome
 }
 
 /// [`process_results`] processor 收到的迭代器：只产出 `Ok` 值，遇 `Err` 置外
@@ -565,10 +579,10 @@ where
 pub struct ProcessResults<'a, I, E> {
     error: &'a mut Result<(), E>,
     iter: I,
-    /// 已产出 Ok 数（首 Err 短路事件的位置字段；仅 log-embed 存在——关=零状态
-    /// 零开销，Debug 输出亦不含）。
+    /// 已产出 Ok 数（首 Err 短路事件的位置；仅 log-embed 存在——关=零状态零
+    /// 开销）。只计数不调用宿主：事件由 [`process_results`] 在结果成形后发。
     #[cfg(feature = "log-embed")]
-    pos: u64,
+    pos: &'a std::cell::Cell<u64>,
 }
 
 impl<I, T, E> Iterator for ProcessResults<'_, I, E>
@@ -585,15 +599,12 @@ where
         match self.iter.next() {
             Some(Ok(x)) => {
                 #[cfg(feature = "log-embed")]
-                {
-                    self.pos += 1;
-                }
+                self.pos.set(self.pos.get() + 1);
                 Some(x)
             }
+            // 只置错误位，不在此发事件（诊断面在 process_results 边界，issue#206）。
             Some(Err(e)) => {
                 *self.error = Err(e);
-                // 埋点「首 Err 短路」：位置=已产出 Ok 数（0 起）。
-                embed_event!(warn, target: "skeleton::iter::process_results", pos = self.pos);
                 None
             }
             None => None,
@@ -615,21 +626,19 @@ where
         let Self {
             error,
             mut iter,
-            mut pos,
+            pos,
         } = self;
-        // try_fold 短路：遇 Err 记错误位并以 Err(acc) 中断（itertools 同构）
+        // try_fold 短路：遇 Err 记错误位并以 Err(acc) 中断（itertools 同构）。
+        // 分支内不发事件：累加器与错误位先在迭代器内定型，诊断在
+        // process_results 边界发（issue#206——订阅者不得顶替 Err(acc)）。
         iter.try_fold(init, |acc, item| match item {
             Ok(x) => {
                 #[cfg(feature = "log-embed")]
-                {
-                    pos += 1;
-                }
+                pos.set(pos.get() + 1);
                 Ok(f(acc, x))
             }
             Err(e) => {
                 *error = Err(e);
-                // 埋点「首 Err 短路」（fold 快路径）：位置语义与 next 通路一致。
-                embed_event!(warn, target: "skeleton::iter::process_results", pos = pos);
                 Err(acc)
             }
         })

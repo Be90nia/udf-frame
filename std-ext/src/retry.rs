@@ -50,11 +50,19 @@
 //!
 //! log-embed 埋点（`log-embed` feature，默认关=宏消除零开销）：target
 //! `skeleton::retry::{attempt,verdict,backoff}`。级别规范（骨架默认：正常
-//! 流转=debug / 异常路径=warn / 终态=info）：尝试开始=debug；重试放行
-//! （异常路径「重试发生」）=warn，backoff_ms 字段带退避时长；停机终态
-//! （次数到顶/判定拒绝/预算耗尽）=info；退避截平（base>max 线性值越过
-//! 上限）=warn（target `...::backoff`，linear_ms→capped_ms）。attempt 序号
-//! 进字段承载循环内跨事件关联，不起 span。
+//! 流转=debug / 异常路径=warn / 终态=info）：尝试结束=debug（事件在 op 返回后
+//! 发，承载 attempt 序号）；重试放行（异常路径「重试发生」）=warn，backoff_ms
+//! 字段带退避时长；停机终态（次数到顶/判定拒绝/预算耗尽）=info；退避截平
+//! （base>max 线性值越过上限）=warn（target `...::backoff`，linear_ms→capped_ms）。
+//! attempt 序号进字段承载循环内跨事件关联，不起 span。
+//!
+//! **埋点不参与语义（issue#204）**：每个事件都在对应动作/结果落地之后发——op 先
+//! 调用、typed `RetryError` 先成形、退避睡眠先完成，事件才发；订阅者 panic 被宏的
+//! catch_unwind 边界吞掉并计数（`embedded_event_panic_count`），订阅者阻塞只能推迟
+//! 后续动作、不能跳过它。预算口径仍读注入钟（同步）/墙钟（异步）：同步面注入钟不
+//! 因遥测走动 ⇒ 遥测耗时不计入 elapsed；异步面墙钟把遥测耗时算进预算 ⇒ 只会更早
+//! 停机，绝不会多试一次。剩余限制：同步订阅者在事件点仍占用调用线程（不影响结果，
+//! 只影响该事件点之后的时间线）。
 //!
 //! 性能锚（2026-10-16 批 2-b 定性，release/std Instant 粗测，详见
 //! retry 域性能锚（本地留存，未入库））：不可重试快路径零分配零睡眠（判定即返，
@@ -332,18 +340,24 @@ where
     let mut attempts = 0u32;
     loop {
         attempts += 1;
+        // 必需动作先落：op 先于任何诊断——订阅者失败或阻塞不得阻止一次尝试，也
+        // 不得让「尝试开始」事件成为 op 的前置条件（issue#204）。
+        let outcome = op();
         embed_event!(debug, target: "skeleton::retry::attempt", attempt = attempts);
-        match op() {
+        match outcome {
             Ok(v) => return Ok(v),
             Err(e) => {
                 // 裁决序：次数 → 可重试 → 预算；睡前裁决，不为不会发生的重试等待。
+                // 每条停判都先把 typed 错误成形，再发事件：诊断失败不得顶替返回值。
                 if attempts >= policy.max_attempts {
+                    let err = RetryError::Exhausted { attempts, last: e };
                     embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_max_attempts");
-                    return Err(RetryError::Exhausted { attempts, last: e });
+                    return Err(err);
                 }
                 if !retryable(&e) {
+                    let err = RetryError::Exhausted { attempts, last: e };
                     embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_non_retryable");
-                    return Err(RetryError::Exhausted { attempts, last: e });
+                    return Err(err);
                 }
                 if let Some(budget) = policy.budget {
                     let elapsed = sleeper
@@ -351,25 +365,28 @@ where
                         .checked_duration_since(start)
                         .expect("单调钟上 start 恒不晚于 now（Sleeper: Clock 契约）");
                     if elapsed >= budget {
-                        embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_out_of_budget", elapsed_ms = elapsed.as_millis() as u64);
-                        return Err(RetryError::OutOfBudget {
+                        let err = RetryError::OutOfBudget {
                             attempts,
                             last: e,
                             elapsed,
-                        });
+                        };
+                        embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_out_of_budget", elapsed_ms = elapsed.as_millis() as u64);
+                        return Err(err);
                     }
                 }
                 let delay = backoff_delay(attempts, policy.base, policy.max_delay);
-                embed_event!(warn, target: "skeleton::retry::verdict", attempt = attempts, decision = "retry", backoff_ms = delay.as_millis() as u64);
+                // 退避睡眠先落（调度好的重试不因遥测失败/阻塞被跳过），诊断在其后：
+                // 遥测耗时落在睡眠之外，不被当作退避等待（issue#204）。
+                sleeper.sleep((policy.jitter)(delay));
+                // 原 `skeleton::backoff` 的计算入参事件在这里补齐（issue#202：纯算术件不发事件，
+                // 观测面移到调用点；base/max/backoff 三者同处一条事件）。
+                embed_event!(warn, target: "skeleton::retry::verdict", attempt = attempts, decision = "retry", base_ms = policy.base.as_millis() as u64, max_ms = policy.max_delay.as_millis() as u64, backoff_ms = delay.as_millis() as u64);
                 // 截平（base 线性值 > max）才发：saturating 语义下的静默截平
                 // 是异常路径留痕点（契约「base>cap 截平发生」）。
                 #[cfg(feature = "log-embed")]
                 if policy.base.saturating_mul(attempts) > delay {
                     embed_event!(warn, target: "skeleton::retry::backoff", attempt = attempts, linear_ms = policy.base.saturating_mul(attempts).as_millis() as u64, capped_ms = delay.as_millis() as u64);
                 }
-                // 抖动在睡前应用（full jitter 内建禁关）：backoff_ms 字段
-                // 记政策退避值（确定性观测口径），实际睡眠=抖动映射值。
-                sleeper.sleep((policy.jitter)(delay));
             }
         }
     }
@@ -484,42 +501,52 @@ where
     let mut attempts = 0u32;
     loop {
         attempts += 1;
+        // 必需动作先落（同同步面）：op 先于任何诊断，且 op 的 await 在事件之前
+        // ⇒ 订阅者失败/阻塞不得阻止一次尝试（issue#204）。
+        let outcome = op(attempts).await;
         embed_event!(debug, target: "skeleton::retry::attempt", attempt = attempts);
-        match op(attempts).await {
+        match outcome {
             Ok(v) => return Ok(v),
             Err(e) => {
                 // 裁决序与同步面逐字同：次数 → 可重试 → 预算；睡前裁决。
+                // 停判先把 typed 错误成形，再发事件（诊断失败不得顶替返回值）。
                 if attempts >= policy.max_attempts {
+                    let err = RetryError::Exhausted { attempts, last: e };
                     embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_max_attempts");
-                    return Err(RetryError::Exhausted { attempts, last: e });
+                    return Err(err);
                 }
                 if !retryable(&e) {
+                    let err = RetryError::Exhausted { attempts, last: e };
                     embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_non_retryable");
-                    return Err(RetryError::Exhausted { attempts, last: e });
+                    return Err(err);
                 }
                 if let Some(budget) = policy.budget {
                     let elapsed = Instant::now()
                         .checked_duration_since(start)
                         .expect("单调钟上 start 恒不晚于 now（std Instant 单调契约）");
                     if elapsed >= budget {
-                        embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_out_of_budget", elapsed_ms = elapsed.as_millis() as u64);
-                        return Err(RetryError::OutOfBudget {
+                        let err = RetryError::OutOfBudget {
                             attempts,
                             last: e,
                             elapsed,
-                        });
+                        };
+                        embed_event!(info, target: "skeleton::retry::verdict", attempt = attempts, decision = "stop_out_of_budget", elapsed_ms = elapsed.as_millis() as u64);
+                        return Err(err);
                     }
                 }
                 let delay = backoff_delay(attempts, policy.base, policy.max_delay);
-                embed_event!(warn, target: "skeleton::retry::verdict", attempt = attempts, decision = "retry", backoff_ms = delay.as_millis() as u64);
+                // 取消安全锚点：sleep 内联 await，不 spawn 不装箱——外层
+                // future drop 即连带 drop 在途 sleep future，全停。
+                // 睡眠先于诊断：调度好的重试不因遥测失败/阻塞被跳过（issue#204）。
+                sleep.sleep((policy.jitter)(delay)).await;
+                // 原 `skeleton::backoff` 的计算入参事件在这里补齐（issue#202：纯算术件不发事件，
+                // 观测面移到调用点；base/max/backoff 三者同处一条事件）。
+                embed_event!(warn, target: "skeleton::retry::verdict", attempt = attempts, decision = "retry", base_ms = policy.base.as_millis() as u64, max_ms = policy.max_delay.as_millis() as u64, backoff_ms = delay.as_millis() as u64);
                 // 截平（base 线性值 > max）才发：与同步面同口径（抖动前值）。
                 #[cfg(feature = "log-embed")]
                 if policy.base.saturating_mul(attempts) > delay {
                     embed_event!(warn, target: "skeleton::retry::backoff", attempt = attempts, linear_ms = policy.base.saturating_mul(attempts).as_millis() as u64, capped_ms = delay.as_millis() as u64);
                 }
-                // 取消安全锚点：sleep 内联 await，不 spawn 不装箱——外层
-                // future drop 即连带 drop 在途 sleep future，全停。
-                sleep.sleep((policy.jitter)(delay)).await;
             }
         }
     }
