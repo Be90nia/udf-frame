@@ -1620,9 +1620,14 @@ mod tests {
             // thread while the worker samples the clock, which the try_lock probe
             // would misclassify as a same-thread lock regression.
             worker.stop.store(true, AtomicOrd::SeqCst);
-            while clock.in_call.load(AtomicOrd::SeqCst) {
+            let idle_deadline = Instant::now() + Duration::from_secs(2);
+            while clock.in_call.load(AtomicOrd::SeqCst) && Instant::now() < idle_deadline {
                 std::thread::yield_now();
             }
+            assert!(
+                !clock.in_call.load(AtomicOrd::SeqCst),
+                "clock probe must leave its sampling window before stop synchronization"
+            );
             let state = lock(&sched.shared.state);
             drop(state);
             sched.shared.signal.notify_all();
@@ -1826,129 +1831,127 @@ mod tests {
     mod telemetry_boundary_tests {
         use super::*;
         use skeleton::clock::MockClock;
-    use std::sync::atomic::AtomicUsize;
-    use tracing::span::{Attributes, Id, Record};
-    use tracing::{Event, Metadata};
+        use std::sync::atomic::AtomicUsize;
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata};
 
-    struct PanicSubscriber;
+        struct PanicSubscriber;
 
-    struct CountingSubscriber(Arc<AtomicUsize>);
+        struct CountingSubscriber(Arc<AtomicUsize>);
 
-    impl tracing::Subscriber for CountingSubscriber {
-        fn enabled(&self, _: &Metadata<'_>) -> bool {
-            true
+        impl tracing::Subscriber for CountingSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+            fn event(&self, _: &Event<'_>) {
+                self.0.fetch_add(1, AtomicOrd::SeqCst);
+            }
+
+            fn enter(&self, _: &Id) {}
+
+            fn exit(&self, _: &Id) {}
         }
 
-        fn new_span(&self, _: &Attributes<'_>) -> Id {
-            Id::from_u64(1)
+        impl tracing::Subscriber for PanicSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+            fn event(&self, _: &Event<'_>) {
+                panic!("injected scheduler telemetry panic");
+            }
+
+            fn enter(&self, _: &Id) {}
+
+            fn exit(&self, _: &Id) {}
         }
 
-        fn record(&self, _: &Id, _: &Record<'_>) {}
+        #[test]
+        fn cancel_returns_actual_cas_result_when_subscriber_panics() {
+            let sched = Scheduler::new(Arc::new(MockClock::new()));
+            let handle = sched
+                .after(Duration::from_secs(60), || {})
+                .expect("register");
+            let before = crate::embedded_event_panic_count();
 
-        fn record_follows_from(&self, _: &Id, _: &Id) {}
+            tracing::subscriber::with_default(PanicSubscriber, || {
+                assert!(handle.cancel(), "first cancellation wins");
+                assert!(!handle.cancel(), "second cancellation loses");
+            });
 
-        fn event(&self, _: &Event<'_>) {
-            self.0.fetch_add(1, AtomicOrd::SeqCst);
+            assert!(
+                crate::embedded_event_panic_count() >= before.saturating_add(2),
+                "both subscriber panics are contained and counted"
+            );
         }
 
-        fn enter(&self, _: &Id) {}
+        #[test]
+        fn manual_tick_finishes_callback_before_subscriber_panic_is_contained() {
+            let sched = Scheduler::new(Arc::new(MockClock::new()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&calls);
+            sched
+                .after(Duration::ZERO, move || {
+                    callback_calls.fetch_add(1, AtomicOrd::SeqCst);
+                })
+                .expect("register")
+                .detach();
+            let before = crate::embedded_event_panic_count();
 
-        fn exit(&self, _: &Id) {}
+            tracing::subscriber::with_default(PanicSubscriber, || {
+                assert_eq!(sched.tick(), 1);
+            });
+
+            assert_eq!(calls.load(AtomicOrd::SeqCst), 1);
+            assert!(
+                crate::embedded_event_panic_count() >= before.saturating_add(1),
+                "fire telemetry runs only after the callback and terminal transition"
+            );
+        }
+
+        #[test]
+        fn worker_mode_tick_never_invokes_synchronous_subscriber() {
+            let sched = Scheduler::new(Arc::new(MockClock::new()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&calls);
+            sched
+                .after(Duration::ZERO, move || {
+                    callback_calls.fetch_add(1, AtomicOrd::SeqCst);
+                })
+                .expect("register")
+                .detach();
+            let events = Arc::new(AtomicUsize::new(0));
+            let subscriber_events = Arc::clone(&events);
+
+            tracing::subscriber::with_default(CountingSubscriber(subscriber_events), || {
+                assert_eq!(sched.tick_inner(false), 1);
+            });
+
+            assert_eq!(calls.load(AtomicOrd::SeqCst), 1);
+            assert_eq!(
+                events.load(AtomicOrd::SeqCst),
+                0,
+                "bounded worker-mode execution emits no synchronous host events"
+            );
+        }
     }
-
-    impl tracing::Subscriber for PanicSubscriber {
-        fn enabled(&self, _: &Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _: &Attributes<'_>) -> Id {
-            Id::from_u64(1)
-        }
-
-        fn record(&self, _: &Id, _: &Record<'_>) {}
-
-        fn record_follows_from(&self, _: &Id, _: &Id) {}
-
-        fn event(&self, _: &Event<'_>) {
-            panic!("injected scheduler telemetry panic");
-        }
-
-        fn enter(&self, _: &Id) {}
-
-        fn exit(&self, _: &Id) {}
-    }
-
-    #[test]
-    fn cancel_returns_actual_cas_result_when_subscriber_panics() {
-        let sched = Scheduler::new(Arc::new(MockClock::new()));
-        let handle = sched
-            .after(Duration::from_secs(60), || {})
-            .expect("register");
-        let before = crate::embedded_event_panic_count();
-
-        tracing::subscriber::with_default(PanicSubscriber, || {
-            assert!(handle.cancel(), "first cancellation wins");
-            assert!(!handle.cancel(), "second cancellation loses");
-        });
-
-        assert_eq!(
-            crate::embedded_event_panic_count(),
-            count if count >= before.saturating_add(2),
-            "both subscriber panics are contained and counted"
-        );
-    }
-
-    #[test]
-    fn manual_tick_finishes_callback_before_subscriber_panic_is_contained() {
-        let sched = Scheduler::new(Arc::new(MockClock::new()));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let callback_calls = Arc::clone(&calls);
-        sched
-            .after(Duration::ZERO, move || {
-                callback_calls.fetch_add(1, AtomicOrd::SeqCst);
-            })
-            .expect("register")
-            .detach();
-        let before = crate::embedded_event_panic_count();
-
-        tracing::subscriber::with_default(PanicSubscriber, || {
-            assert_eq!(sched.tick(), 1);
-        });
-
-        assert_eq!(calls.load(AtomicOrd::SeqCst), 1);
-        assert_eq!(
-            crate::embedded_event_panic_count(),
-            count if count >= before.saturating_add(1),
-            "fire telemetry runs only after the callback and terminal transition"
-        );
-    }
-
-    #[test]
-    fn worker_mode_tick_never_invokes_synchronous_subscriber() {
-        let sched = Scheduler::new(Arc::new(MockClock::new()));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let callback_calls = Arc::clone(&calls);
-        sched
-            .after(Duration::ZERO, move || {
-                callback_calls.fetch_add(1, AtomicOrd::SeqCst);
-            })
-            .expect("register")
-            .detach();
-        let events = Arc::new(AtomicUsize::new(0));
-        let subscriber_events = Arc::clone(&events);
-
-        tracing::subscriber::with_default(CountingSubscriber(subscriber_events), || {
-            assert_eq!(sched.tick_inner(false), 1);
-        });
-
-        assert_eq!(calls.load(AtomicOrd::SeqCst), 1);
-        assert_eq!(
-            events.load(AtomicOrd::SeqCst),
-            0,
-            "bounded worker-mode execution emits no synchronous host events"
-        );
-    }
-}
 }
 
 
