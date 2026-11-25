@@ -142,12 +142,11 @@ pub mod retry;
 pub mod scheduler;
 pub mod text;
 
-
-#[cfg(all(test, feature = "log-embed"))]
+#[cfg(all(test, feature = "log-embed"))
 mod embedded_event_panic_tests {
     use super::*;
-    use tracing::{Event, Metadata};
     use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata};
 
     struct PanicSubscriber;
 
