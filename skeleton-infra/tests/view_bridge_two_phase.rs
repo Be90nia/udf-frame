@@ -1,4 +1,4 @@
-#![cfg(feature = "view")]
+#![cfg(all(feature = "view", feature = "runtime"))]
 //! #140 公共面验收：ViewBridge 的采用方回调（`JsonEncoder::to_json`、
 //! `RegionEncoder::encode`、`RegionBacking::with_bytes_mut`、`M::View` 的
 //! `PartialEq`/`Clone`/`Drop`）**不得在桥内部锁内执行**，以及两阶段提交的代次语义
