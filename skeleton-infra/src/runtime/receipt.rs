@@ -82,6 +82,10 @@ pub(crate) enum Outcome {
 struct LedgerState {
     /// 未终局的因果后代数（外部根本身不计入）。
     outstanding: usize,
+    /// 本根**累计已接受**的因果后代数（issue#105/#144 per-root 因果工作量预算的
+    /// 用量；单调不回落，随账本复位清零）。与 `outstanding` 分立：后者是终局谓词
+    /// 的在途计数，前者是准入闸的用量。
+    work: usize,
     /// 根 action 自身阶段是否已完成。
     root_done: bool,
     /// 已发布终局（发布后不可变）。
@@ -127,10 +131,40 @@ impl Ledger {
         })
     }
 
-    /// 接受一个因果后代（queue 锁内调用：锁序 queue → ledger）。
-    pub(crate) fn add_descendant(&self) {
+    /// 因果后代的**预算预留 + 未终局计数**（queue 锁内调用：锁序 queue → ledger；
+    /// issue#105/#144）：`budget > 0` 且本根已接受后代数达上限 ⇒ 拒绝预留并返回
+    /// `false`（两个计数都不动——调用方不得让该子动作进入主队列）。
+    pub(crate) fn try_add_descendant(&self, budget: usize) -> bool {
         let mut st = self.lock();
+        if budget > 0 && st.work >= budget {
+            return false;
+        }
+        st.work += 1;
         st.outstanding += 1;
+        true
+    }
+
+    /// 未获预算预留的子动作去向（issue#105/#144）：它从未计入 `outstanding`，只把
+    /// 「已停放（可恢复）/ 被停放容量拒收」记入原账本——根回执据此以 `Deferred` /
+    /// `CapacityRejected` 收口。调用时产出它的 action 仍在途（账本不可能已终局）。
+    pub(crate) fn note_unadmitted(&self, retained: bool) {
+        let mut st = self.lock();
+        debug_assert!(
+            st.terminal.is_none(),
+            "未获预留子动作记账时原账本已终局：产出它的 action 不该仍在途"
+        );
+        if retained {
+            st.deferred += 1;
+        } else {
+            st.deferred_rejected += 1;
+        }
+    }
+
+    /// 本账本的因果子树是否已无在途后代（终局已发布，或 `outstanding` 为 0）。
+    /// 排空让出点用它判定「非等待型入口 action 的完成边界是否已过」。
+    pub(crate) fn has_no_inflight(&self) -> bool {
+        let st = self.lock();
+        st.terminal.is_some() || st.outstanding == 0
     }
 
     /// 后代终局（成功 / 失败 / 脱钩后另行记账）。
@@ -256,6 +290,7 @@ impl Ledger {
         );
         debug_assert!(st.released, "复位未被 claim 归还的账本");
         st.outstanding = 0;
+        st.work = 0;
         st.root_done = false;
         st.terminal = None;
         st.first_failure = None;
@@ -318,5 +353,11 @@ impl Ledger {
     /// 测试读侧：终局是否已发布（复用池不变式断言用）。
     pub(crate) fn terminal_published(&self) -> bool {
         self.lock().terminal.is_some()
+    }
+
+    /// 测试读侧：累计已接受后代数 / 在途后代数（预留原子性探针用）。
+    pub(crate) fn work_counts(&self) -> (usize, usize) {
+        let st = self.lock();
+        (st.work, st.outstanding)
     }
 }

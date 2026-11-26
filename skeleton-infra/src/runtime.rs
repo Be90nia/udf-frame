@@ -88,14 +88,23 @@ fn back_sender<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                     audit_enqueued(&inner, origin);
                     true
                 }
-                Enqueue::Draining(_, _, first) => {
+                Enqueue::Parked { retained, .. } => {
+                    // 因果后代撞工作量预算：已停放 = 仍归本 store（true，结果由根账本
+                    // 承担）；被停放容量拒收 = 未留存（false，显式拒绝）。
+                    if !retained {
+                        audit_emit(&inner, AuditEventKind::Rejected);
+                    }
+                    retained
+                }
+                Enqueue::Draining(_, ledger, first) => {
                     // 静默态（无在任排空者）：本线程夺得排空权 ⇒ 同步排空至 idle
                     // ⇒ 返回时该 action 已被 reduce、其完成边界必然已达成。此路径
                     // 强于 Store::dispatch 的 per-action 完成边界契约——后者不承诺
                     // 队列为空。契约（两条路径 + bool 的唯一含义）见
                     // skeleton::ActionSender::dispatch 的 rustdoc。
                     audit_enqueued_as_lease_winner(&inner, origin, first.as_ref());
-                    drain_owned(&inner, first);
+                    // 入口账本随行：本 action 完成边界之前不让出（见 drain_owned）。
+                    drain_owned(&inner, first, Some(&ledger));
                     true
                 }
             }
@@ -252,6 +261,10 @@ struct PendingSegment<A, Op> {
     /// 段内下一条待转发效果的 0-based 位置（含回灌变体占位）。转发逐条推进，
     /// panic 时随段留存 ⇒ 续转的后缀从断点继续编号（与逐条包装版同值）。
     next_index: u64,
+    /// 分段效果预算快照（issue#144）：本段 `effect_index < effect_cap` 的效果是
+    /// **已接受前缀**，其余是超量后缀（Emit ⇒ 停放/拒收；Run/Cancel ⇒ 提交后部分
+    /// 失败）。`0` = 不限。提交点读当前配置并固化——已提交段不随 setter 缩容回溯。
+    effect_cap: usize,
     /// 段内待转发效果。缓冲本体在 `staged` ↔ 段之间 `mem::swap` 循环
     /// （提交点移交、摘壳点回收）⇒ 稳态零新增分配（分配锚见 `tests/memgov.rs`）。
     buf: EffectBuf<A, Op>,
@@ -272,13 +285,16 @@ impl<A, Op> EffectBufs<A, Op> {
     /// `(origin_action_seq, effect_index)` 语义零变化——审计事件/失败回执/
     /// 探针全部同值）。swap 后 `staged` 留空壳（容量 0），摘壳点把满缓冲换回
     /// （稳态零新增分配，分配锚见 `tests/memgov.rs`）。
-    fn commit(&mut self, origin_action_seq: u64) {
+    /// 分段效果预算（issue#144）在此快照进段（`effect_cap`，`0` = 不限）：超量
+    /// 后缀在转发游标处切分，提交点仍是 O(1) 整段移交。
+    fn commit(&mut self, origin_action_seq: u64, effect_cap: usize) {
         if self.staged.is_empty() {
             return;
         }
         let mut seg = PendingSegment {
             origin_action_seq,
             next_index: 0,
+            effect_cap,
             buf: EffectBuf::new(),
         };
         std::mem::swap(&mut seg.buf, &mut self.staged);
@@ -544,9 +560,12 @@ struct StoreInner<S, A, Op> {
     state: Mutex<Arc<S>>,
     runtime: Mutex<Box<dyn EffectRuntime<A, Op> + Send>>,
     queue: Mutex<VecDeque<ActionRecord<A>>>,
-    /// 入队序号计数器（store 内单调递增）：**外部入队**路径在 queue 锁内分配，
-    /// **`Effect::Emit` 回灌**路径在取锁之前分配 ⇒ 序号序与全局 FIFO 序**不保证**
-    /// 恒等（已知张力，见 `docs/reference.md`）；回执按序号定位失败 action。
+    /// 入队序号计数器（store 内单调递增）：**外部准入与 `Effect::Emit` 回灌都在
+    /// `queue` 锁内分配**（同临界区、紧邻后代记账与 push，issue#158）⇒ 序号序 =
+    /// **队列插入线性化序**（出队序按插入序 ⇒ 未停放路径的序号序 == 执行序）；
+    /// 回执/审计消费方据此对齐与重排 action 时间线。停放后经
+    /// [`SyncStore::resume_deferred`] 入队的记录保留**取号时**的序号（取号早于
+    /// 恢复，不回溯重编号）。
     next_seq: AtomicU64,
     /// 队列容量上限（issue#38）：等待被 reduce 的 action 数上限；`0` = 不限
     /// （默认）。正在执行的 action 已出队 → 不计入。容量满 = typed reject
@@ -560,6 +579,11 @@ struct StoreInner<S, A, Op> {
     /// 裁决、尚未 retain/reject」的 deferred_queue 锁窗口停靠。
     #[cfg(test)]
     deferred_gate: CapacitySettle,
+    /// 异步投递口登记停靠闸（**仅 `cfg(test)`**，issue#159）：`subscribe_notify`
+    /// 停在「初始 closed 检查之后、registry 插入之前」——「入口检查即线性化点」
+    /// 这条契约的可观测窗口（重叠 `close` 的确定性编排面）。
+    #[cfg(test)]
+    notify_sub_gate: CapacitySettle,
     /// 容量满拒绝计数（fail-visible）：读侧 [`SyncStore::admission_full_count`]。
     admission_full: AtomicU64,
     /// 完成账本复用池（issue#40 性能协议：稳态零分配；issue#84 生命周期）：
@@ -586,6 +610,32 @@ struct StoreInner<S, A, Op> {
     /// `StoreInner::feedback_exceeded` 分账：后者数「撞预算」，本计数数
     /// 「撞预算且续接无法留存」。
     deferred_capacity_rejected: AtomicU64,
+    /// per-root 因果工作量预算（issue#105/#144）：单个根累计可接受的因果后代数；
+    /// `0` = 不限。与外部准入容量（`capacity`）、停放容量（`deferred_capacity`）
+    /// 三维分立，禁并成一个计数器。预留只在 `queue` 锁内读取本值（锁序
+    /// queue → ledger），故与 [`SyncStore::set_causal_work_budget`] 共锁线性化。
+    causal_work_budget: AtomicUsize,
+    /// 因果工作量预算拒绝计数（读侧 [`SyncStore::causal_work_budget_exceeded`]）：
+    /// 未获预留的子动作数（已停放 + 被拒收），与深度预算的 `feedback_exceeded` 分账。
+    causal_work_exceeded: AtomicU64,
+    /// per-reducer 分段效果预算（issue#144）：单次 `reduce` 可被接受的效果条数；
+    /// `0` = 不限。提交点把当前值快照进段（`PendingSegment::effect_cap`），已提交段
+    /// 不随 setter 缩容回溯。
+    segment_effect_budget: AtomicUsize,
+    /// 分段预算超量计数（读侧 [`SyncStore::segment_effect_budget_exceeded`]）。
+    segment_effect_exceeded: AtomicU64,
+    /// per-drain 租约工作量预算（issue#144）：单个排空租约连续出队处理的记录数
+    /// 上限；`0` = 不限。
+    drain_work_budget: AtomicUsize,
+    /// 租约让出计数（读侧 [`SyncStore::drain_lease_yields`]）。
+    drain_lease_yields: AtomicU64,
+    /// 让出停靠闸（**仅 `cfg(test)`**）：让出窗口（已放旗、尚未重新竞争）停靠。
+    #[cfg(test)]
+    yield_gate: CapacitySettle,
+    /// 预留停靠闸（**仅 `cfg(test)`**）：因果后代预留临界区**之前**（未持 queue
+    /// 锁）停靠——预留原子性探针的可观测窗口。
+    #[cfg(test)]
+    reserve_gate: CapacitySettle,
     /// 订阅集（Arc 包裹：票据 Drop 经共享句柄即时摘表）
     subs: Arc<Mutex<Vec<Weak<SubscriptionSlot<S>>>>>,
     /// 订阅闸（issue#63）：闭门翻转（closed=false→true）与可失败订阅登记
@@ -820,6 +870,17 @@ struct StoreInner<S, A, Op> {
 /// queue / ledger 锁的释放在前，收据结算与载荷析构在后。被中断的 action
 /// **绝不重放**（#45 at-most-once），终局回执照常 fail-visible 结算
 /// （#41 语义不变）。
+/// # 因果工作量预算（issue#105/#144；**默认启用 = 行为变更**）
+///
+/// 回灌深度预算只守递归链深；扇出与总量另由三个**独立计数**的工作量预算设界，
+/// 默认全部启用（`0` = 不限，须显式置）：per-root 因果工作量
+/// （[`Self::set_causal_work_budget`]）、per-reducer 分段效果
+/// （[`Self::set_segment_effect_budget`]）、per-drain 租约
+/// （[`Self::set_drain_work_budget`]）。**以前能跑通的程序若单根扇出或单次
+/// reducer 输出超过默认值，现在会得到停放 / 拒收 / typed 失败**（legacy
+/// [`Self::dispatch`] 在失败路径按既有口径 panic）——逃生口 = 把对应预算置 `0`。
+/// 各自的计入口径、耗尽语义与计数见这三个 setter 的文档；数值见
+/// `docs/reference.md` §资源上限与默认值。
 pub struct SyncStore<S, A, Op = Infallible> {
     inner: Arc<StoreInner<S, A, Op>>,
 }
@@ -855,17 +916,35 @@ pub enum AdmissionOutcome {
 /// 止步+计数上浮（[`SyncStore::feedback_budget_exceeded`]）。
 const FEEDBACK_DEPTH_BUDGET: u64 = 64;
 
+/// per-root 因果工作量预算默认值（issue#105/#144）：单个根 action 累计可接受的
+/// 因果后代数上限。深度预算只约束链深、不约束扇出与总量，故另设总量闸，二者
+/// 互不代理。数值 = 4 × 分段预算（一个根可吸收四次满额 reducer 输出），与既有
+/// 1024 族默认值同量级偏保守；改大 = 兼容放宽，改小 = 破坏性变更（走 ADR）。
+const DEFAULT_CAUSAL_WORK_BUDGET: usize = 16_384;
+
+/// per-reducer 分段效果预算默认值（issue#144）：单次 `reduce` 调用可被接受的效果
+/// 条数上限 = 套件内单 action 最大效果批（`tests/batch_effects_order.rs` 的 1024）
+/// 的 4 倍余量。
+const DEFAULT_SEGMENT_EFFECT_BUDGET: usize = 4096;
+
+/// per-drain 租约工作量预算默认值（issue#144）：单个排空租约连续出队处理的记录数
+/// 上限（约一个满额分段的记录数；让出成本 µs 级）。
+const DEFAULT_DRAIN_WORK_BUDGET: usize = 4096;
+
 /// 根因果回执的终局（issue#57：结果面的公开观测点）。
 ///
 /// [`Self::Completed`] 与 [`Self::Deferred`] 的区分正是 legacy void
 /// [`skeleton::Store::dispatch`] 无法表达的那条信息：某个因果后代撞上回灌深度
-/// 预算（[`SyncStore::feedback_budget_exceeded`]）时，**状态与已转发效果都已
+/// 预算（[`SyncStore::feedback_budget_exceeded`]）或 per-root 因果工作量预算 /
+/// 分段效果预算（[`SyncStore::causal_work_budget_exceeded`] /
+/// [`SyncStore::segment_effect_budget_exceeded`]）时，**状态与已转发效果都已
 /// 生效，但被停放的子树没跑**——那是「未完成」，不是成功完成。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchOutcome {
     /// 根 action 与全部因果后代终局成功（完整因果完成）。
     Completed,
-    /// 至少一个因果后代被回灌深度预算**停放**（`retained` = 留存的停放记录数）。
+    /// 至少一个因果后代被回灌深度预算或工作量预算**停放**（`retained` = 留存的
+    /// 停放记录数）。
     ///
     /// 不是成功完成：恢复走 [`SyncStore::resume_deferred`]（**无**自动重试）。
     Deferred { retained: u64 },
@@ -875,7 +954,10 @@ pub enum DispatchOutcome {
     /// 停放却被容量拒收；专用计数见 [`SyncStore::deferred_capacity_rejected`]。
     CapacityRejected { retained: u64, rejected: u64 },
     /// 根或某个因果后代失败（legacy [`skeleton::Store::dispatch`] 在同一路径上
-    /// panic；结果面以值返回同一份失败摘要）。
+    /// panic；结果面以值返回同一份失败摘要）。含分段效果预算切掉的 Run/Cancel
+    /// 超量：提交后部分失败（`phase = ForwardingEffects`、`state_committed = true`）
+    /// ——仅凭本 outcome 分不清「预算因」还是「解释器端口因」，归因靠
+    /// [`SyncStore::segment_effect_budget_exceeded`] 计数。
     Failed(DispatchFailure),
 }
 
@@ -901,7 +983,9 @@ pub struct DispatchReceipt<S: Clone + Send + Sync + 'static, A: Send + 'static, 
 impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>
     DispatchReceipt<S, A, Op>
 {
-    /// 根 action 的入队序号（store 内单调；回执身份，可与审计/trace 时间线对齐）。
+    /// 根 action 的**入队线性化序号**（store 内单调；外部准入与 `Effect::Emit`
+    /// 回灌在同一 `queue` 临界区内取号 ⇒ 序号序 = 队列插入序，issue#158）。回执
+    /// 身份：可与审计/trace 时间线对齐，也可按它重排 action 时间线。
     pub fn seq(&self) -> u64 {
         self.seq
     }
@@ -1062,9 +1146,9 @@ fn temp_drain_frame<A>(store_id: u64, first: &ActionRecord<A>) -> DrainFrameGuar
 
 /// 已准入的 action 记录（队列元素）：序号 + 载荷 + 来源 + 账本。
 ///
-/// 序号 store 内单调；**外部入队**路径在 queue 锁内分配（入队线性化点），
-/// **`Effect::Emit` 回灌**路径在取锁之前分配 ⇒ 序号序与全局 FIFO 序**不保证**
-/// 恒等（已知张力，见 `docs/reference.md`）。
+/// 序号 store 内单调，**外部准入与 `Effect::Emit` 回灌同在 `queue` 锁内分配**
+/// （issue#158）⇒ 序号序 = 队列插入线性化序（出队按插入序 ⇒ 未停放路径的
+/// 序号序 == 执行序）；停放后经恢复入队的记录保留取号时的序号（不回溯重编号）。
 /// `ledger` 是完成账本：外部根自持新账本；同栈回灌**共享**根账本（因果父）
 /// ——共享而非各持一份，是因果后代屏障（根账本在全部因果后代终局前不发布
 /// 终局）的实现基础。
@@ -1092,6 +1176,14 @@ enum Enqueue<A> {
     Queued(u64, Arc<Ledger>),
     /// 已入队且夺得排空权：序号 + 账本 + 同临界区内 pop 出的首个记录。
     Draining(u64, Arc<Ledger>, Option<ActionRecord<A>>),
+    /// 因果后代未获工作量预算预留（issue#105/#144）：**未入主队列、不计
+    /// outstanding**——已停放（`retained = true`）或被停放容量拒收（`false`），
+    /// 结果由根账本承担（`Deferred` / `CapacityRejected`）。`ledger` = 原账本。
+    Parked {
+        seq: u64,
+        ledger: Arc<Ledger>,
+        retained: bool,
+    },
 }
 
 /// 准入上下文：来源标签 + 因果父账本（`None` = 外部根，自开新账本）。
@@ -1181,6 +1273,14 @@ fn enqueue<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'stat
     action: A,
     admission: Admission,
 ) -> Enqueue<A> {
+    // 测试停靠点：因果后代预留临界区**之前**（尚未持 queue 锁）——预留原子性
+    // 探针的可观测窗口（持 queue 锁的观测者此刻不得看到任何预留）。
+    #[cfg(test)]
+    {
+        if admission.parent.is_some() {
+            inner.reserve_gate.park();
+        }
+    }
     let mut queue = lock(&inner.queue);
     // 持 queue 锁后复检 closed——close 的 store 与本复检经 queue 锁
     // 线性化合拢：复检先于 store 则 close 的 drain 必覆盖本 push；后于 store 则
@@ -1208,9 +1308,32 @@ fn enqueue<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'stat
     let seq = inner.next_seq.fetch_add(1, Ordering::SeqCst);
     let (ledger, root) = match &admission.parent {
         Some(parent) => {
-            // 因果后代：共享父账本并累加未终局后代计数（锁序 queue → ledger）。
-            // 计数先于 push：父账本在后代可见前不可能发布终局。
-            parent.add_descendant();
+            // 因果后代：预算预留 + 未终局后代计数（同一账本临界区，锁序 queue →
+            // ledger；issue#105/#144）。计数先于 push：父账本在后代可见前不可能
+            // 发布终局。未获预留 ⇒ 不入队、不计数——停放/拒收在放锁之后
+            // （同深度预算的停放路径，见 `park_unadmitted`）。
+            let budget = inner.causal_work_budget.load(Ordering::Relaxed);
+            if !parent.try_add_descendant(budget) {
+                drop(queue);
+                let retained = park_unadmitted(
+                    inner,
+                    ActionRecord {
+                        seq,
+                        action,
+                        origin: ActionOrigin::Resumed {
+                            prior_depth: record_depth(admission.origin),
+                        },
+                        ledger: Arc::clone(parent),
+                        root: false,
+                    },
+                );
+                inner.causal_work_exceeded.fetch_add(1, Ordering::SeqCst);
+                return Enqueue::Parked {
+                    seq,
+                    ledger: Arc::clone(parent),
+                    retained,
+                };
+            }
             (Arc::clone(parent), false)
         }
         None => {
@@ -1256,7 +1379,8 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
     /// 外层根调用者的账本承担（因果后代屏障）。
     ///
     /// **例外二（回灌预算停放，Deferred）**：某个因果后代撞上回灌深度预算
-    /// （[`Self::feedback_budget_exceeded`]）时，根回执以 `Deferred` 收口 ⇒
+    /// （[`Self::feedback_budget_exceeded`]）或 per-root 因果工作量预算
+    /// （[`Self::causal_work_budget_exceeded`]）时，根回执以 `Deferred` 收口 ⇒
     /// **本方法的 void 返回不证明完整因果完成**（状态与已转发效果都已生效，
     /// 但被停放的子树没跑）。要拿到那个终局请用结果面
     /// [`Self::dispatch_with_receipt`]（本方法签名不变、行为不变）。
@@ -1348,6 +1472,15 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
     /// 停机序推荐走 [`SyncStore::try_subscribe`]（闭门显式 `Err`，见其文档）；
     /// 本方法保留签名作迁移期兼容面——闭门登记照常 + 计数
     /// （[`SyncStore::subscriptions_after_close`]），不静默。
+    ///
+    /// # 与 `close` 的线性化点（issue#159）
+    ///
+    /// **线性化点 = 本方法入口的初始 `closed` 检查**（它与 `close` 的闭门翻转同持
+    /// 订阅闸 ⇒ 二者互斥）。观察到 open ⇒ 本调用合法地排在并发 `close` **之前**
+    /// ——即使后续登记插入与函数返回发生在 `close` 返回之后：票据惰性（闭门后
+    /// 永无通知），但登记照常入表、Drop 照常注销，且**不计**
+    /// [`SyncStore::subscriptions_after_close`]。观察到 closed ⇒ 登记照常 + 计数
+    /// +1。⇒ **重叠调用的返回顺序可以与线性化序不同**。
     fn subscribe(&self, f: impl FnMut(&S) + Send + 'static) -> Subscription<S> {
         // 闸内「闭门观测 + 登记」（issue#63）：与 close 的闭门翻转互斥 ⇒
         // 闭门观测与登记同一线性化点（legacy 语义不变：闭门后仍登记并计数）。
@@ -1382,6 +1515,15 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
     /// 清掉留存后缀用 [`Self::discard_pending_effects`]。
     /// 幂等。闭门后 push 恒拒：dispatch no-op、send 显式 `false`、subscribe
     /// 照常登记但永不触发——三入口对照见类型文档「闭门后的入口对照」表。
+    ///
+    /// # 与订阅登记的线性化（issue#159）
+    ///
+    /// 闭门翻转只与**订阅入口的初始 `closed` 检查**互为判定依据：本方法不等待
+    /// 在途登记，也不取投递口表锁。初始检查观察到 open 的 [`Self::subscribe`] /
+    /// [`Notify::subscribe_notify`] 调用合法地线性化在本次闭门**之前**（返回惰性
+    /// 票据、不计 [`SyncStore::subscriptions_after_close`]）；只有初始检查观察到
+    /// closed 的调用排在其后并计数。⇒ **重叠调用的返回顺序可与线性化序不同**
+    /// （登记插入与本方法返回的先后不是判据）。
     fn close(&self) {
         // Release 配对 push 路径的 Acquire 复检。线性化不靠原子序：close 的
         // drain 与 dispatch 的 push 在 queue 锁上串行——stale false（迟见的
@@ -1422,6 +1564,20 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> No
     /// [`Self::notify_published`]。投递口 O(1) 是宿主契约义务（
     /// `skeleton::notify::NotifySink` 文档），框架无法检测也无法阻止阻塞
     /// ——重活请在投递口内自备通道/工作线程移出。
+    ///
+    /// # 与 `close` 的线性化点（issue#159 拍板：入口检查线性化）
+    ///
+    /// **线性化点 = 调用入口的初始 `closed` 检查**（不是 registry 插入）。于是：
+    ///
+    /// - 初始检查观察到 open ⇒ 本调用合法地排在**并发 `close` 之前**被接纳——即使
+    ///   投递口入表与函数返回都发生在 `close` 返回之后。此时票据**惰性**：闭门后
+    ///   不再产生落位拍 ⇒ 永不投递；但登记照常入表、票据 Drop 照常注销，且
+    ///   **不计** [`Self::subscriptions_after_close`]；
+    /// - 初始检查观察到 closed ⇒ 排在闭门之后：登记照常 + 计数 +1。
+    ///
+    /// ⇒ **重叠调用的返回顺序可以不同于其线性化序**（`close` 不等待在途登记，也不
+    /// 取投递口表锁）。`subscriptions_after_close` 的判定口径固定为「初始检查观察
+    /// 到 closed 的笔数」，不是「插入时 store 已闭门的笔数」。
     ///
     /// # Examples
     ///
@@ -1466,6 +1622,10 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> No
                 .subscriptions_after_close
                 .fetch_add(1, Ordering::SeqCst);
         }
+        // 测试停靠点（issue#159）：线性化点（上面的入口检查）之后、registry 插入
+        // 之前——重叠 `close` 的确定性编排窗口。
+        #[cfg(test)]
+        self.inner.notify_sub_gate.park();
         notify::register(
             &self.inner.notify_sinks,
             &self.inner.notify_subs,
@@ -1722,6 +1882,18 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             deferred_queue: Mutex::new(VecDeque::new()),
             deferred_capacity: AtomicUsize::new(DEFAULT_DEFERRED_CAPACITY),
             deferred_capacity_rejected: AtomicU64::new(0),
+            causal_work_budget: AtomicUsize::new(DEFAULT_CAUSAL_WORK_BUDGET),
+            causal_work_exceeded: AtomicU64::new(0),
+            segment_effect_budget: AtomicUsize::new(DEFAULT_SEGMENT_EFFECT_BUDGET),
+            segment_effect_exceeded: AtomicU64::new(0),
+            drain_work_budget: AtomicUsize::new(DEFAULT_DRAIN_WORK_BUDGET),
+            drain_lease_yields: AtomicU64::new(0),
+            #[cfg(test)]
+            yield_gate: CapacitySettle::new(),
+            #[cfg(test)]
+            reserve_gate: CapacitySettle::new(),
+            #[cfg(test)]
+            notify_sub_gate: CapacitySettle::new(),
             subs: Arc::new(Mutex::new(Vec::new())),
             sub_gate: Mutex::new(()),
             back: back_sender(weak),
@@ -2053,9 +2225,13 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
                 audit_enqueued(&self.inner, origin); // 在任排空者覆盖（交接论证见 enqueue）
                 Ok((seq, is_root, ledger))
             }
+            // 因果后代撞工作量预算（同栈回灌）：已停放 / 被拒收都由根账本承担——
+            // 不走 `Err(Full)`（那会让 void dispatch 把停放当过载 panic）。
+            Enqueue::Parked { seq, ledger, .. } => Ok((seq, is_root, ledger)),
             Enqueue::Draining(seq, ledger, first) => {
                 audit_enqueued_as_lease_winner(&self.inner, origin, first.as_ref());
-                drain_owned(&self.inner, first);
+                // 等待型根：让出后回到下方的账本等待，无需入口闸。
+                drain_owned(&self.inner, first, None);
                 Ok((seq, is_root, ledger))
             }
         };
@@ -2088,6 +2264,12 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 静默态那句「完成边界必然已达成」**不含**被回灌预算停放的子树：某个因果
     /// 后代撞上预算时根回执以 `Deferred` 收口（issue#57），准入面本来就不承载
     /// 终局信息——要终局用 [`Self::dispatch_with_receipt`]。
+    ///
+    /// **同栈回灌撞 per-root 因果工作量预算**（issue#105/#144）：超出的子动作被
+    /// 停放 ⇒ 返回 [`AdmissionOutcome::Accepted`]（仍归本 store，结果由根账本
+    /// 承担）；停放区满被拒收 ⇒ 返回 [`AdmissionOutcome::Full`]（未留存，显式
+    /// 拒绝）。另：静默态夺得的租约在本 action 完成边界之后可能按 per-drain
+    /// 预算让出（[`Self::set_drain_work_budget`]）——不影响上述完成边界保证。
     pub fn try_dispatch(&self, action: A) -> AdmissionOutcome {
         if self.is_closed() {
             self.inner
@@ -2112,9 +2294,19 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
                 audit_enqueued(&self.inner, origin);
                 AdmissionOutcome::Accepted
             }
-            Enqueue::Draining(_, _, first) => {
+            // 同栈回灌撞工作量预算：已停放 = 仍归本 store（Accepted，结果由根账本
+            // 承担）；被停放容量拒收 = 未留存（Full，显式拒绝）。
+            Enqueue::Parked { retained: true, .. } => AdmissionOutcome::Accepted,
+            Enqueue::Parked {
+                retained: false, ..
+            } => {
+                audit_emit(&self.inner, AuditEventKind::Rejected);
+                AdmissionOutcome::Full
+            }
+            Enqueue::Draining(_, ledger, first) => {
                 audit_enqueued_as_lease_winner(&self.inner, origin, first.as_ref());
-                drain_owned(&self.inner, first);
+                // 非等待型入口：账本随行，本 action 完成边界之前不让出。
+                drain_owned(&self.inner, first, Some(&ledger));
                 AdmissionOutcome::Accepted
             }
         }
@@ -2148,6 +2340,97 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// 容量满拒绝计数（fail-visible）：读侧。
     pub fn admission_full_count(&self) -> u64 {
         self.inner.admission_full.load(Ordering::SeqCst)
+    }
+
+    /// per-root 因果工作量预算（issue#105/#144）：`cap` = 单个根 action 累计可
+    /// 接受的因果后代数上限（含 Emit 回灌与解释器 / 订阅回调内的同栈回灌）；
+    /// `0` = 不限。深度预算（[`Self::feedback_budget_exceeded`]）只守递归链深，
+    /// 本预算守扇出与总量，两者互不代理；与外部准入容量（[`Self::set_capacity`]）、
+    /// 停放容量（[`Self::set_deferred_capacity`]）三维分立计数。**默认启用**——
+    /// 数值见 `docs/reference.md` §资源上限与默认值。
+    ///
+    /// 超界 = 拒绝预留：超出的子动作**不入主队列、不占账本在途计数**，改挂独立
+    /// 续接账本后**停放**（根回执 [`DispatchOutcome::Deferred`]，显式恢复走
+    /// [`Self::resume_deferred`]，无自动重试）；停放区满则被容量拒收（根回执
+    /// [`DispatchOutcome::CapacityRejected`]）。两者都不报 `Completed`，并计入
+    /// [`Self::causal_work_budget_exceeded`]。
+    ///
+    /// # 与预留的线性化（issue#95 同款）
+    ///
+    /// 每次预留都在 `queue` 锁内读 cap 并完成记账 + 入队，本方法先取同一把锁再写
+    /// 新值 ⇒ 二者只有两种合法先后：预留先得锁 ⇒ 按旧 cap 判定，本方法随后返回
+    /// （**缩容不回溯**已准入后代）；本方法先得锁 ⇒ 其后预留一律按新 cap。
+    pub fn set_causal_work_budget(&self, cap: usize) {
+        let _queue = lock(&self.inner.queue);
+        self.inner.causal_work_budget.store(cap, Ordering::Relaxed);
+    }
+
+    /// per-root 因果工作量预算读侧（`0` = 不限）。
+    pub fn causal_work_budget(&self) -> usize {
+        self.inner.causal_work_budget.load(Ordering::Relaxed)
+    }
+
+    /// 因果工作量预算拒绝计数（fail-visible 读侧）：未获 per-root 预算预留的子
+    /// 动作累计数（已停放 + 被停放容量拒收各计一次）。与深度预算计数
+    /// [`Self::feedback_budget_exceeded`] 分账——本计数只随工作量预算推进。
+    pub fn causal_work_budget_exceeded(&self) -> u64 {
+        self.inner.causal_work_exceeded.load(Ordering::SeqCst)
+    }
+
+    /// per-reducer 分段效果预算（issue#144）：`cap` = 单次 `reduce` 调用可被接受
+    /// 的效果条数上限（Emit / Run / Cancel 合计）；`0` = 不限。预算内的前缀照常
+    /// 提交转发；**超量后缀从不成为已接受效果**：Emit ⇒ 停放 / 容量拒收（同
+    /// [`Self::set_causal_work_budget`] 的超界行为，不另占根预算），Run / Cancel
+    /// 无法停放 ⇒ 不转发，产出它的 action 以**提交后部分失败**结算
+    /// （[`DispatchOutcome::Failed`]，`state_committed = true`；legacy
+    /// [`Self::dispatch`] 按既有转发失败口径 panic）。两者都计入
+    /// [`Self::segment_effect_budget_exceeded`]——**仅凭 outcome 分不清预算因还是
+    /// 解释器端口因，归因靠该计数**。**默认启用**。
+    ///
+    /// 生效点 = 提交点：预算在 reducer 正常返回的提交点快照进段，已提交的段不随
+    /// 本方法缩容回溯；reducer **调用期间**框架无控制点（`EffectBuf::push` 无失败
+    /// 面），故本预算约束的是「被接受并转发」的条数与留存容量，不是 reducer 自身
+    /// 在调用期内的瞬时分配。
+    pub fn set_segment_effect_budget(&self, cap: usize) {
+        self.inner
+            .segment_effect_budget
+            .store(cap, Ordering::Relaxed);
+    }
+
+    /// per-reducer 分段效果预算读侧（`0` = 不限）。
+    pub fn segment_effect_budget(&self) -> usize {
+        self.inner.segment_effect_budget.load(Ordering::Relaxed)
+    }
+
+    /// 分段效果预算超量计数（fail-visible 读侧）：被分段预算切掉的效果累计数
+    /// （Emit 停放 + Emit 拒收 + Run/Cancel 未转发各计一次）。
+    pub fn segment_effect_budget_exceeded(&self) -> u64 {
+        self.inner.segment_effect_exceeded.load(Ordering::SeqCst)
+    }
+
+    /// per-drain 租约工作量预算（issue#144）：`cap` = 单个排空租约连续出队处理的
+    /// 记录数上限；`0` = 不限。到界且主队列非空即**让出**排空租约：放旗后重新
+    /// 竞争，窗口内到达的外部 push / [`Self::resume_deferred`] / [`Self::close`]
+    /// 可接手剩余队列（FIFO 不变、无丢失、无重复），无人接手则原线程续排——
+    /// 不依赖外部流量，无自死锁。单写者不变：所有权只在 `queue` 锁内转移。让出
+    /// 只用 `std::thread::yield_now`，与异步运行时无关。
+    ///
+    /// 例外：经 [`Self::try_dispatch`] / [`skeleton::ActionSender::dispatch`] 夺得
+    /// 租约的调用方，在**自己的 action 完成边界之前不让出**（契约层的「静默态
+    /// 返回即完成边界」优先）。让出次数见 [`Self::drain_lease_yields`]。
+    pub fn set_drain_work_budget(&self, cap: usize) {
+        self.inner.drain_work_budget.store(cap, Ordering::Relaxed);
+    }
+
+    /// per-drain 租约工作量预算读侧（`0` = 不限）。
+    pub fn drain_work_budget(&self) -> usize {
+        self.inner.drain_work_budget.load(Ordering::Relaxed)
+    }
+
+    /// 排空租约让出计数（fail-visible 读侧）：per-drain 预算到界且主队列非空的
+    /// 累计次数（无论随后由谁重新夺得）。
+    pub fn drain_lease_yields(&self) -> u64 {
+        self.inner.drain_lease_yields.load(Ordering::SeqCst)
     }
 
     /// 停放队列容量（issue#49）：`cap` = 可留存的停放记录数上限；`0` = 不限。
@@ -2264,7 +2547,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         let drained = !self.inner.draining.swap(true, Ordering::AcqRel);
         drop(queue);
         if drained {
-            drain_owned(&self.inner, None);
+            drain_owned(&self.inner, None, None);
         }
         // 每条恢复记录等自己的续接回执终局（Completed / 再次停放 / 容量拒收）。
         // 不等待 ⇒ 三项计数只能是猜测；等待边界 = 这些记录各自的因果子树终局。
@@ -2311,6 +2594,11 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// [`Self::subscriber_count`] 可查）但闭门后永无 dispatch 触发——本计数让
     /// 该状态从观测死角显形。与 [`Self::rejected_after_close`] 分立：登记不是
     /// 拒绝，并数会污染拒绝语义（闭门对照见类型文档）。
+    ///
+    /// **判定口径（issue#159）**：线性化点 = 订阅入口的**初始 `closed` 检查**
+    /// ——只有初始检查就观察到 closed 的登记才计入；观察到 open 的重叠调用即使
+    /// 在 `close` 返回之后才完成插入，也合法地排在闭门之前，**不计**（它拿到的是
+    /// 惰性票据）。故本计数不等于「插入时 store 已闭门的笔数」。
     pub fn subscriptions_after_close(&self) -> u64 {
         self.inner.subscriptions_after_close.load(Ordering::SeqCst)
     }
@@ -2975,6 +3263,12 @@ impl<S, A, Op> DrainGuard<'_, S, A, Op> {
         // 「队列空 + 无租约」的终局谓词。
         self.inner.stop_wait.notify_all();
     }
+
+    /// 让出后被他人接手：放弃租约而**不动旗**（旗归接手者）——Drop 不再结算、
+    /// 不放旗（此刻无在途记录，调用点保证）。
+    fn handoff(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl<S, A, Op> Drop for DrainGuard<'_, S, A, Op> {
@@ -3047,7 +3341,7 @@ fn drain<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
     if inner.draining.swap(true, Ordering::AcqRel) {
         return;
     }
-    drain_owned(inner, None);
+    drain_owned(inner, None, None);
 }
 
 /// 持排空权排空至 idle：出队→reduce→快照替换→效果转发（Emit 回灌入队，
@@ -3059,9 +3353,18 @@ fn drain<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
 /// 内不可插入，复检退化为同锁内的已见空）；晚到的 push 由后到者自己的夺权排空。
 /// 「重夺排空权」分支随窗口封死而不可达，rearm 机制随之删除（不变量由孤儿
 /// 监视测试与守恒竞速持续咬住）。
+///
+/// **让出（issue#105/#144 per-drain 工作量预算）**：每出队处理
+/// [`DEFAULT_DRAIN_WORK_BUDGET`] 条记录（可配，`0` = 不限）即到让出点——持
+/// `queue` 锁判队列非空则放旗、重新竞争（见 [`yield_lease`]）。`entry` = 经
+/// `try_dispatch` / `ActionSender::dispatch` 夺得租约的调用方自己的账本：它们的
+/// 契约是「静默态返回即本 action 的完成边界」，故该 action 结算且其因果子树无
+/// 在途后代之前不让出；等待型入口 / `close` / `resume_deferred` 返回后自会等各自
+/// 的账本，传 `None` 即随时可让出。
 fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
     inner: &Arc<StoreInner<S, A, Op>>,
     first: Option<ActionRecord<A>>,
+    entry: Option<&Arc<Ledger>>,
 ) {
     let mut guard = DrainGuard {
         inner,
@@ -3071,6 +3374,12 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         committed: false,
     };
     let mut first = first;
+    // 本租约已出队处理的记录数（per-drain 工作量预算的计量；首条记录也计入）。
+    let mut work = usize::from(first.is_some());
+    // 入口 action 的让出闸：`entry_settled` = 入口记录已结算；`entry_complete` =
+    // 其因果子树已无在途后代（此后才允许让出，见函数文档）。
+    let mut entry_settled = false;
+    let mut entry_complete = entry.is_none();
     loop {
         let mut record = match first.take() {
             Some(record) => record,
@@ -3078,6 +3387,23 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                 // let-else 绑定：queue 守卫先于 action 使用释放，Emit 回灌再锁
                 // queue 不会自死锁
                 let mut queue = lock(&inner.queue);
+                // 让出点（per-drain 工作量预算）：到界先清零；队列空则无需让出，
+                // 下方 pop None 即走原出口协议。
+                let budget = inner.drain_work_budget.load(Ordering::Relaxed);
+                if budget > 0 && work >= budget {
+                    work = 0;
+                    if let Some(ledger) = entry {
+                        entry_complete |= entry_settled && ledger.has_no_inflight();
+                    }
+                    if entry_complete && !queue.is_empty() {
+                        if !yield_lease(inner, queue) {
+                            // 他人已接手剩余队列：本线程交出租约返回。
+                            guard.handoff();
+                            return;
+                        }
+                        queue = lock(&inner.queue);
+                    }
+                }
                 let Some(record) = queue.pop_front() else {
                     // 出口交接（M1）：持锁放旗——push 被锁外挡，锁内空即终局空；
                     // queue 守卫随 return 释放，晚到 push 由其排空者自排空
@@ -3085,6 +3411,7 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                     return;
                 };
                 drop(queue);
+                work += 1;
                 record
             }
         };
@@ -3109,30 +3436,7 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
             // 满 ⇒ 续接无法留存 = 显式非成功终局 + 专用计数（不消失、不标成
             // 「已停放」）。只有本排空者会 push ⇒ 判长与 push 之间无 push 竞争
             // （恢复路径只 pop）。
-            let mut parked = lock(&inner.deferred_queue);
-            let cap = inner.deferred_capacity.load(Ordering::Relaxed);
-            let retained = cap == 0 || parked.len() < cap;
-            // 测试停靠点（issue#95）：停放已按旧 cap 裁决、留存/拒收尚未提交——
-            // 容量 setter 此刻只能被 deferred_queue 锁挡住。
-            #[cfg(test)]
-            inner.deferred_gate.park();
-            let continuation = detach_deferred(record, retained);
-            if retained {
-                parked.push_back(continuation);
-            } else {
-                drop(parked);
-                // 续接拿自己的非成功终局（不进任何 population），原账本记容量拒收。
-                continuation.ledger.finish_root(Some(DispatchFailure {
-                    seq: continuation.seq,
-                    phase: DispatchPhase::Queued,
-                    state_committed: false,
-                    cause: "deferred queue full: continuation not retained",
-                }));
-                release_ledger(inner, &continuation.ledger);
-                inner
-                    .deferred_capacity_rejected
-                    .fetch_add(1, Ordering::SeqCst);
-            }
+            park_record(inner, record, detach_deferred);
             // 脱钩把**原账本**以 Deferred 收口：它可能在此刻终局 ⇒ 按同一归还
             // 规则尝试一次（续接账本是独立账本，不随原账本入池——issue#84）。
             release_ledger(inner, &origin_ledger);
@@ -3199,7 +3503,10 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                     // 发布之前——旧快照析构 panic（状态已发布）时，已提交效果
                     // 不得随之丢失。**来源在此固化**（issue#48）：产出这些效果
                     // 的 action = 当前被 reduce 的 `record` ⇒ 其入队序号。
-                    bufs.commit(record.seq);
+                    bufs.commit(
+                        record.seq,
+                        inner.segment_effect_budget.load(Ordering::Relaxed),
+                    );
                     Ok(next)
                 }
                 Err(payload) => {
@@ -3267,7 +3574,8 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // action）的入队序号——与 pending 效果各自的来源序号（可能更早）区分
         // （issue#48）。
         guard.phase = DispatchPhase::ForwardingEffects;
-        inner.effect_buf.with_mut(|bufs| {
+        // `unforwarded` = 分段预算切掉的 Run/Cancel 条数（结算时折成提交后部分失败）。
+        let unforwarded = inner.effect_buf.with_mut(|bufs| {
             forward_effects(inner, bufs, feedback_depth, &record.ledger, record.seq)
         });
         guard.phase = DispatchPhase::EffectsForwarded;
@@ -3289,10 +3597,20 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         }
         // 结算本记录：自身阶段完成 → 账本终局判定（根账本在全部因果后代终局
         // 前不发布终局——因果后代屏障：根调用者的同步边界覆盖其引发的子动作）。
+        // 分段预算切掉的 Run/Cancel 超量 = 提交后部分失败（显式、不报 Completed）。
+        let failure = (unforwarded > 0).then_some(DispatchFailure {
+            seq: record.seq,
+            phase: DispatchPhase::ForwardingEffects,
+            state_committed: true,
+            cause: "segment effect budget exceeded: Run/Cancel effects not forwarded",
+        });
+        if let Some(ledger) = entry {
+            entry_settled |= record.root && Arc::ptr_eq(ledger, &record.ledger);
+        }
         if record.root {
-            record.ledger.finish_root(None);
+            record.ledger.finish_root(failure);
         } else {
-            record.ledger.descendant_done(None);
+            record.ledger.descendant_done(failure);
         }
         guard.current = None;
         // 每个可能使账本终局的转移后都尝试归还：非等待型根的**最后一个后代**
@@ -3315,6 +3633,112 @@ fn detach_deferred<A: Send + 'static>(
     record.ledger = continuation;
     record.root = true;
     record
+}
+
+/// 停放一条续接记录（**唯一停放点**，issue#49/#57；深度预算与工作量预算共用）：
+/// 停放锁内按容量裁决留存 / 拒收，`reattach` 在裁决之后、仍持停放锁时把记录
+/// 改挂到独立续接账本并给原账本记账。满 ⇒ 续接拿显式非成功终局（不进任何
+/// population）+ 容量拒收计数。只有排空者会 push ⇒ 判长与 push 之间无竞争
+/// （恢复路径只 pop）。锁序 `queue → deferred_queue → ledger / pool` 单向（持
+/// queue 锁调用亦安全；`ledger_pool` 的持有者不再取 deferred / queue ⇒ 无环）。
+fn park_record<S, A, Op>(
+    inner: &Arc<StoreInner<S, A, Op>>,
+    record: ActionRecord<A>,
+    reattach: impl FnOnce(ActionRecord<A>, bool) -> ActionRecord<A>,
+) -> bool
+where
+    S: Clone + Send + Sync + 'static,
+    A: Send + 'static,
+    Op: Send + 'static,
+{
+    let mut parked = lock(&inner.deferred_queue);
+    let cap = inner.deferred_capacity.load(Ordering::Relaxed);
+    let retained = cap == 0 || parked.len() < cap;
+    // 测试停靠点（issue#95）：停放已按旧 cap 裁决、留存/拒收尚未提交——
+    // 容量 setter 此刻只能被 deferred_queue 锁挡住。
+    #[cfg(test)]
+    inner.deferred_gate.park();
+    let continuation = reattach(record, retained);
+    if retained {
+        parked.push_back(continuation);
+        return true;
+    }
+    drop(parked);
+    // 续接拿自己的非成功终局（不进任何 population），原账本记容量拒收。
+    continuation.ledger.finish_root(Some(DispatchFailure {
+        seq: continuation.seq,
+        phase: DispatchPhase::Queued,
+        state_committed: false,
+        cause: "deferred queue full: continuation not retained",
+    }));
+    release_ledger(inner, &continuation.ledger);
+    inner
+        .deferred_capacity_rejected
+        .fetch_add(1, Ordering::SeqCst);
+    false
+}
+
+/// 未获工作量预算预留的因果子动作（issue#105/#144）：它**从不进入主队列、从不
+/// 计入原账本 `outstanding`**——原账本只记「已停放 / 被拒收」，记录改挂独立续接
+/// 账本（取自复用池：批量超量时拒收路径不逐条新分配、池不膨胀）后停放。返回
+/// 是否留存。调用点不持 `queue` 锁（与深度预算停放路径同一锁上下文）。
+fn park_unadmitted<S, A, Op>(inner: &Arc<StoreInner<S, A, Op>>, record: ActionRecord<A>) -> bool
+where
+    S: Clone + Send + Sync + 'static,
+    A: Send + 'static,
+    Op: Send + 'static,
+{
+    park_record(inner, record, |record, retained| {
+        detach_unadmitted(inner, record, retained)
+    })
+}
+
+/// [`park_unadmitted`] 的改挂步：原账本记账（不动 outstanding）+ 续接账本换新。
+fn detach_unadmitted<S, A, Op>(
+    inner: &Arc<StoreInner<S, A, Op>>,
+    mut record: ActionRecord<A>,
+    retained: bool,
+) -> ActionRecord<A>
+where
+    S: Clone + Send + Sync + 'static,
+    A: Send + 'static,
+    Op: Send + 'static,
+{
+    record.ledger.note_unadmitted(retained);
+    record.ledger = acquire_ledger(inner, false);
+    record.root = true;
+    record
+}
+
+/// 让出排空租约（issue#105/#144 per-drain 工作量预算的边界；调用点持 `queue`
+/// 锁且已判定队列非空）：放旗 ⇒ 解锁让出 ⇒ 重新竞争。窗口内到达的外部 push /
+/// `resume_deferred` / `close` 可经既有夺权路径接手剩余队列（FIFO 不变：单队列、
+/// 从队首续取）；无人接手则本线程重新夺得续排——**不依赖外部流量，无自死锁**。
+/// 让出与运行时无关：只用 `std::thread::yield_now`，纯 std 线程照常让出。
+///
+/// 单写者：所有权唯一凭证是 `draining` 在 queue 锁内的 `swap(false→true)`；放锁后
+/// 到重新夺得之间本线程不触达任何排空态（无在途记录、无 TLS 帧、无 cell 借用）。
+/// 返回 `true` = 本线程仍是排空者；`false` = 他人已接手（调用方交出租约返回）。
+fn yield_lease<S, A, Op>(
+    inner: &Arc<StoreInner<S, A, Op>>,
+    queue: MutexGuard<'_, VecDeque<ActionRecord<A>>>,
+) -> bool {
+    inner.drain_lease_yields.fetch_add(1, Ordering::SeqCst);
+    // 让出窗口内让出者视同在途（它是兜底接手者）：孤儿谓词
+    // 「!draining && 队列非空 && in_flight == 0」保持不可达。
+    #[cfg(test)]
+    inner.in_flight.fetch_add(1, Ordering::SeqCst);
+    inner.draining.store(false, Ordering::Release);
+    drop(queue);
+    // 测试停靠点：已放旗、尚未重新竞争（并发接手的确定性编排窗口）。
+    #[cfg(test)]
+    inner.yield_gate.park();
+    std::thread::yield_now();
+    let _queue = lock(&inner.queue);
+    let re_acquired = !inner.draining.swap(true, Ordering::AcqRel);
+    #[cfg(test)]
+    inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+    re_acquired
 }
 
 /// CoW 快照落位（快照分配税消除）：稳态（无外部 snapshot() 持有者）强计数
@@ -3367,13 +3791,21 @@ fn place_snapshot<S, A, Op>(inner: &Arc<StoreInner<S, A, Op>>, next_val: S) -> O
 /// **缓冲回收**（j9q）：段空摘壳时把满缓冲 `mem::swap` 回 `staged`（稳态零
 /// 新增分配）；panic 路径不经过摘壳臂 ⇒ 不影响该不变量（毒化半砖后的一次性
 /// 分配不在稳态口径内）。
+///
+/// **分段效果预算（issue#144）**：段自带提交点快照 `effect_cap`；`effect_index ≥
+/// effect_cap` 的效果是**超量后缀、从不成为已接受效果**——Emit 停放/拒收（同未获
+/// 预留子动作），Run/Cancel 不转发并计入返回值（调用方结算为提交后部分失败）。
+/// 判定落在本就逐条推进的段内游标上：提交点的 O(1) 整段移交与稳态零分配不变。
 fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
     inner: &Arc<StoreInner<S, A, Op>>,
     bufs: &mut EffectBufs<A, Op>,
     feedback_depth: u64,
     parent: &Arc<Ledger>,
     dispatch_action_seq: u64,
-) {
+) -> u64 {
+    // 分段效果预算（issue#144）：`unforwarded` 数被预算切掉的 Run/Cancel 条数
+    // （调用方折成提交后部分失败）；Emit 超量走停放/拒收，不计入。
+    let mut unforwarded = 0u64;
     // 单步转发决策：把「段内弹出一条」与「段空摘壳」从借用区带出——
     // `bufs.pending` 与 `bufs.staged` 的 &mut 互斥 ⇒ 决策与执行分段借用。
     enum Step<A, Op> {
@@ -3381,8 +3813,11 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
             effect: Effect<A, Op>,
             origin_action_seq: u64,
             effect_index: u64,
+            excess: bool,
         },
-        Retire,
+        /// 段空摘壳；`recycle` = 段内效果数未超分段预算（超量段的缓冲不回收：
+        /// 留存容量回到 ≤ 预算量级，issue#144）。
+        Retire { recycle: bool },
     }
     loop {
         let step = {
@@ -3390,6 +3825,7 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                 Some(seg) => seg,
                 None => break,
             };
+            let cap = seg.effect_cap;
             match seg.buf.pop_front() {
                 Some(effect) => {
                     let effect_index = seg.next_index;
@@ -3398,37 +3834,86 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                         effect,
                         origin_action_seq: seg.origin_action_seq,
                         effect_index,
+                        // 分段预算：预算内 = 已接受前缀；其余 = 超量后缀。
+                        excess: cap > 0 && effect_index >= cap as u64,
                     }
                 }
-                None => Step::Retire,
+                None => Step::Retire {
+                    recycle: !(cap > 0 && seg.next_index > cap as u64),
+                },
             }
         };
-        let (origin_action_seq, effect_index, effect) = match step {
-            Step::Retire => {
+        let (origin_action_seq, effect_index, excess, effect) = match step {
+            Step::Retire { recycle } => {
                 // 段空摘壳：满缓冲换回 staged（稳态零新增分配），空壳出队 drop。
                 let mut seg = bufs.pending.pop_front().expect("front_mut 判空后队首必存");
-                std::mem::swap(&mut seg.buf, &mut bufs.staged);
+                if recycle {
+                    std::mem::swap(&mut seg.buf, &mut bufs.staged);
+                }
                 continue;
             }
             Step::Forward {
                 effect,
                 origin_action_seq,
                 effect_index,
-            } => (origin_action_seq, effect_index, effect),
+                excess,
+            } => (origin_action_seq, effect_index, excess, effect),
         };
         match effect {
             Effect::Emit(a) => {
                 inner.feedback_emitted.fetch_add(1, Ordering::Relaxed);
-                // 回灌入队 = 因果后代：共享父账本 + 未终局后代计数 +1（计数与入队
-                // 同一 queue 临界区，锁序 queue → ledger）——父账本在后代可见前
-                // 不可能发布终局。
-                let seq = inner.next_seq.fetch_add(1, Ordering::SeqCst);
+                let depth = feedback_depth + 1;
+                // 测试停靠点：序号分配与预留临界区**之前**（尚未持 queue 锁）。
+                #[cfg(test)]
+                inner.reserve_gate.park();
+                let budget = inner.causal_work_budget.load(Ordering::Relaxed);
                 let mut queue = lock(&inner.queue);
-                parent.add_descendant();
+                // 序号在 queue 临界区内分配（issue#158），紧邻后代记账与 push ⇒
+                // 序号序 = **队列插入线性化序**：外部准入（[`enqueue`]）与回灌同一
+                // 分配序，回执/审计消费方可按 `seq` 重排出队（= 执行）序。分段超量
+                // 的记录不入主队列，但取号同在此处 ⇒「凡回灌取号皆持 queue 锁」无
+                // 例外（`next_seq` 不是新争用点：本临界区本就在自增它，且已含
+                // `push_back` 的指针写）。
+                let seq = inner.next_seq.fetch_add(1, Ordering::SeqCst);
+                // 分段超量的 Emit 从不接受（不占根预算）：直接停放 / 拒收。
+                if excess {
+                    drop(queue);
+                    park_unadmitted(
+                        inner,
+                        ActionRecord {
+                            seq,
+                            action: a,
+                            origin: ActionOrigin::Resumed { prior_depth: depth },
+                            ledger: Arc::clone(parent),
+                            root: false,
+                        },
+                    );
+                    inner.segment_effect_exceeded.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+                // 回灌入队 = 因果后代：**预算预留** + 未终局后代计数（同一账本临界
+                // 区）与入队同在 queue 临界区（锁序 queue → ledger；issue#105/#144）
+                // ——父账本在后代可见前不可能发布终局，未获预留的子动作不可见、
+                // 不计数。
+                if !parent.try_add_descendant(budget) {
+                    drop(queue);
+                    park_unadmitted(
+                        inner,
+                        ActionRecord {
+                            seq,
+                            action: a,
+                            origin: ActionOrigin::Resumed { prior_depth: depth },
+                            ledger: Arc::clone(parent),
+                            root: false,
+                        },
+                    );
+                    inner.causal_work_exceeded.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
                 queue.push_back(ActionRecord {
                     seq,
                     action: a,
-                    origin: ActionOrigin::Feedback(feedback_depth + 1),
+                    origin: ActionOrigin::Feedback(depth),
                     ledger: Arc::clone(parent),
                     root: false,
                 });
@@ -3437,11 +3922,18 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                 audit_emit(
                     inner,
                     AuditEventKind::Enqueued {
-                        feedback_depth: feedback_depth + 1,
+                        feedback_depth: depth,
                     },
                 );
             }
             effect => {
+                // 分段超量的 Run/Cancel 无法停放（停放区只装 action）⇒ 不转发，
+                // 计数并由调用方折成提交后部分失败（不静默、不报 Completed）。
+                if excess {
+                    inner.segment_effect_exceeded.fetch_add(1, Ordering::SeqCst);
+                    unforwarded += 1;
+                    continue;
+                }
                 // 效果身份（kind + 逻辑 id）：**单一映射点** `EffectKind::of`
                 // （skeleton crate 内穷尽匹配 Effect 词表 ⇒ 词表演进时编译期
                 // 强制同步）。非 Emit ⇒ 恒 `Some`（`of` 仅对 Emit 返回 `None`，
@@ -3510,6 +4002,8 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
             }
         }
     }
+
+    unforwarded
 }
 
 /// 通知段：本地订阅先行、跨线程订阅随后（确定性），返回当拍**是否真有订阅
@@ -3838,6 +4332,46 @@ mod tests {
             1,
             "稳态强计数必须回落 1"
         );
+    }
+
+    /// #160 的**分配 profile 锚**（白盒）：状态落位 [`place_snapshot`] 唯一持有
+    /// 走 `Arc::get_mut` + `mem::replace` ⇒ **同一分配**（零新分配）；共享态
+    /// `Arc::new(next_val)` ⇒ 换**一次**新分配，旧分配整块留给持有者（冻结、不
+    /// 回收、不覆写）。事件计数面由 `tests/memgov.rs` 的 `CountingAllocator` 锚
+    /// （黑盒：稳态 dispatch 双口径 0 分配）覆盖；本锚补的是「共享态恰换一次、
+    /// 旧分配留给持有者」这一半。
+    ///
+    /// 判别：落位改回无条件 `Arc::new(next_val)` ⇒ 唯一持有臂的指针身份变化 ⇒ 红。
+    #[test]
+    fn state_placement_allocation_profile() {
+        let store = SyncStore::new(TickFeature, NopRuntime);
+        let inner = Arc::clone(&store.inner);
+
+        // 唯一持有：原地装新值（同一分配，零新分配）
+        let unique_before = Arc::as_ptr(&*lock(&inner.state));
+        let retired = place_snapshot(&inner, 42);
+        assert_eq!(retired, Some(0), "唯一持有换出的旧值交还调用方（锁外析构）");
+        assert_eq!(
+            Arc::as_ptr(&*lock(&inner.state)),
+            unique_before,
+            "唯一持有必须原地落位：同一分配、零新分配（无条件 Arc::new 即红）"
+        );
+        assert_eq!(*store.snapshot(), 42);
+
+        // 共享态：一次新分配，旧分配冻结给持有者
+        let held = store.snapshot();
+        let held_ptr = Arc::as_ptr(&held);
+        let shared_before = Arc::as_ptr(&*lock(&inner.state));
+        assert_eq!(held_ptr, shared_before, "持有者持的就是当前分配");
+        let retired = place_snapshot(&inner, 43);
+        assert_eq!(retired, None, "旧分配由持有者持有：本线程不得析构");
+        assert_ne!(
+            Arc::as_ptr(&*lock(&inner.state)),
+            shared_before,
+            "共享态必须换新分配（一次）"
+        );
+        assert_eq!(*held, 42, "旧快照冻结：持有者仍见落位前的值");
+        assert_eq!(*store.snapshot(), 43, "新快照照常前进");
     }
 
     /// 旧 S 析构必须发生在 state 锁外（锁消融形态回归）：
@@ -4180,6 +4714,73 @@ mod tests {
         assert_eq!(store.subscriber_count(), 1, "毒订阅者已摘除");
         store.dispatch(Tick::Tick); // 健康者照常通知
         assert_eq!(store.subscriber_panics(), 1, "已摘除者不得重复计数");
+    }
+
+    /// 投递口夹具：只把版本号写进共享原子（「是否真被投递」的可观测面）。
+    struct RecordingSink(Arc<AtomicU64>);
+
+    impl NotifySink for RecordingSink {
+        fn publish(&self, version: u64) {
+            self.0.store(version, Ordering::SeqCst);
+        }
+    }
+
+    /// #159（方案 1：入口检查线性化）确定性探针：`subscribe_notify` 的线性化点
+    /// = 入口的初始 `closed` 检查。初始检查观察到 open 的调用合法地排在并发
+    /// `close` 之前 ⇒ 即使插入发生在 `close` 返回之后，也返回**惰性票据**、登记
+    /// 照常入表、且**不计** `subscriptions_after_close`。
+    ///
+    /// 编排（握手）：`notify_sub_gate` 把登记线程停在「入口检查之后、registry
+    /// 插入之前」→ 主线程 `close()` 完成 → 放行 → 断言票据与计数。
+    ///
+    /// 判别：把计数条件改成「插入时再观察 closed」⇒ 停靠期内的 close 已翻转 ⇒
+    /// 计数变 1 ⇒ 红；`tests/async_notify.rs::register_after_close_counted_and_silent`
+    /// 那条顺序用例在该变异下仍绿（它走的是初始检查就观察 closed 的臂），故本
+    /// 探针不可省。
+    #[test]
+    fn subscribe_notify_linearizes_at_entry_closed_check() {
+        let store = Arc::new(SyncStore::new(TickFeature, NopRuntime));
+        let published = Arc::new(AtomicU64::new(0));
+        store.inner.notify_sub_gate.arm();
+        let racer = {
+            let store = Arc::clone(&store);
+            let published = Arc::clone(&published);
+            std::thread::spawn(move || store.subscribe_notify(RecordingSink(published)))
+        };
+        assert!(
+            store
+                .inner
+                .notify_sub_gate
+                .wait_entered(Duration::from_secs(5)),
+            "登记线程未停在「入口 closed 检查之后、registry 插入之前」"
+        );
+        // 停靠者的入口检查已观察到 open ⇒ 它的线性化点在本次 close 之前。
+        store.close();
+        store.inner.notify_sub_gate.release();
+        let ticket = racer.join().expect("登记线程不得 panic");
+
+        assert_eq!(
+            store.subscriptions_after_close(),
+            0,
+            "入口检查观察到 open 的登记合法排在并发 close 之前，不得计入闭门后"
+        );
+        assert_eq!(
+            store.inner.notify_subs.load(Ordering::SeqCst),
+            1,
+            "登记照常入表（闭门不等于拒登）"
+        );
+        store.dispatch(Tick::Tick); // 闭门后恒 no-op
+        assert_eq!(
+            published.load(Ordering::SeqCst),
+            0,
+            "闭门后零落位拍：重叠调用拿到的是惰性票据"
+        );
+        drop(ticket);
+        assert_eq!(
+            store.inner.notify_subs.load(Ordering::SeqCst),
+            0,
+            "票据 Drop 照常注销"
+        );
     }
 
     /// 两段闸（白盒编排用）：进入点 + 放行点（确定性握手，禁 sleep 竞速）。
@@ -4705,5 +5306,430 @@ mod tests {
         );
         assert_eq!(store.pending_actions(), 0, "闭门排空后主队列为空");
         assert_eq!(store.deferred_actions(), 0, "本次无停放记录");
+    }
+
+    // ── 因果工作量预算（issue#105/#144）：白盒探针 ──────────────────────────
+    // 产品面行为测试在 `tests/causal_budget.rs`；此处只放需要私有态的四条：
+    // 让出窗口内的接手、非等待型入口的让出闸、Emit 预留与入队的原子性、
+    // 同栈回灌分支的预留原子性。
+
+    /// 扇出夹具的动作词表：`Fan(n)` 产 n 个 `Leaf(i)`；`Run` 产一条 Run；
+    /// `Leaf` / `Ping` 零效果。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FanAct {
+        Fan(usize),
+        Leaf(usize),
+        Run,
+        Ping,
+    }
+
+    type FanLog = Arc<Mutex<Vec<(FanAct, std::thread::ThreadId)>>>;
+    type FanFrameLedger = Arc<Mutex<Option<Arc<Ledger>>>>;
+    type FanStore = Arc<SyncStore<u64, FanAct, ()>>;
+    type FanInner = Arc<StoreInner<u64, FanAct, ()>>;
+
+    /// reduce 序 + 执行线程（「谁在排空」的证据面）；并把当前排空帧的账本交出来
+    /// （帧栈只在排空线程的 TLS 上——观测线程经此拿到根账本）。
+    struct Fan {
+        log: FanLog,
+        frame_ledger: FanFrameLedger,
+    }
+
+    impl Reducer for Fan {
+        type State = u64;
+        type Action = FanAct;
+        type Op = ();
+
+        fn initial(&self) -> u64 {
+            0
+        }
+
+        fn reduce(&self, s: &u64, a: FanAct, out: &mut EffectBuf<FanAct, ()>) -> u64 {
+            self.log
+                .lock()
+                .unwrap()
+                .push((a, std::thread::current().id()));
+            *self.frame_ledger.lock().unwrap() = DRAIN_FRAMES
+                .with(|cell| cell.borrow().last().map(|frame| Arc::clone(&frame.ledger)));
+            if let FanAct::Fan(n) = a {
+                for i in 0..n {
+                    out.push(Effect::Emit(FanAct::Leaf(i)));
+                }
+            }
+            if matches!(a, FanAct::Run) {
+                out.push(Effect::Run {
+                    id: EffectId::new(1),
+                    op: (),
+                });
+            }
+            s + 1
+        }
+    }
+
+    /// 解释器：`back_feed` 里备好的动作在回调内**同栈回灌**（逐条记录 `dispatch`
+    /// 的返回值）。
+    #[derive(Default)]
+    struct FanFx {
+        back_feed: Arc<Mutex<Vec<FanAct>>>,
+        back_results: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl EffectRuntime<FanAct, ()> for FanFx {
+        fn run(&mut self, _: Effect<FanAct, ()>, back: &ActionSender<FanAct>) {
+            for act in std::mem::take(&mut *self.back_feed.lock().unwrap()) {
+                let accepted = back.dispatch(act);
+                self.back_results.lock().unwrap().push(accepted);
+            }
+        }
+    }
+
+    /// 装配扇出 store（per-drain 预算 = `drain_budget`），连同观测面一起交出。
+    fn fan_store(drain_budget: usize, fx: FanFx) -> (FanStore, FanLog, FanFrameLedger, FanInner) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let frame_ledger = Arc::new(Mutex::new(None));
+        let store = Arc::new(SyncStore::new(
+            Fan {
+                log: Arc::clone(&log),
+                frame_ledger: Arc::clone(&frame_ledger),
+            },
+            fx,
+        ));
+        store.set_drain_work_budget(drain_budget);
+        let inner = Arc::clone(&store.inner);
+        (store, log, frame_ledger, inner)
+    }
+
+    /// 有界轮询到 `ready` 成立（OS 时钟截止；超时即 panic 报红，不挂死）。
+    fn wait_until(what: &str, ready: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(std::time::Instant::now() < deadline, "5s 内未达成：{what}");
+            std::thread::yield_now();
+        }
+    }
+
+    /// reduce 序（去掉线程标注）。
+    fn acts(log: &MutexGuard<'_, Vec<(FanAct, std::thread::ThreadId)>>) -> Vec<FanAct> {
+        log.iter().map(|(act, _)| *act).collect()
+    }
+
+    /// 让出窗口内的接手（per-drain 预算 = 2）：排空线程 A 处理两条记录后在让出点
+    /// 停靠 ⇒ 租约空闲而主队列非空；此时并发的 `try_dispatch` 接手剩余队列，并在
+    /// **它自己的线程**上 reduce 后续记录。判别：不让出 / 让出不放旗 ⇒ 停靠不可达
+    /// （`wait_entered` 超时）或后续记录仍在 A 的线程上执行，皆红。
+    #[test]
+    fn yield_hands_lease_to_concurrent_producer() {
+        let (store, log, _frame_ledger, inner) = fan_store(2, FanFx::default());
+        inner.yield_gate.arm();
+        let a = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.dispatch(FanAct::Fan(6)))
+        };
+        assert!(
+            inner.yield_gate.wait_entered(Duration::from_secs(5)),
+            "排空线程未在让出点停靠"
+        );
+        {
+            let queue = lock(&inner.queue);
+            assert!(!inner.draining.load(Ordering::SeqCst), "让出窗口：租约已放");
+            assert_eq!(
+                queue.len(),
+                5,
+                "剩余 5 个子代仍在主队列（Fan、Leaf0 已处理）"
+            );
+        }
+        assert_eq!(store.drain_lease_yields(), 1, "到界让出一次");
+
+        let taker = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.try_dispatch(FanAct::Ping))
+        };
+        // 有界等待接手者推进：Fan、Leaf0（A）之后的两条必须已被 reduce。
+        wait_until("接手者 reduce 到 Leaf2", || {
+            log.lock().unwrap().len() >= 4
+        });
+        inner.yield_gate.release();
+        a.join().expect("排空线程不得 panic");
+        assert_eq!(
+            taker.join().expect("接手线程不得 panic"),
+            AdmissionOutcome::Accepted
+        );
+
+        let log = log.lock().unwrap();
+        let a_id = log[0].1;
+        assert_eq!(log[1].1, a_id, "前置：Fan、Leaf0 由同一线程 reduce");
+        assert_ne!(log[2].1, a_id, "让出后的记录由接手者（另一线程）reduce");
+        assert_eq!(log[3].1, log[2].1, "接手者连续处理到自己的让出点");
+        assert_eq!(
+            acts(&log),
+            vec![
+                FanAct::Fan(6),
+                FanAct::Leaf(0),
+                FanAct::Leaf(1),
+                FanAct::Leaf(2),
+                FanAct::Leaf(3),
+                FanAct::Leaf(4),
+                FanAct::Leaf(5),
+                FanAct::Ping,
+            ],
+            "FIFO 不变、无丢失、无重复"
+        );
+        drop(log);
+        assert_eq!(*store.snapshot(), 8);
+        assert_eq!(store.pending_actions(), 0);
+        assert_eq!(
+            store.drain_lease_yields(),
+            1,
+            "只有 A 到界让出；接手者是 try_dispatch 入口，自己的 action 完成前不让出"
+        );
+        assert!(!inner.draining.load(Ordering::SeqCst), "静止态排空旗已放");
+        assert_eq!(inner.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// 非等待型入口的让出闸（per-drain 预算 = 1）：`try_dispatch` 在让出窗口内
+    /// 接手后，自己的 action（排在剩余队列之后）尚未处理 ⇒ 途中的到界点**不放
+    /// 旗**，返回即其完成边界（契约层对静默态 sender / try_dispatch 的保证）。
+    /// 判别：去掉入口闸 ⇒ 接手者在自己的 action 之前再次停靠进（仍布防的）让出
+    /// 闸，5s 内不返回，红。
+    #[test]
+    fn non_waiting_entry_does_not_yield_before_its_own_completion() {
+        let (store, _log, _frame_ledger, inner) = fan_store(1, FanFx::default());
+        inner.yield_gate.arm();
+        let a = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.dispatch(FanAct::Fan(2)))
+        };
+        assert!(
+            inner.yield_gate.wait_entered(Duration::from_secs(5)),
+            "排空线程未在让出点停靠"
+        );
+        assert_eq!(store.drain_lease_yields(), 1);
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let taker = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let outcome = store.try_dispatch(FanAct::Ping);
+                let _ = done.send(());
+                outcome
+            })
+        };
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("接手者在自己的 action 完成前不得让出（让出闸仍布防 ⇒ 让出即停靠不返回）");
+        assert_eq!(
+            *store.snapshot(),
+            4,
+            "返回即完成边界：Fan、Leaf0、Leaf1、Ping 全部已 reduce"
+        );
+        assert_eq!(
+            store.drain_lease_yields(),
+            1,
+            "入口 action 完成前的到界点不计让出"
+        );
+        inner.yield_gate.release();
+        a.join().expect("排空线程不得 panic");
+        assert_eq!(
+            taker.join().expect("接手线程不得 panic"),
+            AdmissionOutcome::Accepted
+        );
+        assert_eq!(store.pending_actions(), 0);
+        assert!(!inner.draining.load(Ordering::SeqCst));
+        assert_eq!(inner.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// 预留原子性探针（issue#105 第 3 条）：`reserve_gate` 停靠在预留临界区**之前**
+    /// （尚未持 queue 锁）。(1) 停靠时不得已有预留；(2) 放行后观测者仍持 queue
+    /// 锁 ⇒ 排空线程被挡在临界区外，预留计数必须保持 0。判别：把预留挪到取
+    /// queue 锁之前 ⇒ (1) 或 (2) 读到非 0，红。
+    fn assert_reservation_needs_queue_lock(inner: &FanInner, frame_ledger: &FanFrameLedger) {
+        assert!(
+            inner.reserve_gate.wait_entered(Duration::from_secs(5)),
+            "排空线程未在预留临界区之前停靠"
+        );
+        let ledger = frame_ledger
+            .lock()
+            .unwrap()
+            .take()
+            .expect("根账本已在 reduce 期交出");
+        let hold = lock(&inner.queue);
+        assert_eq!(
+            ledger.work_counts(),
+            (0, 0),
+            "停靠点在预留之前：此刻不得有任何预留"
+        );
+        inner.reserve_gate.release();
+        // 放行后：正确实现下排空线程被本观测者的 queue 锁挡在临界区外。有界负向
+        // 观测窗（OS 时钟）：窗内任一时刻读到预留即「已预留但不可见」。
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            assert_eq!(
+                ledger.work_counts(),
+                (0, 0),
+                "预留发生在 queue 锁外（已预留但不可见）"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(hold);
+    }
+
+    /// Emit 回灌的预算预留与入队在同一 queue 临界区。
+    #[test]
+    fn emit_reservation_is_atomic_with_queue_insertion() {
+        let (store, log, frame_ledger, inner) = fan_store(0, FanFx::default());
+        inner.reserve_gate.arm();
+        let drainer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.dispatch(FanAct::Fan(3)))
+        };
+        assert_reservation_needs_queue_lock(&inner, &frame_ledger);
+        drainer.join().expect("排空线程不得 panic");
+        assert_eq!(
+            acts(&log.lock().unwrap()),
+            vec![
+                FanAct::Fan(3),
+                FanAct::Leaf(0),
+                FanAct::Leaf(1),
+                FanAct::Leaf(2)
+            ]
+        );
+        assert_eq!(
+            frame_ledger
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|ledger| ledger.work_counts()),
+            Some((3, 0)),
+            "三个子代全部获准预留并结算"
+        );
+        assert_eq!(store.causal_work_budget_exceeded(), 0);
+    }
+
+    /// 同栈回灌分支（`enqueue` 的因果后代路径）的预留原子性：解释器经 back 通道
+    /// 回灌的子动作同样「预留 + 入队」同临界区。判别同上。
+    #[test]
+    fn reentrant_reservation_is_atomic_with_queue_insertion() {
+        let fx = FanFx {
+            back_feed: Arc::new(Mutex::new(vec![FanAct::Leaf(0)])),
+            back_results: Arc::new(Mutex::new(Vec::new())),
+        };
+        let back_results = Arc::clone(&fx.back_results);
+        let (store, log, frame_ledger, inner) = fan_store(0, fx);
+        inner.reserve_gate.arm();
+        let drainer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.dispatch(FanAct::Run))
+        };
+        assert_reservation_needs_queue_lock(&inner, &frame_ledger);
+        drainer.join().expect("排空线程不得 panic");
+        assert_eq!(
+            acts(&log.lock().unwrap()),
+            vec![FanAct::Run, FanAct::Leaf(0)],
+            "回灌子代恰被 reduce 一次"
+        );
+        assert_eq!(*back_results.lock().unwrap(), vec![true]);
+        assert_eq!(
+            frame_ledger
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|ledger| ledger.work_counts()),
+            Some((1, 0))
+        );
+    }
+
+    // ── 序号 = 队列插入序（issue#158，方案 2）────────────────────────────
+
+    /// #158 确定性探针：回灌 `Effect::Emit` 的序号必须在 `queue` 临界区内分配
+    /// （紧邻后代记账与 push）⇒ 序号序 = 队列插入序（= 出队/执行序）。
+    ///
+    /// 编排（握手，无 sleep）：
+    /// 1. 排空线程 dispatch `Fan(1)` ⇒ reduce 产一条 `Emit(Leaf0)`，回灌路停在
+    ///    `reserve_gate`（**尚未持 queue 锁**）；
+    /// 2. 观测线程外部准入 `Ping`（在锁内取号）——排空租约仍在停靠线程手上，
+    ///    该记录只入队不执行；
+    /// 3. 放行 ⇒ 排空线程先 push 回灌子代，再 pop 并执行 `Ping`；执行完 `Ping`
+    ///    的通知段用订阅回调把排空线程停在**主队列里只剩回灌子代**的时刻，
+    ///    于是子代的 `seq` 可读。
+    ///
+    /// 判别：取号挪回取锁之前（旧形态）⇒ 子代拿到 1、`Ping` 拿到 2 ⇒ 队列序与
+    /// 序号序相反 ⇒ `(1, 2)` 断言红。
+    #[test]
+    fn feedback_seq_follows_queue_insertion_order() {
+        let (store, log, _frame_ledger, inner) = fan_store(0, FanFx::default());
+        let gate = PoolGate::new();
+        let notified = Arc::new(AtomicUsize::new(0));
+        let _ticket = {
+            let notified = Arc::clone(&notified);
+            let gate = Arc::clone(&gate);
+            store.subscribe(move |_| {
+                // 第 2 次通知 = `Ping` 执行完毕（回灌子代此时仍在主队列里）。
+                if notified.fetch_add(1, Ordering::SeqCst) == 1 {
+                    gate.mark_entered();
+                    gate.wait_release();
+                }
+            })
+        };
+        inner.reserve_gate.arm();
+        let drainer = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.dispatch(FanAct::Fan(1)))
+        };
+        assert!(
+            inner.reserve_gate.wait_entered(Duration::from_secs(5)),
+            "排空线程未在回灌路的预留停靠点（queue 锁之前）停靠"
+        );
+        assert_eq!(
+            store.try_dispatch(FanAct::Ping),
+            AdmissionOutcome::Accepted,
+            "排空租约在停靠线程手上：外部记录照常准入"
+        );
+        let external_seq = {
+            let queue = lock(&inner.queue);
+            assert_eq!(queue.len(), 1, "停靠点在锁前：回灌子代此刻不得已入队");
+            assert_eq!(queue[0].action, FanAct::Ping, "队列里必须是那条外部记录");
+            queue[0].seq
+        };
+        inner.reserve_gate.release();
+        // 有界等待（OS 时钟）：外部记录必须被执行完（第 2 次通知）——否则本条
+        // 报红而不是挂死；随后 `wait_entered` 必然立即返回（停靠线程无条件标记）。
+        wait_until(
+            "外部记录必须被执行完毕（订阅第 2 次通知）",
+            || notified.load(Ordering::SeqCst) >= 2,
+        );
+        gate.wait_entered();
+        let (queued_len, leaf_action, leaf_is_feedback, leaf_seq) = {
+            let queue = lock(&inner.queue);
+            let front = queue.front().expect("回灌子代必须在主队列里");
+            (
+                queue.len(),
+                front.action,
+                matches!(front.origin, ActionOrigin::Feedback(1)),
+                front.seq,
+            )
+        };
+        gate.open();
+        drainer.join().expect("排空线程不得 panic");
+
+        assert_eq!(queued_len, 1, "此时主队列里只剩回灌子代");
+        assert_eq!(leaf_action, FanAct::Leaf(0), "残留记录必须是回灌子代");
+        assert!(leaf_is_feedback, "回灌子代的来源标签必须是 Feedback(1)");
+        assert_eq!(
+            (external_seq, leaf_seq),
+            (1, 2),
+            "回灌取号必须在 queue 锁内、紧邻 push：子代序号紧接外部记录（旧形态下相反）"
+        );
+        assert_eq!(
+            inner.next_seq.load(Ordering::SeqCst),
+            3,
+            "根 + 外部 + 回灌子代 = 3 个序号：无空洞、无重复"
+        );
+        assert_eq!(
+            acts(&log.lock().unwrap()),
+            vec![FanAct::Fan(1), FanAct::Ping, FanAct::Leaf(0)],
+            "出队序 = 插入序 = 序号序（FIFO 行为未受改动影响）"
+        );
+        assert_eq!(store.pending_actions(), 0);
+        assert_eq!(store.causal_work_budget_exceeded(), 0);
     }
 }
