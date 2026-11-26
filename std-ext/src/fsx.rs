@@ -1011,15 +1011,24 @@ fn report_tempdir_cleanup_failure(path: &Path, err: &io::Error) {
     report_tempdir_cleanup_failure_to(&mut writer, path, err);
 }
 
+/// Drop 诊断的围栏：上报器自身 panic（自定义 `Write`/`Display` 实现失控）同样
+/// 不许逃出析构——既有 unwind 中逃出的 panic 会把 best-effort 清理变成 abort
+/// （#183）。`panic=abort` 档 `catch_unwind` 拦不住，属进程策略而非本围栏面。
+fn contain_drop_report(report: impl FnOnce()) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(report));
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
-        if let Err(err) = rm_all(&self.path) {
-            // Drop is strictly best-effort: no host tracing subscriber and no
-            // infallible stderr macro. Explicit close() remains error-reporting.
-            report_tempdir_cleanup_failure(&self.path, &err.err);
+        if let Err(failure) = rm_all(&self.path) {
+            // Drop is strictly best-effort: no host tracing subscriber, no
+            // infallible stderr macro, and no reporter panic may escape.
+            // Explicit close() remains the error-reporting path.
+            let (path, err) = (&self.path, &failure.err);
+            contain_drop_report(|| report_tempdir_cleanup_failure(path, err));
         }
     }
 }
@@ -1065,6 +1074,13 @@ mod tempdir_drop_reporting_tests {
             Some(&"primary application panic"),
             "diagnostic I/O failure must not trigger a second panic"
         );
+    }
+
+    /// #183：上报器本身 panic（issue 的 "test reporter that panics" 面）也必须被
+    /// 围栏收容——析构路径里逃出的 panic 会 abort（既有 unwind 时必 abort）。
+    #[test]
+    fn drop_report_panic_is_contained() {
+        contain_drop_report(|| panic!("injected reporter panic"));
     }
 }
 

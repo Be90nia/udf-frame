@@ -670,6 +670,49 @@ fn temp_dir_drop_removes_tree() {
     assert!(!path.exists());
 }
 
+/// #183：显式 close 仍是错误上报口——清理失败必须返回 Err（禁吞），底层 io
+/// 错误原样透传（变异：close 改成吞错 ⇒ 本用例红）。
+#[test]
+fn temp_dir_close_reports_cleanup_failure() {
+    let g = guard("tclosefail");
+    let t = temp_dir_in(g.path(), "victim-").unwrap();
+    fs::remove_dir_all(t.path()).unwrap(); // 目录先消失 ⇒ close 的 rm_all 必败
+
+    let err = t
+        .close()
+        .expect_err("close must surface the cleanup failure");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::NotFound,
+        "原错误透传: {err}"
+    );
+}
+
+/// #183：既有 unwind 中 drop 清理失败的 TempDir——best-effort 上报不得升级成
+/// 二次 panic（析构里的二次 panic 会 abort 整个测试进程），主 panic 必须还是
+/// 原来那条。用 catch_unwind 而非子进程：判据是 payload 身份，只有在同进程内
+/// 才断言得了。
+#[test]
+fn temp_dir_drop_cleanup_failure_during_unwind_does_not_abort() {
+    let g = guard("tunwind");
+    let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let t = temp_dir_in(g.path(), "victim-").unwrap();
+        fs::remove_dir_all(t.path()).unwrap(); // 让 Drop 的 rm_all 失败
+        assert!(
+            rm_all(t.path()).is_err(),
+            "premise: cleanup must fail inside Drop, otherwise this case proves nothing"
+        );
+        panic!("primary application panic");
+    }));
+
+    let payload = primary.expect_err("the primary panic must propagate");
+    assert_eq!(
+        payload.downcast_ref::<&'static str>(),
+        Some(&"primary application panic"),
+        "drop-time cleanup reporting must not replace the primary panic"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn temp_dir_drop_failure_records_and_leaves() {
