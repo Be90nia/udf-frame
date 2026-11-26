@@ -1109,6 +1109,9 @@ impl FxScope {
 
     /// 入集：把已预留的槽位与任务装进生命周期集（`set` 锁已持；`rt` = 准入前预检
     /// 取得的显式 Handle，不读隐式当前位置）。
+    // 本函数是 fx 的入集闸本身（预留/记账/生命周期集都在这里收口）：
+    // `JoinSet::spawn_on` 仅此处合法；新调用点请走 spawn_tracked/try_spawn_tracked。
+    #[allow(clippy::disallowed_methods)]
     fn spawn_reserved<T>(
         &self,
         set: &mut JoinSet<Result<(), TaskError>>,
@@ -1155,6 +1158,9 @@ impl FxScope {
     /// **runtime 上下文前置条件**（issue#92）：没有当前 Tokio runtime 时返回
     /// [`AdmissionError::NoRuntime`]（与 tracked 侧同口：判定在任何内部锁与
     /// accepting 闸核验之前；宿主 Future 随返回析构一次，不入集）。脱管语义不变。
+    // 本函数是 fx 唯一的脱管 spawn 闸（闸核验/账号语义都在这里收口）：
+    // `Handle::spawn` 仅此处合法；新调用点请走本函数。
+    #[allow(clippy::disallowed_methods)]
     pub fn spawn_detached<T>(
         &self,
         fut: impl Future<Output = T> + Send + 'static,
@@ -2308,6 +2314,10 @@ mod tests {
             spawners.push(handle);
         }
         while spawners.iter().any(|handle| !handle.is_finished()) {
+            // 观测口径（bd udf-frame-6w5）：`completed_unreaped` 与准入轴在同一把
+            // `caps` 锁内记账（`report_terminal` +1；`try_reap` 与 `tracked` 同减）⇒
+            // `completed_unreaped <= tracked <= max_tracked` 是锁内不变量，不是跨锁
+            // 采样，故这条断言不需要放宽容差。
             let unreaped = scope.counts().completed_unreaped;
             assert!(
                 unreaped <= MAX_TRACKED,

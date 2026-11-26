@@ -129,6 +129,7 @@ fn concurrent_churn_never_breaches_total_and_settles_to_zero() {
     let stop = Arc::new(AtomicBool::new(false));
     let breaches = Arc::new(AtomicUsize::new(0));
     let samples = Arc::new(AtomicUsize::new(0));
+    let sampling = Arc::new(AtomicBool::new(false));
 
     thread::scope(|scope| {
         let sampler = {
@@ -136,15 +137,29 @@ fn concurrent_churn_never_breaches_total_and_settles_to_zero() {
             let stop = Arc::clone(&stop);
             let breaches = Arc::clone(&breaches);
             let samples = Arc::clone(&samples);
+            let sampling = Arc::clone(&sampling);
             scope.spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
+                loop {
+                    // 采样先于停止判据：do-while 保证至少一拍——churn 可能在采样
+                    // 线程被调度前就跑完（CI 负载下 `samples == 0` 的偶红即此窗口）。
                     if budget.held() > TOTAL {
                         breaches.fetch_add(1, Ordering::Relaxed);
                     }
                     samples.fetch_add(1, Ordering::Relaxed);
+                    sampling.store(true, Ordering::Release);
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
             })
         };
+
+        // 握手（禁 sleep 猜时长）：采样线程真的转过一圈，churn 才起跑。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sampling.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "采样线程未在 10s 内起跑");
+            thread::yield_now();
+        }
 
         let churn: Vec<_> = (0..CHURN_THREADS)
             .map(|worker| {
