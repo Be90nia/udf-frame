@@ -31,7 +31,7 @@
 //! | （常驻，零 feature） | `ratelimit`：令牌桶限流（突发预算 + 恒速回填；满桶启动；MockClock 确定性令牌时间线 + Sleeper 锁外睡到再查，零自旋） |
 //! | （常驻，零 feature） | `cache`：LRU+TTL 缓存（O(1) get/insert 索引 arena 双向链零 unsafe；get=touch/peek 不 touch；TtlCache 逐条 expire-after-write + 惰性过期 fail-visible 计数；单线程 `&mut` 面 + `SyncLruCache`/`SyncTtlCache` 并发薄包装（`&self`+内部 Mutex，语义一致）） |
 //! | （常驻，零 feature） | `id`：UUIDv7 确定性变体时间有序 id（RFC 9562 §5.7 布局；指纹+挂钟毫秒→同指纹严格递增/跨毫秒时间序/回拨停走；同毫秒 4096 配额耗尽 fail-closed；指纹派生推荐 `crate::hash::stable64`）；凭据级 `RandomId`（UUIDv4，OS CSPRNG 直通 fail-closed 禁弱熵回退）在 `random` 门后 |
-//! | `log-embed` | 行为域 tracing 埋点（七域 47 调用点：fsx 6/iter 2/scheduler 14/ratelimit 4/retry 12/cache 9；口径=`embed_event!` 宏调用点，排除宏定义/文档注释/`#[cfg(test)]` 之后内容；默认关=宏消除零依赖零开销；target 沿用 `skeleton::<domain>[::<phase>]` 稳定观测契约） |
+//! | `log-embed` | 行为域 tracing 埋点（七域 49 调用点：fsx 6/iter 2/scheduler 14/ratelimit 4/retry 12/cache 11；口径=`embed_event!` 宏调用点，排除宏定义/文档注释/`#[cfg(test)]` 之后内容；默认关=宏消除零依赖零开销；target 沿用 `skeleton::<domain>[::<phase>]` 稳定观测契约） |
 //!
 //! ## cache 域锁边界契约（共享面 = 用户代码**仍在锁内**）
 //!
@@ -178,9 +178,11 @@ mod embedded_event_panic_tests {
         tracing::subscriber::with_default(PanicSubscriber, || {
             embed_event!(debug, target: "skeleton::telemetry_test", marker = 1);
         });
-        assert_eq!(
-            embedded_event_panic_count(),
-            before.saturating_add(1),
+        // 基线增量而非「恰好 +1」：计数是 crate 级全局，同二进制另一条
+        // panic-subscriber 测试并发跑时会多计（bd udf-frame-ep5）⇒ 只钉可判定的
+        // 方向：panic 被观测到且不穿出发射调用。
+        assert!(
+            embedded_event_panic_count() > before,
             "subscriber panic is counted without escaping the emitting call"
         );
     }

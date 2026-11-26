@@ -2,12 +2,18 @@
 //!
 //! log-embed 埋点（级别规范：正常流转=debug / 显式清扫=info；target
 //! `skeleton::cache[::phase]`，字段化纪律见 lib.rs `embed_event!` 注）：
-//! evict=TTL 惰性单条 debug（kind/key 指纹/过期累计）、满插清扫 debug
-//!（kind/key 指纹/僵尸数，真回收才发）、容量淘汰 debug（kind/被逐者指纹/
-//! LRU 序/残留）；purge=显式清扫 info（回收数/残留）。**键身份以
-//! `DefaultHasher`（定长种子）指纹承载**——`K` 无 Debug/Display bound，加
-//! bound=公共 API 破坏性变更（未经拍板不做）；指纹供进程内/同构建日志关联，
-//! 跨 Rust 版本不承诺稳定。
+//! evict=TTL 惰性单条 debug（kind/过期累计）、满插清扫 debug（kind/僵尸数，
+//! 真回收才发）、容量淘汰 debug（kind/LRU 序/残留）；purge=显式清扫 info
+//!（回收数/残留）。
+//!
+//! **发点在缓存锁之外、且在被退休值析构之后**（issue#203）：锁内只收集紧凑
+//! 事实（事件种类、计数、决策布尔），解锁 → 析构退休批 → 才调订阅者。故订阅者
+//! 可重入本缓存（不自锁）、可 panic（`embed_event!` 的 panic 边界吸收：不投毒、
+//! 不打断已提交的操作）、可阻塞（不再挡住全体缓存用户）。**事件不带键指纹**：
+//! `K::Hash` 是采用方代码，诊断不得为一次已提交的变更多跑一次用户 Hash
+//!（Round 3 拍板，#221 §4）；`K` 亦无 Debug/Display bound——加 bound = 公共 API
+//! 破坏性变更。单线程面（[`LruCache`]/[`TtlCache`]）同理：事件在整次插入收尾
+//! 之后才发。
 //!
 //! 常驻零依赖件：纯 std，无 feature 门。与 `memgov` 的分工：memgov=
 //! 有界容器族（BTreeMap 序淘汰，`K: Ord`，首键退化语义）；本模块=精确 LRU+
@@ -159,16 +165,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use skeleton::clock::Clock;
-
-/// 键指纹（log-embed 事件字段）：`DefaultHasher::new` 定长种子=进程内确定，
-/// 日志关联用（跨 Rust 版本不承诺稳定，仅身份对账非持久标识）。
-#[cfg(feature = "log-embed")]
-fn key_fingerprint<K: Hash + ?Sized>(k: &K) -> u64 {
-    use std::hash::Hasher;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    k.hash(&mut h);
-    h.finish()
-}
 
 /// 链尾哨兵：`u32::MAX` 不可能成为槽号（构造期 `cap <= u32::MAX - 1` 断言）。
 const NONE: u32 = u32::MAX;
@@ -409,17 +405,8 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
         let mut evicted = false;
         let mut retired = Retired::empty();
         if self.map.len() >= self.cap {
-            // 埋点「容量淘汰」：被逐者恒 LRU 尾（order 字段=选择策略留痕）。
             retired = self.evict_tail();
             evicted = true;
-            embed_event!(
-                debug,
-                target: "skeleton::cache::evict",
-                kind = "capacity",
-                key_hash = retired.slot_key.as_ref().map(|k| key_fingerprint(k)),
-                order = "lru_tail",
-                len_at_evict = self.map.len() as u64
-            );
         }
         let idx = match self.free.pop() {
             Some(i) => i,
@@ -625,8 +612,17 @@ impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
     /// 插入/覆盖。已存在键=更新值+touch（len 不变，不触发淘汰）；
     /// 新键满=先逐 LRU 尾再插（被逐者静默丢弃，需要看见用 [`Self::pop_lru`]）。
     pub fn insert(&mut self, k: K, v: V) {
-        let (_, retired) = self.core.insert(k, v);
+        let (evicted, retired) = self.core.insert(k, v);
         retired.retire();
+        if evicted {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "capacity",
+                order = "lru_tail",
+                len_at_evict = self.core.len().saturating_sub(1) as u64
+            );
+        }
     }
 
     /// 读（**touch**：命中刷新 recency，故需 `&mut self`）。只读共享场景用
@@ -769,40 +765,43 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
         let expires = now.checked_add(ttl).expect(
             "TtlCache::insert: now + ttl 溢出 Instant 表示范围（fail-closed，clock armor 同款）",
         );
+        let mut purged = 0usize;
+        let mut evicted = false;
         if self.core.idx_of(&k).is_none() && self.core.len() >= self.core.capacity() {
             // 双界拍板：先过期先淘汰（单次 now 快照判定，确定性），仍满再逐 LRU 尾。
             let now = self.clock.now_instant();
-            let (purged, purge_retired) = self.core.retain(|_, e| e.expires > now);
+            let (count, purge_retired) = self.core.retain(|_, e| e.expires > now);
+            purged = count;
             self.expired += purged as u64;
-            // 埋点「TTL 过期驱逐（满插清扫）」：真回收才发（僵尸数+触发键指纹；
-            // 零僵尸路径由容量淘汰事件承载）。
-            #[cfg(feature = "log-embed")]
-            if purged > 0 {
-                embed_event!(
-                    debug,
-                    target: "skeleton::cache::evict",
-                    kind = "ttl_sweep",
-                    key_hash = key_fingerprint(&k),
-                    zombies = purged as u64
-                );
-            }
             if self.core.len() >= self.core.capacity() {
-                // 埋点「容量淘汰」（TtlCache 站点）：被逐者恒 LRU 尾。
+                // 被逐者恒 LRU 尾；退休批先析构，事件在整次插入收尾后才发。
                 let retired = self.core.evict_tail();
-                embed_event!(
-                    debug,
-                    target: "skeleton::cache::evict",
-                    kind = "capacity",
-                    key_hash = retired.slot_key.as_ref().map(|k| key_fingerprint(k)),
-                    order = "lru_tail",
-                    len_at_evict = self.core.len() as u64
-                );
+                evicted = true;
                 retired.retire();
             }
             drop(purge_retired);
         }
         let (_, retired) = self.core.insert(k, TtlEntry { expires, value: v });
         retired.retire();
+        // 埋点在**收尾提交之后**（issue#203）：诊断 panic/阻塞不得切断一次插入的
+        // 中间提交（旧值已逐、新值未插）。零僵尸路径由容量淘汰事件承载。
+        if purged > 0 {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "ttl_sweep",
+                zombies = purged as u64
+            );
+        }
+        if evicted {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "capacity",
+                order = "lru_tail",
+                len_at_evict = self.core.len().saturating_sub(1) as u64
+            );
+        }
     }
 
     /// 读（touch + 惰性过期）。过期触碰即回收并计入 [`Self::expired`]。
@@ -913,12 +912,12 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
             retired.value = value;
             retired.retire();
             self.expired += 1;
-            // 埋点「TTL 过期驱逐（惰性单条）」：触碰即回收留痕（键指纹+累计）。
+            // 埋点「TTL 过期驱逐（惰性单条）」：退休析构与计数已在上面完成，事件
+            // 不改写任何缓存状态；指纹省略（状态变更后不再跑用户 `K::hash`）。
             embed_event!(
                 debug,
                 target: "skeleton::cache::evict",
                 kind = "ttl",
-                key_hash = key_fingerprint(k),
                 expired_total = self.expired
             );
         }
@@ -961,6 +960,9 @@ impl<K: Eq + Hash + Clone, V> TtlCache<K, V> {
 /// - **与 #71 的精确对照**（两句并列，勿互相误读）：#71 移出锁的是**退休值的
 ///   析构**；读侧 **`Clone` 仍在锁内**。#71/#80 **都没有**让 `Hash`/`Eq` 或
 ///   读侧 `Clone` 变成无锁执行。
+/// - **遥测不在锁内**（issue#203）：淘汰/过期/purge 事件在**解锁且退休批已
+///   析构之后**才发（锁内只收集计数与决策布尔）⇒ 订阅者可重入、可 panic、可
+///   阻塞，均不牵连缓存不变量，也不为诊断多跑一次用户 `K::Hash`。
 /// - **既有 API 属性未被改动**：[`Self::remove`]/[`Self::pop_lru`] 仍**移动出
 ///   owned `V`**、**不需要 `V: Clone`**；只有返回 owned 值的 `get`/`peek`
 ///   要求 `V: Clone`。
@@ -1047,6 +1049,15 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
         retired.retire();
         if evicted {
             self.evictions.fetch_add(1, Ordering::Relaxed);
+            // No key fingerprint here: invoking user Hash for diagnostics would
+            // add another arbitrary callback after the state transition.
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "capacity",
+                order = "lru_tail",
+                len_at_evict = self.capacity().saturating_sub(1) as u64
+            );
         }
     }
 
@@ -1189,6 +1200,9 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
 /// - **与 #71 的精确对照**（两句并列，勿互相误读）：#71 移出锁的是**退休值的
 ///   析构**；读侧 **`Clone` 仍在锁内**。#71/#80 **都没有**让 `Hash`/`Eq` 或
 ///   读侧 `Clone` 变成无锁执行。
+/// - **遥测不在锁内**（issue#203）：淘汰/过期/purge 事件在**解锁且退休批已
+///   析构之后**才发（锁内只收集计数与决策布尔）⇒ 订阅者可重入、可 panic、可
+///   阻塞，均不牵连缓存不变量，也不为诊断多跑一次用户 `K::Hash`。
 /// - **既有 API 属性未被改动**：[`Self::remove`]/[`Self::pop_lru`] 仍**移动出
 ///   owned `V`**、**不需要 `V: Clone`**；只有返回 owned 值的 `get`/`peek`
 ///   要求 `V: Clone`。
@@ -1305,49 +1319,52 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         let purge_now = self.clock.now_instant();
         // 阶段 2：重取锁 + 重查（**第二次锁定检查 = 线性化点**；重查**早于**
         // 过期清扫/淘汰 ⇒ panic 的 clone 不会造成部分清扫/变更）。
-        let (purge_retired, evict_retired, insert_retired) = {
+        let (purge_retired, evict_retired, insert_retired, purged, evicted) = {
             let mut g = self.lock_core();
             let mut purge_retired = Vec::new();
             let mut evict_retired = Retired::empty();
+            let mut purged = 0usize;
+            let mut evicted = false;
             if g.idx_of(&k).is_none() && g.len() >= g.capacity() {
                 // 双界拍板：先过期先淘汰（单次锁外 now 快照判定，确定性），仍满再逐 LRU 尾。
-                let (purged, retired) = g.retain(|_, e| e.expires > purge_now);
+                let (count, retired) = g.retain(|_, e| e.expires > purge_now);
+                purged = count;
                 purge_retired = retired;
                 self.expired.fetch_add(purged as u64, Ordering::Relaxed);
-                // 埋点「TTL 过期驱逐（满插清扫）」：真回收才发（僵尸数+触发键指纹）。
-                #[cfg(feature = "log-embed")]
-                if purged > 0 {
-                    embed_event!(
-                        debug,
-                        target: "skeleton::cache::evict",
-                        kind = "ttl_sweep",
-                        key_hash = key_fingerprint(&k),
-                        zombies = purged as u64
-                    );
-                }
                 if g.len() >= g.capacity() {
-                    // 埋点「容量淘汰」（TtlCache 站点）：被逐者恒 LRU 尾。
-                    let retired = g.evict_tail();
-                    evict_retired = retired;
+                    // 容量淘汰只记录决策；subscriber 在解锁与退休析构后调用。
+                    evict_retired = g.evict_tail();
+                    evicted = true;
                     self.evictions.fetch_add(1, Ordering::Relaxed);
-                    embed_event!(
-                        debug,
-                        target: "skeleton::cache::evict",
-                        kind = "capacity",
-                        key_hash = evict_retired.slot_key.as_ref().map(|k| key_fingerprint(k)),
-                        order = "lru_tail",
-                        len_at_evict = g.len() as u64
-                    );
                 }
             }
             // 锁内不调 `K::clone`（备好的键副本直接用）；竞态落败（键已被他人
             // 插入）⇒ 走普通覆盖路径，未被采用的候选键**解锁后**才析构。
             let (_, retired) = g.insert_with_map_key(k, map_key, entry);
-            (purge_retired, evict_retired, retired)
+            (purge_retired, evict_retired, retired, purged, evicted)
         };
         drop(purge_retired);
         evict_retired.retire();
         insert_retired.retire();
+        if purged > 0 {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "ttl_sweep",
+                zombies = purged as u64
+            );
+        }
+        if evicted {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "capacity",
+                order = "lru_tail",
+                // 淘汰发生在「恰满」时 ⇒ 驱逐后残留 = cap - 1；不在锁内留一个
+                // 只喂事件字段的局部变量（feature 关时它没有读者）。
+                len_at_evict = self.capacity().saturating_sub(1) as u64
+            );
+        }
     }
 
     /// 读（touch + 惰性过期 + 命中计数）。过期条目按 miss（不计命中）。
@@ -1368,20 +1385,28 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         Q: Hash + Eq + ?Sized,
     {
         let now = self.clock.now_instant();
-        let (hit, retired) = {
+        let (hit, retired, due) = {
             let mut g = self.lock_core();
             let (due, retired) = Self::expire_if_due(&mut g, &self.expired, k, now);
             if due {
-                (None, retired)
+                (None, retired, true)
             } else {
                 let hit = g.get_mut(k).map(|e| e.value.clone());
                 if hit.is_some() {
                     self.hits.fetch_add(1, Ordering::Relaxed);
                 }
-                (hit, retired)
+                (hit, retired, false)
             }
         };
         retired.retire();
+        if due {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "ttl",
+                expired_total = self.expired.load(Ordering::Relaxed)
+            );
+        }
         hit
     }
 
@@ -1398,16 +1423,24 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         V: Clone,
     {
         let now = self.clock.now_instant();
-        let (hit, retired) = {
+        let (hit, retired, due) = {
             let mut g = self.lock_core();
             let (due, retired) = Self::expire_if_due(&mut g, &self.expired, k, now);
             if due {
-                (None, retired)
+                (None, retired, true)
             } else {
-                (g.peek(k).map(|e| e.value.clone()), retired)
+                (g.peek(k).map(|e| e.value.clone()), retired, false)
             }
         };
         retired.retire();
+        if due {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "ttl",
+                expired_total = self.expired.load(Ordering::Relaxed)
+            );
+        }
         hit
     }
 
@@ -1454,16 +1487,17 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
             let mut g = self.lock_core();
             let (n, retired) = g.retain(|_, e| e.expires > now);
             self.expired.fetch_add(n as u64, Ordering::Relaxed);
-            // 埋点「purge」：显式清扫动作 info（回收数/残留）。
-            embed_event!(
-                info,
-                target: "skeleton::cache::purge",
-                purged = n as u64,
-                len_after = g.len() as u64
-            );
             (n, retired)
         };
         drop(retired);
+        // 埋点「purge」：退休析构之后、锁外才发；`len_after` 取发送时刻的快照
+        // （显式清扫是冷路径，不为一个诊断字段在锁内多留状态）。
+        embed_event!(
+            info,
+            target: "skeleton::cache::purge",
+            purged = n as u64,
+            len_after = self.len() as u64
+        );
         n
     }
 
@@ -1525,15 +1559,7 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
             // 值（含用户 V）一并进退休批 ⇒ 解锁后才析构（issue#71）。
             retired.value = value;
             expired.fetch_add(1, Ordering::Relaxed);
-            // 埋点「TTL 过期驱逐（惰性单条）」：触碰即回收留痕（键指纹+累计）。
-            #[cfg(feature = "log-embed")]
-            embed_event!(
-                debug,
-                target: "skeleton::cache::evict",
-                kind = "ttl",
-                key_hash = key_fingerprint(k),
-                expired_total = expired.load(Ordering::Relaxed)
-            );
+
             return (true, retired);
         }
         (false, Retired::empty())
@@ -1550,6 +1576,10 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
 /// （`Hash`/`Eq`/`Clone`）内升级 Weak 并对**同一个内部 mutex** 调 `try_lock` ⇒
 /// 期望 `Err(TryLockError::WouldBlock)`（同线程重入，非重入锁立即失败，不阻塞
 /// ⇒ 不会挂死测试进程）。`Poisoned`/`Ok` 都不算「锁被持有」的证据。
+///
+/// 末段是本组的**反面**用例（issue#203）：遥测事件必须在解锁、退休析构之后才发
+/// ⇒ 订阅者里的同一 `try_lock` 必须恒 `Ok`（违规计数 0），另附退休析构序、
+/// 重入、panic 边界三条。
 #[cfg(test)]
 mod lock_boundary_probe {
     use super::{Hash, LruCache, SyncLruCache, SyncTtlCache, TtlCache};
@@ -1888,6 +1918,288 @@ mod lock_boundary_probe {
         let mut ttl: TtlCache<HashProbeKey, u32> = TtlCache::new(clock, 8);
         ttl.insert(HashProbeKey(1), 1, std::time::Duration::from_secs(60));
         assert_eq!(ttl.get(&HashProbeKey(1)), Some(&1));
+    }
+
+    #[cfg(feature = "log-embed")]
+    struct CallbackSubscriber(Box<dyn Fn() + Send + Sync>);
+
+    #[cfg(feature = "log-embed")]
+    impl tracing::Subscriber for CallbackSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {
+            (self.0)();
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn sync_lru_eviction_subscriber_runs_after_core_unlock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::subscriber::with_default;
+
+        let cache = Arc::new(SyncLruCache::new(1));
+        cache.insert("a".to_owned(), 1);
+        let violations = Arc::new(AtomicUsize::new(0));
+        let observed_cache = Arc::clone(&cache);
+        let observed_violations = Arc::clone(&violations);
+        let subscriber = CallbackSubscriber(Box::new(move || {
+            match observed_cache.core.try_lock() {
+                Ok(guard) => drop(guard),
+                Err(TryLockError::WouldBlock) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            }
+            let _ = observed_cache.len();
+        }));
+
+        with_default(subscriber, || cache.insert("b".to_owned(), 2));
+        assert_eq!(
+            violations.load(Ordering::SeqCst),
+            0,
+            "host subscriber must run after SyncLruCache releases its mutex"
+        );
+    }
+
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn shared_cache_remains_usable_after_subscriber_panic() {
+        use skeleton::clock::MockClock;
+        use std::time::Duration;
+        use tracing::subscriber::with_default;
+
+        let panics_before = crate::embedded_event_panic_count();
+        let lru = SyncLruCache::new(1);
+        lru.insert("a".to_owned(), 1);
+        with_default(
+            CallbackSubscriber(Box::new(|| panic!("injected cache subscriber panic"))),
+            || lru.insert("b".to_owned(), 2),
+        );
+        assert_eq!(
+            lru.get(&"b".to_owned()),
+            Some(2),
+            "LRU mutation survives telemetry panic"
+        );
+
+        let clock = Arc::new(MockClock::new());
+        let ttl = SyncTtlCache::new(clock.clone(), 1);
+        ttl.insert("a".to_owned(), 1, Duration::from_secs(1));
+        with_default(
+            CallbackSubscriber(Box::new(|| panic!("injected cache subscriber panic"))),
+            || ttl.insert("b".to_owned(), 2, Duration::from_secs(1)),
+        );
+        assert_eq!(
+            ttl.get(&"b".to_owned()),
+            Some(2),
+            "TTL cache remains usable"
+        );
+        assert!(
+            crate::embedded_event_panic_count() > panics_before,
+            "订阅者 panic 必须真被引发并被 panic 边界接住（否则本条是空断言）"
+        );
+    }
+
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn sync_ttl_events_run_after_core_unlock() {
+        use skeleton::clock::MockClock;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tracing::subscriber::with_default;
+
+        let clock = Arc::new(MockClock::new());
+        let cache = Arc::new(SyncTtlCache::new(clock.clone(), 1));
+        let violations = Arc::new(AtomicUsize::new(0));
+        let observed_cache = Arc::clone(&cache);
+        let observed_violations = Arc::clone(&violations);
+        let subscriber = CallbackSubscriber(Box::new(move || {
+            match observed_cache.core.try_lock() {
+                Ok(guard) => drop(guard),
+                Err(TryLockError::WouldBlock) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            }
+            let _ = observed_cache.len();
+        }));
+
+        with_default(subscriber, || {
+            cache.insert("a".to_owned(), 1, Duration::from_secs(1));
+            clock.advance(Duration::from_secs(1));
+            assert_eq!(cache.get(&"a".to_owned()), None); // lazy TTL event
+
+            cache.insert("b".to_owned(), 2, Duration::from_secs(1));
+            clock.advance(Duration::from_secs(1));
+            cache.insert("c".to_owned(), 3, Duration::from_secs(1)); // TTL sweep event
+            cache.insert("d".to_owned(), 4, Duration::from_secs(1)); // capacity event
+            clock.advance(Duration::from_secs(1));
+            assert_eq!(cache.purge_expired(), 1); // explicit purge event
+
+            cache.insert("e".to_owned(), 5, Duration::from_secs(1));
+            clock.advance(Duration::from_secs(1));
+            assert_eq!(cache.peek(&"e".to_owned()), None); // lazy TTL event (peek site)
+        });
+
+        assert_eq!(
+            violations.load(Ordering::SeqCst),
+            0,
+            "all SyncTtlCache subscribers must run after the core mutex is released"
+        );
+    }
+
+    /// 被逐值的析构必须早于事件（issue#203：解锁 → 退休析构 → 再发）。
+    /// 变异=把 emit 提到 `retired.retire()` 之前 ⇒ 订阅者读到标志仍为 false ⇒ 红。
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn sync_lru_eviction_telemetry_runs_after_retired_value_drop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tracing::subscriber::with_default;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cache = SyncLruCache::new(1);
+        cache.insert("a".to_owned(), DropFlag(Arc::clone(&dropped)));
+        let saw_drop_first = Arc::new(AtomicBool::new(false));
+        let observed_dropped = Arc::clone(&dropped);
+        let observed_flag = Arc::clone(&saw_drop_first);
+        with_default(
+            CallbackSubscriber(Box::new(move || {
+                observed_flag.store(observed_dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+            })),
+            || cache.insert("b".to_owned(), DropFlag(Arc::new(AtomicBool::new(false)))),
+        );
+        assert!(
+            saw_drop_first.load(Ordering::SeqCst),
+            "容量淘汰事件必须在被逐值析构之后发出（先退休、后发）"
+        );
+    }
+
+    /// 重入订阅者：回调里再 `insert`（覆盖路径 ⇒ 不产生新事件、无递归）+ `get`
+    /// 同一缓存。发点在锁内 ⇒ 非重入 mutex 自锁死 ⇒ 卡到 OS 时钟截止才红。
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn reentrant_subscriber_can_use_same_cache() {
+        use std::sync::mpsc;
+        use std::time::Duration as StdDuration;
+        use tracing::subscriber::with_default;
+
+        let (done, wait) = mpsc::channel();
+        std::thread::spawn(move || {
+            let cache = Arc::new(SyncLruCache::new(1));
+            cache.insert("a".to_owned(), 1);
+            let observed = Arc::clone(&cache);
+            let subscriber = CallbackSubscriber(Box::new(move || {
+                observed.insert("b".to_owned(), 9); // 覆盖已提交的键：零事件
+                let _ = observed.get(&"b".to_owned());
+            }));
+            with_default(subscriber, || cache.insert("b".to_owned(), 2));
+            assert_eq!(
+                cache.get(&"b".to_owned()),
+                Some(9),
+                "回调里的覆盖插入必须生效"
+            );
+            let _ = done.send(());
+        });
+        wait.recv_timeout(StdDuration::from_secs(10))
+            .expect("订阅者在缓存锁内重入同一缓存 ⇒ 自锁死（issue#203 回归）");
+    }
+
+    /// 单线程面：panic 订阅者不得让一次插入停在半途（新键已提交、旧键已逐）。
+    /// 本条锁的是「订阅者 panic 已被 `embed_event!` 的 panic 边界吸收」这一行为
+    /// 契约（`lib.rs::emit_embedded_event`）——**不是**发点位置的变异探针：
+    /// 边界在，事件即使退回到插入中途也不会被打断（实测该变异下本条仍绿）。
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn single_threaded_ttl_insert_survives_telemetry_panic() {
+        use skeleton::clock::MockClock;
+        use std::time::Duration;
+        use tracing::subscriber::with_default;
+
+        let clock = Arc::new(MockClock::new());
+        let mut cache: TtlCache<String, u32> = TtlCache::new(clock, 1);
+        cache.insert("a".to_owned(), 1, Duration::from_secs(60));
+        with_default(
+            CallbackSubscriber(Box::new(|| panic!("injected cache subscriber panic"))),
+            || cache.insert("b".to_owned(), 2, Duration::from_secs(60)),
+        );
+        assert_eq!(cache.get(&"b".to_owned()), Some(&2), "新键必须已提交");
+        assert_eq!(cache.get(&"a".to_owned()), None, "满插已逐旧键");
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// 单线程 `TtlCache` 的「先退休、后发」：被逐值的析构必须早于容量事件。
+    /// 变异=把 emit 提到 `retired.retire()` 之前 ⇒ 订阅者读到标志仍为 false ⇒ 红。
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn single_threaded_ttl_capacity_telemetry_runs_after_retired_value_drop() {
+        use skeleton::clock::MockClock;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        use tracing::subscriber::with_default;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(MockClock::new());
+        let mut cache: TtlCache<String, DropFlag> = TtlCache::new(clock, 1);
+        cache.insert(
+            "a".to_owned(),
+            DropFlag(Arc::clone(&dropped)),
+            Duration::from_secs(60),
+        );
+        let saw_drop_first = Arc::new(AtomicBool::new(false));
+        let observed_dropped = Arc::clone(&dropped);
+        let observed_flag = Arc::clone(&saw_drop_first);
+        with_default(
+            CallbackSubscriber(Box::new(move || {
+                observed_flag.store(observed_dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+            })),
+            || {
+                cache.insert(
+                    "b".to_owned(),
+                    DropFlag(Arc::new(AtomicBool::new(false))),
+                    Duration::from_secs(60),
+                );
+            },
+        );
+        assert!(
+            saw_drop_first.load(Ordering::SeqCst),
+            "容量淘汰事件必须在被逐值析构之后发出（先退休、后发）"
+        );
     }
 }
 

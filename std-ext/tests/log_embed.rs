@@ -1007,7 +1007,8 @@ fn retry_stop_verdicts_are_info() {
 }
 
 // ---- cache 域（target skeleton::cache[::phase]；流转=debug / 显式清扫=info；
-// 键身份=指纹字段，无明文键断言；批 5-2 自 skeleton-infra 迁入）----
+// 事件不带键身份字段（issue#203：遥测不得为已提交变更再跑用户 Hash）；
+// 批 5-2 自 skeleton-infra 迁入）----
 
 #[test]
 fn cache_lru_capacity_evict_is_debug_with_lru_tail() {
@@ -1022,12 +1023,7 @@ fn cache_lru_capacity_evict_is_debug_with_lru_tail() {
     cap.assert_event(
         "skeleton::cache::evict",
         Level::DEBUG,
-        &[
-            "kind=capacity",
-            "order=lru_tail",
-            "len_at_evict=1",
-            "key_hash=",
-        ],
+        &["kind=capacity", "order=lru_tail", "len_at_evict=1"],
     );
     assert_eq!(cap.len(), 1, "容量淘汰恰一条事件");
     assert_eq!(c.get(&"a"), None, "被逐者恒 LRU 尾");
@@ -1060,7 +1056,7 @@ fn cache_ttl_lazy_and_sweep_events() {
     cap.assert_event(
         "skeleton::cache::evict",
         Level::DEBUG,
-        &["kind=ttl_sweep", "zombies=2", "key_hash="],
+        &["kind=ttl_sweep", "zombies=2"],
     );
     assert_eq!(
         cap.len(),

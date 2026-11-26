@@ -719,8 +719,9 @@ fn sync_ttl_semantics_parity_with_serial() {
     assert_eq!(syn.purge_expired(), 0, "活键不被清扫：两面一致");
 }
 
-// ── log-embed 埋点（cache 事件点红绿；键身份以 DefaultHasher 定长种子指纹
-// 入字段——K 无 Debug/Display bound，加 bound=公共 API 破坏性变更）──
+// ── log-embed 埋点（cache 事件点红绿；字段只收数值/静态串——K 无
+// Debug/Display bound，加 bound=公共 API 破坏性变更。键指纹因 issue#203 省略：
+// 遥测不得为一次已提交的变更再跑用户 `K::hash`）──
 
 #[cfg(feature = "log-embed")]
 #[path = "common/log_capture.rs"]
@@ -730,18 +731,9 @@ mod log_capture;
 mod log_embed {
     use super::*;
     use log_capture::Capture;
-    use std::hash::{Hash, Hasher};
     use tracing::Level;
 
-    /// 与实现同构的键指纹（`DefaultHasher::new` 定长种子=进程内确定）：
-    /// key_hash 字段断言的期望值来源。
-    fn fingerprint(k: &str) -> String {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        k.hash(&mut h);
-        h.finish().to_string()
-    }
-
-    // 埋点「TTL 过期驱逐（惰性单条）」：过期触碰回收 → debug（键指纹+累计数）。
+    // 埋点「TTL 过期驱逐（惰性单条）」：过期触碰回收 → debug（过期累计）。
     #[test]
     fn lazy_ttl_expire_emits_debug_event() {
         let clock = Arc::new(MockClock::new());
@@ -757,8 +749,6 @@ mod log_embed {
         let e = log_capture::only(&capture, "skeleton::cache::evict");
         assert_eq!(e.level, Level::DEBUG);
         assert_eq!(e.field("kind"), Some("ttl"));
-        let expected = fingerprint("k");
-        assert_eq!(e.field("key_hash"), Some(expected.as_str()), "键指纹入字段");
         assert_eq!(e.field("expired_total"), Some("1"), "过期累计入字段");
     }
 
@@ -798,15 +788,10 @@ mod log_embed {
         assert_eq!(e.level, Level::DEBUG);
         assert_eq!(e.field("kind"), Some("ttl_sweep"));
         assert_eq!(e.field("zombies"), Some("1"), "僵尸计数入字段");
-        let expected = fingerprint("c");
-        assert_eq!(
-            e.field("key_hash"),
-            Some(expected.as_str()),
-            "触发键指纹入字段"
-        );
     }
 
-    // 埋点「容量淘汰（LRU 尾）」：LruCache 满插 → debug（被逐者指纹/LRU 序/残留）。
+    // 埋点「容量淘汰（LRU 尾）」：LruCache 满插 → debug（策略/LRU 序/残留）。
+    // 不计算被逐键指纹：诊断不能为已提交变更额外调用用户 Hash。
     #[test]
     fn lru_capacity_evict_emits_debug_event() {
         let mut c = LruCache::new(2);
@@ -821,12 +806,6 @@ mod log_embed {
         assert_eq!(e.level, Level::DEBUG);
         assert_eq!(e.field("kind"), Some("capacity"));
         assert_eq!(e.field("order"), Some("lru_tail"), "LRU 序选择策略入字段");
-        let expected = fingerprint("x");
-        assert_eq!(
-            e.field("key_hash"),
-            Some(expected.as_str()),
-            "被逐者=x（LRU 尾）"
-        );
         assert_eq!(
             e.field("len_at_evict"),
             Some("1"),
@@ -848,11 +827,10 @@ mod log_embed {
 
         let e = log_capture::only(&capture, "skeleton::cache::evict");
         assert_eq!(e.field("kind"), Some("capacity"));
-        let expected = fingerprint("a");
         assert_eq!(
-            e.field("key_hash"),
-            Some(expected.as_str()),
-            "被逐者=a（LRU 尾）"
+            e.field("len_at_evict"),
+            Some("1"),
+            "发事件瞬间=驱逐后残留（cap-1）"
         );
     }
 
