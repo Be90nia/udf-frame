@@ -5,12 +5,15 @@
 // - `readRegionSnapshot`：不可变字节快照（宿主已持有稳定副本）。普通 load、单次扫描，
 //   序列必须为 even；odd ⇒ `writerInProgress`。
 // - `readRegionLockFree`：SAB 直读。对 8 字节对齐序列做 `Atomics.load` → 扫描 →
-//   `Atomics.load`，前后相等且为 even 才接受；odd/变化 ⇒ 有界重试，耗尽 ⇒ 即使
-//   写者持续占用也不把读者拖成死循环（`retryExhausted`）。
+//   `Atomics.load`，前后相等且为 even 才接受；odd/变化 ⇒ 有界重试，耗尽按最后一次
+//   原子观测分两种可见结局：仍 odd ⇒ `writerInProgress`，even 间持续变化 ⇒
+//   `retryExhausted`——写者忙不得把读者拖成死循环。
 //
 // 判定权分工：序列（even = 已提交水位）是唯一一致性标记；条目 `gen` 只是逻辑修订号，
-// **不参与**无锁读判定（规格 §1/§4）。值类型 tag 是协议自描述层（本读器按 tag 空间
-// 判已知）；载荷形状 `kind` 是 schema 层，判定集由调用方 [declaredKinds] 传入。
+// **不参与**一致性判定（规格 §1/§4）。lock-free 形态仍对每个条目做 gen 前后复核，但那
+// 只当**撕裂探测器**（gen 变化必落在 odd 窗口内，本就被序列拒收），不是第二套协议。
+// 值类型 tag 是协议自描述层（本读器按 tag 空间判已知）；载荷形状 `kind` 是 schema 层，
+// 判定集由调用方 [declaredKinds] 传入。
 //
 // 常量一律引生成物 `view_bridge_constants.ts`（manifest 是唯一真源），禁手写偏移字面量。
 //
@@ -20,6 +23,7 @@
 import {
   ENTRY_LEN,
   ENTRY_OFFSET_BINDING_ID,
+  ENTRY_OFFSET_GEN,
   ENTRY_OFFSET_KIND,
   ENTRY_OFFSET_LEN,
   ENTRY_OFFSET_OFFSET,
@@ -98,6 +102,8 @@ export interface RegionRead {
   regionId: number;
   /** 本次读取观察到的稳定 even 发布序列（桥唯一 watermark）。 */
   sequence: bigint;
+  /** bootstrap 布局 major（恒为 `PROTOCOL_VERSION`；不等值时本读器不解释任何 v1 偏移）。 */
+  protocolVersion: number;
 }
 
 /**
@@ -135,8 +141,9 @@ export function readRegionSnapshot(
 }
 
 /**
- * SAB 直读入口：`load` → 扫描 → `load`，两次相等且为 even 才接受。前后不等 ⇒ 本次
- * 字节处在撕裂窗口内，重试；重试耗尽 ⇒ `retryExhausted`（可见的 writer busy）。
+ * SAB 直读入口：`load` → 扫描 → `load`，两次相等且为 even 才接受。前后不等或条目
+ * `gen` 在扫描期间变化 ⇒ 本次字节跨在提交窗口里，重试；耗尽按最后一次原子观测给出
+ * `writerInProgress`（仍 odd）或 `retryExhausted`（even 间持续变化）。
  */
 export function readRegionLockFree(
   backing: RegionBacking,
@@ -144,8 +151,10 @@ export function readRegionLockFree(
   retries: number = DEFAULT_RETRIES,
 ): RegionRead {
   const attempts = Math.max(1, retries);
+  let lastSeen: bigint | undefined;
   for (let i = 0; i < attempts; i++) {
     const before = backing.loadSequence();
+    lastSeen = before;
     if (before % 2n !== 0n) continue; // odd = 写事务进行中：本次不得接受
     let failure: RegionError | null = null;
     let read: RegionRead | undefined;
@@ -153,6 +162,8 @@ export function readRegionLockFree(
       // 序列字不进扫描：SAB 形下字节副本可能被撕裂，判定权只给原子序列。
       read = backing.withBytes((bytes) => scan(bytes, declaredKinds, before));
     } catch (error) {
+      // 条目 gen 在扫描期间变化 = 这份字节不再是同一提交态 ⇒ 本次作废（重试）。
+      if (error instanceof TornSnapshot) continue;
       if (!(error instanceof RegionError)) throw error; // 宿主缺陷，不是数据问题
       failure = error;
     }
@@ -162,6 +173,15 @@ export function readRegionLockFree(
       throw new RegionError("malformed", "region backing produced no bytes");
     }
     return read;
+  }
+  // 耗尽按最后一次原子观测分类（规格 §4⑥）：仍是 odd ⇒ 写者在途；一直在 even 之间
+  // 变化 ⇒ 持续提交。两种结局都可见，写者忙不得把读者拖成死循环。
+  if (lastSeen !== undefined && lastSeen % 2n !== 0n) {
+    throw new RegionError(
+      "writerInProgress",
+      `region publication in progress (odd sequence ${lastSeen})`,
+      { sequence: lastSeen },
+    );
   }
   throw new RegionError(
     "retryExhausted",
@@ -174,7 +194,7 @@ export function readRegionLockFree(
 function readHeader(
   bytes: Uint8Array,
   stableSequence?: bigint,
-): { sequence: bigint; regionId: number; count: number; indexEnd: number } {
+): { protocolVersion: number; sequence: bigint; regionId: number; count: number; indexEnd: number } {
   if (bytes.length < HEADER_LEN) throw truncated(HEADER_LEN, bytes.length);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   for (let i = 0; i < MAGIC.length; i++) {
@@ -212,7 +232,7 @@ function readHeader(
   // count 是 u32：count × 24 ≤ 2^32 × 24 < 2^53，无精度损失。
   const indexEnd = INDEX_OFFSET_V1 + count * ENTRY_LEN;
   if (bytes.length < indexEnd) throw truncated(indexEnd, bytes.length);
-  return { sequence, regionId, count, indexEnd };
+  return { protocolVersion: major, sequence, regionId, count, indexEnd };
 }
 
 /**
@@ -224,7 +244,7 @@ function scan(
   declaredKinds: readonly number[],
   stableSequence?: bigint,
 ): RegionRead {
-  const { sequence, regionId, count, indexEnd } = readHeader(bytes, stableSequence);
+  const { protocolVersion, sequence, regionId, count, indexEnd } = readHeader(bytes, stableSequence);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const out: RegionRead = {
     values: new Map(),
@@ -232,10 +252,16 @@ function scan(
     needsResync: false,
     regionId,
     sequence,
+    protocolVersion,
   };
+  // 条目 gen 复核只在 lock-free 形态做（有并发写者）；快照形态按规格 §4 单遍读，
+  // 不可变字节即真相。
+  const recheckGen = stableSequence !== undefined;
   const seen = new Set<number>();
   for (let i = 0; i < count; i++) {
     const at = INDEX_OFFSET_V1 + ENTRY_LEN * i;
+    // gen 前读：与段解码之后的复核配成撕裂探测，窗口覆盖本条目全部字段与载荷字节。
+    const genBefore = recheckGen ? view.getUint32(at + ENTRY_OFFSET_GEN, true) : 0;
     const bindingId = view.getUint32(at + ENTRY_OFFSET_BINDING_ID, true);
     if (seen.has(bindingId)) throw new RegionError("malformed", "duplicate BindingId in index");
     seen.add(bindingId);
@@ -256,11 +282,15 @@ function scan(
     if (offset < BigInt(indexEnd)) {
       throw new RegionError("malformed", "segment overlaps header/index");
     }
-    if (offset > BigInt(Number.MAX_SAFE_INTEGER)) {
+    if (!Number.isSafeInteger(Number(offset))) {
       throw new RegionError("malformed", "segment offset is not representable");
     }
     const start = Number(offset);
-    const end = start + len; // start < 2^53 且 len < 2^32 ⇒ 无精度损失
+    const end = start + len;
+    // checked 算术：safe-int 偏移 + u32 长度仍可能越出安全整数域（禁先截断再比较）。
+    if (!Number.isSafeInteger(end)) {
+      throw new RegionError("malformed", "segment end is not representable");
+    }
     if (end > bytes.length) throw truncated(end, bytes.length);
     try {
       out.values.set(bindingId, decodeSegment(bytes.subarray(start, end)));
@@ -270,9 +300,17 @@ function scan(
       out.unknownTagsSkipped += 1;
       out.needsResync = true;
     }
+    // gen 后读：与前读不等 ⇒ 本快照在扫描期间被改写，整次作废（上层重试）。这只是
+    // 撕裂探测器，不是第二套一致性协议——判定权仍在原子序列（规格 §4）。
+    if (recheckGen && view.getUint32(at + ENTRY_OFFSET_GEN, true) !== genBefore) {
+      throw new TornSnapshot();
+    }
   }
   return out;
 }
+
+/** 条目 `gen` 在扫描期间变化（内部信号；lock-free 入口据此重试整次读）。 */
+class TornSnapshot extends Error {}
 
 /** 段内解码故障（内部信号；对外一律折成「整段失效 + 计数 + resync」）。 */
 class SegFault extends Error {}

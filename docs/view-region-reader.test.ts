@@ -148,6 +148,21 @@ function hex(bytes: Uint8Array): string {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// ── 真 SAB 写者（供 §③ 的读窗口改写用例） ──
+
+/**
+ * 写者视角的字节搬运（规格 §3 第 2/3 步）：段字节先写，再写索引与 Header。序列字节
+ * `8..16` **不搬**——它只经 `Atomics.store` 写，禁字节拷贝覆盖。
+ */
+function writeRegionBytes(sab: SharedArrayBuffer, next: Uint8Array): void {
+  const bytes = new Uint8Array(sab);
+  const view = new DataView(next.buffer, next.byteOffset, next.byteLength);
+  const indexEnd = INDEX_OFFSET_V1 + ENTRY_LEN * view.getUint32(OFFSET_BINDING_COUNT, true);
+  bytes.set(next.subarray(indexEnd), indexEnd); // 段字节
+  bytes.set(next.subarray(0, OFFSET_PUBLISH_SEQ), 0); // Header 0..8
+  bytes.set(next.subarray(OFFSET_REGION_ID, indexEnd), OFFSET_REGION_ID); // Header 16..32 + 索引
+}
+
 /** 抓 typed 错误（禁 assert.throws 的宽松匹配：kind 必须精确）。 */
 function errorOf(run: () => unknown): RegionError {
   try {
@@ -192,6 +207,7 @@ test("黄金样本：region_auto 字节（Rust 夹具同构）解出同一结果
   assert.equal(read.needsResync, false);
   assert.equal(read.regionId, 1);
   assert.equal(read.sequence, BigInt(INITIAL_SEQ));
+  assert.equal(read.protocolVersion, PROTOCOL_VERSION, "header 元数据随结果返回");
 });
 
 test("major 不支持时任何 v1 偏移都不解释", () => {
@@ -271,6 +287,12 @@ test("结构损坏一律 typed 错误（不 panic、不静默）", () => {
       "malformed",
     ],
     [
+      // offset 本身安全（2^53−8），但 + u32 长度越出安全整数域：禁先算后丢精度。
+      "段 end 超出安全整数域",
+      regionRaw(INITIAL_SEQ, 1, [[0, KIND, 2 ** 53 - 8, 0xffffffff]], new Uint8Array(0)),
+      "malformed",
+    ],
+    [
       "段越界（尾部截断）",
       mutate(regionAuto(INITIAL_SEQ, [[0, KIND, seg]]), (b) => b.subarray(0, b.length - 1)),
       "truncated",
@@ -302,6 +324,22 @@ test("未知 kind / 不可解 TLV 只跳过该条目：计数 + resync，独立�
   assert.equal(read.needsResync, true, "降级必须显形");
   assert.equal(read.sequence, BigInt(INITIAL_SEQ));
   assert.equal(read.regionId, 1);
+});
+
+test("TLV 长度按无符号 u32 读：高位为 1 须判载荷截断，禁当负数放行", () => {
+  const highBitLen = new Uint8Array(TLV_HEADER_LEN); // tag + len 头，无载荷
+  highBitLen[0] = TAG_U64;
+  new DataView(highBitLen.buffer).setUint32(1, 0x80000000, true); // 2^31
+  const bytes = regionAuto(INITIAL_SEQ, [
+    [0, KIND, highBitLen],
+    [1, KIND, tlv(TAG_U64, u64(5n))],
+  ]);
+
+  const read = readRegionSnapshot(bytes, DECLS);
+  assert.equal(read.values.has(0), false, "长度高位为 1 的段必须整段失效（不是负数放行）");
+  assert.equal(read.values.get(1), 5n, "同区其他条目照常");
+  assert.equal(read.unknownTagsSkipped, 1);
+  assert.equal(read.needsResync, true);
 });
 
 test("数值/文本/字节/JSON 载荷解对（含非 0 byteOffset 视图）", () => {
@@ -374,7 +412,72 @@ test("写者在两次 load 之间提交 ⇒ 重试，且只返回完整快照", 
   assert.equal(read.sequence, 4n);
 });
 
-test("写者持续占用 ⇒ 有界重试 + 可见 retryExhausted（不转成死循环）", () => {
+test("真 SAB：写者在 before/after 两次原子 load 之间提交整笔事务 ⇒ 重试且只接受同版快照", () => {
+  const older = regionAuto(INITIAL_SEQ, [[0, KIND, tlv(TAG_U64, u64(1n))]]);
+  const newer = regionAuto(INITIAL_SEQ + 2, [[0, KIND, tlv(TAG_U64, u64(2n))]]);
+  const sab = new SharedArrayBuffer(older.length);
+  const seq = new BigUint64Array(sab, OFFSET_PUBLISH_SEQ, 1);
+  new Uint8Array(sab).set(older);
+
+  let loads = 0;
+  let scans = 0;
+  const backing: RegionBacking = {
+    withBytes<T>(read: (bytes: Uint8Array) => T): T {
+      scans += 1;
+      if (scans === 1) {
+        // 读器已取到 before 水位，此刻写者完成整笔事务：odd → 字节 → even（规格 §3）。
+        Atomics.store(seq, 0, BigInt(INITIAL_SEQ + 1));
+        writeRegionBytes(sab, newer);
+        Atomics.store(seq, 0, BigInt(INITIAL_SEQ + 2));
+      }
+      return read(new Uint8Array(sab));
+    },
+    loadSequence: () => {
+      loads += 1;
+      return Atomics.load(seq, 0);
+    },
+  };
+
+  const read = readWith(backing);
+  assert.equal(loads, 4, "旧水位 + 新字节的窗口必须整次重试");
+  assert.equal(scans, 2, "第二次扫描才被采信");
+  assert.equal(read.sequence, BigInt(INITIAL_SEQ + 2));
+  assert.equal(read.values.get(0), 2n, "(sequence, value) 必须同版配对，永不混合");
+});
+
+test("真 SAB：写者停在 odd ⇒ writerInProgress{sequence}；提交后读到新快照", () => {
+  const older = regionAuto(INITIAL_SEQ, [[0, KIND, tlv(TAG_U64, u64(1n))]]);
+  const newer = regionAuto(INITIAL_SEQ + 2, [[0, KIND, tlv(TAG_U64, u64(2n))]]);
+  const sab = new SharedArrayBuffer(older.length);
+  const seq = new BigUint64Array(sab, OFFSET_PUBLISH_SEQ, 1);
+  new Uint8Array(sab).set(older);
+
+  let scans = 0;
+  const backing: RegionBacking = {
+    withBytes<T>(read: (bytes: Uint8Array) => T): T {
+      scans += 1;
+      return read(new Uint8Array(sab));
+    },
+    loadSequence: () => Atomics.load(seq, 0),
+  };
+
+  // 写者发布 odd 后停住（事务在途、尚未提交）：真实 Atomics.store，无定时器、无线程。
+  Atomics.store(seq, 0, BigInt(INITIAL_SEQ + 1));
+  const busy = errorOf(() => readWith(backing, 3));
+  assert.equal(busy.kind, "writerInProgress");
+  assert.equal(busy.sequence, BigInt(INITIAL_SEQ + 1));
+  assert.equal(scans, 0, "odd 窗口内不得扫描字节");
+
+  // 写者完成提交：字节 + even（序列字节只走原子写，禁字节拷贝覆盖）。
+  writeRegionBytes(sab, newer);
+  Atomics.store(seq, 0, BigInt(INITIAL_SEQ + 2));
+  const read = readWith(backing);
+  assert.equal(read.sequence, BigInt(INITIAL_SEQ + 2));
+  assert.equal(read.values.get(0), 2n, "提交后必须读到整版新快照");
+  assert.equal(scans, 1);
+});
+
+test("写者持续占用 ⇒ 有界重试 + 可见 writerInProgress（不转成死循环）", () => {
   const bytes = regionAuto(INITIAL_SEQ, [[0, KIND, tlv(TAG_U64, u64(1n))]]);
   let scans = 0;
   const odd: RegionBacking = {
@@ -385,8 +488,8 @@ test("写者持续占用 ⇒ 有界重试 + 可见 retryExhausted（不转成死
     loadSequence: () => 3n, // 事务永不提交
   };
   const busy = errorOf(() => readWith(odd, 4));
-  assert.equal(busy.kind, "retryExhausted");
-  assert.equal(busy.attempts, 4);
+  assert.equal(busy.kind, "writerInProgress", "最后一次原子观测仍是 odd ⇒ 写者在途");
+  assert.equal(busy.sequence, 3n);
   assert.equal(scans, 0, "odd 窗口内不得扫描字节");
 
   // 每轮前后都不同（写者一直在推进）：同样耗尽，且不会返回撕裂内容。

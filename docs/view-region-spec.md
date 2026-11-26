@@ -6,8 +6,8 @@
 - 常量真源：`docs/view-bridge-constants/manifest.toml`（手维护）→ `view_constants_gen`
   生成 TS/Python/C 三件（`--check` 只比对不写，diff 非空即红）。Rust 侧常量住
   `skeleton::view::region_layout`，与清单逐值一致（`tests/view_region_wire.rs` 咬）。
-- 镜像读器：TS 片段 `docs/view-region-reader.ts`（**待按本文 §8 交接清单更新**，
-  该文件归 #170 批次）；Python/C 按同一语义复刻。
+- 镜像读器：TS 片段 `docs/view-region-reader.ts`（**已按本文 §9 交接清单落地 v1 读协议**，
+  #170）；Python/C 按同一语义复刻。
 - 演进纪律：Header/Index 的字段序/宽度/字节序**跨版本冻结**。任何 bootstrap 布局
   改动 = 升 `protocol_version` major + 读侧协商（§6），不靠「未知标签跳过」掩盖。
 
@@ -220,7 +220,8 @@ Rust/规范已定稿的 v1；TS 读器需按以下清单一次性改写（不得
    序列 = 8 字节对齐的 `getBigUint64(8, true)`。
 3. **读协议**：SAB 直读用 `BigUint64Array(header, 8, 1)` 做
    `Atomics.load` → 扫描 → `Atomics.load`，两次相等且为 even 才接受；odd 或变化
-   ⇒ 有界重试，耗尽返回 typed `writerBusy`；不可变拷贝用普通读并单选一次（odd ⇒
+   ⇒ 有界重试，耗尽按 §4⑥ 返回 `writerInProgress`（最后一次原子观测仍 odd）或
+   `retryExhausted`（even 之间持续变化）；不可变拷贝用普通读并单选一次（odd ⇒
    `writerInProgress`）。
 4. **版本闸**：`major != 1` ⇒ 立即 `unsupportedVersion`，不得按 v1 偏移硬解。
 5. **逐条目降级**：未知 `kind` 跳过该条目；段内任一 TLV 不可解（含非有限 f64、
