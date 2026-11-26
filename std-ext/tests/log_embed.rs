@@ -1022,12 +1022,7 @@ fn cache_lru_capacity_evict_is_debug_with_lru_tail() {
     cap.assert_event(
         "skeleton::cache::evict",
         Level::DEBUG,
-        &[
-            "kind=capacity",
-            "order=lru_tail",
-            "len_at_evict=1",
-            "key_hash=",
-        ],
+        &["kind=capacity", "order=lru_tail", "len_at_evict=1"],
     );
     assert_eq!(cap.len(), 1, "容量淘汰恰一条事件");
     assert_eq!(c.get(&"a"), None, "被逐者恒 LRU 尾");

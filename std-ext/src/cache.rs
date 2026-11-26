@@ -409,17 +409,8 @@ impl<K: Eq + Hash + Clone, V> LruCore<K, V> {
         let mut evicted = false;
         let mut retired = Retired::empty();
         if self.map.len() >= self.cap {
-            // 埋点「容量淘汰」：被逐者恒 LRU 尾（order 字段=选择策略留痕）。
             retired = self.evict_tail();
             evicted = true;
-            embed_event!(
-                debug,
-                target: "skeleton::cache::evict",
-                kind = "capacity",
-                key_hash = retired.slot_key.as_ref().map(|k| key_fingerprint(k)),
-                order = "lru_tail",
-                len_at_evict = self.map.len() as u64
-            );
         }
         let idx = match self.free.pop() {
             Some(i) => i,
@@ -625,8 +616,17 @@ impl<K: Eq + Hash + Clone, V> LruCache<K, V> {
     /// 插入/覆盖。已存在键=更新值+touch（len 不变，不触发淘汰）；
     /// 新键满=先逐 LRU 尾再插（被逐者静默丢弃，需要看见用 [`Self::pop_lru`]）。
     pub fn insert(&mut self, k: K, v: V) {
-        let (_, retired) = self.core.insert(k, v);
+        let (evicted, retired) = self.core.insert(k, v);
         retired.retire();
+        if evicted {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "capacity",
+                order = "lru_tail",
+                len_at_evict = self.core.len().saturating_sub(1) as u64
+            );
+        }
     }
 
     /// 读（**touch**：命中刷新 recency，故需 `&mut self`）。只读共享场景用
@@ -1047,6 +1047,15 @@ impl<K: Eq + Hash + Clone, V> SyncLruCache<K, V> {
         retired.retire();
         if evicted {
             self.evictions.fetch_add(1, Ordering::Relaxed);
+            // No key fingerprint here: invoking user Hash for diagnostics would
+            // add another arbitrary callback after the state transition.
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "capacity",
+                order = "lru_tail",
+                len_at_evict = self.capacity().saturating_sub(1) as u64
+            );
         }
     }
 
@@ -1305,49 +1314,59 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         let purge_now = self.clock.now_instant();
         // 阶段 2：重取锁 + 重查（**第二次锁定检查 = 线性化点**；重查**早于**
         // 过期清扫/淘汰 ⇒ panic 的 clone 不会造成部分清扫/变更）。
-        let (purge_retired, evict_retired, insert_retired) = {
+        let (purge_retired, evict_retired, insert_retired, purged, evicted, len_at_evict) = {
             let mut g = self.lock_core();
             let mut purge_retired = Vec::new();
             let mut evict_retired = Retired::empty();
+            let mut purged = 0usize;
+            let mut evicted = false;
+            let mut len_at_evict = 0usize;
             if g.idx_of(&k).is_none() && g.len() >= g.capacity() {
                 // 双界拍板：先过期先淘汰（单次锁外 now 快照判定，确定性），仍满再逐 LRU 尾。
-                let (purged, retired) = g.retain(|_, e| e.expires > purge_now);
+                let (count, retired) = g.retain(|_, e| e.expires > purge_now);
+                purged = count;
                 purge_retired = retired;
                 self.expired.fetch_add(purged as u64, Ordering::Relaxed);
-                // 埋点「TTL 过期驱逐（满插清扫）」：真回收才发（僵尸数+触发键指纹）。
-                #[cfg(feature = "log-embed")]
-                if purged > 0 {
-                    embed_event!(
-                        debug,
-                        target: "skeleton::cache::evict",
-                        kind = "ttl_sweep",
-                        key_hash = key_fingerprint(&k),
-                        zombies = purged as u64
-                    );
-                }
                 if g.len() >= g.capacity() {
-                    // 埋点「容量淘汰」（TtlCache 站点）：被逐者恒 LRU 尾。
-                    let retired = g.evict_tail();
-                    evict_retired = retired;
+                    // 容量淘汰只记录决策；subscriber 在解锁与退休析构后调用。
+                    evict_retired = g.evict_tail();
+                    evicted = true;
                     self.evictions.fetch_add(1, Ordering::Relaxed);
-                    embed_event!(
-                        debug,
-                        target: "skeleton::cache::evict",
-                        kind = "capacity",
-                        key_hash = evict_retired.slot_key.as_ref().map(|k| key_fingerprint(k)),
-                        order = "lru_tail",
-                        len_at_evict = g.len() as u64
-                    );
+                    len_at_evict = g.len();
                 }
             }
             // 锁内不调 `K::clone`（备好的键副本直接用）；竞态落败（键已被他人
             // 插入）⇒ 走普通覆盖路径，未被采用的候选键**解锁后**才析构。
             let (_, retired) = g.insert_with_map_key(k, map_key, entry);
-            (purge_retired, evict_retired, retired)
+            (
+                purge_retired,
+                evict_retired,
+                retired,
+                purged,
+                evicted,
+                len_at_evict,
+            )
         };
         drop(purge_retired);
         evict_retired.retire();
         insert_retired.retire();
+        if purged > 0 {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "ttl_sweep",
+                zombies = purged as u64
+            );
+        }
+        if evicted {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "capacity",
+                order = "lru_tail",
+                len_at_evict = len_at_evict as u64
+            );
+        }
     }
 
     /// 读（touch + 惰性过期 + 命中计数）。过期条目按 miss（不计命中）。
@@ -1368,20 +1387,28 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         Q: Hash + Eq + ?Sized,
     {
         let now = self.clock.now_instant();
-        let (hit, retired) = {
+        let (hit, retired, due) = {
             let mut g = self.lock_core();
             let (due, retired) = Self::expire_if_due(&mut g, &self.expired, k, now);
             if due {
-                (None, retired)
+                (None, retired, true)
             } else {
                 let hit = g.get_mut(k).map(|e| e.value.clone());
                 if hit.is_some() {
                     self.hits.fetch_add(1, Ordering::Relaxed);
                 }
-                (hit, retired)
+                (hit, retired, false)
             }
         };
         retired.retire();
+        if due {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "ttl",
+                expired_total = self.expired.load(Ordering::Relaxed)
+            );
+        }
         hit
     }
 
@@ -1398,16 +1425,24 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
         V: Clone,
     {
         let now = self.clock.now_instant();
-        let (hit, retired) = {
+        let (hit, retired, due) = {
             let mut g = self.lock_core();
             let (due, retired) = Self::expire_if_due(&mut g, &self.expired, k, now);
             if due {
-                (None, retired)
+                (None, retired, true)
             } else {
-                (g.peek(k).map(|e| e.value.clone()), retired)
+                (g.peek(k).map(|e| e.value.clone()), retired, false)
             }
         };
         retired.retire();
+        if due {
+            embed_event!(
+                debug,
+                target: "skeleton::cache::evict",
+                kind = "ttl",
+                expired_total = self.expired.load(Ordering::Relaxed)
+            );
+        }
         hit
     }
 
@@ -1450,20 +1485,19 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
     /// 被回收条目的键值所有权在**解锁之后**才析构（issue#71）。
     pub fn purge_expired(&self) -> usize {
         let now = self.clock.now_instant();
-        let (n, retired) = {
+        let (n, retired, len_after) = {
             let mut g = self.lock_core();
             let (n, retired) = g.retain(|_, e| e.expires > now);
             self.expired.fetch_add(n as u64, Ordering::Relaxed);
-            // 埋点「purge」：显式清扫动作 info（回收数/残留）。
-            embed_event!(
-                info,
-                target: "skeleton::cache::purge",
-                purged = n as u64,
-                len_after = g.len() as u64
-            );
-            (n, retired)
+            (n, retired, g.len() as u64)
         };
         drop(retired);
+        embed_event!(
+            info,
+            target: "skeleton::cache::purge",
+            purged = n as u64,
+            len_after = len_after
+        );
         n
     }
 
@@ -1525,15 +1559,7 @@ impl<K: Eq + Hash + Clone, V> SyncTtlCache<K, V> {
             // 值（含用户 V）一并进退休批 ⇒ 解锁后才析构（issue#71）。
             retired.value = value;
             expired.fetch_add(1, Ordering::Relaxed);
-            // 埋点「TTL 过期驱逐（惰性单条）」：触碰即回收留痕（键指纹+累计）。
-            #[cfg(feature = "log-embed")]
-            embed_event!(
-                debug,
-                target: "skeleton::cache::evict",
-                kind = "ttl",
-                key_hash = key_fingerprint(k),
-                expired_total = expired.load(Ordering::Relaxed)
-            );
+
             return (true, retired);
         }
         (false, Retired::empty())
@@ -1888,6 +1914,139 @@ mod lock_boundary_probe {
         let mut ttl: TtlCache<HashProbeKey, u32> = TtlCache::new(clock, 8);
         ttl.insert(HashProbeKey(1), 1, std::time::Duration::from_secs(60));
         assert_eq!(ttl.get(&HashProbeKey(1)), Some(&1));
+    }
+
+    #[cfg(feature = "log-embed")]
+    struct CallbackSubscriber(Box<dyn Fn() + Send + Sync>);
+
+    #[cfg(feature = "log-embed")]
+    impl tracing::Subscriber for CallbackSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {
+            (self.0)();
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn sync_lru_eviction_subscriber_runs_after_core_unlock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::subscriber::with_default;
+
+        let cache = Arc::new(SyncLruCache::new(1));
+        cache.insert("a".to_owned(), 1);
+        let violations = Arc::new(AtomicUsize::new(0));
+        let observed_cache = Arc::clone(&cache);
+        let observed_violations = Arc::clone(&violations);
+        let subscriber = CallbackSubscriber(Box::new(move || {
+            match observed_cache.core.try_lock() {
+                Ok(guard) => drop(guard),
+                Err(TryLockError::WouldBlock) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            }
+            let _ = observed_cache.len();
+        }));
+
+        with_default(subscriber, || cache.insert("b".to_owned(), 2));
+        assert_eq!(
+            violations.load(Ordering::SeqCst),
+            0,
+            "host subscriber must run after SyncLruCache releases its mutex"
+        );
+    }
+
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn shared_cache_remains_usable_after_subscriber_panic() {
+        use skeleton::clock::MockClock;
+        use std::time::Duration;
+        use tracing::subscriber::with_default;
+
+        let lru = SyncLruCache::new(1);
+        lru.insert("a".to_owned(), 1);
+        with_default(
+            CallbackSubscriber(Box::new(|| panic!("injected cache subscriber panic"))),
+            || lru.insert("b".to_owned(), 2),
+        );
+        assert_eq!(lru.get("b"), Some(2), "LRU mutation survives telemetry panic");
+
+        let clock = Arc::new(MockClock::new());
+        let ttl = SyncTtlCache::new(clock.clone(), 1);
+        ttl.insert("a".to_owned(), 1, Duration::from_secs(1));
+        with_default(
+            CallbackSubscriber(Box::new(|| panic!("injected cache subscriber panic"))),
+            || ttl.insert("b".to_owned(), 2, Duration::from_secs(1)),
+        );
+        assert_eq!(ttl.get(&"b".to_owned()), Some(2), "TTL cache remains usable");
+    }
+
+    #[cfg(feature = "log-embed")]
+    #[test]
+    fn sync_ttl_events_run_after_core_unlock() {
+        use skeleton::clock::MockClock;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tracing::subscriber::with_default;
+
+        let clock = Arc::new(MockClock::new());
+        let cache = Arc::new(SyncTtlCache::new(clock.clone(), 1));
+        let violations = Arc::new(AtomicUsize::new(0));
+        let observed_cache = Arc::clone(&cache);
+        let observed_violations = Arc::clone(&violations);
+        let subscriber = CallbackSubscriber(Box::new(move || {
+            match observed_cache.core.try_lock() {
+                Ok(guard) => drop(guard),
+                Err(TryLockError::WouldBlock) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    observed_violations.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            }
+            let _ = observed_cache.len();
+        }));
+
+        with_default(subscriber, || {
+            cache.insert("a".to_owned(), 1, Duration::from_secs(1));
+            clock.advance(Duration::from_secs(1));
+            assert_eq!(cache.get(&"a".to_owned()), None); // lazy TTL event
+
+            cache.insert("b".to_owned(), 2, Duration::from_secs(1));
+            clock.advance(Duration::from_secs(1));
+            cache.insert("c".to_owned(), 3, Duration::from_secs(1)); // TTL sweep event
+            cache.insert("d".to_owned(), 4, Duration::from_secs(1)); // capacity event
+            clock.advance(Duration::from_secs(1));
+            assert_eq!(cache.purge_expired(), 1); // explicit purge event
+        });
+
+        assert_eq!(
+            violations.load(Ordering::SeqCst),
+            0,
+            "all SyncTtlCache subscribers must run after the core mutex is released"
+        );
     }
 }
 
