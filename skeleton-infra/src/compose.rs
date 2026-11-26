@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use skeleton::{Effect, EffectBuf, Fragment, Infallible};
 
+// 组合命名空间面（issue#163）：`combine!` 的 `namespaces:` 臂在**编译期**断言这里的
+// 校验函数；宏在采用方 crate 展开，故路径必须经 `$crate::compose::` 公开可达。
+pub use skeleton::{EffectNamespace, validate_effect_namespaces};
+
 /// 组合器：父子分片，协作=显式结构（字符串路由组合的封死形态）。
 ///
 /// - `get`/`set`：父状态内子切片的读写镜头
@@ -301,6 +305,77 @@ where
 /// assert_eq!(*store.snapshot(), Parent { total: 101, child: 2 });
 /// store.close();
 /// ```
+///
+/// # 组合命名空间声明（issue#163）
+///
+/// 独立子件**不自动可组合**：`combine!` 原值转发子件的 `Run { id }` / `Cancel { id }`，
+/// 两个各自从 1 计数的子件装上同一 store 就会撞 id（见 [`skeleton::EffectId`] 的
+/// 「组合纪律」段）。组合方用 `namespaces: [("子件名", lo, hi), …]` 显式声明各子件占用
+/// 的 id 区间（**含两端**；`Run`/`Cancel` 共用同一 id 空间 ⇒ 每个子件只声明一次），宏在
+/// **编译期**断言区间互不相交且不倒置——重叠 = 编译错误，不是运行期 panic。
+/// **不写 `namespaces:` = 不校验 = 保持现状**（旧写法一字不动）。
+///
+/// 只看显式形态（`wrap`/`unwrap`/`lift` 全写）：声明是装配方关切，装配方本来就在写
+/// 显式形态；短变体的三条捷径臂不提供 `namespaces:`。
+///
+/// ```
+/// use skeleton::{EffectBuf, Fragment, Infallible, Reducer};
+///
+/// #[derive(Clone, Debug, PartialEq)]
+/// struct Parent { timer: u32, http: u32 }
+///
+/// #[derive(Clone, Debug, PartialEq)]
+/// enum PAction { Timer(u32), Http(u32) }
+///
+/// struct Counter;
+///
+/// impl Reducer for Counter {
+///     type State = u32;
+///     type Action = u32;
+///     type Op = Infallible;
+///     fn initial(&self) -> u32 { 0 }
+///     fn reduce(&self, s: &u32, a: u32, _out: &mut EffectBuf<u32, Infallible>) -> u32 { s + a }
+/// }
+///
+/// fn timer_fragment() -> impl Fragment<State = Parent, Action = PAction, Op = Infallible> {
+///     skeleton_infra::combine!(
+///         Counter,
+///         Parent.timer,
+///         wrap: PAction::Timer,
+///         unwrap: |p: &PAction| match p { PAction::Timer(c) => Some(*c), _ => None },
+///         lift: |_, _| {},
+///         // 本装配点全部子件自报区间（timer 0..=999，http 1000..=1999）
+///         namespaces: [("timer", 0, 999), ("http", 1000, 1999)],
+///     )
+/// }
+/// # let _ = timer_fragment;
+/// ```
+///
+/// 重叠在编译期即被拒（与运行期同一个判定函数，`const` 断言）：
+///
+/// ```compile_fail
+/// # use skeleton::{EffectBuf, Fragment, Infallible, Reducer};
+/// # #[derive(Clone, Debug, PartialEq)] struct Parent { timer: u32 }
+/// # #[derive(Clone, Debug, PartialEq)] enum PAction { Timer(u32) }
+/// # struct Counter;
+/// # impl Reducer for Counter {
+/// #     type State = u32;
+/// #     type Action = u32;
+/// #     type Op = Infallible;
+/// #     fn initial(&self) -> u32 { 0 }
+/// #     fn reduce(&self, s: &u32, a: u32, _o: &mut EffectBuf<u32, Infallible>) -> u32 { s + a }
+/// # }
+/// # fn f() -> impl Fragment<State = Parent, Action = PAction, Op = Infallible> {
+/// skeleton_infra::combine!(
+///     Counter,
+///     Parent.timer,
+///     wrap: PAction::Timer,
+///     unwrap: |p: &PAction| match p { PAction::Timer(c) => Some(*c), _ => None },
+///     lift: |_, _| {},
+///     namespaces: [("timer", 0, 999), ("http", 500, 1499)], // ERROR: 与 timer 相交
+/// )
+/// # }
+/// ```
 #[macro_export]
 macro_rules! combine {
     // 变体短形态（省略 lift = 安全形态）：wrap/unwrap 由变体构造子一体生成
@@ -368,6 +443,29 @@ macro_rules! combine {
             |_, _| {},
         )
     };
+    // 显式形态 + lift + 显式命名空间声明（issue#163）：各子件自报效果 ID 区间，
+    // 装配期**编译期**校验（重叠/倒置 = 编译错误）。不写 namespaces: 走下面那臂
+    // ⇒ 未声明路径的展开一字不变（不声明 = 不校验 = 现状）。
+    ($child:expr, $state:ident . $field:ident,
+        wrap: $wrap:expr, unwrap: $unwrap:expr, lift: $lift:expr,
+        namespaces: [$(($ns_name:literal, $ns_lo:expr, $ns_hi:expr)),* $(,)?] $(,)?) => {{
+        const _: () = assert!(
+            matches!(
+                $crate::compose::validate_effect_namespaces(&[
+                    $($crate::compose::EffectNamespace::new($ns_name, $ns_lo, $ns_hi)),*
+                ]),
+                Ok(())
+            ),
+            "combine!: 子件声明的效果 ID 命名空间重叠或区间倒置 —— 独立子件不自动可组合；让各 namespaces: 区间互不相交（Run/Cancel 共用同一 id 空间），或去掉 namespaces: 放弃校验（见 skeleton::EffectId 文档「组合纪律」）"
+        );
+        $crate::combine!(
+            $child,
+            $state . $field,
+            wrap: $wrap,
+            unwrap: $unwrap,
+            lift: $lift,
+        )
+    }};
     // 显式形态 + lift：与 combine 函数逐参对应
     ($child:expr, $state:ident . $field:ident,
         wrap: $wrap:expr, unwrap: $unwrap:expr, lift: $lift:expr $(,)?) => {

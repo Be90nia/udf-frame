@@ -193,6 +193,19 @@ impl<T: Reducer> Fragment for T {
 /// 被取消」，极难定位。撞车的运行期观测面：参考实现 `SyncStore` 的
 /// `cancel_unknown_id` 读侧（`Cancel` 引用从未发出的 `Run` id 即计数留痕）。
 ///
+/// # 组合纪律（issue#163）：独立子件不自动可组合
+///
+/// `combine` 只做 reduce 委托 + 效果原值转发，**不改写**子件发出的 `Run { id }` /
+/// `Cancel { id }`：两个各自从 1 计数的子件装上同一 store 就会撞 id，
+/// `Cancel(1)` 取消到**另一个**子件的在途效果——`cancel_unknown_id` 读侧抓不到
+/// （id 不未知，只是归属错了），现象是「另一个效果莫名被取消」。
+///
+/// ⇒ **组合方必须显式声明**各子件的效果 ID 命名空间/范围，并在装配期校验重叠：
+/// [`EffectNamespace`] + [`validate_effect_namespaces`]（`combine!` 的
+/// `namespaces:` 臂在**编译期**断言同一判定）。**不声明 = 不校验 = 保持现状**：
+/// 加新子件可能静默作废既有子件的 id 命名空间，这条路只在组合方明确放弃校验时
+/// 才该走。
+///
 /// 裸元组构造已封死（doctest 即外部 crate 视角编译验证）：
 ///
 /// ```compile_fail
@@ -221,6 +234,156 @@ impl EffectId {
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+/// 效果 ID 命名空间声明（组合面，issue#163）：一个子件独占 `[lo, hi]`（**含两端**）。
+///
+/// 单个 `Fragment` 只保证自己内部 id 唯一；**独立子件的命名空间互不相同不是自动
+/// 的**——组合方必须显式声明各子件占用哪段 id，并在装配期校验
+/// （[`validate_effect_namespaces`]）。不自报声明 = 不校验 = 保持 issue#163 之前的
+/// 行为（见 [`EffectId`] 文档「组合纪律」段）。
+///
+/// [`Effect::Run`] 与 [`Effect::Cancel`] 共用同一 id 空间（`Cancel` 寻址的就是
+/// `Run` 写出的同值句柄），所以**每个子件只声明一次**区间，不按效果种类分开声明。
+///
+/// 声明列表是**每个装配点一份（扁平）**：嵌套组合（父装配点里含一个子组合分片）
+/// 时，子组合整体在父装配点上按一整段区间声明，父级不自动继承/推导子件的内部分配
+/// ——「显式」正是本方案的全部内容。
+///
+/// ```
+/// use skeleton::{EffectNamespace, validate_effect_namespaces};
+/// let decls = [
+///     EffectNamespace::new("timer", 0, 999),
+///     EffectNamespace::new("http", 1000, 1999),
+/// ];
+/// assert_eq!(validate_effect_namespaces(&decls), Ok(()));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectNamespace {
+    name: &'static str,
+    lo: u64,
+    hi: u64,
+}
+
+impl EffectNamespace {
+    /// 声明子件 `name` 占用 `lo..=hi`。
+    ///
+    /// **不在此校验** `lo > hi`：单条声明的合法性由
+    /// [`validate_effect_namespaces`] 统一判定（一处语义），构造保持 `const` 以便
+    /// 写进 `const` 数组——`combine!` 的 `namespaces:` 臂正是靠这一点在**编译期**
+    /// 断言重叠。
+    pub const fn new(name: &'static str, lo: u64, hi: u64) -> Self {
+        Self { name, lo, hi }
+    }
+
+    /// 子件名（诊断文案用）。
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    /// 占用区间 `(lo, hi)`（含两端）。
+    pub const fn range(self) -> (u64, u64) {
+        (self.lo, self.hi)
+    }
+}
+
+/// 命名空间声明被拒的 typed 原因（[`validate_effect_namespaces`]）。
+///
+/// `Display` 含子件名 + 区间 + 首个重叠 id，可直接打印进装配期诊断；本类型不
+/// panic（拒绝经返回值给出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectNamespaceConflict {
+    /// 单条声明自身无效：`lo > hi`（区间空置）。**必须拒绝**——空区间永不与任何
+    /// 声明相交，会把重叠校验对全部 id 静默失效。
+    Inverted {
+        /// 声明方子件名。
+        name: &'static str,
+        /// 声明的下界。
+        lo: u64,
+        /// 声明的上界（在 `lo` 之前 ⇒ 空区间）。
+        hi: u64,
+    },
+    /// 两个子件的区间相交（含一端完全包含另一端——嵌套组合的常见形态）：它们会
+    /// 发出同一个 id，运行时 [`Effect::Cancel`] 可能取消到另一个子件的在途效果。
+    Overlap {
+        /// 声明序在前的一方。
+        left: EffectNamespace,
+        /// 声明序在后的一方。
+        right: EffectNamespace,
+        /// 首个重叠 id（`max(left.lo, right.lo)`）。
+        at: u64,
+    },
+}
+
+impl std::fmt::Display for EffectNamespaceConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inverted { name, lo, hi } => write!(
+                f,
+                "effect id namespace rejected: `{name}` declares {lo}..={hi} with lo > hi \
+                 (an empty range would silently disable overlap checking)"
+            ),
+            Self::Overlap { left, right, at } => write!(
+                f,
+                "effect id namespace overlap: `{}` {}..={} and `{}` {}..={} share id {at} \
+                 (independently counted fragments collide; declare disjoint ranges)",
+                left.name, left.lo, left.hi, right.name, right.lo, right.hi
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EffectNamespaceConflict {}
+
+/// 装配期命名空间校验：`lo > hi` 或任意两声明相交 ⇒ typed `Err`；空声明 ⇒ `Ok`
+/// （**不声明 = 不校验 = 现状**）。
+///
+/// `const fn`：`combine!` 的 `namespaces:` 臂在**编译期**断言它（重叠 = 编译错误，
+/// 比运行期 panic 早且强）。零依赖、零分配、O(n²)（声明数 = 子件数，个位数），报
+/// **声明序上的第一处**冲突（确定性）。相交判定按闭区间：
+/// `a.lo <= b.hi && b.lo <= a.hi`。
+///
+/// 重叠在编译期即被拒绝（`combine!` 的 `namespaces:` 臂用的是同一个函数）：
+///
+/// ```compile_fail
+/// use skeleton::{EffectNamespace, validate_effect_namespaces};
+/// const _: () = assert!(matches!(
+///     validate_effect_namespaces(&[
+///         EffectNamespace::new("timer", 0, 999),
+///         EffectNamespace::new("http", 500, 1499),
+///     ]),
+///     Ok(())
+/// )); // ERROR: `http` 与 `timer` 相交 ⇒ 编译期断言失败
+/// ```
+pub const fn validate_effect_namespaces(
+    decls: &[EffectNamespace],
+) -> Result<(), EffectNamespaceConflict> {
+    let n = decls.len();
+    let mut i = 0;
+    while i < n {
+        let a = decls[i];
+        if a.lo > a.hi {
+            return Err(EffectNamespaceConflict::Inverted {
+                name: a.name,
+                lo: a.lo,
+                hi: a.hi,
+            });
+        }
+        let mut j = 0;
+        while j < i {
+            let b = decls[j];
+            if a.lo <= b.hi && b.lo <= a.hi {
+                return Err(EffectNamespaceConflict::Overlap {
+                    left: b,
+                    right: a,
+                    at: if a.lo > b.lo { a.lo } else { b.lo },
+                });
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 /// Effect：纯描述值。解释器（宿主适配层）执行后经回灌通道把 Action 重入 store（环闭合）。
