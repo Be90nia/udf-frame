@@ -49,9 +49,27 @@ pub mod read;
 
 /// std Mutex 取锁：中毒 = 持锁方已 panic——fail-fast 传播（fx/pool 同纪律）。
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    #[cfg(test)]
+    lock_probe::ACQUISITIONS.with(|c| c.set(c.get() + 1));
     mutex
         .lock()
         .expect("view bridge lock poisoned: prior panic while holding the lock")
+}
+
+/// 单元测试专用的**线程局部**取锁计数（#140 热路径锁次数预算）。线程局部是必须的：
+/// 进程级计数器会被同二进制里并发跑的其它测试污染（计数不变量只对本线程窗口成立）。
+#[cfg(test)]
+mod lock_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static ACQUISITIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// 本线程取锁次数的绝对值。
+    pub(super) fn here() -> u64 {
+        ACQUISITIONS.with(Cell::get)
+    }
 }
 
 // ── 错误词表（手写 Display/Error，journal.rs 先例；#[non_exhaustive] M6 纪律）──
@@ -506,10 +524,77 @@ pub struct Encoders<J, R> {
 
 // ── 机制胞（L1 输入键等值记忆化，两处应用同一机制同一「input 覆盖实读」红线）──
 
+/// 机制胞的锁内态（[`Derived`] / [`Sentinel`] 共用，#157 两阶段代际协议）。临界区内
+/// **只有**句柄搬移与代际记账，不执行任何采用方代码。
+///
+/// 协议三步：①锁内快照（值句柄 + 代际）→ ②锁外跑采用方代码（`eq` / `Clone` /
+/// `compute` / 旧值 `Drop`）→ ③重取锁，**仅当代际未变**（快照之后无人发布）才裁决
+/// 或发布。值以 [`Arc`] 句柄共享：快照只做原子计数，旧值随最后一个句柄在锁外析构。
+struct CellState<T> {
+    /// 最近一次采纳的值；`None` = 从未发布。
+    current: Option<Arc<T>>,
+    /// 每次采纳 +1；两阶段协议的令牌。
+    generation: u64,
+}
+
+impl<T> CellState<T> {
+    /// 锁内快照：值句柄 + 代际（临界区内仅原子计数）。
+    fn snapshot(cell: &Mutex<Self>) -> (Option<Arc<T>>, u64) {
+        let state = lock(cell);
+        (state.current.clone(), state.generation)
+    }
+
+    /// 锁内复核：自 `generation` 那次快照以来是否无人发布。
+    fn is_current(cell: &Mutex<Self>, generation: u64) -> bool {
+        lock(cell).generation == generation
+    }
+
+    /// 锁内发布：代际未变 ⇒ 换入 `next`、代际 +1，返回被换出的旧值；代际已变 ⇒
+    /// 缓存不动，`next` 原样退回。返回的句柄由调用方在锁外析构。
+    fn publish(
+        cell: &Mutex<Self>,
+        generation: u64,
+        next: Arc<T>,
+    ) -> Result<Option<Arc<T>>, Arc<T>> {
+        let displaced = {
+            let mut state = lock(cell);
+            if state.generation != generation {
+                return Err(next);
+            }
+            // 回绕需 2^64 次发布（不可达）；wrapping 只为不留溢出 panic 路径。
+            state.generation = state.generation.wrapping_add(1);
+            state.current.replace(next)
+        };
+        Ok(displaced)
+    }
+}
+
 /// 派生记忆化胞（ViewMap 内持字段使用）：`input(state)` 等值于缓存 ⇒ 返回缓存
 /// （零重算）。
+///
+/// # 锁边界与并发语义（#157）
+///
+/// **采用方代码全在胞锁之外**：`input`、`compute`、`In::eq`、`Out::clone` 与缓存
+/// 旧值的 `Drop` 都不在内部互斥量下执行。它们可以重入本胞、也可以 panic——既不会
+/// 自锁，也不会毒化胞：panic 原样穿出 `get`，胞此后照常可用（`input` / `compute` /
+/// `eq` / `clone` 的 panic 都发生在发布之前，缓存不变）。临界区内只有句柄搬移与
+/// 代际记账。重入须自带终止条件：对**尚未缓存**的键在 `compute` 里再 `get` 会无限
+/// 递归。
+///
+/// **并发未命中允许重复计算**：算出的 `Out` 对本次请求的输入恒是正确结果。只有
+/// 「快照以来无人发布」（代际未变）才写缓存；代际已变 ⇒ 结果照常返回但**不写
+/// 缓存**、不重试——陈旧计算永不覆盖更新的已提交值，缓存里的 `(In, Out)` 恒为同
+/// 一次计算的自洽配对。
+///
+/// **线程共享门槛**：`Derived<S, In, Out>: Sync` 需要 `In: Send + Sync` 与
+/// `Out: Send + Sync`（`Send` 同）。这是「采用方代码移出胞锁」的直接后果——比对
+/// 与克隆在锁外读快照句柄（`Arc`），多线程可同时持有缓存值的共享引用。`In` /
+/// `Out` 为 `Send` 但非 `Sync` 的胞只能在单线程内使用。
+///
+/// 胞内互斥量只可能在框架自身 bug 下中毒；一旦中毒沿本模块 `lock()` 约定 fail-fast
+/// （panic 带因），不做静默降级。
 pub struct Derived<S, In, Out> {
-    cell: Mutex<Option<(In, Out)>>,
+    cell: Mutex<CellState<(In, Out)>>,
     input: Box<dyn Fn(&S) -> In + Send + Sync>,
     compute: Box<dyn Fn(&In) -> Out + Send + Sync>,
 }
@@ -520,50 +605,119 @@ impl<S, In: PartialEq, Out: Clone> Derived<S, In, Out> {
         compute: impl Fn(&In) -> Out + Send + Sync + 'static,
     ) -> Self {
         Self {
-            cell: Mutex::new(None),
+            cell: Mutex::new(CellState {
+                current: None,
+                generation: 0,
+            }),
             input: Box::new(input),
             compute: Box::new(compute),
         }
     }
-    /// 命中返回缓存；未命中重算并换缓存。
+
+    /// 命中返回缓存；未命中重算，且仅当快照以来无人发布才换缓存（并发语义见
+    /// 类型文档）。
     pub fn get(&self, state: &S) -> Out {
         let key = (self.input)(state);
-        let mut cell = lock(&self.cell);
-        if let Some((cached_in, cached_out)) = cell.as_ref() {
-            if *cached_in == key {
-                return cached_out.clone();
-            }
+        let (generation, hit) = self.lookup(&key);
+        if let Some(out) = hit {
+            return out;
         }
         let out = (self.compute)(&key);
-        *cell = Some((key, out.clone()));
+        // 缓存副本与句柄分配都在锁外；返回的旧值 / 未采纳值在此（锁外）析构。
+        drop(CellState::publish(
+            &self.cell,
+            generation,
+            Arc::new((key, out.clone())),
+        ));
         out
+    }
+
+    /// 锁内快照 + 锁外等值比对：返回（代际，命中的缓存副本）。快照句柄只活到
+    /// 这里——旧值不随其后的长计算滞留，其析构也在锁外。
+    fn lookup(&self, key: &In) -> (u64, Option<Out>) {
+        let (cached, generation) = CellState::snapshot(&self.cell);
+        let hit = match cached.as_deref() {
+            Some((cached_in, cached_out)) if *cached_in == *key => Some(cached_out.clone()),
+            _ => None,
+        };
+        (generation, hit)
     }
 }
 
-/// 绑定级输入哨兵：[`Derived`] 的退化形（只记输入不记输出）。胞锁恒为桥 core
-/// 锁的外层短叶锁（先取先放，零嵌套）。In 抽取纪律：零分配或近零；抽不廉价的
-/// 绑定不设哨兵（缺省 `true` 形态），禁哈希指纹（碰撞 = 漏报 = 静默陈旧）。
+/// 绑定级输入哨兵：[`Derived`] 的退化形（只记输入不记输出）。In 抽取纪律：零分配
+/// 或近零；抽不廉价的绑定不设哨兵（缺省 `true` 形态），禁哈希指纹（碰撞 = 漏报 =
+/// 静默陈旧）。
+///
+/// # 锁边界与并发语义（#157）
+///
+/// **采用方代码全在胞锁之外**：`extract`、`In::eq` 与缓存旧键的 `Drop` 都不在内部
+/// 互斥量下执行——可重入本胞，panic 不毒化：panic 原样穿出 `changed`，胞此后照常
+/// 可用（`extract` / `eq` 的 panic 都发生在发布之前，缓存不变）。临界区内只有句柄
+/// 搬移与代际记账。重入须自带终止条件：在 `In::eq` 里对同一个胞再 `changed` 会再
+/// 进 `eq`，须保证它能终止。
+///
+/// **裁决在线性化点复核**：返回 `false` 当且仅当最后一次持锁那一刻，缓存键确等于
+/// 本次键且自快照以来无人发布——与「一把锁包住比对 + 换缓存」同一语义。撞上并发
+/// 发布（代际已变）用新快照**重试一轮**；仍不一致 ⇒ 返回 `true` 且**不提交**：
+/// 多报只是多做一次投影，漏报才是违约。
+///
+/// 相对桥 core 锁恒为外层叶锁（先取先放，零嵌套）——这是调用方的锁序义务，与
+/// 临界区内跑什么无关。
+///
+/// **线程共享门槛**：`Sentinel<S, In>: Sync` 需要 `In: Send + Sync`（`Send` 同）。
+/// 这是「采用方代码移出胞锁」的直接后果——比对在锁外读快照句柄（`Arc`），多线程
+/// 可同时持有缓存键的共享引用。`In` 为 `Send` 但非 `Sync` 的哨兵只能在单线程内
+/// 使用。
+///
+/// 胞内互斥量只可能在框架自身 bug 下中毒；一旦中毒沿本模块 `lock()` 约定 fail-fast
+/// （panic 带因），不做静默降级。
 pub struct Sentinel<S, In> {
-    cell: Mutex<Option<In>>,
+    cell: Mutex<CellState<In>>,
     extract: Box<dyn Fn(&S) -> In + Send + Sync>,
 }
 
 impl<S, In: PartialEq> Sentinel<S, In> {
     pub fn new(extract: impl Fn(&S) -> In + Send + Sync + 'static) -> Self {
         Self {
-            cell: Mutex::new(None),
+            cell: Mutex::new(CellState {
+                current: None,
+                generation: 0,
+            }),
             extract: Box::new(extract),
         }
     }
-    /// 抽取 + 等值；变更 ⇒ 换缓存返 `true`。
+
+    /// 抽取 + 等值；变更 ⇒ 换缓存返 `true`（并发语义见类型文档）。
     pub fn changed(&self, state: &S) -> bool {
         let key = (self.extract)(state);
-        let mut cell = lock(&self.cell);
-        if cell.as_ref() == Some(&key) {
+        let (generation, equal) = self.equals_cached(&key);
+        let key = if equal {
+            if CellState::is_current(&self.cell, generation) {
+                return false;
+            }
+            Arc::new(key) // 撞上并发发布：句柄化后带进重试
+        } else {
+            match CellState::publish(&self.cell, generation, Arc::new(key)) {
+                Ok(displaced) => {
+                    drop(displaced);
+                    return true;
+                }
+                Err(unadopted) => unadopted, // 撞上并发发布：原句柄带回重试
+            }
+        };
+        // 终轮：复核通过才算未变；否则再发布一次，采纳与否都多报 `true`。
+        let (generation, equal) = self.equals_cached(&key);
+        if equal && CellState::is_current(&self.cell, generation) {
             return false;
         }
-        *cell = Some(key);
+        drop(CellState::publish(&self.cell, generation, key));
         true
+    }
+
+    /// 锁内快照 + 锁外等值比对：返回（代际，是否与缓存键等值）。
+    fn equals_cached(&self, key: &In) -> (u64, bool) {
+        let (cached, generation) = CellState::snapshot(&self.cell);
+        (generation, cached.as_deref() == Some(key))
     }
 }
 
@@ -577,6 +731,9 @@ impl<S, In: PartialEq> Sentinel<S, In> {
 #[derive(Default)]
 pub struct RegionWriter {
     out: Vec<u8>,
+    /// 当前段在 `out` 中的起点。外部使用者恒 0；桥内批缓冲复用由 [`Self::begin_segment`]
+    /// 前移，让每段编码直接写进可复用批次缓冲（零每段临时分配）。
+    start: usize,
     fault: Option<WriterFault>,
 }
 
@@ -584,26 +741,53 @@ impl RegionWriter {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// 以调用方给的（可复用）缓冲起一个空 writer——桥内批缓冲复用入口。
+    fn with_buffer(buf: Vec<u8>) -> Self {
+        Self {
+            out: buf,
+            start: 0,
+            fault: None,
+        }
+    }
+
+    /// 交出底层缓冲（段边界见 [`Self::segment_start`]）。
+    fn into_buffer(self) -> Vec<u8> {
+        self.out
+    }
+
+    /// 起新段：段起点前移到缓冲尾并复位故障标记（批内多段共用一块连续缓冲）。
+    fn begin_segment(&mut self) {
+        self.start = self.out.len();
+        self.fault = None;
+    }
+
+    /// 当前段在底层缓冲中的起点。
+    fn segment_start(&self) -> usize {
+        self.start
+    }
+
     /// 清空复用（批内多段共享一个 writer，省分配）。
     pub fn clear(&mut self) {
         self.out.clear();
+        self.start = 0;
         self.fault = None;
     }
     /// 累计字节数（含已写各段；段边界由调用方以 `len()` 差值记录）。
     pub fn len(&self) -> usize {
-        self.out.len()
+        self.out.len() - self.start
     }
     /// 空判（`len` 配对纪律）。
     pub fn is_empty(&self) -> bool {
-        self.out.is_empty()
+        self.len() == 0
     }
     /// 本次累计期间的写入故障（`None` = 全部合法）。
     pub fn fault(&self) -> Option<WriterFault> {
         self.fault
     }
-    /// 已累计字节（发布前校验用；不对采用方开放改写）。
+    /// 当前段已累计字节（发布前校验用；不对采用方开放改写）。
     fn as_slice(&self) -> &[u8] {
-        &self.out
+        &self.out[self.start..]
     }
     fn tlv(&mut self, tag: u8, payload: &[u8]) {
         if self.fault.is_some() {
@@ -656,7 +840,26 @@ impl RegionWriter {
     /// tag 5（len:u32 + 紧凑 JSON UTF-8）。复杂嵌套一律 json_blob——与
     /// `JsonEncoder::to_json` 同源取值（两编码语义一致性的机制保证）。
     pub fn json_blob(&mut self, v: &Value) {
-        self.tlv(TAG_JSON, v.to_string().as_bytes());
+        // 直接序列化进缓冲（省 `to_string()` 的整段临时 String）：先占 TLV 头，写完回填
+        // 长度。只有 io 层错误会失败，失败即整体回退到段前（不留半截 TLV）。
+        if self.fault.is_some() {
+            return;
+        }
+        let head_at = self.out.len();
+        self.out.push(TAG_JSON);
+        self.out.extend_from_slice(&[0u8; 4]);
+        let payload_at = self.out.len();
+        if serde_json::to_writer(&mut self.out, v).is_err() {
+            self.out.truncate(head_at);
+            self.fault = Some(WriterFault::BadPayload);
+            return;
+        }
+        let Ok(len) = u32::try_from(self.out.len() - payload_at) else {
+            self.out.truncate(head_at);
+            self.fault = Some(WriterFault::PayloadTooLong);
+            return;
+        };
+        self.out[payload_at - 4..payload_at].copy_from_slice(&len.to_le_bytes());
     }
 }
 
@@ -872,12 +1075,19 @@ struct Core<V> {
     bound: Option<Arc<[Bound]>>,
     /// 封板进行中（禁并发 `bind` 挤进尚未投影的绑定）。
     sealing: bool,
-    last: Vec<Option<V>>,
+    /// 已提交投影值**句柄**（#140 两阶段：锁内只搬 `Arc`，采用方 `Clone`/`Drop`
+    /// 一律在锁外——退役句柄由调用方带出临界区后析构）。
+    last: Vec<Option<Arc<V>>>,
     dirty: Vec<bool>,
+    /// 每绑定脏代次（JSON 交付的清零令牌：只有捕获到的那一代仍是当前才清脏位，
+    /// 编码期间竞态的新脏写留着）。
+    dirty_rev: Vec<u64>,
     poisoned: bool,
     /// 已提交的 even 发布水位（与区域头 publish-sequence / `to_version` 同值）。
     version: u64,
     delivered_epoch: u64,
+    /// 提交代次（每次提交 `last`/`version` 都 +1；两阶段提交的校验令牌）。
+    commit_gen: u64,
 }
 
 /// 区域索引条目（背衬 Index 区的内存镜像）。
@@ -890,13 +1100,43 @@ struct RegionEntry {
     gen: u32,
 }
 
-/// 一段已编码且已对齐填充的段字节。
+/// 一段已编码载荷在批缓冲中的位置（`len` = 未填充长度；填充在背衬目标区直接补零）。
 struct Seg {
     entry: usize,
     /// 未填充长度（Index `len` 字段；TLV 自描述，填充字节不可见）。
     len: u32,
-    /// 已 8 字节对齐填充的段字节。
-    padded: Vec<u8>,
+    /// 段字节在批缓冲中的起点。
+    at: usize,
+}
+
+/// 一批段字节：连续缓冲 + 段描述。编码直接写进 `bytes`（[`RegionWriter::with_buffer`]），
+/// 故每绑定零临时分配、最终只拷一次进背衬；跨 publish 复用（段描述只有偏移，无采用方值）。
+#[derive(Default)]
+struct SegBatch {
+    bytes: Vec<u8>,
+    segs: Vec<Seg>,
+}
+
+impl SegBatch {
+    /// 复位为「空批」（保留两块容量）。
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.segs.clear();
+    }
+}
+
+/// 段落位占宽（8 字节对齐；Index `len` 记未填充长度）。
+fn seg_total(s: &Seg) -> usize {
+    pad8(s.len as usize)
+}
+
+/// 一批段的总落位字节（溢出 `None`）。
+fn segs_need(segs: &[Seg]) -> Option<usize> {
+    let mut need = 0usize;
+    for s in segs {
+        need = need.checked_add(seg_total(s))?;
+    }
+    Some(need)
 }
 
 /// 一次发布事务的计划（**纯计算产物**，不含任何采用方调用）。
@@ -906,8 +1146,8 @@ struct PublishPlan {
     sequence: u64,
     entries: Vec<RegionEntry>,
     cursor: usize,
-    /// `(arena 偏移, 已填充段字节)`。
-    segments: Vec<(usize, Vec<u8>)>,
+    /// `(arena 偏移, 批缓冲偏移, 未填充长度)`——填充字节在目标区直接补零。
+    segments: Vec<(usize, usize, u32)>,
     header: [u8; HEADER_LEN],
     capacity: usize,
 }
@@ -1019,16 +1259,11 @@ impl<R: RegionEncoder> RegionChannel<R> {
     /// （#155/#190）：已登记绑定的现值各占一段，不等后续变更——Region-only 部署
     /// 封板即可用。放不下 ⇒ typed `CapacityExceeded`（封板失败，不是 arena-full）。
     fn plan_initial(&self, segs: &[Seg]) -> Result<PublishPlan, RegionFailure> {
-        let mut need = 0usize;
-        for s in segs {
-            need = need
-                .checked_add(s.padded.len())
-                .ok_or(RegionFailure::CapacityExceeded {
-                    required: usize::MAX,
-                    capacity: self.capacity,
-                    region_id: self.region_id,
-                })?;
-        }
+        let need = segs_need(segs).ok_or(RegionFailure::CapacityExceeded {
+            required: usize::MAX,
+            capacity: self.capacity,
+            region_id: self.region_id,
+        })?;
         let required =
             self.arena_start
                 .checked_add(need)
@@ -1050,11 +1285,7 @@ impl<R: RegionEncoder> RegionChannel<R> {
 
     /// 增量计划；`None` = arena 不足（调用方先做全量重编，再走 [`Self::plan_reseed`]）。
     fn plan_incremental(&self, segs: &[Seg], sequence: u64) -> Option<PublishPlan> {
-        let mut need = 0usize;
-        for s in segs {
-            need = need.checked_add(s.padded.len())?;
-        }
-        let end = self.cursor.checked_add(need)?;
+        let end = self.cursor.checked_add(segs_need(segs)?)?;
         if end > self.capacity {
             return None;
         }
@@ -1064,16 +1295,11 @@ impl<R: RegionEncoder> RegionChannel<R> {
     /// 全量重编计划（换区）：先算总编码大小再动任何 live 状态；放不下 ⇒ typed
     /// `CapacityExceeded` 且**上一份已知良好元数据保持有效**（#172）。
     fn plan_reseed(&self, segs: &[Seg], sequence: u64) -> Result<PublishPlan, RegionFailure> {
-        let mut need = 0usize;
-        for s in segs {
-            need = need
-                .checked_add(s.padded.len())
-                .ok_or(RegionFailure::CapacityExceeded {
-                    required: usize::MAX,
-                    capacity: self.capacity,
-                    region_id: self.region_id,
-                })?;
-        }
+        let need = segs_need(segs).ok_or(RegionFailure::CapacityExceeded {
+            required: usize::MAX,
+            capacity: self.capacity,
+            region_id: self.region_id,
+        })?;
         let required =
             self.arena_start
                 .checked_add(need)
@@ -1130,8 +1356,8 @@ impl<R: RegionEncoder> RegionChannel<R> {
             e.offset = cursor;
             e.len = s.len;
             e.gen = e.gen.wrapping_add(1); // 条目逻辑修订号（非原子标记，见规格 §5.2）
-            segments.push((cursor, s.padded.clone()));
-            cursor = cursor.checked_add(s.padded.len())?;
+            segments.push((cursor, s.at, s.len));
+            cursor = cursor.checked_add(seg_total(s))?;
         }
         Some(PublishPlan {
             region_id: self.region_id,
@@ -1196,7 +1422,11 @@ fn store_seq(backing: &dyn RegionBacking, seq: u64) -> Result<(), RegionFailure>
 /// 序列是唯一事务边界（一次事务可拆成两次 backing 调用）：odd 之后任何失败都
 /// 让区域留在「进行中」，读者必拒收；even 只在全部字节落盘后以 release 语义
 /// store（提交点，最后写）。
-fn execute_plan(backing: &dyn RegionBacking, plan: &PublishPlan) -> Result<(), RegionFailure> {
+fn execute_plan(
+    backing: &dyn RegionBacking,
+    plan: &PublishPlan,
+    batch: &[u8],
+) -> Result<(), RegionFailure> {
     // even 序列 ⇒ odd = seq - 1。计划只产出 even（禁把 odd 当已提交版本）。
     let odd = plan
         .sequence
@@ -1205,18 +1435,30 @@ fn execute_plan(backing: &dyn RegionBacking, plan: &PublishPlan) -> Result<(), R
         .ok_or(RegionFailure::GenerationExhausted)?;
     store_seq(backing, odd)?;
 
-    // ① 段字节（按计划偏移整段写入，禁部分段）。
+    // ① 段字节（按计划偏移整段写入 + 目标区直接补零，禁部分段）。`batch` 是本批段
+    // 字节的连续缓冲：每段只拷一次未填充载荷，填充字节在目标区就地清零。
     if !plan.segments.is_empty() {
         let mut short: Option<(usize, usize)> = None;
         match catch_unwind(AssertUnwindSafe(|| {
             backing.with_bytes_mut(&mut |buf| {
-                for (off, bytes) in &plan.segments {
-                    let Some(end) = off.checked_add(bytes.len()) else {
+                for (off, at, len) in &plan.segments {
+                    let len = *len as usize;
+                    let Some(end) = off.checked_add(pad8(len)) else {
                         short = Some((usize::MAX, buf.len()));
                         return;
                     };
+                    let Some(src) = at
+                        .checked_add(len)
+                        .and_then(|end_at| batch.get(*at..end_at))
+                    else {
+                        short = Some((end, buf.len()));
+                        return;
+                    };
                     match buf.get_mut(*off..end) {
-                        Some(slot) => slot.copy_from_slice(bytes),
+                        Some(slot) => {
+                            slot[..len].copy_from_slice(src);
+                            slot[len..].fill(0);
+                        }
                         None => short = Some((end, buf.len())),
                     }
                 }
@@ -1281,6 +1523,66 @@ fn execute_plan(backing: &dyn RegionBacking, plan: &PublishPlan) -> Result<(), R
     store_seq(backing, plan.sequence)
 }
 
+/// 两阶段提交的校验重试上限（期间 `repair`/`seal` 提交过才用得上；有界，禁自旋）。
+const COMMIT_ATTEMPTS: u32 = 3;
+
+/// 通知路径 scratch（跨通知复用容量；单个排空回调**独占**持有，见
+/// [`Notifier::take_notify`]）。只装句柄与容量，无采用方值语义。
+///
+/// 归还前必须在**锁外** `recycle()`：丢弃的 `Arc` 会触发采用方 `Drop`，禁在桥内锁里跑。
+struct NotifyScratch<V> {
+    /// 本拍投影结果 `(绑定表位置, 值句柄)`。
+    pending: Vec<(usize, Arc<V>)>,
+    /// 本拍真正变更的项（两阶段比较后 latest-wins）。
+    changed: Vec<(usize, Arc<V>)>,
+    /// 被换出的旧值句柄（锁外析构）。
+    retired: Vec<Arc<V>>,
+    /// `last` 句柄快照（只读比较面）。
+    prev: Vec<Option<Arc<V>>>,
+}
+
+// 手写 Default：`derive` 会额外要求 `V: Default`（空 Vec 不需要）。
+impl<V> Default for NotifyScratch<V> {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            changed: Vec::new(),
+            retired: Vec::new(),
+            prev: Vec::new(),
+        }
+    }
+}
+
+impl<V> NotifyScratch<V> {
+    /// 锁外丢弃全部句柄。
+    fn recycle(&mut self) {
+        self.pending.clear();
+        self.changed.clear();
+        self.retired.clear();
+        self.prev.clear();
+    }
+}
+
+/// 一条通知路径的全部 scratch（单个排空回调独占，见 [`Notifier::take_scratch`]）：
+/// 投影/提交句柄表 + 区域发布批字节。`batch` 与通知共用一槽，故一次取/还即够。
+struct Scratch<V> {
+    notify: NotifyScratch<V>,
+    batch: SegBatch,
+}
+
+// 手写 Default：`derive` 会额外要求 `V: Default`（空 Vec 不需要）。
+impl<V> Default for Scratch<V> {
+    fn default() -> Self {
+        Self {
+            notify: NotifyScratch::default(),
+            batch: SegBatch::default(),
+        }
+    }
+}
+
+/// 一个待交付脏项：（绑定位置, 脏代次, 值句柄）。
+type DirtyItem<V> = (usize, u64, Option<Arc<V>>);
+
 /// 通知体共享态（订阅闭包捕获 `Arc<Self>`；不含 store/票据 ⇒ 无环）。
 struct Notifier<S, M: ViewMap<S>, J: JsonEncoder, R: RegionEncoder> {
     map: Arc<M>,
@@ -1301,6 +1603,8 @@ struct Notifier<S, M: ViewMap<S>, J: JsonEncoder, R: RegionEncoder> {
     region_failures: AtomicU64,
     /// 封板前到达的通知（装配纪律违约：可见计数，不投影不发布）。
     pre_seal_notifications: AtomicU64,
+    /// 通知 + 发布 scratch（独占式复用：取不到 = 并发通知在跑，临时新建）。
+    scratch: Mutex<Option<Scratch<M::View>>>,
     _s: std::marker::PhantomData<fn(&S)>,
 }
 
@@ -1315,29 +1619,40 @@ where
         lock(&self.core).bound.as_ref().map(Arc::clone)
     }
 
+    /// 取本拍 scratch（独占；并发通知取不到 ⇒ 新建空的，行为不变只是多分配）。
+    fn take_scratch(&self) -> Scratch<M::View> {
+        lock(&self.scratch).take().unwrap_or_default()
+    }
+
+    /// 归还本拍 scratch：先在**锁外**丢句柄（采用方 `Drop` 不落锁内），再入槽。
+    fn put_scratch(&self, mut scratch: Scratch<M::View>) {
+        scratch.notify.recycle();
+        *lock(&self.scratch) = Some(scratch);
+    }
+
     /// 初始区域发布（#155/#190，`core` 锁外）：建表（纯内存）→ **全量**初始
     /// 段落位 → 一次事务提交。水位 = 封板 even（[`INITIAL_SEQ`]）。
     fn seal_region(
         &self,
         bound: &[Bound],
-        items: &[(usize, M::View)],
+        items: &[(usize, Arc<M::View>)],
     ) -> Result<(), RegionFailure> {
         let Some(encoder) = self.region_encoder() else {
             return Ok(()); // 未挂区域通道
         };
-        let segs = match self.encode_segments(encoder.as_ref(), bound, items) {
-            Ok(segs) => segs,
-            Err(f) => {
-                self.fail_region(f.clone(), false);
-                return Err(f);
-            }
-        };
+        let mut batch = SegBatch::default();
+        if let Err(f) = self.encode_into(encoder.as_ref(), bound, items, &mut batch) {
+            self.fail_region(f.clone(), false);
+            return Err(f);
+        }
         let plan = {
             let mut rg = lock(&self.region);
             let Some(ch) = rg.as_mut() else {
                 return Ok(());
             };
-            let outcome = ch.begin_seal(bound).and_then(|()| ch.plan_initial(&segs));
+            let outcome = ch
+                .begin_seal(bound)
+                .and_then(|()| ch.plan_initial(&batch.segs));
             match outcome {
                 Ok(p) => p,
                 Err(f) => {
@@ -1348,8 +1663,8 @@ where
             }
         };
         self.region_encodes
-            .fetch_add(segs.len() as u64, Ordering::Relaxed);
-        self.publish_plan(plan);
+            .fetch_add(batch.segs.len() as u64, Ordering::Relaxed);
+        self.publish_plan(plan, &batch.bytes);
         match lock(&self.region_failure).clone() {
             None => Ok(()),
             Some(f) => Err(f),
@@ -1370,94 +1685,107 @@ where
 
     /// 逐绑定编码（采用方代码，锁外）：每绑定恰一段非空完整 TLV（#168/#185），
     /// 宽度/有限性由 writer 自报（#141/#153）。覆盖判定吃装配期缓存。
-    fn encode_segments(
+    ///
+    /// 段字节**直接写进批缓冲**（`batch.bytes`，跨 publish 复用）：每绑定零临时分配，
+    /// 最终由 [`execute_plan`] 一次拷入背衬。`batch` 由本调用独占持有。
+    fn encode_into(
         &self,
         encoder: &R,
         bound: &[Bound],
-        items: &[(usize, M::View)],
-    ) -> Result<Vec<Seg>, RegionFailure> {
-        let mut writer = RegionWriter::new();
-        let mut segs: Vec<Seg> = Vec::new();
+        items: &[(usize, Arc<M::View>)],
+        batch: &mut SegBatch,
+    ) -> Result<(), RegionFailure> {
+        batch.clear();
+        let mut writer = RegionWriter::with_buffer(std::mem::take(&mut batch.bytes));
         for (bi, view) in items {
             if !bound[*bi].region_cover {
                 continue;
             }
-            writer.clear();
+            writer.begin_segment();
             if catch_unwind(AssertUnwindSafe(|| encoder.encode(view, &mut writer))).is_err() {
+                batch.bytes = writer.into_buffer();
                 return Err(RegionFailure::EncoderPanicked {
                     path: bound[*bi].path,
                 });
             }
             let seg = writer.as_slice();
-            if let Some(fault) = writer.fault().or_else(|| validate_single_tlv(seg).err()) {
+            let fault = writer.fault().or_else(|| validate_single_tlv(seg).err());
+            let len = u32::try_from(seg.len()).ok();
+            if let Some(fault) = fault {
+                batch.bytes = writer.into_buffer();
                 return Err(RegionFailure::EncoderOutput {
                     path: bound[*bi].path,
                     fault,
                 });
             }
-            let Ok(len) = u32::try_from(seg.len()) else {
+            let Some(len) = len else {
+                batch.bytes = writer.into_buffer();
                 return Err(RegionFailure::EncoderOutput {
                     path: bound[*bi].path,
                     fault: WriterFault::PayloadTooLong,
                 });
             };
-            let mut padded = seg.to_vec();
-            padded.resize(pad8(seg.len()), 0);
-            segs.push(Seg {
+            batch.segs.push(Seg {
                 entry: *bi,
                 len,
-                padded,
+                at: writer.segment_start(),
             });
         }
-        Ok(segs)
+        batch.bytes = writer.into_buffer();
+        Ok(())
     }
 
     /// 区域增量发布：**锁外编码 → 锁内计划 → 锁外事务 → 锁内提交**。
     /// `changed` = `(绑定表位置, 视图值)`。
-    fn publish_changes(&self, bound: &[Bound], changed: &[(usize, M::View)], sequence: u64) {
+    fn publish_changes(
+        &self,
+        bound: &[Bound],
+        changed: &[(usize, Arc<M::View>)],
+        sequence: u64,
+        batch: &mut SegBatch,
+    ) {
         let Some(encoder) = self.region_encoder() else {
             return;
         };
         if !self.region_ready() {
             return;
         }
-        let segs = match self.encode_segments(encoder.as_ref(), bound, changed) {
-            Ok(segs) => segs,
-            Err(f) => return self.fail_region(f, false),
-        };
+        if let Err(f) = self.encode_into(encoder.as_ref(), bound, changed, batch) {
+            return self.fail_region(f, false);
+        }
         // 计划：锁内纯算术（无采用方调用）。
         let plan = {
             let rg = lock(&self.region);
             let Some(ch) = rg.as_ref() else {
                 return;
             };
-            match ch.plan_incremental(&segs, sequence) {
+            match ch.plan_incremental(&batch.segs, sequence) {
                 Some(p) => p,
-                // 增量放不下 ⇒ 全量重编（先算总大小再动 live 状态）。
+                // 增量放不下 ⇒ 全量重编（先算总大小再动 live 状态；同一批缓冲重编）。
                 None => {
                     drop(rg);
-                    return self.reseed_with(bound, encoder.as_ref(), sequence);
+                    return self.reseed_with(bound, encoder.as_ref(), sequence, batch);
                 }
             }
         };
         self.region_encodes
-            .fetch_add(segs.len() as u64, Ordering::Relaxed);
-        self.publish_plan(plan);
+            .fetch_add(batch.segs.len() as u64, Ordering::Relaxed);
+        self.publish_plan(plan, &batch.bytes);
     }
 
-    /// 全量重编 + 换区（增量耗尽路径 / `reseed_region` 恢复口）。
-    fn reseed_with(&self, bound: &[Bound], encoder: &R, sequence: u64) {
+    /// 全量重编 + 换区（增量耗尽路径 / `reseed_region` 恢复口）。`batch` 由调用方
+    /// 独占持有——重编复用同一块批缓冲，容量不丢。
+    fn reseed_with(&self, bound: &[Bound], encoder: &R, sequence: u64, batch: &mut SegBatch) {
         let items = self.full_snapshot(bound);
-        let segs = match self.encode_segments(encoder, bound, &items) {
-            Ok(segs) => segs,
-            Err(f) => return self.fail_region(f, false),
-        };
+        if let Err(f) = self.encode_into(encoder, bound, &items, batch) {
+            return self.fail_region(f, false);
+        }
         let plan = {
             let rg = lock(&self.region);
             let Some(ch) = rg.as_ref() else {
                 return;
             };
-            match ch.plan_reseed(&segs, sequence) {
+            match ch.plan_reseed(&batch.segs, sequence) {
                 Ok(p) => p,
                 // 放不下 ⇒ 上一份已知良好元数据保持有效，失败可见（不再 debug_assert）。
                 Err(f) => {
@@ -1466,23 +1794,24 @@ where
                 }
             }
         };
-        self.publish_plan(plan);
+        self.publish_plan(plan, &batch.bytes);
     }
 
-    /// 现态全量视图快照（core 锁内捕获；未发布过的绑定缺席）。
-    fn full_snapshot(&self, bound: &[Bound]) -> Vec<(usize, M::View)> {
+    /// 现态全量视图快照（core 锁内只搬 `Arc` 句柄，零采用方 `Clone`；未发布过的
+    /// 绑定缺席）。
+    fn full_snapshot(&self, bound: &[Bound]) -> Vec<(usize, Arc<M::View>)> {
         let core = lock(&self.core);
         bound
             .iter()
             .enumerate()
-            .filter_map(|(bi, _)| core.last[bi].as_ref().map(|v| (bi, v.clone())))
+            .filter_map(|(bi, _)| core.last[bi].as_ref().map(|v| (bi, Arc::clone(v))))
             .collect()
     }
 
     /// 执行 + 提交（唯一入口：先锁外事务，成功才锁内换镜像并对外宣称新水位）。
     /// `publishing` 旗提供并发可见失败（`PublishBusy`）而不是死锁——它**不是**
     /// 互斥量：采用方代码（encode/backing）在锁外执行。
-    fn publish_plan(&self, plan: PublishPlan) {
+    fn publish_plan(&self, plan: PublishPlan, batch: &[u8]) {
         let (backing, busy) = {
             let rg = lock(&self.region);
             let Some(ch) = rg.as_ref() else {
@@ -1497,7 +1826,7 @@ where
         if busy {
             return self.fail_region(RegionFailure::PublishBusy, false);
         }
-        let outcome = execute_plan(backing.as_ref(), &plan);
+        let outcome = execute_plan(backing.as_ref(), &plan, batch);
         let committed = {
             let mut rg = lock(&self.region);
             let mut meta = None;
@@ -1541,13 +1870,59 @@ where
 
     /// 通知体（dispatch 线程同步）。封板前到达 = 装配纪律违约：只计数不投影
     /// （禁静默吞吐，也禁事后补投影掩盖边界不一致）。
+    ///
+    /// **最后一道闸**：任何采用方 panic（含本体内各 `Drop` 点：退役句柄、句柄表快照）
+    /// 都不得穿出通知体——穿出会被 store 按「订阅者 panic」摘除整条桥订阅，桥此后
+    /// 永远收不到通知而其失败面（`resync`/`projection_panics`）全不动。此处兜底只做
+    /// 计数 + 毒化，让失败可见而不失联。
     fn on_notify(&self, state: &S) {
+        if catch_unwind(AssertUnwindSafe(|| self.dispatch_notify(state))).is_err() {
+            self.projection_panics.fetch_add(1, Ordering::Relaxed);
+            lock(&self.core).poisoned = true;
+        }
+    }
+
+    /// 通知体本体（两阶段提交见 [`Self::commit_two_phase`]）。
+    ///
+    /// 投影/提交/发布 scratch 由本帧**独占**（[`Self::take_scratch`]）：并发通知取不到
+    /// 就新建一个（行为不变，只是多分配），故不需要别名证明，也没有 unsafe。取用是
+    /// **惰性**的——哨兵全报未变的快路径不取、不放，一次锁都不多加。
+    fn dispatch_notify(&self, state: &S) {
         let Some(bound) = self.sealed_bound() else {
             self.pre_seal_notifications.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        // 锁外：哨兵粗闸（跳投影）→ 单点投影（panic catch：三态提交唯一缺口）。
-        let mut pending: Vec<(usize, M::View)> = Vec::new(); // (绑定注册序, view)
+        // 首个变更落地时才取 scratch（未变更快路径零分配、零新增取锁）；本帧全权拥有，
+        // 收尾（含未提交的早退）在这里统一归还。
+        let mut scratch: Option<Scratch<M::View>> = None;
+        let sequence = self.project_into(state, &bound, &mut scratch);
+        if let Some(sequence) = sequence {
+            match scratch.as_mut() {
+                Some(Scratch { notify, batch }) => {
+                    // eager 区域编码 + 事务（锁外编码；空批也推进头序列，跨通道同源）。
+                    self.publish_changes(&bound, &notify.changed, sequence, batch);
+                }
+                None => {
+                    // 未变更拍的空批发布：零段 ⇒ 空批 scratch 不分配。
+                    let mut empty = SegBatch::default();
+                    self.publish_changes(&bound, &[], sequence, &mut empty);
+                }
+            }
+        }
+        if let Some(scratch) = scratch {
+            self.put_scratch(scratch);
+        }
+    }
+
+    /// 锁外投影（哨兵粗闸 → 单点投影，panic catch：三态提交唯一缺口）→ 提交；返回本拍
+    /// 新 even 水位（`None` = 未提交且已毒化）。scratch 经 `scratch` 出入（取用与否由本
+    /// 函数决定，归还归调用方）。
+    fn project_into(
+        &self,
+        state: &S,
+        bound: &[Bound],
+        scratch: &mut Option<Scratch<M::View>>,
+    ) -> Option<u64> {
         let mut panicked = false;
         for (bi, b) in bound.iter().enumerate() {
             // #152/#189：`input_changed` 与 `project` 同为**采用方代码**，panic 禁穿出
@@ -1568,38 +1943,138 @@ where
             }
             self.projection_runs.fetch_add(1, Ordering::Relaxed);
             match catch_unwind(AssertUnwindSafe(|| self.map.project(b.index, state))) {
-                Ok(v) => pending.push((bi, v)),
+                Ok(v) => scratch
+                    .get_or_insert_with(|| self.take_scratch())
+                    .notify
+                    .pending
+                    .push((bi, Arc::new(v))),
                 Err(_) => {
                     self.projection_panics.fetch_add(1, Ordering::Relaxed);
                     panicked = true;
                 }
             }
         }
-        // 锁内折叠：类型 eq 细闸（跳补丁）→ 移槽置脏（latest-wins）+ 水位推进 + 毒化。
-        let sequence;
-        let mut changed: Vec<(usize, M::View)> = Vec::new();
-        {
+        let Some(scratch) = scratch.as_mut() else {
+            // 未变更快路径：只有一次 `core` 锁、零分配、零新增取锁。
+            return self.advance_uncommitted(panicked);
+        };
+        self.commit_two_phase(&mut scratch.notify, panicked)
+    }
+
+    /// 未变更快路径的水位推进（锁内纯记账：无采用方代码、零分配）。
+    ///
+    /// **不推进 `commit_gen`**：提交令牌的含义是「`last` 自快照以来是否被换过」，本路径
+    /// 不动 `last`，推进令牌只会让并发的变更提交白白重来（#169/#174 一旦放开并发通知，
+    /// 就成了「重试轮次被无谓耗尽 ⇒ 整批丢弃 + 毒化」的放大器）。前置条件由此固定：
+    /// **只有真正改写 `last` 的提交才 +1 令牌**。
+    fn advance_uncommitted(&self, panicked: bool) -> Option<u64> {
+        let mut core = lock(&self.core);
+        let Some(next) = core.version.checked_add(SEQ_STEP) else {
+            // 代次耗尽：typed/可见降级（禁 wrapping 复用旧代次）。
+            core.poisoned = true;
+            return None;
+        };
+        core.version = next;
+        if panicked {
+            core.poisoned = true;
+        }
+        Some(next)
+    }
+
+    /// 变更路径的两阶段提交：锁内捕获 `Arc` 句柄快照 + 提交代次 → **锁外**跑采用方
+    /// `PartialEq` → 锁内校验代次后只换变更槽（latest-wins），退役旧句柄带出临界区
+    /// 析构。快照只做原子计数，不跑 `View::clone`。
+    ///
+    /// 校验失败（期间 `repair`/`seal` 提交过 ⇒ 快照与现态不配）⇒ 重取快照重来，共
+    /// [`COMMIT_ATTEMPTS`] 轮；仍不配 ⇒ **不提交** + 毒化可见：已提交值可能更新于本次
+    /// 投影，禁以更旧值覆盖它（毒化强制 `snapshot_doc` 重同步，可见而非静默）。
+    ///
+    /// **采用方 `panic` 一律在桥边界 contain（#140 复审 P0）**：`PartialEq` 抛错 ⇒ 本批
+    /// 不提交、`projection_panics` +1、毒化（经 `resync` / `SnapshotError::Incomplete`
+    /// 可见）；退役值 `Drop` 抛错 ⇒ 提交已成立但同样计数 + 毒化。两者**都不得穿出**
+    /// `on_notify`——穿出会被 store 按「订阅者 panic」摘除订阅，桥此后永远收不到通知。
+    fn commit_two_phase(
+        &self,
+        scratch: &mut NotifyScratch<M::View>,
+        panicked: bool,
+    ) -> Option<u64> {
+        // 投影结果与 `changed` 同住 scratch：移出以分离可变/不可变借用（零分配）。
+        let pending = std::mem::take(&mut scratch.pending);
+        let out = self.commit_attempts(&pending, scratch, panicked);
+        // 句柄的析构留给归还时的锁外 `recycle`（不在任何桥内锁里跑采用方 Drop）。
+        scratch.pending = pending;
+        out
+    }
+
+    /// 有界提交本体（协议见 [`Self::commit_two_phase`]）。
+    fn commit_attempts(
+        &self,
+        pending: &[(usize, Arc<M::View>)],
+        scratch: &mut NotifyScratch<M::View>,
+        panicked: bool,
+    ) -> Option<u64> {
+        let NotifyScratch {
+            changed,
+            retired,
+            prev,
+            ..
+        } = scratch;
+        for _ in 0..COMMIT_ATTEMPTS {
+            // 上一轮快照的句柄先在此（锁外）丢；锁内只搬句柄快照 + 取代次令牌。
+            prev.clear();
+            let token = {
+                let core = lock(&self.core);
+                prev.clone_from(&core.last);
+                core.commit_gen
+            };
+            // 锁外：采用方 `PartialEq`（句柄读只做原子计数）。
+            changed.clear();
+            let compared = catch_unwind(AssertUnwindSafe(|| {
+                for (bi, v) in pending {
+                    if prev[*bi].as_deref() != Some(&**v) {
+                        changed.push((*bi, Arc::clone(v)));
+                    }
+                }
+            }));
+            if compared.is_err() {
+                // 判不出「变没变」⇒ 禁当未变（静默陈旧），也禁提交半批：不推进水位，
+                // 只显形（计数 + 毒化 ⇒ 下一批 resync，UI 走 snapshot_doc 重同步）。
+                self.projection_panics.fetch_add(1, Ordering::Relaxed);
+                lock(&self.core).poisoned = true;
+                return None;
+            }
             let mut core = lock(&self.core);
+            if core.commit_gen != token {
+                drop(core);
+                continue;
+            }
             let Some(next) = core.version.checked_add(SEQ_STEP) else {
-                // 代次耗尽：typed/可见降级（禁 wrapping 复用旧代次）。
                 core.poisoned = true;
-                return;
+                return None;
             };
             core.version = next;
-            sequence = next;
-            for (bi, v) in pending {
-                if core.last[bi].as_ref() != Some(&v) {
-                    changed.push((bi, v.clone()));
-                    core.last[bi] = Some(v);
-                    core.dirty[bi] = true;
-                }
-            }
+            core.commit_gen = core.commit_gen.wrapping_add(1);
             if panicked {
                 core.poisoned = true;
             }
+            for (bi, v) in changed.iter() {
+                core.dirty[*bi] = true;
+                core.dirty_rev[*bi] = core.dirty_rev[*bi].wrapping_add(1);
+                if let Some(old) = core.last[*bi].replace(Arc::clone(v)) {
+                    retired.push(old);
+                }
+            }
+            drop(core);
+            // 退役值在**锁外**析构（采用方 `Drop`）；析构 panic 同样 contain：提交已成立，
+            // 但必须计数 + 毒化让「该批的完整性」在 resync 上可见。
+            if catch_unwind(AssertUnwindSafe(|| retired.clear())).is_err() {
+                self.projection_panics.fetch_add(1, Ordering::Relaxed);
+                lock(&self.core).poisoned = true;
+            }
+            return Some(next);
         }
-        // eager 区域编码 + 事务（锁外编码；空批也推进头序列，跨通道同源）。
-        self.publish_changes(&bound, &changed, sequence);
+        lock(&self.core).poisoned = true;
+        None
     }
 }
 
@@ -1639,9 +2114,29 @@ where
 /// 已提交视图 + 初始区域全量）。装配后句柄可跨线程共享（Send + Sync）；票据归桥，
 /// 桥 Drop = 注销订阅；store 所有权随桥（`snapshot_doc` 修复路径的现态源），桥
 /// Drop ⇒ store 随桥回收（上行句柄经 `send_intent` 透传闭门 false）。
+///
+/// # 采用方代码零锁内（#140 / #222 §3）
+///
+/// 已提交投影值以 [`Arc`] 句柄存放：锁内只搬句柄与代次，采用方
+/// `JsonEncoder::{covers,to_json}`、`RegionEncoder::{covers,encode}`、
+/// `RegionBacking::*` 与 `M::View` 的 `PartialEq`/`Clone`/`Drop` **一律不在桥内互斥量
+/// 下执行**（两阶段：锁内捕获 → 锁外运行 → 锁内校验令牌提交；退役值在锁外析构）。
+/// 两个 `covers()` 只在 `mount`（桥尚不存在的装配期）各求值一次并缓存，运行期零调用。
+///
+/// **门槛**（本桥新增，[`ViewMap`] 自身约束不变）：`M::View` 必须 `Send + Sync`。
+/// 这是「句柄快照」的直接后果——`Arc<V>: Send` 要求 `V: Send + Sync`，而桥跨线程
+/// 共享（`Sync` 订阅回调）。与 #157 机制胞同质的编译期门槛；`View` 若含
+/// `Cell`/`RefCell`/裸指针包装（`Send + !Sync`）则无法挂在桥上。
+///
+/// **锁序**：`core` 与 `region` 从不同时持有（每次获取都是叶锁）；唯一嵌套是
+/// `region_failure → region`。`bind` 只在 `core.bound.is_none()` 时继续，封板后
+/// 直接 `Err(BindError::Sealed)` ⇒ `core→region`（bind/seal）与 `region→core`
+/// （旧 fallback）被封板状态互斥。**封板后禁止 bind；若未来允许 sealed 后 bind 或
+/// 改变封板顺序，必须重审此锁序**（#140 评论 7153375286 的状态机前提）。
 pub struct ViewBridge<S, A, M, I, J, R>
 where
     M: ViewMap<S>,
+    M::View: Send + Sync,
     J: JsonEncoder,
     R: RegionEncoder,
 {
@@ -1655,6 +2150,7 @@ where
     S: Send + 'static,
     A: Send + 'static,
     M: ViewMap<S> + Send + Sync + 'static,
+    M::View: Send + Sync,
     I: IntentMap<A, Wire = Value, Err = IntentError> + Send + Sync + 'static,
     J: JsonEncoder<View = M::View> + Send + Sync + 'static,
     R: RegionEncoder<View = M::View> + Send + Sync + 'static,
@@ -1713,9 +2209,11 @@ where
                 sealing: false,
                 last: Vec::new(),
                 dirty: Vec::new(),
+                dirty_rev: Vec::new(),
                 poisoned: false,
                 version: 0,
                 delivered_epoch: 0,
+                commit_gen: 0,
             }),
             json_covers,
             region_covers,
@@ -1727,6 +2225,7 @@ where
             region_failure: Mutex::new(initial_failure),
             region_failures: AtomicU64::new(0),
             pre_seal_notifications: AtomicU64::new(0),
+            scratch: Mutex::new(None),
             _s: std::marker::PhantomData,
         });
         let cb = Arc::clone(&notify);
@@ -1807,39 +2306,80 @@ where
     /// `to_version` = 已提交 even 水位（与区域头 publish-sequence 同源同值）。
     pub fn take_patches(&self) -> PatchBatch {
         let notify = &self.inner.notify;
-        let mut core = lock(&notify.core);
-        let bound = match &core.bound {
-            Some(b) => Arc::clone(b),
-            None => return empty_batch(0),
-        };
-        let resync = core.poisoned;
-        let from = core.delivered_epoch;
-        core.delivered_epoch = core.version;
-        let mut patches = Vec::new();
-        if let Some(j) = &notify.json {
-            for (bi, b) in bound.iter().enumerate() {
+        // ① 锁内捕获：绑定表 + 每个脏绑定的（位置, 脏代次, 值句柄）+ 水位/游标。
+        // 句柄化 ⇒ 锁内零采用方代码（`to_json` 一律在锁外，#140）。
+        let (bound, due, resync, from, to) = {
+            let core = lock(&notify.core);
+            let bound = match &core.bound {
+                Some(b) => Arc::clone(b),
+                None => return empty_batch(0),
+            };
+            let capture_views = notify.json.is_some();
+            let mut due: Vec<DirtyItem<M::View>> = Vec::new();
+            for bi in 0..core.dirty.len() {
                 if !core.dirty[bi] {
                     continue;
                 }
-                if b.json_cover {
-                    if let Some(v) = &core.last[bi] {
-                        patches.push(Patch {
-                            path: b.path,
-                            kind: b.kind,
-                            value: j.to_json(v),
-                        });
+                let view = if capture_views {
+                    core.last[bi].clone()
+                } else {
+                    None
+                };
+                due.push((bi, core.dirty_rev[bi], view));
+            }
+            (
+                bound,
+                due,
+                core.poisoned,
+                core.delivered_epoch,
+                core.version,
+            )
+        };
+        // ② 锁外：逐项编码（采用方代码，panic 在桥边界 contain）。
+        let mut patches = Vec::with_capacity(due.len());
+        if let Some(j) = &notify.json {
+            for (bi, _, view) in &due {
+                let b = &bound[*bi];
+                let Some(view) = view else { continue };
+                if !b.json_cover {
+                    continue;
+                }
+                match catch_unwind(AssertUnwindSafe(|| j.to_json(view))) {
+                    Ok(value) => patches.push(Patch {
+                        path: b.path,
+                        kind: b.kind,
+                        value,
+                    }),
+                    Err(_) => {
+                        // 采用方 panic ⇒ **整批原子失败**：不交付半成品、不清脏位、
+                        // 不推进交付游标；毒化闩经 `resync` 显形（UI 走 snapshot_doc）。
+                        lock(&notify.core).poisoned = true;
+                        return PatchBatch {
+                            patches: Vec::new(),
+                            resync: true,
+                            from_version: from,
+                            to_version: from,
+                            protocol_version: PROTOCOL_VERSION,
+                        };
                     }
                 }
-                core.dirty[bi] = false;
             }
-        } else {
-            core.dirty.iter_mut().for_each(|d| *d = false);
         }
+        // ③ 锁内提交：只清**捕获到的那一代**脏位（编码期间竞态的新脏写留着）；交付游标
+        // **只前进不后退**（并发拉取时不得把更早捕获的水位写回，否则 `from_version` 回退）。
+        let mut core = lock(&notify.core);
+        for (bi, rev, _) in &due {
+            if core.dirty_rev[*bi] == *rev {
+                core.dirty[*bi] = false;
+            }
+        }
+        core.delivered_epoch = core.delivered_epoch.max(to);
+        drop(core);
         PatchBatch {
             patches,
             resync,
             from_version: from,
-            to_version: core.version,
+            to_version: to,
             protocol_version: PROTOCOL_VERSION,
         }
     }
@@ -1869,12 +2409,12 @@ where
                 return Err(SealError::SnapshotPanicked);
             }
         };
-        let mut views: Vec<Option<M::View>> = Vec::with_capacity(bound.len());
+        let mut views: Vec<Option<Arc<M::View>>> = Vec::with_capacity(bound.len());
         let mut panicked = false;
         for b in bound.iter() {
             notify.projection_runs.fetch_add(1, Ordering::Relaxed);
             match catch_unwind(AssertUnwindSafe(|| notify.map.project(b.index, &state))) {
-                Ok(v) => views.push(Some(v)),
+                Ok(v) => views.push(Some(Arc::new(v))),
                 Err(_) => {
                     notify.projection_panics.fetch_add(1, Ordering::Relaxed);
                     panicked = true;
@@ -1882,20 +2422,25 @@ where
                 }
             }
         }
-        // 区域初始事务的输入在锁外取（`View::clone` 是采用方代码）。
-        let items: Vec<(usize, M::View)> = views
+        // 区域初始事务的输入在锁外取（只搬句柄，不跑采用方 `Clone`）。
+        let items: Vec<(usize, Arc<M::View>)> = views
             .iter()
             .enumerate()
-            .filter_map(|(bi, v)| v.as_ref().map(|v| (bi, v.clone())))
+            .filter_map(|(bi, v)| v.as_ref().map(|v| (bi, Arc::clone(v))))
             .collect();
         {
             let mut core = lock(&notify.core);
-            core.last = views;
+            // 与 `repair` 同款：旧表句柄带出临界区析构（采用方 `Drop` 不在锁内）。
+            let retired = std::mem::replace(&mut core.last, views);
             core.dirty = vec![false; bound.len()];
+            core.dirty_rev = vec![0; bound.len()];
             core.poisoned = panicked;
             core.version = INITIAL_SEQ;
+            core.commit_gen = core.commit_gen.wrapping_add(1);
             core.bound = Some(Arc::clone(&bound));
             core.sealing = false;
+            drop(core);
+            drop(retired);
         }
         notify
             .seal_region(&bound, &items)
@@ -1909,27 +2454,61 @@ where
     ///
     /// 不完整（修复后仍有缺失/仍毒化）⇒ [`SnapshotError::Incomplete`]，禁把部分
     /// 树当完整快照交付。
+    ///
+    /// **判定与捕获同住一个临界区（#140 复审 D1）**：`bridge_complete` 与
+    /// `(last, version, dirty_rev)` 在同一次取锁内取，两段之间不存在「他人 `repair`
+    /// 让本次快照掉槽」的窗口；`repair` 之后的再判定同样在同一临界区内做（有界两轮）。
     pub fn snapshot_doc(&self) -> Result<Snapshot, SnapshotError> {
         let notify = &self.inner.notify;
-        let (bound, complete) = {
-            let core = lock(&notify.core);
-            match &core.bound {
-                Some(b) => (Arc::clone(b), bridge_complete(&core)),
-                None => return Err(SnapshotError::Unsealed),
+        for _ in 0..2 {
+            // ① 判定 + 捕获（同一临界区，锁内零采用方代码）。
+            let (bound, complete, views, version, revs) = {
+                let core = lock(&notify.core);
+                let Some(bound) = &core.bound else {
+                    return Err(SnapshotError::Unsealed);
+                };
+                (
+                    Arc::clone(bound),
+                    bridge_complete(&core),
+                    core.last.clone(),
+                    core.version,
+                    core.dirty_rev.clone(),
+                )
+            };
+            if !complete {
+                self.repair(&bound)?;
+                continue; // 修复后重新在同一临界区判定 + 捕获
             }
-        };
-        if !complete {
-            self.repair(&bound)?;
+            // ② 锁外：逐叶 `to_json` 组装（采用方代码，panic 在桥边界 contain）。
+            let doc = match &notify.json {
+                Some(j) => {
+                    match catch_unwind(AssertUnwindSafe(|| {
+                        assemble_doc(&bound, &views, j.as_ref())
+                    })) {
+                        Ok(doc) => doc,
+                        Err(_) => {
+                            // 失败快照不清脏位、不推进交付基线；毒化闩显形（#140 §3.3）。
+                            lock(&notify.core).poisoned = true;
+                            return Err(SnapshotError::Incomplete);
+                        }
+                    }
+                }
+                None => Value::Object(serde_json::Map::new()),
+            };
+            // ③ 锁内提交：只清捕获代次仍匹配的脏位（期间竞态的新脏写留着）；交付游标
+            // **只前进不后退**（并发拉取时不得把更早捕获的水位写回）。
+            {
+                let mut core = lock(&notify.core);
+                for (bi, rev) in revs.iter().enumerate() {
+                    if core.dirty[bi] && core.dirty_rev[bi] == *rev {
+                        core.dirty[bi] = false;
+                    }
+                }
+                core.delivered_epoch = core.delivered_epoch.max(version);
+            }
+            return Ok(Snapshot { version, doc });
         }
-        let mut core = lock(&notify.core);
-        let version = core.version;
-        let doc = match &notify.json {
-            Some(j) => assemble_doc(&bound, &core.last, j.as_ref()),
-            None => Value::Object(serde_json::Map::new()),
-        };
-        core.dirty.iter_mut().for_each(|d| *d = false);
-        core.delivered_epoch = version;
-        Ok(Snapshot { version, doc })
+        Err(SnapshotError::Incomplete)
     }
 
     /// 修复重投影（#104 req 3）：Store 快照与已提交水位必须描述**同一逻辑边界**。
@@ -1951,12 +2530,12 @@ where
                 Ok(state) => state,
                 Err(_) => return Err(SnapshotError::Incomplete),
             };
-            let mut views: Vec<Option<M::View>> = Vec::with_capacity(bound.len());
+            let mut views: Vec<Option<Arc<M::View>>> = Vec::with_capacity(bound.len());
             let mut panicked = false;
             for b in bound.iter() {
                 notify.projection_runs.fetch_add(1, Ordering::Relaxed);
                 match catch_unwind(AssertUnwindSafe(|| notify.map.project(b.index, &state))) {
-                    Ok(v) => views.push(Some(v)),
+                    Ok(v) => views.push(Some(Arc::new(v))),
                     Err(_) => {
                         notify.projection_panics.fetch_add(1, Ordering::Relaxed);
                         panicked = true;
@@ -1968,9 +2547,15 @@ where
             if core.version != v0 {
                 continue; // 期间消费过通知 ⇒ 边界不配，重试
             }
-            core.last = views;
-            core.dirty.iter_mut().for_each(|d| *d = true);
+            let retired = std::mem::replace(&mut core.last, views);
+            for bi in 0..core.dirty.len() {
+                core.dirty[bi] = true;
+                core.dirty_rev[bi] = core.dirty_rev[bi].wrapping_add(1);
+            }
             core.poisoned = panicked;
+            core.commit_gen = core.commit_gen.wrapping_add(1);
+            drop(core);
+            drop(retired); // 退役值在锁外析构（采用方 `Drop`，#140）
             return if panicked {
                 Err(SnapshotError::Incomplete)
             } else {
@@ -2003,7 +2588,8 @@ where
             core.version = next;
             next
         };
-        notify.reseed_with(&bound, encoder.as_ref(), sequence);
+        let mut batch = SegBatch::default();
+        notify.reseed_with(&bound, encoder.as_ref(), sequence, &mut batch);
         let failure = lock(&notify.region_failure).clone();
         match failure {
             None => Ok(()),
@@ -2046,7 +2632,21 @@ where
         self.inner.notify.projection_runs.load(Ordering::Relaxed)
     }
 
-    /// 投影 panic 跳过累计（对齐 subscriber_panics 先例：让降级显形）。
+    /// 采用方代码 panic 的累计计数（对齐 `subscriber_panics` 先例：让降级显形）。
+    ///
+    /// **计什么**：`project` panic、`input_changed`（哨兵）panic、`M::View::PartialEq`
+    /// panic，以及退役 `M::View` 的 `Drop` panic，全部计入本计数器（#140 两阶段提交
+    /// 与 #167 的三态提交共用这一本账）。
+    ///
+    /// **不算「跳过」**：哨兵 panic 走 fail-open——判不出「未变」时当拍**仍尝试**
+    /// `project`（禁把不确定性吞成「未变」而丢一拍）；「跳过」只描述 `project` 自己
+    /// panic 的那一支（保留 last-known-good，标不完整）。`PartialEq` panic 则该批
+    /// **不提交**（水位不推进）；退役 `Drop` panic 发生于提交之后，不改变已提交值。
+    ///
+    /// **可见面**：以上任何 panic 都置毒化 ⇒ `PatchBatch::resync` 为真、
+    /// `snapshot_doc` 走修复路径（仍有缺失/仍毒化 ⇒ `SnapshotError::Incomplete`），
+    /// 修复成功后毒化复位。计数 > 0 即「降级显形」——桥本身不失联（panic 一律在
+    /// 桥边界 contain，不穿出订阅回调）。
     pub fn projection_panics(&self) -> u64 {
         self.inner.notify.projection_panics.load(Ordering::Relaxed)
     }
@@ -2094,7 +2694,11 @@ fn doc_parent<'a>(
 /// 全量文档组装：按**装配期编译的**路径段建树（#146：运行期零拆串、零转义解码；
 /// 重复指针/前缀冲突已在 `mount` 拒绝 ⇒ 此处形状必然可表示）。覆盖判定吃缓存。
 /// `None` 槽 = 该绑定无已知良好投影（调用方已判不完整，这里跳过该叶）。
-fn assemble_doc<J: JsonEncoder>(bound: &[Bound], views: &[Option<J::View>], json: &J) -> Value {
+fn assemble_doc<J: JsonEncoder>(
+    bound: &[Bound],
+    views: &[Option<Arc<J::View>>],
+    json: &J,
+) -> Value {
     let mut root = Value::Object(serde_json::Map::new());
     for (bi, b) in bound.iter().enumerate() {
         if !b.json_cover {
@@ -2115,4 +2719,619 @@ fn assemble_doc<J: JsonEncoder>(bound: &[Bound], views: &[Option<J::View>], json
         }
     }
     root
+}
+
+#[cfg(all(test, feature = "runtime"))]
+mod bridge_lock_boundary {
+    //! #140 锁边界探针（同模块 ⇒ 可直取 `notify.core` / `notify.region`）。直接证据 =
+    //! 采用方回调（`to_json` / `encode` / `RegionBacking::with_bytes_mut` / `View::eq` /
+    //! 退役 `View::drop`）正在执行时，对**两个**桥内互斥量 `try_lock` 都成功（框架此刻
+    //! 未持任何桥锁）；`View::clone` 更进一层：桥内**零调用**。
+    //!
+    //! 公共面（自死锁探测 / 脏代次 / panic 协议 / 并发发布）见
+    //! `tests/view_bridge_two_phase.rs`。把任一处回调挪回锁内 ⇒ 本模块 `WouldBlock` 即红。
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock, TryLockError, Weak};
+
+    use serde_json::{Value, json};
+    use skeleton::view::{BindingDecl, IntentMap, PayloadTag, ViewMap};
+    use skeleton::{EffectBuf, Infallible, NoFx, Reducer};
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct App {
+        n: u32,
+    }
+
+    struct AppReducer;
+
+    impl Reducer for AppReducer {
+        type State = App;
+        type Action = u32;
+        type Op = Infallible;
+        fn initial(&self) -> App {
+            App { n: 0 }
+        }
+        fn reduce(&self, s: &App, a: u32, _: &mut EffectBuf<u32, Infallible>) -> App {
+            App { n: s.n + a }
+        }
+    }
+
+    static DECLS: [BindingDecl; 1] = [BindingDecl {
+        path: "/n",
+        kind: PayloadTag(1),
+    }];
+
+    type ProbeInner = Inner<App, u32, Map, Intent, Json, Region>;
+    type ProbeBridge = ViewBridge<App, u32, Map, Intent, Json, Region>;
+    /// 回指桥内部件（视图先于桥构造 ⇒ 建好后再注入 `Weak`）。
+    type Link = Arc<OnceLock<Weak<ProbeInner>>>;
+
+    /// 直接证据：此刻对桥内互斥量 `try_lock` 成功（`Poisoned` 也算未持有）。
+    ///
+    /// 违规**记录**而非 panic：桥已把采用方 panic 全 contain（#140 复审 P0），探针
+    /// panic 会被当成编码器/析构故障吞掉 ⇒ 记录 + 用例末尾断言 `violations == 0`
+    /// 才具有判别力。
+    fn unlocked<T>(mutex: &Mutex<T>, site: &str, mark: &Mark) {
+        match mutex.try_lock() {
+            Ok(_) | Err(TryLockError::Poisoned(_)) => {}
+            Err(TryLockError::WouldBlock) => {
+                mark.violations.fetch_add(1, Ordering::SeqCst);
+                eprintln!("VIOLATION：{site} 在桥锁内执行");
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Mark {
+        eq: AtomicUsize,
+        clone: AtomicUsize,
+        drop: AtomicUsize,
+        json: AtomicUsize,
+        encode: AtomicUsize,
+        backing_writes: AtomicUsize,
+        /// 锁边界违规累计（探针只记不 panic，见 [`unlocked`]）。
+        violations: AtomicUsize,
+    }
+
+    struct V {
+        n: u32,
+        link: Link,
+        mark: Arc<Mark>,
+    }
+
+    impl V {
+        /// 回调里同时探两个桥锁（`core` 与 `region` 都不许被持有）。
+        fn probe(&self, site: &str, counter: &AtomicUsize) {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if let Some(inner) = self.link.get().and_then(Weak::upgrade) {
+                unlocked(&inner.notify.core, site, &self.mark);
+                unlocked(&inner.notify.region, site, &self.mark);
+            }
+        }
+    }
+
+    impl PartialEq for V {
+        fn eq(&self, other: &Self) -> bool {
+            self.probe("View::eq", &self.mark.eq);
+            self.n == other.n
+        }
+    }
+
+    impl Clone for V {
+        fn clone(&self) -> Self {
+            self.mark.clone.fetch_add(1, Ordering::SeqCst);
+            Self {
+                n: self.n,
+                link: Arc::clone(&self.link),
+                mark: Arc::clone(&self.mark),
+            }
+        }
+    }
+
+    impl Drop for V {
+        fn drop(&mut self) {
+            self.probe("退役 View::drop", &self.mark.drop);
+        }
+    }
+
+    struct Map {
+        link: Link,
+        mark: Arc<Mark>,
+        /// `true` ⇒ 哨兵恒报未变（复现「未变更快路径」）。
+        quiet: bool,
+    }
+
+    impl ViewMap<App> for Map {
+        type View = V;
+        fn bindings(&self) -> &[BindingDecl] {
+            &DECLS
+        }
+        fn input_changed(&self, _: usize, _: &App) -> bool {
+            !self.quiet
+        }
+        fn project(&self, _: usize, s: &App) -> V {
+            V {
+                n: s.n,
+                link: Arc::clone(&self.link),
+                mark: Arc::clone(&self.mark),
+            }
+        }
+    }
+
+    struct Intent;
+
+    impl IntentMap<u32> for Intent {
+        type Wire = Value;
+        type Err = IntentError;
+        fn intent(&self, w: Value) -> Result<u32, IntentError> {
+            w.as_u64()
+                .map(|n| n as u32)
+                .ok_or_else(|| IntentError::malformed("expect number"))
+        }
+    }
+
+    struct Json {
+        mark: Arc<Mark>,
+    }
+
+    impl JsonEncoder for Json {
+        type View = V;
+        fn covers(&self) -> Coverage {
+            Coverage::All
+        }
+        fn to_json(&self, v: &V) -> Value {
+            v.probe("JsonEncoder::to_json", &self.mark.json);
+            json!(v.n)
+        }
+    }
+
+    struct Region {
+        mark: Arc<Mark>,
+    }
+
+    impl RegionEncoder for Region {
+        type View = V;
+        fn covers(&self) -> Coverage {
+            Coverage::All
+        }
+        fn encode(&self, v: &V, w: &mut RegionWriter) {
+            v.probe("RegionEncoder::encode", &self.mark.encode);
+            w.u64(u64::from(v.n));
+        }
+    }
+
+    struct Backing {
+        inner: VecBacking,
+        link: Link,
+        mark: Arc<Mark>,
+    }
+
+    impl RegionBacking for Backing {
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+        fn with_bytes_mut(&self, write: &mut dyn FnMut(&mut [u8])) {
+            self.mark.backing_writes.fetch_add(1, Ordering::SeqCst);
+            if let Some(inner) = self.link.get().and_then(Weak::upgrade) {
+                unlocked(
+                    &inner.notify.core,
+                    "RegionBacking::with_bytes_mut",
+                    &self.mark,
+                );
+                unlocked(
+                    &inner.notify.region,
+                    "RegionBacking::with_bytes_mut",
+                    &self.mark,
+                );
+            }
+            self.inner.with_bytes_mut(write);
+        }
+        fn with_bytes(&self, read: &mut dyn FnMut(&[u8])) {
+            self.inner.with_bytes(read);
+        }
+        fn store_publish_seq(&self, seq: u64) -> Result<(), SeqError> {
+            self.inner.store_publish_seq(seq)
+        }
+        fn load_publish_seq(&self) -> Result<u64, SeqError> {
+            self.inner.load_publish_seq()
+        }
+    }
+
+    /// 建桥 + 注入回指 + 封板。`region_capacity` = `None` ⇒ 只开 JSON 通道。
+    fn fixture(region_capacity: Option<usize>, quiet: bool) -> (Arc<ProbeBridge>, Arc<Mark>) {
+        let link: Link = Arc::new(OnceLock::new());
+        let mark = Arc::new(Mark::default());
+        let store = crate::runtime::SyncStore::new(AppReducer, NoFx);
+        let bridge = Arc::new(
+            ViewBridge::mount(
+                store,
+                Map {
+                    link: Arc::clone(&link),
+                    mark: Arc::clone(&mark),
+                    quiet,
+                },
+                Intent,
+                Encoders {
+                    json: Some(Json {
+                        mark: Arc::clone(&mark),
+                    }),
+                    region: region_capacity.map(|capacity| {
+                        (
+                            Region {
+                                mark: Arc::clone(&mark),
+                            },
+                            Arc::new(Backing {
+                                inner: VecBacking::new(capacity),
+                                link: Arc::clone(&link),
+                                mark: Arc::clone(&mark),
+                            }) as Arc<dyn RegionBacking>,
+                        )
+                    }),
+                },
+            )
+            .expect("static declarations are well-formed"),
+        );
+        let inner: Weak<ProbeInner> = Arc::downgrade(&bridge.inner);
+        assert!(link.set(inner).is_ok(), "回指只注入一次");
+        bridge.bind("/n").unwrap();
+        bridge.seal().expect("seal before dispatch");
+        (bridge, mark)
+    }
+
+    #[test]
+    fn json_encoder_runs_outside_both_bridge_locks() {
+        let (bridge, mark) = fixture(None, false);
+        assert!(bridge.send_intent(json!(3)).unwrap());
+        let batch = bridge.take_patches();
+        assert_eq!(batch.patches.len(), 1);
+        assert!(bridge.snapshot_doc().is_ok());
+        assert!(
+            mark.json.load(Ordering::SeqCst) >= 2,
+            "to_json 至少跑了两条路径"
+        );
+        assert_eq!(
+            mark.violations.load(Ordering::SeqCst),
+            0,
+            "to_json 在桥锁内执行"
+        );
+    }
+
+    #[test]
+    fn region_encoder_and_backing_run_outside_both_bridge_locks() {
+        let (bridge, mark) = fixture(Some(4096), false);
+        for i in 1..=4u32 {
+            assert!(bridge.send_intent(json!(i)).unwrap());
+        }
+        // 增量耗尽 ⇒ 全量重编（fallback 路径）也过同一组探针。
+        bridge.reseed_region().expect("reseed succeeds");
+        assert!(mark.encode.load(Ordering::SeqCst) >= 4, "encode 确实跑了");
+        assert!(
+            mark.backing_writes.load(Ordering::SeqCst) >= 4,
+            "with_bytes_mut 确实跑了"
+        );
+        assert_eq!(
+            mark.violations.load(Ordering::SeqCst),
+            0,
+            "encode/with_bytes_mut 在桥锁内执行"
+        );
+    }
+
+    #[test]
+    fn view_eq_and_retired_drop_run_outside_both_bridge_locks() {
+        let (bridge, mark) = fixture(None, false);
+        assert!(bridge.send_intent(json!(1)).unwrap());
+        assert!(bridge.send_intent(json!(1)).unwrap());
+        let _ = bridge.take_patches();
+        assert!(mark.eq.load(Ordering::SeqCst) >= 2, "采用方 eq 确实跑了");
+        assert!(mark.drop.load(Ordering::SeqCst) >= 1, "退役值确实被析构");
+        assert_eq!(
+            mark.violations.load(Ordering::SeqCst),
+            0,
+            "eq/退役 Drop 在桥锁内执行"
+        );
+    }
+
+    /// 桥内**零** `View::clone`：句柄快照取代值拷贝（旧实现每次变更在 core 锁内
+    /// 复制完整视图）。变异「把 `Arc::clone(v)` 换成 `(**v).clone()`」⇒ 红。
+    #[test]
+    fn bridge_never_clones_views() {
+        let (bridge, mark) = fixture(Some(4096), false);
+        for i in 1..=4u32 {
+            assert!(bridge.send_intent(json!(i)).unwrap());
+            let _ = bridge.take_patches();
+            let _ = bridge.snapshot_doc();
+        }
+        let _ = bridge.reseed_region();
+        assert_eq!(
+            mark.clone.load(Ordering::SeqCst),
+            0,
+            "桥内不得调用采用方 View::clone"
+        );
+        assert_eq!(
+            mark.violations.load(Ordering::SeqCst),
+            0,
+            "采用方回调在桥锁内执行"
+        );
+    }
+
+    /// 未变更快路径的取锁预算（线程局部计数，同二进制并发测试不污染）。两种部署各测
+    /// 一次：仅 JSON 与 JSON+Region（区域通道的发布事务每拍办一次，锁数是部署事实，
+    /// 不是回退）。两次都不复制值快照。
+    #[test]
+    fn hot_path_lock_budget() {
+        let json_only = locks_per_notify(None);
+        let with_region = locks_per_notify(Some(4096));
+        eprintln!("#140 未变更快路径取锁/通知：仅 JSON = {json_only}，JSON+Region = {with_region}");
+        assert!(json_only <= 3.0, "仅 JSON 取锁超预算：{json_only}");
+        assert!(with_region <= 8.0, "JSON+Region 取锁超预算：{with_region}");
+    }
+
+    fn locks_per_notify(region_capacity: Option<usize>) -> f64 {
+        let (bridge, _mark) = fixture(region_capacity, true);
+        assert!(bridge.send_intent(json!(1)).unwrap()); // 预热
+        let before = super::lock_probe::here();
+        let rounds = 64u64;
+        for _ in 0..rounds {
+            assert!(bridge.send_intent(json!(1)).unwrap());
+        }
+        (super::lock_probe::here() - before) as f64 / rounds as f64
+    }
+}
+
+#[cfg(test)]
+mod cell_lock_boundary {
+    //! #157 锁边界探针（同模块 ⇒ 可直取胞的私有 `cell`）。直接证据 = 采用方代码
+    //! 正在执行时，对同一个胞 `try_lock` 成功（框架此刻未持胞锁）；同线程重入
+    //! 不死锁且结果确定。公共面场景（并发未命中竞态 / 代际裁决 / panic 不毒化）
+    //! 见 `tests/view_cells_two_phase.rs`。
+    //!
+    //! 闭包先于胞存在（构造器要 `'static` 闭包）⇒ 经共享槽位回指：胞建好后再注入
+    //! `Weak`，回调里 upgrade 取回。重入一律「恰一次」（原子旗子自清）防无限递归。
+
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use std::sync::TryLockError;
+    use std::sync::Weak;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{Derived, Sentinel};
+
+    /// OS 时钟护栏：探针体在独立线程执行，死锁表现为有界失败而非挂死。
+    const LIMIT: Duration = Duration::from_secs(20);
+
+    type Link<T> = Arc<OnceLock<Weak<T>>>;
+
+    fn linked<T>(slot: &Link<T>) -> Arc<T> {
+        slot.get()
+            .and_then(Weak::upgrade)
+            .expect("cell linked before use")
+    }
+
+    /// 直接证据：调用方正跑在采用方代码里 ⇒ 胞锁此刻必须空闲。
+    fn assert_unlocked<T>(cell: &Mutex<T>, site: &str) {
+        match cell.try_lock() {
+            // Poisoned 也算「未持有」：析构探针可能在另一次断言的回退期被调，二次
+            // panic 会 abort 整个测试进程、吞掉首发失败的报文。
+            Ok(_) | Err(TryLockError::Poisoned(_)) => {}
+            Err(TryLockError::WouldBlock) => panic!("{site} 在胞锁内执行"),
+        }
+    }
+
+    fn bounded<T: Send + 'static>(probe: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe());
+        });
+        match rx.recv_timeout(LIMIT) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("探针疑似死锁（OS 时钟上限 {LIMIT:?}）")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("探针线程在回报前 panic")
+            }
+        }
+    }
+
+    #[test]
+    fn compute_runs_outside_the_cell_lock_and_may_reenter() {
+        bounded(|| {
+            let link: Link<Derived<u32, u32, u32>> = Arc::new(OnceLock::new());
+            let hook = Arc::clone(&link);
+            let reenter = Arc::new(AtomicBool::new(true));
+            let first = Arc::clone(&reenter);
+            let computes = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&computes);
+            let cell: Arc<Derived<u32, u32, u32>> = Arc::new(Derived::new(
+                |state: &u32| *state,
+                move |key: &u32| {
+                    let cell = linked(&hook);
+                    assert_unlocked(&cell.cell, "compute");
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    if first.swap(false, Ordering::SeqCst) {
+                        assert_eq!(cell.get(key), key * 10, "同线程重入同一个胞");
+                    }
+                    key * 10
+                },
+            ));
+            assert!(link.set(Arc::downgrade(&cell)).is_ok(), "回指只注入一次");
+            assert_eq!(cell.get(&7), 70);
+            assert_eq!(computes.load(Ordering::SeqCst), 2, "外层 + 重入各算一次");
+            assert_eq!(cell.get(&7), 70);
+            assert_eq!(
+                computes.load(Ordering::SeqCst),
+                2,
+                "重入那次已发布，其后命中零重算"
+            );
+        });
+    }
+
+    /// 带回指的键：`PartialEq` 里做锁边界探针，并（恰一次）重入同一个胞。
+    struct ProbeKey {
+        id: u32,
+        link: Link<Derived<u32, ProbeKey, u32>>,
+        reenter: Arc<AtomicBool>,
+    }
+
+    impl PartialEq for ProbeKey {
+        fn eq(&self, other: &Self) -> bool {
+            let cell = linked(&self.link);
+            assert_unlocked(&cell.cell, "In::eq");
+            if self.reenter.swap(false, Ordering::SeqCst) {
+                assert_eq!(cell.get(&8), 80, "重入时换一个键：触发重算并发布");
+            }
+            self.id == other.id
+        }
+    }
+
+    #[test]
+    fn partial_eq_runs_outside_the_cell_lock_and_may_reenter() {
+        bounded(|| {
+            let link: Link<Derived<u32, ProbeKey, u32>> = Arc::new(OnceLock::new());
+            let key_link = Arc::clone(&link);
+            let reenter = Arc::new(AtomicBool::new(true));
+            let key_reenter = Arc::clone(&reenter);
+            let computes = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&computes);
+            let cell: Arc<Derived<u32, ProbeKey, u32>> = Arc::new(Derived::new(
+                move |state: &u32| ProbeKey {
+                    id: *state,
+                    link: Arc::clone(&key_link),
+                    reenter: Arc::clone(&key_reenter),
+                },
+                move |key: &ProbeKey| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    key.id * 10
+                },
+            ));
+            assert!(link.set(Arc::downgrade(&cell)).is_ok(), "回指只注入一次");
+            assert_eq!(cell.get(&7), 70, "首次：缓存空，eq 未跑");
+            assert_eq!(
+                cell.get(&7),
+                70,
+                "命中：eq 里重入并发布 8 之后，外层仍按自己的快照作答"
+            );
+            assert!(!reenter.load(Ordering::SeqCst), "重入恰发生一次");
+            assert_eq!(computes.load(Ordering::SeqCst), 2, "首次 + eq 里的重入");
+            assert_eq!(cell.get(&8), 80);
+            assert_eq!(computes.load(Ordering::SeqCst), 2, "8 已在重入里发布，命中");
+            assert_eq!(cell.get(&7), 70);
+            assert_eq!(computes.load(Ordering::SeqCst), 3);
+        });
+    }
+
+    /// 带回指的值：`Clone` 里做锁边界探针并（恰一次）重入；`Drop` 里复核析构
+    /// 不在胞锁内（缓存旧值的析构同样是采用方代码）。胞已析构（回指失效）时跳过。
+    struct ProbeVal {
+        v: u32,
+        link: Link<Derived<u32, u32, ProbeVal>>,
+        reenter: Arc<AtomicBool>,
+    }
+
+    impl Clone for ProbeVal {
+        fn clone(&self) -> Self {
+            let cell = linked(&self.link);
+            assert_unlocked(&cell.cell, "Out::clone");
+            if self.reenter.swap(false, Ordering::SeqCst) {
+                assert_eq!(cell.get(&8).v, 80, "重入时换一个键：触发重算并发布");
+            }
+            Self {
+                v: self.v,
+                link: Arc::clone(&self.link),
+                reenter: Arc::clone(&self.reenter),
+            }
+        }
+    }
+
+    impl Drop for ProbeVal {
+        fn drop(&mut self) {
+            if let Some(cell) = self.link.get().and_then(Weak::upgrade) {
+                assert_unlocked(&cell.cell, "缓存值 Drop");
+            }
+        }
+    }
+
+    #[test]
+    fn out_clone_and_cached_drop_run_outside_the_cell_lock() {
+        bounded(|| {
+            let link: Link<Derived<u32, u32, ProbeVal>> = Arc::new(OnceLock::new());
+            let val_link = Arc::clone(&link);
+            let reenter = Arc::new(AtomicBool::new(true));
+            let val_reenter = Arc::clone(&reenter);
+            let cell: Arc<Derived<u32, u32, ProbeVal>> = Arc::new(Derived::new(
+                |state: &u32| *state,
+                move |key: &u32| ProbeVal {
+                    v: key * 10,
+                    link: Arc::clone(&val_link),
+                    reenter: Arc::clone(&val_reenter),
+                },
+            ));
+            assert!(link.set(Arc::downgrade(&cell)).is_ok(), "回指只注入一次");
+            // 首次未命中：缓存副本的 clone 里重入（换键 8，抢先发布）。
+            assert_eq!(cell.get(&7).v, 70);
+            assert!(!reenter.load(Ordering::SeqCst), "重入恰发生一次");
+            // 命中路径的 clone；换键（旧缓存值析构）；再命中。
+            assert_eq!(cell.get(&8).v, 80);
+            assert_eq!(cell.get(&7).v, 70);
+            assert_eq!(cell.get(&7).v, 70);
+        });
+    }
+
+    /// 哨兵键：`eq` 里做锁边界探针并（恰一次）重入；`Drop` 复核析构不在胞锁内。
+    struct GuardKey {
+        id: u32,
+        link: Link<Sentinel<u32, GuardKey>>,
+        reenter: Arc<AtomicBool>,
+    }
+
+    impl PartialEq for GuardKey {
+        fn eq(&self, other: &Self) -> bool {
+            let cell = linked(&self.link);
+            assert_unlocked(&cell.cell, "In::eq");
+            if self.reenter.swap(false, Ordering::SeqCst) {
+                assert!(cell.changed(&8), "重入时换一个键：提交 8");
+            }
+            self.id == other.id
+        }
+    }
+
+    impl Drop for GuardKey {
+        fn drop(&mut self) {
+            if let Some(cell) = self.link.get().and_then(Weak::upgrade) {
+                assert_unlocked(&cell.cell, "缓存值 Drop");
+            }
+        }
+    }
+
+    #[test]
+    fn sentinel_partial_eq_and_cached_drop_run_outside_the_cell_lock() {
+        bounded(|| {
+            let link: Link<Sentinel<u32, GuardKey>> = Arc::new(OnceLock::new());
+            let key_link = Arc::clone(&link);
+            let reenter = Arc::new(AtomicBool::new(true));
+            let key_reenter = Arc::clone(&reenter);
+            let cell: Arc<Sentinel<u32, GuardKey>> =
+                Arc::new(Sentinel::new(move |state: &u32| GuardKey {
+                    id: *state,
+                    link: Arc::clone(&key_link),
+                    reenter: Arc::clone(&key_reenter),
+                }));
+            assert!(link.set(Arc::downgrade(&cell)).is_ok(), "回指只注入一次");
+            assert!(cell.changed(&7), "首次：缓存空，eq 未跑");
+            assert!(
+                cell.changed(&7),
+                "命中但重入已提交 8：裁决须复核代际，相对最新提交 7 确实变了"
+            );
+            assert!(!reenter.load(Ordering::SeqCst), "重入恰发生一次");
+            assert!(cell.changed(&8), "重入那轮之后缓存是 7");
+            assert!(cell.changed(&7));
+            assert!(!cell.changed(&7));
+        });
+    }
 }

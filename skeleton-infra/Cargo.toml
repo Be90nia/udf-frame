@@ -57,8 +57,8 @@ log = ["log-fs", "dep:log", "dep:tracing", "dep:tracing-subscriber", "dep:tracin
 tracing = ["runtime", "dep:tracing", "dep:tracing-subscriber"]
 # log-embed：行为+数据域 tracing 埋点（本 crate：shutdown 一域 6 + fx 一域 1 = 7 调用点；
 # target 规范 skeleton::<domain>[::<phase>]，级别规范见各模块头注）。
-# scheduler/ratelimit/retry/cache 四域 39 调用点随批 5-2 拆至 std-ext（其自有
-# log-embed feature 承载，宏同款副本；连同批 5-1 三域 9 点合计 48）。默认
+# scheduler/ratelimit/retry/cache 四域 41 调用点随批 5-2 拆至 std-ext（其自有
+# log-embed feature 承载，宏同款副本；连同批 5-1 三域 9 点合计 50）。默认
 # 不开——埋点宏展开为空、tracing 依赖不进树（cargo tree 零 tracing 证明）；
 # tracingx/logx 桥不受本 feature 影响（观测栈仍由宿主自选）。
 log-embed = ["dep:tracing"]
@@ -108,14 +108,16 @@ tokio = { workspace = true, features = ["test-util"] }
 # roundtrip + ns 对照锚），dev-dep only——零依赖证明不受影响。
 humantime = "2"
 
-# bench 跨 fx/journal/memgov/testing + 池维度（ObjectPool/MemoryPool/ThreadPool）五 feature，
-# required-features 取并集——只开 tokio 会被整目标跳过（hollow gate）。池组用到
-# `pool` feature（ThreadPool），缺它则 `--no-default-features --features
-# tokio,journal,memgov,testing` 下 bench 编译失败（CI 用 --all-features 会掩盖此缺口）。
+# bench 跨 fx/journal/memgov/testing + 池维度（ObjectPool/MemoryPool/ThreadPool）五 feature
+# + view 域（#169/#174 的 ViewBridge 发布/通知臂：SyncStore 走 runtime、区域通道走
+# view 的 serde_json 面），required-features 取并集——只开 tokio 会被整目标跳过
+# （hollow gate）。池组用到 `pool` feature（ThreadPool），缺它则 `--no-default-features
+# --features tokio,journal,memgov,testing` 下 bench 编译失败（CI 用 --all-features 会
+# 掩盖此缺口）。
 [[bench]]
 name = "infra"
 harness = false
-required-features = ["tokio", "journal", "memgov", "testing", "pool"]
+required-features = ["tokio", "journal", "memgov", "testing", "pool", "view"]
 
 [lints.clippy]
 await_holding_lock = "deny"

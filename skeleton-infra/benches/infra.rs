@@ -36,7 +36,8 @@ use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, cr
 use serde::{Deserialize, Serialize};
 
 use skeleton::notify::{Notify as _, NotifySink};
-use skeleton::{Effect, Store as _};
+use skeleton::view::{BindingDecl, IntentMap, PayloadTag, ViewMap};
+use skeleton::{Effect, EffectBuf, Infallible, Reducer, Store as _};
 use skeleton_infra::fx::FxScope;
 use skeleton_infra::memgov::{CountingAllocator, MemoryPool};
 use skeleton_infra::objpool::{ByteBudget, ObjectPool};
@@ -44,6 +45,10 @@ use skeleton_infra::pool::{
     AbortPolicy, CallerRunsPolicy, RejectPolicy, ThreadPool, ThreadPoolTuning,
 };
 use skeleton_infra::runtime::{AdmissionOutcome, DispatchOutcome, SyncStore};
+use skeleton_infra::view::{
+    Coverage, Encoders, IntentError, JsonEncoder, RegionBacking, RegionEncoder, RegionWriter,
+    VecBacking, ViewBridge,
+};
 use skeleton_infra::{Journal, JournalError, JsonlJournal};
 
 // 分配面计量前提：CountingAllocator 必须是本二进制的全局分配器，否则
@@ -1695,6 +1700,160 @@ fn alloc_atomics(c: &mut Criterion) {
     group.finish();
 }
 
+// ---- ViewBridge 发布 / 通知热路径（#169 / #174）----
+//
+// 口径：单线程、预热后稳态；吞吐只作参考（环境相关，跨会话单点不可比）。判别力
+// 证据在 tests/view_bridge_test.rs 的确定性分配锚（每拍 N 次 / 每绑定 1 次）。
+// arena 满时的换区全量重编是稳态的一部分（长跑会周期性出现）。
+
+#[derive(Clone, Default)]
+struct ViewApp {
+    count: u32,
+}
+
+struct ViewReducer;
+
+impl Reducer for ViewReducer {
+    type State = ViewApp;
+    type Action = u32;
+    type Op = Infallible;
+    fn initial(&self) -> ViewApp {
+        ViewApp::default()
+    }
+    fn reduce(&self, s: &ViewApp, a: u32, _: &mut EffectBuf<u32, Infallible>) -> ViewApp {
+        ViewApp { count: s.count + a }
+    }
+}
+
+/// N 绑定宽面： = 哨兵过滤 workload（每拍只有 1 个绑定变更）。
+struct ViewMapN {
+    decls: &'static [BindingDecl],
+    filtered: bool,
+}
+
+impl ViewMap<ViewApp> for ViewMapN {
+    type View = u32;
+    fn bindings(&self) -> &[BindingDecl] {
+        self.decls
+    }
+    fn project(&self, index: usize, s: &ViewApp) -> u32 {
+        s.count.wrapping_mul(1_000).wrapping_add(index as u32)
+    }
+    fn input_changed(&self, index: usize, s: &ViewApp) -> bool {
+        !self.filtered || (s.count as usize) % self.decls.len() == index
+    }
+}
+
+struct VJson;
+
+impl JsonEncoder for VJson {
+    type View = u32;
+    fn covers(&self) -> Coverage {
+        Coverage::All
+    }
+    fn to_json(&self, v: &u32) -> serde_json::Value {
+        serde_json::json!(v)
+    }
+}
+
+struct VRegion;
+
+impl RegionEncoder for VRegion {
+    type View = u32;
+    fn covers(&self) -> Coverage {
+        Coverage::All
+    }
+    fn encode(&self, v: &u32, w: &mut RegionWriter) {
+        w.u64(u64::from(*v));
+    }
+}
+
+type ViewBench = ViewBridge<ViewApp, u32, ViewMapN, ViewIntent, VJson, VRegion>;
+
+struct ViewIntent;
+
+impl IntentMap<u32> for ViewIntent {
+    type Wire = serde_json::Value;
+    type Err = IntentError;
+    fn intent(&self, w: serde_json::Value) -> Result<u32, IntentError> {
+        w.as_u64()
+            .map(|n| n as u32)
+            .ok_or_else(|| IntentError::malformed("expect number"))
+    }
+}
+
+fn view_decls(n: usize) -> &'static [BindingDecl] {
+    let decls: Vec<BindingDecl> = (0..n)
+        .map(|i| BindingDecl {
+            path: Box::leak(format!("/b{i}").into_boxed_str()),
+            kind: PayloadTag(1),
+        })
+        .collect();
+    Box::leak(decls.into_boxed_slice())
+}
+
+fn view_bridge(
+    decls: &'static [BindingDecl],
+    filtered: bool,
+    region_capacity: Option<usize>,
+) -> ViewBench {
+    let bridge = ViewBridge::mount(
+        SyncStore::new(ViewReducer, skeleton::NoFx),
+        ViewMapN { decls, filtered },
+        ViewIntent,
+        Encoders {
+            json: Some(VJson),
+            region: region_capacity.map(|capacity| {
+                (
+                    VRegion,
+                    Arc::new(VecBacking::new(capacity)) as Arc<dyn RegionBacking>,
+                )
+            }),
+        },
+    )
+    .expect("static declarations are well-formed");
+    for decl in decls {
+        bridge.bind(decl.path).expect("declared + covered");
+    }
+    bridge.seal().expect("seal before dispatch");
+    bridge
+}
+
+/// #169：N 个变更绑定的一拍（JSON + Region 部署，含发布事务）。
+fn view_publish(c: &mut Criterion) {
+    let mut group = c.benchmark_group("view_publish");
+    for bindings in [1usize, 16, 256] {
+        let bridge = view_bridge(view_decls(bindings), false, Some(1 << 20));
+        for _ in 0..64u32 {
+            bridge.send_intent(serde_json::json!(1)).unwrap(); // 预热：scratch 容量
+        }
+        group.throughput(Throughput::Elements(bindings as u64));
+        group.bench_function(format!("changed_{bindings}"), |b| {
+            b.iter(|| bridge.send_intent(black_box(serde_json::json!(1))).unwrap())
+        });
+    }
+    group.finish();
+}
+
+/// #174：一拍通知（仅 JSON 部署 ⇒ 只量投影 + 两阶段提交面），两种 workload。
+fn view_notify(c: &mut Criterion) {
+    let mut group = c.benchmark_group("view_notify");
+    for filtered in [false, true] {
+        for bindings in [1usize, 16, 64, 256] {
+            let bridge = view_bridge(view_decls(bindings), filtered, None);
+            for _ in 0..64u32 {
+                bridge.send_intent(serde_json::json!(1)).unwrap();
+            }
+            let tag = if filtered { "filtered" } else { "all" };
+            group.throughput(Throughput::Elements(bindings as u64));
+            group.bench_function(format!("{tag}_{bindings}"), |b| {
+                b.iter(|| bridge.send_intent(black_box(serde_json::json!(1))).unwrap())
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     fxscope_spawn_join,
@@ -1712,6 +1871,8 @@ criterion_group!(
     state_layout_retention,
     multi_producer_admission,
     multi_producer_dispatch,
-    alloc_atomics
+    alloc_atomics,
+    view_publish,
+    view_notify
 );
 criterion_main!(benches);
