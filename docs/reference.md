@@ -36,7 +36,7 @@
 
 > 注（批 1 契约真下沉，2026-10-18；ADR 0001）：`skeleton` 由 optional 转常驻非 optional 依赖（常驻域 cache/id/retry/scheduler 消费 `skeleton::clock` 契约）——workspace path 非三方，`skeleton` 依赖面零三方口径不变。原 `runtime`/`pool`/`journal`/`compose` 的 `dep:skeleton` 叠门随之移除。
 
-必选组合（`Cargo.toml` required-features 口径）：bench `infra` = `["tokio","journal","memgov","testing","pool"]`；示例 `end_to_end` = `["tokio","journal","testing","compose"]`。 hollow gate 纪律：feature 不全的目标整目标跳过——CI 闸与首跑一律 `--all-features`。
+必选组合（`Cargo.toml` required-features 口径）：bench `infra` = `["tokio","journal","memgov","testing","pool","view"]`；示例 `end_to_end` = `["tokio","journal","testing","compose"]`。 hollow gate 纪律：feature 不全的目标整目标跳过——CI 闸与首跑一律 `--all-features`。
 
 构建与测试：`cargo build --workspace --all-features` / `cargo test --workspace --all-features`。
 
@@ -191,6 +191,7 @@ pub enum AdmissionOutcome {
 - `subscribe`（跨线程档）：回调需 `Send`，槽位 Mutex 串行化；返回 `Subscription<S>`（`#[must_use]`，Drop=注销即时摘表，无「一拍滞后」）。
 - `subscribe_local`（单线程档）：回调免 `Send`（可用 Rc/RefCell），只在注册线程触发，免锁免原子量；返回 `LocalSubscription`（`#[must_use]`，`!Send + !Sync`——线程亲和的类型化表达）。同一 dispatch 内通知序：本地订阅先行，跨线程随后（确定性）。
 - **登记与闭门同一把门**（#63）：`try_subscribe` 与 `close`（及 `close_wait`）共用一个**订阅门**（每 store 一把小锁，只在登记/闭门**冷路径**取，热 dispatch 路径零开销）⇒ `try_subscribe` 要么**线性化在 close 之前**并登记成功，要么**线性化在 close 之后**并返回 `Err(StoreClosed)`——**不会出现「已登记但 store 已关」**。legacy `subscribe` 语义不变：闭门后**照常登记**并计入 `subscriptions_after_close`（它不是可失败入口）。close 翻转 `closed` 后**放门再排空/回调**（不在持门期间跑用户回调、丢用户闭包或排空队列）。
+- **线性化点 = 入口的初始 `closed` 检查**（#159 拍板 = 方案 1，2026-11-26）：`subscribe` / `subscribe_notify` 的线性化点是**调用入口的那次 `closed` 读**（`subscribe` 与 `close` 的翻转同持订阅门 ⇒ 二者互斥；`subscribe_notify` 是纯 Acquire 读，`close` 不等待在途登记、也不取投递口表锁）。于是初始检查**观察到 open** 的调用合法地排在并发 `close` **之前**——即使投递口/回调入表与函数返回都发生在 `close` 返回之后：票据是**惰性**的（闭门后不再有落位拍 ⇒ 永不投递），登记照常生效、票据 Drop 照常注销，且**不计** `subscriptions_after_close`；只有初始检查**观察到 closed** 的调用排在其后并 +1。⇒ **重叠调用的返回顺序可以不同于其线性化序**；`subscriptions_after_close` 的口径固定为「初始检查观察 closed 的笔数」，不是「插入时 store 已闭门的笔数」。机械闸：`skeleton-infra/src/runtime.rs::tests::subscribe_notify_linearizes_at_entry_closed_check`（停靠在「入口检查之后、registry 插入之前」→ `close()` → 放行；变异「插入时再观察 closed」⇒ 红）。
 
 - **审计面同理（#60）**：`AuditTicket` 的 Drop 在**持有审计 mutex 时**完成「摘槽 + `gate=false`」**一次**状态变更；`subscribe_events` 的装槽与开闸也在**同一把 mutex** 内 ⇒ 装槽与闸翻转串行，**陈旧票据绝不会禁用更新的 sink**，被禁的闸也**不会**压制环历史（发射在闸 false 时于环入账前返回）。热发射路径仍是一次 Acquire gate load 即返。#65/#75 的「有效代次内的实时投递竞态」是**另一条**边界，其 FIFO 溢出走独立投递丢弃计数（与 ring 溢出分账）。
 - **去活后不再开始新投递/新回调**（#73/#74）：订阅槽持 **atomic alive 标志**（发布前初始化）；票据 Drop 与 panic 摘除**先原子失活**（幂等）再解链 + `subs_version` 递增。异步投递在**收集窗过滤已死槽**并在**每次 publish 前复查 alive**；同步订阅在**每次调用缓存回调前复查 active** ⇒ 缓存快照虽持强 `Arc`，也不能在失活后启动新回调。**窄契约**：通过了最后一次检查的投递/回调视为 **in-flight**，允许在票据 Drop 返回后完成（严格 quiescence 需另立阻塞式协议，本框架不提供）。
@@ -279,15 +280,15 @@ pub enum AuditEventKind {
 
 | 字段 | 含义 |
 |---|---|
-| `dispatch_action_seq` | **本次触发转发、并承接失败回执**的 action 的**入队序号**（store 内单调；**外部入队**路径的序号在队列锁内分配，**`Effect::Emit` 回灌**路径的序号在取锁**之前**分配 ⇒ 序号序与全局 FIFO 序**不保证**恒等——见下方「已知张力」） |
+| `dispatch_action_seq` | **本次触发转发、并承接失败回执**的 action 的**入队序号**（store 内单调；**外部准入与 `Effect::Emit` 回灌同在 `queue` 临界区内取号** ⇒ **序号序 = 队列插入序**，出队（执行）序按插入序——issue#158 方案 2 拍板；停放后经 `resume_deferred` 入队的记录保留取号序，不回溯重编号） |
 | `origin_action_seq` | **实际产出该效果**的 action 的入队序号——可能**早于** `dispatch_action_seq`（pending 效果跨 action 存活：A 产出的后缀在 A 的转发 panic 后留存，后来由 B 的 dispatch 触发续转并再次 panic ⇒ 来源是 A、触发者是 B） |
 | `effect_index` | 该效果在**产出它的 action** 的 reducer 输出序列中的 **0-based** 位置（计数**包含** `Emit`——Emit 也占位）——它定位的是「该 action 产出的**第几条**效果」，与效果种类无关（`EffectId` 在一个 store 内**全局唯一**，见 `skeleton::EffectId` 的唯一性纪律） |
 | `effect_kind` | 效果的解释器侧种类（`skeleton::EffectKind`：`Run` / `Cancel`） |
 | `effect_id` | 效果的**逻辑句柄**（`Option<skeleton::EffectId>`）——当前 `Run`/`Cancel` 恒 `Some`；未来无句柄的种类为 `None`。⚠️ **语义随种类而变**：`Run` 的 `effect_id` 是**该效果自己的**句柄；`Cancel` 的 `effect_id` 是**被取消目标**的句柄（Cancel 效果自身没有句柄）⇒ 因此 `effect_id` **不可**单独当作「效果身份」用——同一 store 内 `Run(id=N)` 与 `Cancel(id=N)` 会发出**相同**的 `effect_id`；两条指向同一目标的 `Cancel` 效果也会发出**相同**的 `effect_id`（合法时序，非误用）。**唯一标识一个效果的作用域**：在**同一个产出 action 内**，`(effect_kind, effect_id, effect_index)` 三元组唯一标识一个效果；**跨 action** 时唯一标识一个效果的是 **`(origin_action_seq, effect_index)`**（= 哪个 action 产出的第几条）——`effect_index` 是**产出 action 内**的序号，不跨 action 唯一 |
 
-**边界**：⚠️ 两个序号都是**入队序号**，**不是**「dispatch 调用发生的时刻序」——外部调用方看到的是「我这次调用排在队列第几位」，并发下与调用时刻序不同。同一次 action 内两者相等；跨 action 续转时**通常** `origin < dispatch`（见下方「已知张力」）。事件**不携带** `Op` / Action / payload（可能很大、不可 Clone、可能含敏感业务数据）。`Effect::Emit` 不经解释器 ⇒ 不产生本事件。
+**边界**：⚠️ 两个序号都是**入队序号**，**不是**「dispatch 调用发生的时刻序」——外部调用方看到的是「我这次调用排在队列第几位」，并发下与调用时刻序不同。同一次 action 内两者相等；跨 action 续转时（**未停放路径**）**恒有** `origin < dispatch`，停放 → 恢复路径保留取号序故仍不保证（见下方「已闭合」段）。事件**不携带** `Op` / Action / payload（可能很大、不可 Clone、可能含敏感业务数据）。`Effect::Emit` 不经解释器 ⇒ 不产生本事件。
 
-**已知张力（2026-11-20 第三轮对抗性审计登记）**：两个序号的**分配纪律不一致**——外部入队路径的序号在 `queue` 锁内分配（与入队同临界区），而 **`Effect::Emit` 回灌**路径的序号在**取锁之前**分配 ⇒ 理论上可能与并发入队的序号**交错**（外部 action 可能拿到更大序号却先入队）⇒ **不保证**全局 FIFO 序 = 序号序，跨 action 续转时的 `origin < dispatch` 亦**不保证**恒成立。**实测状态**：结构可证、经验未复现——探针（Emit 回灌 × 外部入队并发编排，20 秒 / 约 118 万外部轮次）实测 `origin_action_seq > dispatch_action_seq` 的事件数为 **0** ⇒ 窗口极窄，**未**实证该不变量被破坏。⇒ 登记为**已知张力**（登记缺口，非已证实缺陷），**本轮不改实现**（统一纪律需把 Emit 回灌路径的序号分配移入 `queue` 锁内 ⇒ 须先评估锁序与 `parent.add_descendant()` 的锁序约束，另行立项）。
+**已闭合（2026-11-26，issue#158 拍板 = 方案 2：FIFO-correlated sequence）**：此前两条路径的**取号纪律不一致**——外部入队路径在 `queue` 锁内取号，而 `Effect::Emit` 回灌路径在**取锁之前**取号 ⇒ 理论可与并发入队的序号交错。维护者拍板把回灌路的取号**移入 `queue` 临界区**（紧邻后代记账与 `push_back`，锁序 `queue → ledger` 不变、零额外锁）⇒ **序号序 = 队列插入线性化序**，出队（= 执行）序按插入序 ⇒ 未停放路径上跨 action 续转的 `origin_action_seq < dispatch_action_seq` 成立。取证：确定性探针 `skeleton-infra/src/runtime.rs::tests::feedback_seq_follows_queue_insertion_order`（握手编排：回灌停在取号窗口 → 外部准入 → 放行 → 执行外部记录时读主队列里的子代记录；断言取号序 == 队列序），变异「取号挪回锁外」⇒ 红。**边界**：停放后经 `resume_deferred` 入队的记录保留**取号时**的序号（取号早于恢复，不回溯重编号）⇒ 该路径的「插入序 vs 序号序」可相反，跨「停放 → 恢复」的续转仍不保证 `origin < dispatch`；`seq` 是**插入**序，不是「dispatch 调用发生的时刻序」。
 
 **配套公共面（`skeleton` crate）**：
 
@@ -305,6 +306,8 @@ impl EffectKind {
 ⚠️ **演进约束（已知限制，2026-11-20 第三轮对抗性审计登记）**：`of` 的返回类型是 `Option<(EffectKind, Option<EffectId>)>`——**双层 `Option`**：外层 = 「非解释器可见」（今仅 `Emit`），内层 = 「无逻辑句柄」。`of` 的穷尽匹配保证的是「**覆盖 `Effect` 词表的所有变体**」，**不**保证「所有非 `Emit` 变体都必经解释器」⇒ 若将来新增一个**不经解释器**的效果种类并让 `of` 对它返回 `None`，实现侧那条「非 `Emit` 效果必经解释器」的 `expect` 不变式将**在运行时 panic**（编译器**不会**报错——`of` 的编译期强制同步只强制**改 `of`**，不强制**改成 `Some`**）。⇒ **新增不经解释器的效果种类时，实现侧必须同步处理 `of` 返回 `None` 的分支，不得依赖 `expect`**（类型级解法：拆成 `kind_of` / `handle_of` 两个函数，或给 `Effect` 加「解释器可见」的类型级标记——**本轮只登记，不改实现**）。
 
 **`EffectId` ≠ 投递身份**：`EffectId` 是 reducer/消费者定义的**逻辑效果句柄**（**一个 store 内全局唯一**——见 `skeleton::EffectId` 的唯一性纪律），**不是**框架生成的投递尝试身份。本批**不引入重试**、**不承诺** exactly-once；#45 拍板的 Option D 语义（至多一次调用尝试 · 外部结果不确定 · 不自动重放）**保持不变**，幂等/去重属消费方责任。
+
+**组合面纪律（#163）**：全局唯一靠的是**组合方显式声明命名空间 / 范围**，不是自动的——子件各自计数就会撞；声明与校验见 `skeleton::{EffectNamespace, validate_effect_namespaces}` 与 `combine!` 的 `namespaces:` 臂（§compose）。
 
 生命周期重建协议：记账单位是 **action 而非 dispatch**——一笔 dispatch 主 action 走 `Enqueued(depth) → Reduced → [EffectForwarded* | EffectInterrupted] → Notified?`；Emit 回灌派生的每个动作各走一条同形链交错嵌进主链时间线。`Notified` 仅当拍确有状态快照订阅者收到快照时记录。`seq` 在入环临界区内分配（⇒ 环序 = `seq` 序，并发发射下亦然；issue#65），订阅窗内单调**连续**——空洞 = 有界环溢出丢最旧的显式证据。**实时回调是 best-effort 观测面**（不承诺每事件必达，权威历史是环 + `seq`）——词汇与丢弃证据分类见下方「投递语义词汇（订阅面通用）」。默认关闭零开销：未订阅路径 = 每 emit 点一次 gate load 即返。多订阅者间逐字交错顺序不可预推；时间线断言用语义不变量（深度链/节点计数），勿钉逐字全局顺序。
 
@@ -414,7 +417,13 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 | 9 | 对象池/线程池 idle 容量 | `pool` | 由 tuning 显式给 | `ObjectPoolTuning` / `ThreadPoolTuning` **显式必填，无默认**（`SizeClassPool` 逐档继承 tuning，无自有 cap） | 超 `idle_cap` ⇒ `dropped_overflow` 计数（有界降级） | 调 tuning；`shrink_to`/`prune_idle` 主动回收 |
 | 10 | 外部准入队列容量（ingress） | `runtime`（#38） | 无界（默认） | `SyncStore::set_capacity(n)`；默认 **0 = 不限**（等待被 reduce 的 action 数；正在执行的已出队，不计入） | 拒绝：`try_dispatch` ⇒ typed `AdmissionOutcome::Full`；`ActionSender::dispatch` ⇒ `false`；`SyncStore::dispatch`（无失败面）过载 panic fail-visible——均不阻塞、不部分插入；计数 `admission_full_count()` | 显式 `set_capacity(n)`（**#95：与准入共锁线性化**——线性化点 = `inner.queue` 锁内发布；准入先得锁则按旧值完成、setter 返回后一律按新值；**缩容不回溯**既有记录，**扩容与 0 即时**生效）；`admission_full_count()` 读数 |
 
+| 11 | per-root 因果工作量预算 | `runtime`（#105/#144） | 无界（`0`，须显式置） | `set_causal_work_budget(n)` / `causal_work_budget()`；**默认 `DEFAULT_CAUSAL_WORK_BUDGET = 16384`（默认启用）**。用量 = 单根累计**已接受**后代数（单调不回落，随账本复位清零）；与 ingress / deferred / 回灌深度**四维分立**，禁并一计数 | 超界 = 拒绝预留：子动作**不入主队列、不占在途计数**，改挂续接账本**停放**（`DispatchOutcome::Deferred`）或停放区满被**拒收**（`CapacityRejected`）；计数 `causal_work_budget_exceeded()`（停放 + 拒收各计一次） | 显式 `set_causal_work_budget(n)`（**#95 同款共锁线性化**：缩容不回溯已准入后代；`0` = 不限）；`resume_deferred(limit)`（#49，无自动重试） |
+| 12 | per-reducer 分段效果预算 | `runtime`（#144） | 无界（`0`） | `set_segment_effect_budget(n)` / `segment_effect_budget()`；**默认 `DEFAULT_SEGMENT_EFFECT_BUDGET = 4096`（默认启用）**。**生效点 = reduce 正常返回的提交点**（预算快照进段，已提交段不随 setter 缩容回溯）；reducer 调用期间框架无控制点 | 超量 **Emit** ⇒ 停放 / 拒收（同 #11 的超界行为，**不占**根预算）；超量 **Run/Cancel** ⇒ 不转发，产出 action 以**提交后部分失败**结算（`Failed{phase:ForwardingEffects,state_committed:true}`；legacy `dispatch` 按既有转发失败口径 panic）；计数 `segment_effect_budget_exceeded()` | 显式 `set_segment_effect_budget(n)`（`0` = 不限）；Emit 侧 `resume_deferred(limit)` |
+| 13 | per-drain 租约工作量预算 | `runtime`（#144） | 无界（`0`） | `set_drain_work_budget(n)` / `drain_work_budget()`；**默认 `DEFAULT_DRAIN_WORK_BUDGET = 4096`（默认启用）**。计量 = 单个排空租约**连续出队处理**的记录数（到界清零） | 到界且主队列非空 ⇒ **让出**：放旗 → 解锁 → `std::thread::yield_now` → 重新竞争（窗口内外部 push / `resume_deferred` / `close` 可接手；FIFO / 单写者 / 无丢失 / 无重复不变；无人接手则自己续排）。**例外**：经 `try_dispatch` / `ActionSender::dispatch` 夺得租约者，在自己 action 的完成边界前不让出；计数 `drain_lease_yields()` | 显式 `set_drain_work_budget(n)`（`0` = 不限）；让出只降延迟、不丢记录 |
+
 **数值决定记录（2026-11-23 维护者拍板）**：本表全部默认值**保持现值（keep current）**——具体为：Run-ID `1024`、deferred `64`、审计环/待投递 `1024`、回灌深度 `64`、ingress 无界 **照旧**；scheduler 与 watchdog 的提案值（`1024` / `4096`）**不采纳，保持无界**（草案见 `reports/2026-11-23-resource-defaults-draft.md`，留痕备查）。依据：#56 Stage C 消费方验收结论「全默认开箱可用，未出现要求把默认值改小的证据」（`reports/2026-11-23-56-stage-c-consumer-validation.md`）；共同约定 2「默认=保守可用，禁为炫技设小界」。`AUDIT_PENDING_CAP` 无配置面、`FEEDBACK_DEPTH_BUDGET` 固定——均按现状记录，不新增配置面。
+
+**追加（2026-11-26，wave7；#105/#144）**：#11–#13 三项为新增预算，**默认启用**——这是约定 1「显式 opt-in 才设界」的**明文例外**（#144 Required design 5 要求默认启用、关闭须显式 opt-in）；默认值 16384 / 4096 / 4096 由实现提案 + PM 批准，**维护者可推翻**（改大 = 兼容放宽；改小 = 破坏性，走 ADR）。
 
 **修订规则**：某默认值经 #56 Stage B 实测不合格 ⇒ 修订本表一次（改大 = 兼容放宽；改小 = 破坏性，需 ADR 记录理由与迁移路径），各面 rustdoc 随表同步，禁单点改数。
 
@@ -513,6 +522,7 @@ impl PoolBase {
 - 校验规则一套两档出口：`max == 0` / `idle_cap == 0` / `idle_cap > max` → 构造期 panic、运行时 `Err(PoolResizeError)`（拒绝路径零状态变更）。
 - 归还裁决 RAII 唯一自洽：归还永不阻塞永不报错；槽满 = 丢弃 + `PoolMetrics::dropped_overflow` 计数（fail-visible）。
 - 审计发射唯一收口：未订阅 = 一次 gate load 即返；订阅态 = seq 单调入账（容量环溢出丢最旧）+ **锁外**回调（回调内重入 emit 只录环——TLS 在途标记封自指递归）；回调 panic 摘除留痕。
+- **审计票据 Drop 契约**（#209 / #221 §5.1）：`PoolAuditTicket` 是公共生命周期守卫，Drop 为 **best-effort**——先 `take` 关闭回调再调用（**至多一次**），回调 panic 由 `catch_unwind` 收容并累计**饱和**计数 `pool::pool_audit_ticket_drop_panic_count()`；要观察关闭失败用显式 `ticket.close(self) -> Result<(), Box<dyn Any + Send>>`（返回**原始 payload**，不格式化不替换）。回调与其捕获的析构恒在审计锁外（Drop 只 `take` 出 `Box`，`PoolAuditSink` 的 close 回调把槽取到局部后锁外 `drop`）。声明上限：`panic = abort` 不在收容面内。
 - **审计实时回调 = 串行派发，不丢并发事件**（#75）：回调有**显式在途状态 + 待投递 FIFO** ⇒ 回调在途期间的并发 emit **入队而非跳过**（此前是 `notify.take()` 窗口内静默丢件），在途者按 `seq` 序在**所有内部锁之外**补投；FIFO **有界**，溢出丢最旧并计入**独立的投递丢弃计数** `audit_delivery_drops()`（与 ring 溢出 `dropped_overflow` **分账**：历史侧丢 vs 实时流丢）；回调 panic 时 **fail-close 本代次**（摘回调 + 清本代次 pending 并计数），**排队事件不投递给替换订阅**。三条不变：`FnMut` 串行 / 禁锁内调用 / 禁同线程递归。
 - **resize 预留协议：目标 epoch 串行化**（#69）：`workers` 视作**已承诺 + 已预留**总量（增长缺口**不再减去在途预留**）⇒ 并发 resize 不再双预留同一缺口（此前实测 `workers=7 max=4`）；`target_epoch`/`next_epoch` 串行化目标更新 ⇒ **最后发起**的目标生效，旧目标预留的席位在兑现后按最新 core 重算退役令牌（`reconcile_shrink`），**不会被新目标静默满足两次**；缩容令牌只从**可退休的真实 worker** 计且不得退到最新 core 以下；**OS 线程创建仍在状态锁外**，任务创建失败仍退还提交者。
 - `watermark = borrowed / max`，可 >1.0（缩容后借出数高于新池深的合法中间态，读数如实不钳位）。
@@ -1555,9 +1565,9 @@ pub enum TempDirError {
 pub struct TempDir { /* … */ }
 impl TempDir {
     pub fn path(&self) -> &Path;
-    pub fn close(self) -> io::Result<()>;   // 显式清理（Drop 为兜底，best-effort stderr 报告）
+    pub fn close(self) -> io::Result<()>;   // 显式清理：清理错误返回调用方（不吞）
 }
-impl Drop for TempDir { /* rm_all；失败只走 best-effort stderr，不发事件（#221 §6） */ }
+impl Drop for TempDir { /* rm_all；失败走可失败 stderr 写并忽略写错、上报器 panic 亦收容；不发事件（#221 §6 / #183） */ }
 
 pub fn atomic_write(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()>;  // fsx::atomic = Inherit
 pub enum AtomicWritePolicy { Inherit, Private, PreserveExisting }
@@ -1567,6 +1577,7 @@ pub fn atomic_write_with(path: impl AsRef<Path>, bytes: &[u8], policy: AtomicWri
 - `copy_tree`：`dst` 必须不存在（create_dir 独占语义）；首错即停，已处理量以计数显式申报（禁静默半途）；遍历按文件名排序——报错点确定可复现；文件复制=`fs::copy` 本体语义（权限保留，时间戳不承诺）。**源根是符号链接 ⇒ `Prepare(InvalidInput)`**（`Follow`/`Preserve` 同面，#120；`dst` 不创建，不再出现「链接根被当目录、返回 `Ok(dirs:1,files:0)`」的假成功）。**落点解析后等于/位于源根内 ⇒ `Prepare(InvalidInput)`**（#108：`canonicalize` 源根 + 解析目标父 + 叶子，`..`/符号链接父一视同仁；判定在**建目标之前**，`dst` 不创建；与 `create_dir` 之间仍有 TOCTOU 窗口，已文档化，不是 OS 沙箱）。**实测修正**：`Sort::ByName` 的逐目录条目快照会把自我嵌套压成「返回 `Ok` 的半截/错位复制」——危害是**静默坏结果**而非磁盘爆掉；包含关系闸就是为此设。
 - `rm_all`：引擎=std 硬化原语（CVE-2022-21658 防护+Windows DELETE_PENDING 等待）；加 Windows 只读属性装甲（首次 `PermissionDenied` 清只读后重试恰一轮，仍败原错误上浮）。Unix 只读目录 EACCES 属 OS 语义如实上浮（不自动 chmod）。
 - `temp_dir_in`：命名=前缀+pid+进程内原子序号+挂钟纳秒；创建走 `create_dir` 独占语义；**Unix 新建 0700**（umask 只能收窄），Windows 权限继承父目录 ACL（不宣称私有）。落点由调用方给定（禁系统 TEMP）。`prefix` 必须是**单个普通路径组件**：空串合法，含 `/`、`\`、`.`、`..`、绝对/盘符/UNC 前缀 ⇒ `TempDirError::InvalidPrefix`（拒绝后零残留，#182）。
+- **Drop 严格 no-panic**（#183）：清理失败只做 best-effort stderr 报告——写入失败忽略、**上报器自身 panic 由 `catch_unwind` 收容**，故在既有 unwind 中 drop `TempDir` 不会二次 panic / abort；代价是诊断可能整体丢弃。要拿到清理错误请用 `TempDir::close(self) -> io::Result<()>`（错误原样返回）。两条声明上限：`panic = abort` 档收容不生效；stderr 锁被其它线程长时间持有时析构会等待该锁（未做非阻塞通道）。
 - `atomic_write` / `atomic_write_with`：同目录临时件（write+`sync_all`）→ rename 原子替换——读者恒见旧内容或新内容，恒无半写中间态。`atomic_write` = `Inherit`（umask 新建语义，**既有行为零改动**）；`atomic_write_with` 显式策略（#215）：`Private`（Unix 临时件建时即 0600、写首字节前生效；Windows 仅父目录 ACL 继承，**不宣称私有**）、`PreserveExisting`（Unix 以目标现有 mode 建临时件，`symlink_metadata` 不穿链接；目标缺失回落 `Inherit`；目标非普通文件 ⇒ `InvalidInput`；Windows ⇒ `Unsupported`）。**临时件所有权**（#216）：只在 `create_new` 成功后承认所有权，失败/撞名**不删**预置路径；错误路径只清本调用创建的那一条，清理失败不掩盖原错误。其余 armor 不变：**不先删旧**（删旧引入目标缺失窗口毁掉原子性）；`to` 为已存在目录恒败；同目录临时件从根上排除跨分区 rename；父目录必须已存在（不隐式 mkdir）；并发写同目标=最后赢（rename 原子线性化）。崩溃在 rename 前留 `atomic-{pid}-{seq}{nanos}` 临时件（可识别，手扫/启动扫）。
 
 ```rust
@@ -2606,6 +2617,7 @@ pub struct Combine<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L> { /* … */ }
 - 六参语义：`get`/`set`=父状态内子切片的读写镜头；`wrap`/`unwrap`=子 action 上浮 / 父 action 下沉路由（`unwrap` 返回 None=本层不路由，状态克隆原样返回零效果）；`lift_fx`=子效果词表到父词表的显式上提。子效果里的 `Emit(CA)` 由核心经 `wrap` 自动上浮——`lift_fx` 只收 `Run`/`Cancel` 两形。
 - **产物实现 `Fragment` 不实现 `Reducer`**：分片没有 `initial`——根状态由父 Feature 的 `initial` 显式构造（含子初值），分片只承载 reduce 委托；用作根 = **E0277 编译期拒绝**（`#[diagnostic::on_unimplemented]` 错误信息自带修复指引；禁静默空状态）。子件 bound 相应放宽为 `Fragment`：完整 Feature 经 blanket impl 仍可作子件，分片可嵌分片。
 - `combine!` 三档效果面：**省略 `lift`** ⇒ 编译期闸（`assert_effect_free`）——只有子件 `Op = Infallible` 才可省（带效应子件省略 ⇒ E0271，不再静默丢效果）；**`lift:`** ⇒ 显式上提；**`discard_effects`** ⇒ 显式 opt-in 丢弃（关键字在调用点让「丢数据」显形）。**变体短形态** `combine!(Child, Parent.field, Enum::Variant)` 一体生成 wrap/unwrap（unwrap 自 `&PA` 克隆上浮，要求子 action `Clone`）；**显式形态** `wrap:`/`unwrap:`/`lift:` 逐项给（非 Clone 词表与复杂路由的逃生口）。切片表达式限 `状态类型.字段名` 裸段（泛型/路径状态退回 `combine` 显式形态）。
+- **效果 ID 命名空间（#163，additive）**：独立子件**不自动可组合**——`combine`/`combine!` 原值转发子件的 `Run { id }` / `Cancel { id }`，不改写、不哈希、不重编号（`EffectId` 表示与运行时效果归属不变）。两个各自从 1 计数的子件装上同一 store 就会撞 id，`Cancel(1)` 会取消到**另一个**子件的在途效果（`cancel_unknown_id` 读侧抓不到：id 不未知，只是归属错了）。⇒ 组合方须显式声明各子件占用的 id 区间：`combine!(Child, Parent.field, wrap: …, unwrap: …, lift: …, namespaces: [("timer", 0, 999), ("http", 1000, 1999)])`（**含两端**；`Run`/`Cancel` 共用同一 id 空间 ⇒ 每子件只声明一次）。宏在**编译期**断言区间互不相交且不倒置（重叠 / 倒置 = 编译错误），判定与运行期同一函数 `skeleton::validate_effect_namespaces`（typed `Err`：`EffectNamespaceConflict::{Inverted, Overlap}`，`Display` 含子件名 + 区间 + 首个重叠 id）。**不写 `namespaces:` = 不校验 = 保持现状**（旧写法展开一字不变）；声明只在 `wrap`/`unwrap`/`lift` 全写的显式形态提供，短变体三档捷径臂不提供。**已知限制**：声明完备性无校验（漏声明某子件不报错）。
 - 零 dyn 零装箱；采用方可用 `Combine<_, _, …>` 注解持有产物（匿名 `impl Fragment` 形态做不到）。
 
 ```rust
@@ -2684,18 +2696,28 @@ impl ViewBridge<S, A, M, I, J, R> {
 
 **纪律指向**：①视图词表用 enum 表达互斥状态、禁布尔旗子（正反例见 `skeleton::view::ViewMap` 文档与 `bindings()` 语义）；②「派生 input 覆盖 compute 实读」红线的最小可执行反例 = `tests/view_bridge_test.rs::narrow_input_leaks_stale_and_is_detectable`——漏报的**两处**签名：`projection_runs` 停滞、水位推进而补丁为空（第三处「快照真值与补丁值不等」不再适用：快照只吃已提交投影值，#104/§6，陈旧值体现在快照内容本身）。
 
+**机制胞锁边界（#157，`Derived` / `Sentinel`）**：两枚 L1 输入键记忆化胞改走**两阶段代际协议**——①锁内快照（`Arc` 值句柄 + 代际）→ ②锁外跑采用方代码（`input` / `extract` / `compute`、`In::eq`、`Out::clone`、缓存旧值 `Drop`）→ ③重取锁，**仅当代际未变**（快照之后无人发布）才裁决 / 发布。临界区内只有句柄搬移与代际记账：采用方代码可重入同一个胞，panic 不毒化（原样穿出，胞照常可用；`input` / `compute` / `eq` / `clone` 的 panic 发生在发布之前，缓存不变）。并发语义：`Derived::get` 允许并发未命中重复计算，算出的结果对本次请求恒正确，代际已变则**照常返回但不写缓存**（零重试）——陈旧计算不覆盖更新的已提交值，缓存里的 `(In, Out)` 恒为同一次计算的自洽配对；`Sentinel::changed` 的裁决在线性化点复核代际，撞上并发发布用新快照**重试一轮**，仍不一致则**多报 `true` 且不提交**（多报只是多做一次投影，漏报才是违约）。**线程共享门槛（编译期可见的收紧）**：`Sentinel<S, In>: Sync` 需要 `In: Send + Sync`，`Derived<S, In, Out>: Sync` 需要 `In: Send + Sync` 与 `Out: Send + Sync`（`Send` 同）——此前只需 `Send`；这是「采用方代码移出胞锁」的直接后果（比对 / 克隆在锁外读共享的快照句柄）。`In` / `Out` 为 `Send` 但非 `Sync` 的胞只能在单线程内使用。分配面：命中路径零分配不变；每次发布（未命中 / 输入变更）多一次 `Arc` 句柄分配。行为面测试：`tests/view_cells_two_phase.rs` 与 `src/view.rs` 的 `cell_lock_boundary` 单元探针。
+
+**装配期与通知期 panic 的收容面（#167）**：`ViewMap::bindings()` / 编码器 `covers()` 的 panic 在装配边界换成 typed `MountError::{DeclarationsPanicked, CoveragePanicked { channel }}`——不裸 panic、Err 路径不留半装配桥（`store.subscribe` 在 catch/编译之后）；`input_changed`（哨兵）panic 在桥边界收容：计数 + 毒化 + **fail-open 投影**（判不出「未变」不吞成「未变」），`SyncStore` 订阅不被摘除；`project` panic 保留 last-known-good 并标不完整。
+
+**采用方代码零锁内与 `M::View: Send + Sync` 门槛（#140）**：`ViewBridge` 的已提交投影值以不可变 `Arc` 句柄存放——桥内互斥量（`core` / `region`）下**只搬句柄与代次**，不执行任何采用方代码。运行期一律锁外的调用点：`JsonEncoder::to_json`、`RegionEncoder::encode`、`RegionBacking::{len, with_bytes, with_bytes_mut, store/load_publish_seq}`，以及 `M::View` 的 `PartialEq`（变更细闸）、`Clone`（**桥内零调用**：句柄共享取代值拷贝）与退役值的 `Drop`；两个 `covers()` 只在 `mount`（桥尚不存在的装配期）各求值一次并缓存，运行期零调用。两阶段协议：锁内捕获 `Arc` 句柄 + 提交代次 / 逐绑定脏代次 → 锁外跑采用方代码 → 锁内校验令牌后提交。JSON 交付只清**捕获到的那一代**脏位（编码期间竞态的新脏写留着，下批仍交付）；编码器 panic ⇒ 整批原子失败（不交付半成品、不清脏、不推进交付游标），桥保持可用并经 `PatchBatch::resync` / `SnapshotError::Incomplete` 显形。**锁序**：`core` 与 `region` 从不同时持有（唯一嵌套是 `region_failure → region`）；封板后 `bind` 直接 `Sealed`——这是「`core→region` 与 `region→core` 互斥」的状态机前提，若未来允许 sealed 后 bind 或改变封板顺序，必须重审锁序。**门槛（新增，编译期 E0277）**：`M::View` 必须 `Send + Sync`（`ViewMap::View` 自身约束 `Clone + PartialEq + Send + 'static` **不变**）——原因：`Arc<V>: Send` 要求 `V: Send + Sync`，而桥跨线程共享；受影响形态为 `View` 含 `Cell` / `RefCell` / 裸指针包装等 `Send + !Sync` 类型，逃生口 = 换成可共享视图类型或不挂到桥上（容器/投影面本身仍可用），与 #157 机制胞的门槛同质。
+
+**热路径分配面（#169/#174）**：区域发布走**复用批缓冲**——编码器经 `RegionWriter` 的段窗口（`with_buffer` / `begin_segment`）把每段 TLV **直接写进**桥独占的批缓冲（`Seg` 只记 `(entry, len, at)` 偏移），`execute_plan` 再把这批字节一次拷进背衬、**填充字节在目标区就地补零**；因此稳态发布是「每变更绑定 **0 次分配 / 1 次拷贝**」，只余每拍常数 2 次（索引镜像 `entries.clone()` + 段落位表，按 issue「可证明可忽略即有意保留」）。`RegionWriter::json_blob` 直接 `serde_json::to_writer` 进缓冲（不再 `to_string()` 整段临时 String），失败回退到段前不留半截 TLV。通知面把 `pending` / `changed` / `retired` / `prev` 四块容量与区域批缓冲放进**单个 scratch 槽**（`Mutex<Option<Scratch>>` + `Option::take` 移出 = 独占，**无 unsafe、不扩 `DrainExclusive` 证明**）：取用是**惰性**的——哨兵全报未变的快路径不取不放（零新增取锁、零分配）；变更拍多 2 次取锁，换掉每拍 4~6 次分配；并发通知取不到槽就临时新建（行为不变，只多分配）。归还时句柄在**锁外** `recycle`（采用方 `Drop` 不落桥内锁）。实测（本机 release，确定性事件计数，预热后）：`#169` 每拍分配 = `N+2`（N = 变更绑定数，每绑定恰 1 次 = 投影值 `Arc::new`）；`#174` 每拍 = 每绑定 1 次 + **常数 0**（全投影与哨兵过滤两种 workload 同口径；过滤档 1/16/64/256 绑定均为 1 次/拍）。A/B 配对（复用+2 取锁 vs 不复用+0 取锁，4 轮交替）：p50 改善 7%~57%（12/12 臂同向），**无历史基线二进制对照**（对照臂 = 等价改前行为的变异）。锚：`tests/view_bridge_test.rs` 的 `region_publish_has_no_per_binding_allocation` / `notify_scratch_reuse_keeps_per_action_cost_flat`；顺序/补零锚：`region_publish_order_and_padding_are_unchanged`（录制背衬 + `0xAA` 预置字节）。
+
 ---
 
 ## log-embed — 埋点规范
 
 **feature**：`log-embed`（绑 tracing；**默认不开启**——埋点宏展开为空、tracing 依赖不进树，cargo tree 零 tracing 证明；`tracingx`/`logx` 桥不受本 feature 影响）。
 
-九域 54 调用点（`std-ext` 七域 47：scheduler 14 / retry 12 / cache 9 / fsx 6 / ratelimit 4 / iter 2；本 crate 七点：shutdown 6 + fx 1），覆盖 scheduler/ratelimit/retry/fsx/cache/shutdown/iter/fx。**计数口径**：「调用点」= `embed_event!` 宏调用——排除宏定义行、`//` 文档/注释行与 `#[cfg(test)]` 之后的内容，多行调用按首行计一次；改埋点后按此口径重数，同步两 crate 的 `lib.rs`/`Cargo.toml` 注与本段。纪律（lib.rs `embed_event!` 注）：
+九域 56 调用点（`std-ext` 七域 49：scheduler 14 / retry 12 / cache 11 / fsx 6 / ratelimit 4 / iter 2；本 crate 七点：shutdown 6 + fx 1），覆盖 scheduler/ratelimit/retry/fsx/cache/shutdown/iter/fx。**计数口径**：「调用点」= `embed_event!` 宏调用——排除宏定义行、`//` 文档/注释行与 `#[cfg(test)]` 之后的内容，多行调用按首行计一次；改埋点后按此口径重数，同步两 crate 的 `lib.rs`/`Cargo.toml` 注与本段。纪律（lib.rs `embed_event!` 注）：
 
 - **只埋行为决策点**（register/cancel/fire/裁决/拒绝/等待分段），禁埋纯计算路径（`backoff_delay` 现零事件——#202：观测上移到 `retry` 的 verdict/backoff 事件）。
 - **字段化禁格式化**：字段只收数值/布尔/静态串，禁 format!/Display。
 - **关联序号进字段**：seq（scheduler 堆条目）/attempt（retry 轮次）/round（ratelimit 阻塞重查轮）承载跨事件关联，不起 span。
 - 级别规范：正常流转=debug / 异常路径=warn / 终态=info。事件全部在状态锁外发射（订阅方 IO 不持锁）。
+
+**遥测边界（#203）**：淘汰 / 过期 / purge 事件**不在缓存锁内发**——锁内只收集紧凑事实（事件种类、purge / 僵尸计数、容量淘汰决策布尔），解锁 → **先析构退休批**（用户 `K::drop` / `V::drop`）→ 才调 `tracing` 订阅者。因此订阅者可重入同一个缓存（不再自锁死）、可 panic（`embed_event!` 的 panic 边界 `catch_unwind` 吸收并计入 `embedded_event_panic_count`，不投毒、不打断已提交的操作）、可阻塞（不再挡住全体缓存用户）。单线程面（`LruCache` / `TtlCache`）同序：事件在整次插入收尾之后才发。事件**不带键指纹**：`K::Hash` 是采用方代码，诊断不得为一次已提交的变更再跑一次用户 Hash（Round 3，#221 §4）；`K` 无 `Debug` / `Display` bound（加 bound = 公共 API 破坏性变更）。#82/#83 的既有契约不变：锁内仍跑键 `Hash` / `Eq` 与读侧 `V::clone`。
 
 ### 域级埋点表
 
@@ -2705,12 +2727,12 @@ impl ViewBridge<S, A, M, I, J, R> {
 | ratelimit | `skeleton::ratelimit::{try_acquire,acquire}` | 快路径拒绝与超容量拒绝=warn（available/wait_ns/capacity）；阻塞等待分段与醒后重查=debug（round/deficit）；成功扣减零事件；`wait_ns` 字段饱和到 `u64::MAX`，不回绕（#149） | 混合 |
 | retry | `skeleton::retry::{attempt,verdict,backoff}` | 尝试开始=debug；重试放行=warn（backoff_ms）；停机终态=info；退避截平=warn（linear_ms→capped_ms）；`*_ms` 字段饱和到 `u64::MAX`，不回绕（#149） | 混合 |
 | fsx | `skeleton::fsx::{walk,copy}` | walk 帧推进=debug（depth/sort）；copy 逐项=debug + 部分失败=warn（copied/path/error）；**TempDir Drop 清理失败不发事件**（#221 §6：析构路径只做 best-effort stderr 报告） | 混合 |
-| cache | `skeleton::cache::{evict,purge}` | evict（kind=ttl/ttl_sweep/capacity，key 指纹/僵尸数/LRU 序）=debug（真回收才发）；purge=info（回收数/残留） | 混合 |
+| cache | `skeleton::cache::{evict,purge}` | evict（kind=ttl=过期累计 / ttl_sweep=僵尸数 / capacity=LRU 序+驱逐后残留）=debug（真回收才发）；purge=info（回收数/残留）。**不带键指纹**——遥测不为已提交的变更多跑一次用户 `K::Hash`（#203） | 混合 |
 | shutdown | `skeleton::shutdown::{registry,run,report}` | 注册成功/逐组件开始/终态 Stopped/整体报告=info；TimedOut/Failed=warn | 混合 |
 | iter | `skeleton::iter::process_results` | 首 Err 短路=warn（pos=已产出 Ok 数，0 起）；next/fold 双通路各一点 | warn |
 | fx | `skeleton::fx` | 托管任务 panic 归一为 `Panicked` 后若句柄已被丢（结果无人消费）=warn（msg=panic 文案）；`Ok`/`Cancelled` 无人接属设计内，不埋 | warn |
 
-target 规范：域=`skeleton::<domain>`，子流程=`skeleton::<domain>::<phase>`——EnvFilter `skeleton::retry=debug` 按流程开，`skeleton=info` 按域开。键身份以 `DefaultHasher`（定长种子）指纹承载（跨 Rust 版本不承诺稳定，仅进程内日志关联）。开启方式：`--features log-embed` + 宿主 tracing 订阅（见 [`logx`](#logx--日志门面) 的 RUST_LOG 姿势）。
+target 规范：域=`skeleton::<domain>`，子流程=`skeleton::<domain>::<phase>`——EnvFilter `skeleton::retry=debug` 按流程开，`skeleton=info` 按域开。键身份：cache 域**不再**携带任何键指纹（#203，遥测不为已提交的变更多跑一次用户 `K::Hash`）；其余域若出现键关联，以 `DefaultHasher`（定长种子）指纹承载（跨 Rust 版本不承诺稳定，仅进程内日志关联）。开启方式：`--features log-embed` + 宿主 tracing 订阅（见 [`logx`](#logx--日志门面) 的 RUST_LOG 姿势）。
 
 ---
 
@@ -2725,7 +2747,7 @@ target 规范：域=`skeleton::<domain>`，子流程=`skeleton::<domain>::<phase
 | testing | tokio + runtime | TestStore/ScriptedRuntime/parse_mock |
 | tracing | runtime + deps | 桥在审计值面上消费 |
 | config-toml | config-json + toml | 值面叠层；toml 仅此 feature 可达 |
-| bench `infra` | tokio+journal+memgov+testing+pool | required-features 并集（hollow gate 纪律） |
+| bench `infra` | tokio+journal+memgov+testing+pool+view | required-features 并集（hollow gate 纪律；`view` 供 #169/#174 的 `view_publish` / `view_notify` 臂） |
 | example `end_to_end` | tokio+journal+testing+compose | 五件套+combine+TestStore+fx/journal 解释器标准形 |
 
 零依赖证明口径：`cargo tree -p udf-skeleton-infra -e normal`（默认 feature 下 `skeleton` + `std-ext`，均 workspace path 非三方——**默认零三方**）；`--no-default-features --features memgov` 仍独立；`--no-default-features --features log-fs` 树内同样只有 workspace 路径依赖（`log-fs` 不点亮 `json`）。`serde_json` 是**门控依赖**（Cargo optional，ADR-0007 依赖隔离门），仅经这些 feature 进树：std-ext 侧 `json`；infra 侧 `view`（连带 `udf-std-ext/json`）、`journal`、`config-json`（后者连带 `config-toml`）。

@@ -4,6 +4,76 @@
 
 ## [Unreleased]
 
+### Performance(view): 区域发布与通知热路径去掉每绑定分配（#169/#174）
+- **区域发布（#169）**：段字节不再为每个绑定分配临时 `Vec`——编码器经 `RegionWriter` 的段窗口（`with_buffer` / `begin_segment`）**直接写进**桥独占的可复用批缓冲（`Seg` 只记 `(entry, len, at)` 偏移），`execute_plan` 把这批字节一次拷进背衬、**填充字节在目标区就地补零**。⇒ 每变更绑定 **0 次分配 / 1 次拷贝**（原为 `to_vec()` + 二次 clone）；每拍仅余常数 2 次分配（索引镜像 `entries.clone()` + 段落位表，按 issue「可证明可忽略即有意保留」）。`RegionWriter::json_blob` 改为 `serde_json::to_writer` 直写缓冲（省一次整段 `String`），失败回退到段前不留半截 TLV。**发布顺序（payload → index → header）、固定容量/地址稳定、单批 `with_bytes_mut` 边界不变**（录制背衬 + `0xAA` 预置字节的独立读侧反证）。
+- **通知热路径（#174）**：`pending` / `changed` / `retired` / `prev` 与区域批缓冲的容量复用同一**独占 scratch 槽**（`Mutex<Option<Scratch>>` + `Option::take` 移出 = 独占，**无 unsafe、不扩 `DrainExclusive` 证明**）；取用**惰性**——哨兵全报未变的快路径零新增取锁、零分配；变更拍多 2 次取锁，换掉每拍 4~6 次分配；并发通知取不到槽则临时新建（行为不变）。归还时句柄在**锁外** `recycle`（采用方 `Drop` 不落桥内锁）。1/16/64/256 绑定、两种 workload 下每拍分配从「每绑定 1 次 + 每拍 4~6 次」降到「每绑定 1 次 + 0」。
+- **实测**：分配为确定性事件计数（预热后）；A/B 同会话配对（复用+2 取锁 vs 不复用+0 取锁，4 轮交替）p50 改善 7%~57%，12/12 臂同向。**无历史基线二进制对照**（对照臂 = 等价改前行为的变异），跨提交「快多少」只能由分配计数推断。
+- **bench**：`infra` 新增 `view_publish/{1,16,256}` 与 `view_notify/{all,filtered}×{1,16,64,256}` 共 11 臂；`[[bench]] required-features` 追加 `view`（bench 构建面变更）。
+
+### Fix(view): 装配期与通知期 panic 收容的测试与文档补齐（#167 G1/G2/G4 + #230/6w5/ep5/7qj）
+- **装配期收容（有落点、本次补测试）**：`ViewMap::bindings()` panic ⇒ `Err(MountError::DeclarationsPanicked)`；编码器 `covers()` panic ⇒ `Err(MountError::CoveragePanicked { channel })`——都不裸 panic、不泄漏订阅（`store.subscribe` 在 catch/编译之后）。
+- **通知期收容**：`input_changed`（哨兵）panic 在桥边界收容：计数 + 毒化 + **fail-open 投影**（判不出「未变」不吞成「未变」），`SyncStore` 订阅不被摘除；`project` panic 保留 last-known-good 并标不完整。
+- **rustdoc 更正**：`projection_panics()` 原写「投影 panic 跳过累计」，与事实相反（哨兵 panic 也计入，且当拍会投影）——已改为「两类 panic 都计入 + fail-open 语义 + resync 复位」。
+- **测试面**：`tests/view_bridge_test.rs` 新增三条（`DeclarationsPanicked` / `CoveragePanicked` 两通道 / `bindings()` 装配期恰调一次）+ 哨兵 panic 那条强化为「当拍**真的**投影」（`projection_runs() == 3` + 补丁值断言，使「只毒化不投影」的变异必红）。
+- **偶红口径修正**：`byte_budget`（#230）、`fx::tests`（bd 6w5）、`embedded_event` panic 计数（bd ep5）与 `causal_budget::external_traffic_progresses_across_yields`（本波新增）的断言改为负载无关口径（守恒式 / 基线增量 / 锁内不变量），不再依赖调度结果。
+- **lint**：`clippy.toml` 的 `disallowed-methods` 补 `Handle::spawn` / `JoinSet::spawn_on`；`fx.rs` 两个准入闸各加一处逐语句 `#[allow(clippy::disallowed_methods)]` + 「新调用点请走本函数」注释。
+
+### Changed(runtime): 回灌取号移入队列临界区（`seq` = FIFO 插入序）+ 订阅登记线性化点定稿（#158/#159）
+- **语义变更（可观测）**：`Effect::Emit` 回灌路径的 `seq` 改为在 `queue` 临界区内分配（紧邻后代记账与 `push_back`）⇒ **`seq` 成为队列插入线性化序**（外部准入与回灌同一分配序），出队（= 执行）序按插入序 ⇒ `DispatchReceipt::seq()` / 审计 `EffectInterrupted` 的两个序号可按序重排 action 时间线；未停放路径上跨 action 续转的 `origin_action_seq < dispatch_action_seq` 成立（停放 → 恢复路径保留取号序，仍不保证）。锁序不变（`queue → ledger`）、无额外锁；分段超量的 Emit 也进同一取号临界区（不入主队列，仅取号）。
+- **边界（不变）**：停放后经 `resume_deferred` 入队的记录保留**取号时**的序号（取号早于恢复，不回溯重编号）；FIFO 队列行为、停放/恢复、闭门拒绝、回灌深度预算均未改。
+- **契约定稿（#159，方案 1）**：`subscribe` / `subscribe_notify` 的线性化点 = **调用入口的初始 `closed` 检查**——观察到 open 的重叠调用合法排在并发 `close` 之前（返回**惰性票据**、登记照常、**不计** `subscriptions_after_close`），只有初始检查观察到 closed 才 +1；重叠调用的返回顺序可与线性化序不同。`close` 不等待在途登记、不取投递口表锁（rustdoc 四处：`subscribe` / `subscribe_notify` / `close` / `subscriptions_after_close`）。
+- **测试**：`src/runtime.rs` 白盒探针三条——`feedback_seq_follows_queue_insertion_order`（混合并发确定性握手：取号序 == 队列序、无空洞无重复）/ `subscribe_notify_linearizes_at_entry_closed_check`（停靠于入口检查与插入之间 → `close()` → 断言惰性票据与零计数）/ `state_placement_allocation_profile`（#160 分配 profile：唯一持有同一分配、共享态换一次且旧分配留给持有者）。变异：取号挪回锁外 ⇒ 红（`(2,1)`）；计数改「插入时观察 closed」⇒ 红；落位改无条件 `Arc::new` ⇒ 红。
+
+### Changed(view): 采用方回调零锁内 + `M::View: Send + Sync` 门槛（#140）
+- **破坏性（编译期可见，E0277）**：`ViewBridge` 的 where 子句新增 `M::View: Send + Sync`。已提交投影值改为 `Arc` 句柄快照，采用方 `JsonEncoder` / `RegionEncoder` / `RegionBacking` 回调与 `M::View` 的 `PartialEq` / `Clone` / `Drop` 全部移出桥内部锁；`View` 为 `Send + !Sync`（含 `Cell` / `RefCell` / 裸指针包装）的采用方会在此版本编译失败，逃生口见 `docs/reference.md` §view。`skeleton::view::ViewMap::View` 的约束**未变**。
+- **锁边界**：桥内互斥量（`core` / `region`）下只搬 `Arc` 句柄与代次；`to_json` / `encode` / `with_bytes_mut` / `View::eq` / `View::clone`（桥内零调用）/ 退役 `Drop` 全部锁外。两个 `covers()` 只在 `mount` 装配期各求值一次并缓存。
+- **两阶段提交**：JSON 交付只确认/清除**捕获到的那一代**脏位（编码期间竞态的新脏写不被吞）；交付游标只前进不后退（并发拉取不会把更早捕获的水位写回）。
+- **采用方 panic 一律在桥边界 contain**：`to_json` / `encode` / backing 失败 ⇒ typed 失败 + 计数，脏位保留、游标不推进；`View::eq` panic ⇒ 该批不提交；退役 `Drop` panic ⇒ 提交成立但毒化。以上 panic 全部计入 `projection_panics()`（含 `project` 与 `input_changed` panic），毒化经 `PatchBatch::resync` 与 `snapshot_doc` 重同步显形与复位——不再以裸 mutex poison 作为失败协议，**桥不会因单次采用方 panic 失联**。
+- **性能（同探针实测，无 OLD↔NEW 二进制配对）**：未变更快路径 **仅 JSON 部署 3 次取锁 / 0 次分配**（分配数与「订阅者什么都不做」的 store 地面值相等）；**JSON+Region 部署 8 次取锁 / 1 次分配（48B，空事务计划的索引镜像）**——区域那 5 次取锁是每拍一次发布事务本身的开销，不是回调开销。变更路径每个变更绑定额外 1 次 `Arc` 分配（取代原本的 `View::clone`）。
+- **测试**：`tests/view_bridge_two_phase.rs`（逐调用点锁外探针 + 代次确认 + panic 原子性 + 并发 `bind` × `dispatch` × `seal` 屏障）；锁序前提由状态机论证并辅以该屏障测试（小背衬令增量耗尽真正走全量重编，`region_id >= 2` 证明 fallback 真被执行）——**测试覆盖「并发不互锁 + fallback 真被执行」，不声称覆盖所有交错**；若未来允许 sealed 后 `bind` 或改变封板顺序，必须重审锁序。变异 11 组（各自挪回锁内 / 去代次校验 / 去 panic 闸 / 游标改回直接赋值）逐一红。
+
+### Fix(view-region): TS Region 读器按 v1 规范实现无锁读协议与边界校验（#170）
+- **读协议**：`Atomics.load` 序列前后复核（8 字节对齐、odd 拒收）→ 扫描 → 复读；新增逐条目 `gen` 前后复核作撕裂探测；有界重试耗尽按 spec §4⑥ 分 `writerInProgress` / `retryExhausted`（旧实现一律 `retryExhausted`，与 Rust 读侧 `last_seen` 分类不一致）。
+- **边界**：`Number.isSafeInteger` 校验 u64 偏移与 `off + len`；TLV 长度按无符号 u32；段越界/截断显式拒收（不再依赖 `subarray` 静默钳位）。
+- **载荷**：严格 UTF-8（fatal）、`JSON.parse` 逐段 catch ⇒ 未知值 + 计数 + `needsResync`、`null` 标签必须零长、非有限 f64 拒收。
+- **结果面**：`RegionRead` 增 `protocolVersion`（header 元数据，供 UI 换区握手与跨通道版本对齐）。
+- **测试**：真 `SharedArrayBuffer` writer harness（读窗口内完成整笔 odd→字节→even 事务 / 停在 odd 两态），断言「只接受同版快照、永不混合」；新增无符号长度、`off+len` 越界、`writerInProgress` 分类用例（11 → 14 pass）。
+- **文档**：`docs/view-region-spec.md` 的镜像读器状态行与交接清单耗尽语义与 Rust 实现对齐（原写 `writerBusy`，非本仓任何一层的 typed 名字）。
+
+### Fix(std-ext/fsx): `TempDir::drop` 清理上报再加围栏——上报器 panic 也收容（#183）
+- **接口/无接口面不变**：显式 `TempDir::close(self) -> io::Result<()>` 仍是唯一返回清理错误的面；`Drop` 仍只做 best-effort stderr 报告、不发事件（#221 §6）。
+- **行为变更（仅失败路径）**：`Drop` 的上报从「可失败 stderr 写入」升级为「析构路径严格不可能二次 panic / abort」——写入失败忽略、**上报器自身 panic 由 `catch_unwind` 收容**（新增 `contain_drop_report` 漏斗）。在既有 unwind 中 drop `TempDir` 不再有 double-panic 风险；代价是诊断可能整体丢弃。
+- **声明上限**：`panic = abort` 档收容不生效；stderr 锁被其它线程长时间持有时析构会等待该锁（未做非阻塞通道）。
+- **测试**：`drop_report_panic_is_contained`（围栏自身）+ `temp_dir_close_reports_cleanup_failure` + `temp_dir_drop_cleanup_failure_during_unwind_does_not_abort`（真实 `TempDir` 在既有 unwind 中 drop，前提断言 `rm_all` 必败，防空断言）。
+
+### Added(compose): 效果 ID 命名空间显式声明 + 装配期编译期校验（#163）
+- **新增面（additive、零依赖零分配）**：`skeleton::{EffectNamespace, EffectNamespaceConflict, validate_effect_namespaces}`——子件自报 `[lo, hi]` id 区间（含两端），`validate_*` 是 `const fn`，返回 typed 错误（`Inverted` = `lo > hi`；`Overlap` = 首个相交 id，`Display` 含两名 + 区间 + id），不 panic。
+- **`combine!` 新臂**：显式形态可加 `namespaces: [("子件名", lo, hi), …]`，宏用 `const _: () = assert!(…)` 在**编译期**拒绝重叠 / 倒置（重叠 = 编译错误，不是运行期 panic）。**不写 `namespaces:` 的分支展开逐字节不变**（`-Zunpretty=expanded` 对照 HEAD：同一份未声明用例展开 sha256 相同）。
+- **不变**：`EffectId` 表示（`struct EffectId(u64)` + `new`/`get`）、`Fragment` / `Combine` 公共签名、运行时效果归属、路由 miss 语义（有测试钉住）。
+- **文档**：`skeleton::EffectId` 新增「组合纪律」段（独立子件不自动可组合 / 组合方须声明 / 不声明则不校验）；`combine!` 文档新增同名小节（含正向例与 `compile_fail` 反例）。
+- **已知限制（方案 3 的明示边界）**：**声明完备性无校验**——漏声明某子件不会报错，只在确实撞 id 时表现为归属错误；如将来需要，走新机制（自动分层命名空间或父级作用域分配器，本轮已由维护者排除）。
+- **测试**：`skeleton-infra/tests/effect_namespace.rs`（9 条：不相交通过 / 相邻边界不相交 / 同起点·部分相交·一端包含被拒 / 倒置被拒 / 空声明放行 / Run-Cancel 同一空间 / `Display` 文案 / 声明与未声明两种装配均照常运行）+ 两个 `compile_fail` doctest；变异验证 4 组（去重叠判定、去倒置判定、掰成必填、去 const 断言）逐一红。
+
+### Fix(std-ext/cache): 淘汰/过期遥测移出缓存锁并去掉键指纹（#203）
+- **行为变更（`log-embed` 开启时才可见）**：`SyncLruCache::insert` / `SyncTtlCache::{insert,get,peek,purge_expired}` 的 evict/purge 事件改为**锁外**发射，且在被逐/被清条目的键值析构之后；锁内只收集计数与决策布尔。单线程 `LruCache::insert` / `TtlCache::insert` 的事件移到整次插入收尾之后（不再存在「旧值已逐、新值未插」时发事件）。
+- **事件字段变更（日志消费者可见）**：`ttl` / `ttl_sweep` / `capacity` 三类事件**不再带 `key_hash`**（`DefaultHasher` 指纹删除）；`ttl_sweep` 现只带 `zombies`，`ttl` 只带 `expired_total`，`capacity` 带 `order` + `len_at_evict`。理由：指纹需在状态变更后重算采用方 `K::Hash`（慢 / panic / 重入都落在诊断路径上）；如需键身份请在 `log-embed` 之外自行关联。
+- **不影响**：淘汰顺序、TTL 语义、公开 API 签名、其余埋点的 `embed_event!` 计数口径。
+- **测试**：`std-ext/src/cache.rs` 的锁边界探针新增 5 条（5 个共享发点逐一 `try_lock` 断言锁外发射、退休析构序、重入订阅者不自锁、panic 订阅者后缓存可用、单线程「先退休后发」），并逐点做「挪回锁内 → 红」变异验证。
+
+### Changed(runtime): 因果工作量预算三件套（per-root / 分段 / per-drain）+ 深度预算分账（#105/#144）
+- **行为变更（默认启用）**：新增三个**独立计数**的资源维度——per-root 因果工作量 `set_causal_work_budget`（默认 `16384`）、per-reducer 分段效果 `set_segment_effect_budget`（默认 `4096`）、per-drain 租约 `set_drain_work_budget`（默认 `4096`）；`0` = 不限（显式 opt-in）。回灌深度预算（`FEEDBACK_DEPTH_BUDGET = 64`）原样保留为独立守卫，不作总量代理。
+- **超界语义**：per-root 超界 = 拒绝预留（子动作不入主队列、不占在途计数，改挂续接账本停放 `DispatchOutcome::Deferred`；停放区满 ⇒ `CapacityRejected`）；分段超量 Emit 同上（不占根预算），超量 Run/Cancel 不转发、产出 action 以**提交后部分失败**结算（`Failed{phase: ForwardingEffects, state_committed: true}`，legacy `dispatch` 按既有转发失败口径 panic）；per-drain 到界 = 让出排空租约（放旗 + `std::thread::yield_now` + 重新竞争，FIFO / 单写者 / 无丢失不变；非等待型入口在自己的 action 完成边界前不让出）。均不静默、不自动重试、不报 `Completed`。
+- **计数**：`causal_work_budget_exceeded()` / `segment_effect_budget_exceeded()` / `drain_lease_yields()`，与深度预算的 `feedback_budget_exceeded()` 分账；数值与口径见 `docs/reference.md` §资源上限与默认值。
+- **兼容**：以前能跑通、但单根扇出 > `16384` 或单 reducer 一次吐 > `4096` 条效果的程序，现在会得到停放 / 拒收 / typed 失败——逃生口 = 对应预算置 `0`。
+- **测试**：`tests/causal_budget.rs`（14 条，含**非 tokio 线程**上的让出）+ `src/runtime.rs` 白盒探针 4 条（让出窗口内接手 / 非等待型入口让出闸 / Emit 与同栈回灌两条预留原子性）。
+
+### Changed(view): `Derived` / `Sentinel` 采用方代码移出胞锁（两阶段代际协议）+ 线程共享门槛收紧（#157）
+- **锁边界**：`Derived::get` / `Sentinel::changed` 的 `input` / `extract` / `compute`、`In::eq`、`Out::clone` 与缓存旧值 `Drop` 全部在内部互斥量**之外**执行（临界区内只剩 `Arc` 句柄搬移与代际记账）——可重入同一个胞，panic 不毒化（原样穿出，胞照常可用）。
+- **并发语义**：`Derived::get` 允许并发未命中重复计算，代际已变则结果照常返回但**不写缓存**（零重试，陈旧计算不覆盖更新的已提交值）；`Sentinel::changed` 裁决前复核代际，撞上并发发布至多**重试一轮**，仍不一致则多报 `true` 且不提交（多报 = 多做一次投影；漏报才是违约）。
+- **破坏性（编译期可见，E0277）**：auto-trait 门槛收紧——`Sentinel<S, In>: Send + Sync` 需要 `In: Send + Sync`，`Derived<S, In, Out>: Send + Sync` 需要 `In: Send + Sync` 与 `Out: Send + Sync`（此前只需 `Send`）。受影响形态：`In` / `Out` 为 `Send` 但非 `Sync` 且跨线程共享胞；仓内实例（`u32` / 标量元组）不受影响，`tests/view_bridge_test.rs` 的泛型夹具已补 `Sync` 上界。0.1.0 未发布。
+- **分配面**：命中路径零分配不变；每次发布多一次 `Arc` 句柄分配。
+- **测试**：`src/view.rs` 单元探针 `view::cell_lock_boundary::*`（回调里对胞锁 `try_lock` + 同线程重入，4 条）；`tests/view_cells_two_phase.rs`（并发未命中竞态配对自洽 / 陈旧计算不覆盖 / 哨兵复核与终轮多报 / 三类 panic 不毒化，10 条）。
+
 ### Fix(runtime): Notified 只在回调真被调用时发 + 状态落位不克隆 + 退役 sink 槽位回收 + 本地闸计数一致（#145/#160/#161/#162）
 - `Notified` 语义收紧：本地/跨线程都在**最后一次在册检查之后、进回调之前**计 `invoked`，只有 `invoked > 0` 才记一条通知；`local_missed_notifications` 与 panic 计数保持独立。
 - 状态落位不再调用 `S::clone`（#160）：唯一持有走 `Arc::get_mut` + `mem::replace`（锁内只剩 memcpy），共享态 `Arc::new(next_val)` 换一次分配——分配 profile 与旧 CoW 实现逐情形相同，重入/阻塞/panic 三类风险消失；`S::Clone` 退出框架调用面（契约改写）。
@@ -103,8 +173,8 @@
 - tolerant JSON：注释按词法空白处理（块注释内换行保留、其余补分隔符），`1/*c*/.5`、`1/*c*/e3`、`1/*c*/2` 一类 token 拼接现在报错；**未闭合块注释由「容忍到末尾」改为报错**（带原始开注行列）；剥离改单次字节扫描，去掉 `Vec<char>` 的 4x 放大。**行为变更**：未闭合块注释的输入以前可能解析成功，现在报错。
 
 ### Perf(bench): `alloc_atomics/relaxed_rmw` micro 臂 + `state_layout` 基准方差定性（issue#103）
-- bench 新增 micro 臂 `alloc_atomics/relaxed_rmw`（一次 `fetch_add(1, Relaxed)` 的 ns/op），作为 `CountingAllocator` instrumentation 干扰的**上界估计量**；`perf.yml` 期望清单同步登记该 ID。既有 `state_layout_*` 臂零改动，公共 API 零变化。
-- `state_layout_*` 相对 11-23 参考的 +8%~+14% 漂移定性：**跨会话/机器状态水平差，非代码回归**。同会话 OLD（`e5cbf26`）↔NEW（HEAD）二进制交替配对 8 轮：同一份旧代码隔两日差 −16.8%…+21.6%（20 个可比臂中 11 个区间不重叠），而 OLD→NEW 的配对比值有 28 臂落在 ±1–4% 配对噪声内；代码效应只有 4 臂达到或触及判据且幅度 ≤2.4%（`state_layout_update_scope/sharded_256parts_1k_all_{noretain,retain}` +1.7%/+1.6% 变慢、`state_layout_update/mono_16m_retain` −2.4% 变快、`state_layout_retention/sharded_window16` +1.3% 为边缘件），方向不一、未 bisect。
+- bench 新增 micro 臂 `alloc_atomics/relaxed_rmw`（一次 `fetch_add(1, Relaxed)` 的 ns/op），定位是**单次 relaxed RMW 的 atomic micro reference**：它不覆盖 `CountingAllocator` 每次 alloc/dealloc 的多计数点序列（成功 alloc 4 次原子操作、dealloc 3 次）、wrapper 分支与 System allocator 调用，不能当作整个 instrumentation 的上界，更不能当作根因排除证据；真实 allocator wrapper 的对照仍是未完成证据（issue#110）。`perf.yml` 期望清单同步登记该 ID。既有 `state_layout_*` 臂零改动，公共 API 零变化。
+- `state_layout_*` 相对 11-23 参考的 +8%~+14% 漂移：**跨会话大幅漂移主要体现机器状态/会话水平差**——同会话 OLD（`e5cbf26`）↔NEW 二进制交替配对 8 轮，同一份旧代码隔两日差 −16.8%…+21.6%（20 个可比臂中 11 个区间不重叠），28/32 臂的 OLD→NEW 配对差落在 ±1–4% 配对噪声内。**同会话配对中仍有少数臂稳定或边缘变慢、尚未归因**：4 臂达到或触及判据且幅度 ≤2.4%（`state_layout_update_scope/sharded_256parts_1k_all_{noretain,retain}` +1.7%/+1.6% 变慢、`state_layout_retention/sharded_window16` +1.3% 为边缘件、`state_layout_update/mono_16m_retain` −2.4% 变快），方向不一、未 bisect；已核对的每拍热路径源码/汇编对照未发现可解释该差异的逻辑语义变化，但**不能排除代码布局、链接布局、编译器代码生成或其他代码因素**（issue#110 保持跟踪）。本条更正此前「非代码回归」的过度表述（`1e923aa` 的提交标题同此，历史不改写）。
 - instrumentation 变化排除：`state_layout_*` 与 bench 二进制的 `#[global_allocator] CountingAllocator` 同提交 `60a81de` 引入，11-23 基线 HEAD `e5cbf26` 已含它。
 - 纪律：本机跨会话比较在 ±20% 内无判别力；性能归因必须用**同会话二进制交替配对**——单会话重复测量分不开「代码」与「会话」两个变量，「bench 臂没改」也不能证明被测路径没改。
 
