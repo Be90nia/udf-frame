@@ -530,8 +530,10 @@ impl EffectKind {
 /// 边界判断）。`size_hint` 只作预留提示，不是安全证明。
 pub struct EffectBuf<A, Op = Infallible> {
     effects: VecDeque<Effect<A, Op>>,
-    /// 本段生效上限（条数；`0` = 不限）。
-    cap: usize,
+    /// 本段生效上限：`None` = 不限、`Some(n)` = 至多 n 条。**`Some(0)` 是精确零
+    /// 额度**（组合链借出额度时父缓冲可暂时不可写）——公共约定仍是
+    /// [`Self::set_effect_cap`] 的 `0` = 不限，两者不是一回事。
+    cap: Option<usize>,
     /// 到界后是否已拒绝过插入（`clear` 复位）。
     overflowed: bool,
 }
@@ -541,7 +543,7 @@ impl<A, Op> EffectBuf<A, Op> {
     pub fn new() -> Self {
         Self {
             effects: VecDeque::new(),
-            cap: 0,
+            cap: None,
             overflowed: false,
         }
     }
@@ -551,7 +553,7 @@ impl<A, Op> EffectBuf<A, Op> {
     /// 到界（[`Self::set_effect_cap`]）后**本条不入缓冲**并置溢出标志：调用方
     /// 据此整段作废，不得把本条当作已接受（见类型文档「有界暂存」）。
     pub fn push(&mut self, effect: Effect<A, Op>) {
-        if self.cap > 0 && self.effects.len() >= self.cap {
+        if self.cap.is_some_and(|cap| self.effects.len() >= cap) {
             self.overflowed = true;
             return;
         }
@@ -564,11 +566,7 @@ impl<A, Op> EffectBuf<A, Op> {
     /// 额度**）。注意 `Some(0)` 与公共约定「[`Self::set_effect_cap`] 的 `0` =
     /// 不限」不是一回事：不限额度在本方法返回 `None`，绝不返回 `Some(0)`。
     pub fn remaining_limit(&self) -> Option<usize> {
-        if self.cap == 0 {
-            None
-        } else {
-            Some(self.cap.saturating_sub(self.effects.len()))
-        }
+        self.cap.map(|cap| cap.saturating_sub(self.effects.len()))
     }
 
     /// 批量写入（opt-in；issue#237）。一次性快照剩余额度 R 后成批追加，追加
@@ -627,7 +625,7 @@ impl<A, Op> EffectBuf<A, Op> {
 
     /// 本段暂存的条数上限（`0` = 不限）。实现面在每次 reduce 入口重设。
     pub fn set_effect_cap(&mut self, cap: usize) {
-        self.cap = cap;
+        self.cap = (cap != 0).then_some(cap);
     }
 
     /// 自上次 [`Self::clear`] 以来是否有过被拒绝的插入（= 本段已溢出）。
@@ -635,6 +633,48 @@ impl<A, Op> EffectBuf<A, Op> {
     /// 实现面在 reducer 返回后读它：`true` ⇒ 整次转换被拒（全有或全无）。
     pub fn overflowed(&self) -> bool {
         self.overflowed
+    }
+
+    /// 暂存条数（实现面便利：组合链按它归还借出的额度）。
+    pub fn len(&self) -> usize {
+        self.effects.len()
+    }
+
+    /// 把本缓冲标记为已溢出（实现面专用）。组合链用它把**子缓冲**的溢出事实
+    /// 沿父链传回根——否则「子缓冲截断」会退化成静默丢弃，违反 ADR-0011 §2.2
+    /// 的全有或全无。
+    pub fn mark_overflowed(&mut self) {
+        self.overflowed = true;
+    }
+
+    /// 按 `Option` 语义设置上限（实现面专用）：`None` = 不限、`Some(0)` =
+    /// **精确零额度**。组合链用 [`StagingLease::capacity`] 给子缓冲设上限——
+    /// **不得**改用 [`Self::set_effect_cap`]，那条公开约定把 `0` 当「不限」，
+    /// 会把「零额度」误设成无界。
+    pub fn set_staging_cap(&mut self, cap: Option<usize>) {
+        self.cap = cap;
+    }
+
+    /// 借出本段全部剩余额度（组合链预算协作，ADR-0011 §2.2 / issue#235）。
+    ///
+    /// 借出期间**本缓冲的有效上限收缩为当前条数**（新的 `push` 一律被拒，直到
+    /// 借出的 credit 被归还）；不限额度时是空操作。配合 [`StagingLease::release_one`]
+    /// 逐条归还，可保证「父缓冲条数 + 子缓冲仍存活条数 ≤ 本段总预算」——嵌套组
+    /// 合递归成立，即全链 live staging 总量不超过预算。
+    ///
+    /// 租约是 **RAII**：`Drop` 归还全部未释放的 credits 并恢复原上限，故子
+    /// reducer / mapper panic 展开时也不会留下被永久缩小的缓冲。
+    pub fn reserve_all_remaining(&mut self) -> StagingLease<'_, A, Op> {
+        let original = self.cap;
+        let outstanding = self.remaining_limit();
+        if outstanding.is_some() {
+            self.cap = Some(self.effects.len());
+        }
+        StagingLease {
+            buf: self,
+            original,
+            outstanding,
+        }
     }
 
     /// 缓冲是否为空（实现面便利）。
@@ -660,6 +700,83 @@ impl<A, Op> EffectBuf<A, Op> {
 impl<A, Op> Default for EffectBuf<A, Op> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 组合链预算租约（ADR-0011 §2.2 / issue#235）：由
+/// [`EffectBuf::reserve_all_remaining`] 借出父缓冲的全部剩余额度，逐条归还。
+///
+/// 不变式（每步由 `sync` 维持）：父缓冲的有效上限恒为「原上限 − 未归还
+/// credits」，于是「父缓冲条数 + 子缓冲仍存活条数 ≤ 原上限」；嵌套组合时父层
+/// 上限本身已扣除祖先存活缓冲 ⇒ 递归 ⇒ **全链 live staging 总量不超过预算**。
+///
+/// **RAII**：`Drop` 归还全部未释放 credits 并恢复原上限（panic 展开也安全）。
+pub struct StagingLease<'p, A, Op> {
+    buf: &'p mut EffectBuf<A, Op>,
+    /// 借出前的原上限（`None` = 不限）。
+    original: Option<usize>,
+    /// 尚未归还的 credits（`None` = 不限额度：租约是空操作）。
+    outstanding: Option<usize>,
+}
+
+impl<A, Op> StagingLease<'_, A, Op> {
+    /// 借出的额度：子缓冲应以此为自己的上限（`None` = 不限、`Some(0)` =
+    /// 精确零额度，见 [`EffectBuf::set_staging_cap`]）。
+    pub fn capacity(&self) -> Option<usize> {
+        self.outstanding
+    }
+
+    /// 子 reduce 返回后调用：子缓冲只用了 `used` 条 ⇒ 归还多余额度。
+    pub fn release_unused(&mut self, used: usize) {
+        if let Some(outstanding) = self.outstanding {
+            debug_assert!(
+                used <= outstanding,
+                "子缓冲用了 {used} 条，超出借出额度 {outstanding}"
+            );
+            self.outstanding = Some(used.min(outstanding));
+            self.sync();
+        }
+    }
+
+    /// 从子缓冲转交一条之前调用：归还一个 credit（父缓冲可写额度 +1）。
+    pub fn release_one(&mut self) {
+        if let Some(outstanding) = self.outstanding {
+            self.outstanding = Some(outstanding.saturating_sub(1));
+            self.sync();
+        }
+    }
+
+    /// 逐条把子缓冲转交给父缓冲：每 pop 一条先 [`Self::release_one`]，再调
+    /// `mapper`（拿到的是父缓冲的可写借用）。mapper 可按旧契约产生 0/1/多条，
+    /// 全部受父缓冲当前上限约束 ⇒ **fan-out 不能借用子缓冲尚未释放的槽位**。
+    ///
+    /// 子缓冲曾溢出 ⇒ 把溢出事实沿父链传回（整段由框架原子拒绝，不静默截断）。
+    pub fn transfer_from<CA, CO, F>(&mut self, child: &mut EffectBuf<CA, CO>, mut mapper: F)
+    where
+        F: FnMut(Effect<CA, CO>, &mut EffectBuf<A, Op>),
+    {
+        while let Some(effect) = child.pop_front() {
+            self.release_one();
+            mapper(effect, self.buf);
+        }
+        if child.overflowed() {
+            self.buf.mark_overflowed();
+        }
+    }
+
+    /// 父缓冲有效上限 = 原上限 − 未归还 credits。
+    fn sync(&mut self) {
+        if let Some(outstanding) = self.outstanding {
+            self.buf.cap = self.original.map(|b| b.saturating_sub(outstanding));
+        }
+    }
+}
+
+impl<A, Op> Drop for StagingLease<'_, A, Op> {
+    fn drop(&mut self) {
+        // RAII：panic 展开也必须归还全部 credits 并恢复原上限。
+        self.buf.cap = self.original;
+        self.outstanding = None;
     }
 }
 
@@ -1598,5 +1715,121 @@ mod tests {
         );
         assert_eq!(buf.effects.len(), 2, "panic 前已接受的前缀留在缓冲");
         assert!(!buf.overflowed(), "panic 不是溢出");
+    }
+
+    /// 组合链预算租约（#235 / ADR-0011 §2.2）：借出期间父缓冲不可写；每转交一条
+    /// 归还一个 credit ⇒ **任一时刻「父条数 + 子存活条数」≤ 总预算**（fan-out 不得
+    /// 借用子缓冲尚未释放的槽位）。判别：去掉 `release_one` 的 sync、或让父上限
+    /// 不收缩 ⇒ 本测红。
+    #[test]
+    fn staging_lease_keeps_parent_and_child_within_the_budget() {
+        const B: usize = 8;
+        let mut parent: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        parent.set_effect_cap(B);
+        for _ in 0..3 {
+            parent.push(Effect::Emit(Tick::Tick)); // p = 3
+        }
+
+        let mut lease = parent.reserve_all_remaining();
+        assert_eq!(lease.capacity(), Some(5), "借出 = 剩余额度 B - p");
+        let mut child: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        child.set_staging_cap(lease.capacity());
+        child.push(Effect::Emit(Tick::Tick));
+        child.push(Effect::Emit(Tick::Tick)); // k = 2
+        lease.release_unused(child.len());
+
+        // 每次 mapper 调用前记录（父条数, 父剩余额度, 子仍存活条数），fan-out 出 2 条。
+        let total_child = child.len();
+        let mut popped = 0usize;
+        let mut observed = Vec::new();
+        lease.transfer_from(&mut child, |_effect, out| {
+            popped += 1;
+            observed.push((out.len(), out.remaining_limit(), total_child - popped));
+            for _ in 0..2 {
+                out.push(Effect::Emit(Tick::Tick));
+            }
+        });
+        assert_eq!(
+            observed,
+            vec![(3, Some(4), 1), (5, Some(3), 0)],
+            "父上限必须恒为「B − 未归还 credits」"
+        );
+        for (parent_len, _remaining, child_left) in &observed {
+            assert!(
+                parent_len + child_left <= B,
+                "全链 live staging 超预算：父 {parent_len} + 子 {child_left} > {B}"
+            );
+        }
+        drop(lease);
+        // 归还后上限恢复：父可继续写到总预算。
+        while parent.len() < B {
+            parent.push(Effect::Emit(Tick::Tick));
+        }
+        assert_eq!(parent.len(), B);
+        assert!(!parent.overflowed(), "未超界不得置溢出");
+    }
+
+    /// 租约是 RAII：panic 展开时 `Drop` 必须归还 credits 并恢复原上限（否则缓冲
+    /// 被永久缩小，后续 reduce 静默少写效果）。
+    #[test]
+    fn staging_lease_drop_restores_cap_on_panic() {
+        let mut parent: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        parent.set_effect_cap(4);
+        parent.push(Effect::Emit(Tick::Tick));
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = parent.reserve_all_remaining();
+            panic!("mapper blew up");
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(caught.is_err());
+        for _ in 0..3 {
+            parent.push(Effect::Emit(Tick::Tick));
+        }
+        assert_eq!(parent.len(), 4, "上限必须已恢复为原值");
+        assert!(!parent.overflowed());
+        parent.push(Effect::Emit(Tick::Tick));
+        assert!(parent.overflowed(), "恢复后仍受原上限约束");
+    }
+
+    /// 不限额度时租约是空操作：子缓冲同样不限、全部转交。
+    #[test]
+    fn staging_lease_is_a_noop_when_unlimited() {
+        let mut parent: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        let mut lease = parent.reserve_all_remaining();
+        assert_eq!(lease.capacity(), None, "不限额度 → None（绝不是 Some(0)）");
+        let mut child: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        child.set_staging_cap(lease.capacity());
+        child.push_batch((0..100).map(|_| Effect::Emit(Tick::Tick)));
+        lease.release_unused(child.len());
+        lease.transfer_from(&mut child, |effect, out| out.push(effect));
+        drop(lease);
+        assert_eq!(parent.len(), 100);
+        assert!(!parent.overflowed());
+    }
+
+    /// 精确零额度：父已用满 ⇒ 子上限 `Some(0)`（**不是**「不限」）；子一 push 即
+    /// 溢出，转交时把溢出事实沿父链传回 ⇒ 整段由框架拒绝，不静默截断。
+    #[test]
+    fn staging_lease_exact_zero_propagates_child_overflow() {
+        let mut parent: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        parent.set_effect_cap(2);
+        parent.push(Effect::Emit(Tick::Tick));
+        parent.push(Effect::Emit(Tick::Tick));
+        let mut lease = parent.reserve_all_remaining();
+        assert_eq!(lease.capacity(), Some(0), "用满 = 精确零额度");
+        let mut child: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        child.set_staging_cap(lease.capacity());
+        child.push(Effect::Emit(Tick::Tick));
+        assert!(
+            child.overflowed(),
+            "零额度下 push 必须被拒（不得退化成不限）"
+        );
+        lease.release_unused(child.len());
+        lease.transfer_from(&mut child, |effect, out| out.push(effect));
+        drop(lease);
+        assert!(parent.overflowed(), "子缓冲溢出必须沿父链传回");
+        assert_eq!(parent.len(), 2, "被拒的效果一条也没进父缓冲");
     }
 }

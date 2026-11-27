@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Changed(contract): 组合链全链 live staging 受同一份预算（#235 一段 / ADR-0011 §2.2）
+- **内部表示变更（公共语义不变）**：`EffectBuf` 的上限表示由 `usize`（`0` = 不限）改为 `Option<usize>`（`None` = 不限、`Some(0)` = **精确零额度**）——组合链借出额度时父缓冲需要「精确零可写」这一中间态，旧表示无法与「不限」区分。`set_effect_cap(0)` 仍表示不限。
+- **新增实现面原语**：`reserve_all_remaining() -> StagingLease`（RAII：借出本段全部剩余额度，Drop 归还并恢复原上限，panic 展开也安全）、`release_unused(used)`、`release_one()`、`transfer_from(child, mapper)`（每 pop 一条先归还一个 credit 再调 mapper）、`mark_overflowed()`、`set_staging_cap(Option<usize>)`、`len()`。
+- **不变式**：任一时刻「父缓冲条数 + 子缓冲仍存活条数 ≤ 本段预算」；嵌套组合递归成立 ⇒ **全链 live staging 总量不超过预算**（ADR-0011 §1 的内存动机对组合链达成）。fan-out 不能借用子缓冲尚未释放的槽位。
+- **`combine!` 接线**：父缓冲借出全部剩余额度给子缓冲（`set_staging_cap(lease.capacity())`，有限预算下允许 `Some(0)`），子 `reduce` 返回后归还未用部分，逐条转交时归还 credit；子缓冲溢出经 `mark_overflowed` 沿父链传回 ⇒ 框架仍整段原子拒绝，**不静默截断**；旧 `lift_fx` 回调时序不变。
+- **测试**：契约层 4 条租约单测（额度算术逐点观测 / RAII panic 恢复 / 不限额度空操作 / 精确零额度与溢出回传）+ store 级嵌套链（深度 2：叶子 reduce 停靠点观测到 `Some(预算 − 祖先占位)`、超预算整段拒绝且零转发）。**变异三组**：去子缓冲额度继承 ⇒ compose 3 条红；去动态额度回收 ⇒ 契约层 + compose 各红；去溢出传播 ⇒ compose 3 条红；全部还原后绿。
+
 ### Test(view/ci): #236 Windows 偶红——封板用例改三段式状态机 + PublishBusy 专项 fail-closed 测试
 - **修的是测试状态机，不是产品契约**：`bind_races_first_notification_with_region_fallback` 原让 dispatch 洪流与 `seal()` 并发并断言封板必成功；`PublishBusy` 的契约原文是「另一发布者正在进行（`reseed_region` 与 dispatch 并发 = 宿主违约）」，而 `seal()` 先置 `core.bound` 再发布初始区域 ⇒ 中间到达的通知与它抢发布，输者拿到 `PublishBusy`（Windows 偶红即此）。
 - **新结构（三段）**：① 准备——两个**不同** binding 已登记（`AtomicU8` bitmask，不用「成功调用次数 ≥ 2」）；② bind × seal——dispatch worker 收到停止信号后从当前调用返回并退出，协调线程 **join** 它（join = 「无在途 dispatch publication」的确定性握手，禁 sleep / 固定延时）；此时 bind worker 仍在并发登记 ⇒ bind × seal 锁序覆盖保留；随后封板；③ sealed 后——打满 12 拍验证增量耗尽后的全量重编 fallback。

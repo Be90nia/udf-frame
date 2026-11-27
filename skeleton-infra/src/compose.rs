@@ -538,21 +538,28 @@ where
             self.route_miss.fetch_add(1, Ordering::Relaxed);
             return state.clone();
         };
-        // 子效果缓冲：Vec::new 空态零分配，子 action 实际产效果时才分配一次
-        // （稳态零新增分配纪律约束的是 store 效果转发路径，见 EffectBuf 头注；
-        // reducer 禁写共享态——本地缓冲进出即弃，不违纯函数契约）
+        // 组合链预算协作（ADR-0011 §2.2 / issue#235）：父缓冲把全部剩余额度借给
+        // 子缓冲（借出期间父缓冲不可写），子 reduce 返回后归还未用部分，此后每转交
+        // 一条再归还一个 credit ⇒ 「父条数 + 子存活条数」始终 ≤ 本段预算，嵌套
+        // 组合递归成立（全链 live staging ≤ 总预算）；子缓冲溢出的事实沿父链传回，
+        // 框架仍按全有或全无整段拒绝，不静默截断。
+        //
+        // 子缓冲空态零分配：子 action 实际产效果时才分配一次（稳态零新增分配纪律
+        // 约束的是 store 效果转发路径，见 EffectBuf 头注；reducer 禁写共享态——
+        // 本地缓冲进出即弃，不违纯函数契约）。
+        let mut lease = out.reserve_all_remaining();
         let mut child_out = EffectBuf::new();
+        child_out.set_staging_cap(lease.capacity());
         let child_next = self
             .child
             .reduce((self.get)(state), child_action, &mut child_out);
-        while let Some(effect) = child_out.pop_front() {
-            match effect {
-                // Emit 回灌是子 action 上浮（wrap 的职责），核心代 lifted；
-                // Run/Cancel 交 lift_fx 显式上提词表（lift_fx 只会收到这两形）
-                Effect::Emit(a) => out.push(Effect::Emit((self.wrap)(a))),
-                effect => (self.lift_fx)(effect, out),
-            }
-        }
+        lease.release_unused(child_out.len());
+        lease.transfer_from(&mut child_out, |effect, out| match effect {
+            // Emit 回灌是子 action 上浮（wrap 的职责），核心代 lifted；
+            // Run/Cancel 交 lift_fx 显式上提词表（lift_fx 只会收到这两形）
+            Effect::Emit(a) => out.push(Effect::Emit((self.wrap)(a))),
+            effect => (self.lift_fx)(effect, out),
+        });
         let mut next = state.clone();
         (self.set)(&mut next, child_next);
         next

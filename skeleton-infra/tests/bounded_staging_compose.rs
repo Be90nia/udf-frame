@@ -182,3 +182,215 @@ fn teststore_path_rejects_over_default_cap_without_panic_or_state_change() {
     assert_eq!(at_cap.state().child.count, 1, "上限内：接受");
     assert_eq!(at_cap.pending_effects(), 2, "上限内：效果照常产出");
 }
+
+// ── 全链 live staging（#235 / ADR-0011 §2.2）：嵌套深度 2 的额度共享与溢出传播 ──
+
+/// 叶子：reduce 停靠点记录它拿到的**暂存额度**（子缓冲上限），再按需产效果。
+#[derive(Clone, Debug, PartialEq, Default)]
+struct LeafState {
+    n: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum LeafAction {
+    Cuts(u32),
+}
+
+struct Leaf {
+    seen: Arc<Mutex<Vec<Option<usize>>>>,
+}
+
+impl Reducer for Leaf {
+    type State = LeafState;
+    type Action = LeafAction;
+    type Op = Infallible;
+
+    fn initial(&self) -> LeafState {
+        LeafState { n: 0 }
+    }
+
+    fn reduce(
+        &self,
+        s: &LeafState,
+        a: LeafAction,
+        out: &mut EffectBuf<LeafAction, Infallible>,
+    ) -> LeafState {
+        self.seen
+            .lock()
+            .expect("seen 锁")
+            .push(out.remaining_limit());
+        let LeafAction::Cuts(n) = a;
+        for i in 0..n {
+            out.push(Effect::Cancel {
+                id: EffectId::new(u64::from(i) + 1),
+            });
+        }
+        LeafState { n: s.n + 1 }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+struct MidState {
+    leaf: LeafState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum MidAction {
+    Leaf(LeafAction),
+}
+
+struct Mid {
+    seen: Arc<Mutex<Vec<Option<usize>>>>,
+}
+
+impl Reducer for Mid {
+    type State = MidState;
+    type Action = MidAction;
+    type Op = Infallible;
+
+    fn initial(&self) -> MidState {
+        MidState::default()
+    }
+
+    fn reduce(
+        &self,
+        s: &MidState,
+        a: MidAction,
+        out: &mut EffectBuf<MidAction, Infallible>,
+    ) -> MidState {
+        // 自己先占一个槽 ⇒ 叶子拿到的额度应比根预算少 1（嵌套扣除祖先存活缓冲）。
+        out.push(Effect::Cancel {
+            id: EffectId::new(100),
+        });
+        // `combine!` 的 `Fragment::reduce` 返回**父层**状态（`PS`），直接就是本层结果。
+        skeleton_infra::combine!(
+            Leaf {
+                seen: Arc::clone(&self.seen),
+            },
+            MidState.leaf,
+            MidAction::Leaf,
+            lift: |effect: Effect<LeafAction, Infallible>,
+                   out: &mut EffectBuf<MidAction, Infallible>| {
+                if let Effect::Cancel { id } = effect {
+                    out.push(Effect::Cancel { id });
+                }
+            }
+        )
+        .reduce(s, a, out)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+struct RootState {
+    mid: MidState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum RootAction {
+    Mid(MidAction),
+}
+
+struct Root {
+    seen: Arc<Mutex<Vec<Option<usize>>>>,
+}
+
+impl Reducer for Root {
+    type State = RootState;
+    type Action = RootAction;
+    type Op = Infallible;
+
+    fn initial(&self) -> RootState {
+        RootState::default()
+    }
+
+    fn reduce(
+        &self,
+        s: &RootState,
+        a: RootAction,
+        out: &mut EffectBuf<RootAction, Infallible>,
+    ) -> RootState {
+        skeleton_infra::combine!(
+            Mid {
+                seen: Arc::clone(&self.seen),
+            },
+            RootState.mid,
+            RootAction::Mid,
+            lift: |effect: Effect<MidAction, Infallible>,
+                   out: &mut EffectBuf<RootAction, Infallible>| {
+                if let Effect::Cancel { id } = effect {
+                    out.push(Effect::Cancel { id });
+                }
+            }
+        )
+        .reduce(s, a, out)
+    }
+}
+
+/// 解释器：只记条数（根词表）。
+#[derive(Default)]
+struct RootCounting {
+    cancelled: Arc<Mutex<u32>>,
+}
+
+impl EffectRuntime<RootAction, Infallible> for RootCounting {
+    fn run(
+        &mut self,
+        effect: Effect<RootAction, Infallible>,
+        _back: &skeleton::ActionSender<RootAction>,
+    ) {
+        if let Effect::Cancel { .. } = effect {
+            *self.cancelled.lock().expect("cancelled 锁") += 1;
+        }
+    }
+}
+
+/// 嵌套组合链（深度 2）共用**同一份**暂存预算：叶子 reduce 停靠点观测到的额度 =
+/// 根预算 − 祖先已占槽位 ⇒ 全链 live staging 受同一预算约束；超出预算 ⇒ 子缓冲
+/// 溢出、沿父链传回、整段原子拒绝（不静默截断）。
+///
+/// 判别：① 去掉子缓冲额度继承 ⇒ 叶子观测到 `None`（不限）即红；② 去掉溢出回传
+/// ⇒ 截断后的前缀被当成功提交（`BudgetRejected` 变成 `Completed`）即红；③ 去掉
+/// 动态额度回收 ⇒ 上限内的转换也会被拒即红。
+#[test]
+fn nested_compose_chain_shares_one_staging_budget() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let cancelled = Arc::new(Mutex::new(0));
+    let store = SyncStore::new(
+        Root {
+            seen: Arc::clone(&seen),
+        },
+        RootCounting {
+            cancelled: Arc::clone(&cancelled),
+        },
+    );
+    store.set_segment_effect_budget(6);
+
+    // 上限内：中间自己 1 + 叶子 2 = 3 ≤ 6 ⇒ 接受。
+    let ok = store
+        .dispatch_with_receipt(RootAction::Mid(MidAction::Leaf(LeafAction::Cuts(2))))
+        .expect("准入");
+    assert_eq!(ok.wait(), DispatchOutcome::Completed);
+    assert_eq!(store.snapshot().mid.leaf.n, 1);
+    assert_eq!(
+        *cancelled.lock().expect("cancelled 锁"),
+        3,
+        "1 + 2 条照常转发"
+    );
+    assert_eq!(
+        *seen.lock().expect("seen 锁"),
+        vec![Some(5)],
+        "叶子的暂存额度必须是「根预算 6 − 中间已占 1」= 5（缺继承则是 None = 不限）"
+    );
+
+    // 超预算：叶子想产 9 条但只有 5 额度 ⇒ 子缓冲溢出 ⇒ 沿父链传回 ⇒ 整段拒绝。
+    let over = store
+        .dispatch_with_receipt(RootAction::Mid(MidAction::Leaf(LeafAction::Cuts(9))))
+        .expect("准入");
+    assert_eq!(over.wait(), DispatchOutcome::BudgetRejected { rejected: 1 });
+    assert_eq!(store.snapshot().mid.leaf.n, 1, "被拒转换不发布 next state");
+    assert_eq!(
+        *cancelled.lock().expect("cancelled 锁"),
+        3,
+        "被拒转换零转发（截断前缀也不得外泄）"
+    );
+}
