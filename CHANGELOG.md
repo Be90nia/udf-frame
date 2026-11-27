@@ -73,7 +73,7 @@
 - **计数**：`causal_work_budget_exceeded()` / `segment_effect_budget_exceeded()` / `drain_lease_yields()`，与深度预算的 `feedback_budget_exceeded()` 分账；数值与口径见 `docs/reference.md` §资源上限与默认值。
 - **兼容**：以前能跑通、但单根扇出 > `16384` 或单 reducer 一次吐 > `4096` 条效果的程序，现在会得到停放 / 拒收 / typed 失败——逃生口 = 对应预算置 `0`。
 - **测试**：`tests/causal_budget.rs`（14 条，含**非 tokio 线程**上的让出）+ `src/runtime.rs` 白盒探针 4 条（让出窗口内接手 / 非等待型入口让出闸 / Emit 与同栈回灌两条预留原子性）。
-- **口径更正（2026-11-27，#231 维护者评审；本轮无行为改动）**：三项均为**条数界**，不是字节界 / 内存界；默认值 16384 / 4096 / 4096 是**临时兼容基线**（非实测定稿值）；per-drain 值是**协作让出阈值**而非严格上限（经 `try_dispatch` / `ActionSender::dispatch` 夺得租约者在完成边界前不让出）；per-reducer 当前语义（提交点生效、超量 `Run` / `Cancel` 为提交后部分失败）**未被追认为完整资源界**，改为「暂存期即受界 + reducer 转换全有或全无」的契约见 ADR-0011（Proposed，实现待授权）。
+- **口径更正（2026-11-27，#231 维护者评审；本轮无行为改动）**：三项均为**条数界**，不是字节界 / 内存界；默认值 16384 / 4096 / 4096 是**临时兼容基线**（非实测定稿值）；per-drain 值是**协作让出阈值**而非严格上限（经 `try_dispatch` / `ActionSender::dispatch` 夺得租约者在完成边界前不让出）；per-reducer 当前语义（提交点生效、超量 `Run` / `Cancel` 为提交后部分失败）**未被追认为完整资源界**，改为「暂存期即受界 + reducer 转换全有或全无」的契约见 ADR-0011（2026-11-27 **已采纳**，**实现待授权**；超量 `Emit` 也不入 deferred queue，segment 级原子性；legacy `dispatch` 不 panic、以专属计数 + 有界非阻塞诊断事件显形）。
 
 ### Changed(view): `Derived` / `Sentinel` 采用方代码移出胞锁（两阶段代际协议）+ 线程共享门槛收紧（#157）
 - **锁边界**：`Derived::get` / `Sentinel::changed` 的 `input` / `extract` / `compute`、`In::eq`、`Out::clone` 与缓存旧值 `Drop` 全部在内部互斥量**之外**执行（临界区内只剩 `Arc` 句柄搬移与代际记账）——可重入同一个胞，panic 不毒化（原样穿出，胞照常可用）。
