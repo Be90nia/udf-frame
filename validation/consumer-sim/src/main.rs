@@ -482,6 +482,20 @@ fn main() {
         );
     });
 
+    // issue#92：`AdmissionError::NoRuntime` 是环境前置条件（调用线程不在 Tokio runtime
+    // 上下文），不是过载也不是闸关。本夹具只钉三件事：typed 拒绝、不 panic、不入容量账
+    // （不计 `rejected`）。真实采用方应把它当编程错误带因上报，而不是当「丢弃负载」吞掉。
+    // block_on 之外（主线程）调用即从外部 crate 触达该变体。
+    {
+        let scope = FxScope::new();
+        match scope.try_spawn_tracked(async { 1u32 }) {
+            Err(AdmissionError::NoRuntime) => {}
+            Err(other) => panic!("runtime 之外应得 NoRuntime，实得 {other}"),
+            Ok(_) => panic!("runtime 之外不应被接纳"),
+        }
+        assert_eq!(scope.counts().rejected, 0, "NoRuntime 不入容量账");
+    }
+
     // lint 阶段编排：外部 crate 自己实现阶段，注册表按 C 类型分槽。
     lint_roundtrip();
 
