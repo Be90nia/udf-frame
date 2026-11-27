@@ -1866,8 +1866,13 @@ fn effect_push_forms(c: &mut Criterion) {
     let mut group = c.benchmark_group("effect_push_forms");
     for k in [1usize, 4, 16, 64, 256, 1024, 4096] {
         group.throughput(Throughput::Elements(k as u64));
+        // 预构建输入：构造成本不计时；两臂共用同一来源、同一元素黑盒策略。
+        // 预构建载荷（Effect 非 Clone ⇒ 存载荷、两臂同样构造 Effect）
+        let input: Vec<u64> = (0..k as u64).collect();
         let mut buf: skeleton::EffectBuf<u64, Infallible> = skeleton::EffectBuf::new();
-        group.bench_function(format!("push/k{k}"), |b| {
+
+        // A：逐条 push（来源 = range）
+        group.bench_function(format!("push_range/k{k}"), |b| {
             b.iter(|| {
                 buf.clear();
                 buf.set_effect_cap(CAP);
@@ -1877,24 +1882,52 @@ fn effect_push_forms(c: &mut Criterion) {
                 black_box(buf.len())
             })
         });
-        group.bench_function(format!("batch/k{k}"), |b| {
+        // B：push_batch —— **不黑盒整个迭代器**，只在每个产出元素上黑盒（与 A 对称）
+        group.bench_function(format!("batch_range/k{k}"), |b| {
             b.iter(|| {
                 buf.clear();
                 buf.set_effect_cap(CAP);
-                buf.push_batch(black_box((0..k).map(|_| Effect::Emit(0u64))));
+                buf.push_batch((0..k).map(|_| black_box(Effect::Emit(0u64))));
                 black_box(buf.len())
             })
         });
-        // 对照臂：**无上限**的单条 push（其余形状完全相同）⇒ 两臂之差就是
-        // 「每次插入一次额度判断」本身的成本（若被编译器提到循环外则≈0）。
-        group.bench_function(format!("push_nocap/k{k}"), |b| {
+        // C：逐条 push（来源 = 预构建 Vec）
+        group.bench_function(format!("push_vec/k{k}"), |b| {
             b.iter(|| {
                 buf.clear();
-                buf.set_effect_cap(0); // 0 = 不限
-                for _ in 0..k {
-                    buf.push(black_box(Effect::Emit(0u64)));
+                buf.set_effect_cap(CAP);
+                for n in input.iter() {
+                    buf.push(black_box(Effect::Emit(*n)));
                 }
                 black_box(buf.len())
+            })
+        });
+        // D：push_batch（来源 = 同一 Vec）
+        group.bench_function(format!("batch_vec/k{k}"), |b| {
+            b.iter(|| {
+                buf.clear();
+                buf.set_effect_cap(CAP);
+                buf.push_batch(input.iter().map(|n| black_box(Effect::Emit(*n))));
+                black_box(buf.len())
+            })
+        });
+        // E/F：容量不足（每次新建缓冲 ⇒ 含 reserve/分配），两臂同形
+        group.bench_function(format!("push_fresh/k{k}"), |b| {
+            b.iter(|| {
+                let mut fresh: skeleton::EffectBuf<u64, Infallible> = skeleton::EffectBuf::new();
+                fresh.set_effect_cap(CAP);
+                for _ in 0..k {
+                    fresh.push(black_box(Effect::Emit(0u64)));
+                }
+                black_box(fresh.len())
+            })
+        });
+        group.bench_function(format!("batch_fresh/k{k}"), |b| {
+            b.iter(|| {
+                let mut fresh: skeleton::EffectBuf<u64, Infallible> = skeleton::EffectBuf::new();
+                fresh.set_effect_cap(CAP);
+                fresh.push_batch((0..k).map(|_| black_box(Effect::Emit(0u64))));
+                black_box(fresh.len())
             })
         });
     }
