@@ -26,7 +26,7 @@
 //! 到停放队列、可被 [`super::SyncStore::resume_deferred`] 恢复）与 `rejected`
 //! （停放队列满、续接无法留存）。两者不合并：被拒记录**不是**「已停放」。
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -130,7 +130,7 @@ pub(crate) struct Ledger {
     /// 调试面：此刻（或即将）睡在终局等待上的线程数。两个用途：① 让「等待者已睡」
     /// 可被确定性编排（无丢失唤醒探针的握手面）；② 让 [`Self::reset`] 在 debug 构建
     /// 咬住「仍有沉睡等待者却被复用」——那正是丢唤醒的现场。
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     blocked: AtomicUsize,
     /// 测试停靠闸（**仅 `cfg(test)`**）：在进入终局等待面之前（不持锁）停靠，供
     /// 「等待者已睡 / 尚未睡」的确定性交错（复用池 reset 抢先的清况）。
@@ -151,7 +151,7 @@ impl Ledger {
                 ..LedgerState::default()
             }),
             cv: Condvar::new(),
-            #[cfg(debug_assertions)]
+            #[cfg(any(test, debug_assertions))]
             blocked: AtomicUsize::new(0),
             #[cfg(test)]
             wait_gate: super::CapacitySettle::new(),
@@ -298,13 +298,13 @@ impl Ledger {
             }
             // 计数在**持锁且终局未发布**时自增 ⇒ 读侧见 1 即「该等待者确实要睡，
             // 且发布者此刻尚未发布」。
-            #[cfg(debug_assertions)]
+            #[cfg(any(test, debug_assertions))]
             self.blocked.fetch_add(1, Ordering::SeqCst);
             st = self
                 .cv
                 .wait(st)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            #[cfg(debug_assertions)]
+            #[cfg(any(test, debug_assertions))]
             self.blocked.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -366,7 +366,7 @@ impl Ledger {
         // 丢唤醒现场（ADR-0011 §2.4）：还有线程睡在本账本的终局上就复位 ⇒ 它醒来看
         // 不到自己的终局（会被无关根的终局扣留）。交接认领（`claim_handoff`）保证这
         // 不可达；本断言把该不变量在 debug/test 构建下咬住（release 零开销）。
-        #[cfg(debug_assertions)]
+        #[cfg(any(test, debug_assertions))]
         debug_assert_eq!(
             self.blocked.load(Ordering::SeqCst),
             0,
@@ -441,7 +441,7 @@ impl Ledger {
 
     /// 调试读侧：此刻（或即将）睡在终局等待上的线程数（无丢失唤醒探针的握手面 +
     /// 测试停靠闸的读侧）。
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn blocked_waiters(&self) -> usize {
         self.blocked.load(Ordering::SeqCst)
     }
