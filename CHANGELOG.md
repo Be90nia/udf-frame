@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Test(view/ci): #236 Windows 偶红——封板用例改三段式状态机 + PublishBusy 专项 fail-closed 测试
+- **修的是测试状态机，不是产品契约**：`bind_races_first_notification_with_region_fallback` 原让 dispatch 洪流与 `seal()` 并发并断言封板必成功；`PublishBusy` 的契约原文是「另一发布者正在进行（`reseed_region` 与 dispatch 并发 = 宿主违约）」，而 `seal()` 先置 `core.bound` 再发布初始区域 ⇒ 中间到达的通知与它抢发布，输者拿到 `PublishBusy`（Windows 偶红即此）。
+- **新结构（三段）**：① 准备——两个**不同** binding 已登记（`AtomicU8` bitmask，不用「成功调用次数 ≥ 2」）；② bind × seal——dispatch worker 收到停止信号后从当前调用返回并退出，协调线程 **join** 它（join = 「无在途 dispatch publication」的确定性握手，禁 sleep / 固定延时）；此时 bind worker 仍在并发登记 ⇒ bind × seal 锁序覆盖保留；随后封板；③ sealed 后——打满 12 拍验证增量耗尽后的全量重编 fallback。
+- **新增专项测试** `concurrent_publisher_gets_typed_publish_busy_and_bridge_stays_usable`：阻塞背衬把「发布在途」做成确定性窗口——发布者 A 阻塞在 `with_bytes_mut`（`publishing` 已置位），此时 `reseed_region()` 必须返回 typed `PublishBusy`、失败计数 +1；放行 A 后其发布正常完成，桥经显式 `reseed_region` 恢复并继续处理合法发布。
+- **稳定性**：两个目标用例各 30/30 轮绿；整文件 10 轮（`--test-threads=16` + 4 个自旋进程制造 CPU 争用）全绿。**变异**：去掉 `publish_plan` 的 fail-closed 分支 ⇒ 专项测试红（两发布者都阻塞在同一写入口 ⇒ 15s 有界超时），还原绿。
+- **产品代码零改动**（`skeleton/src/**`、`skeleton-infra/src/**` 均未改）；`region_id() >= 2`、`region_failure().is_none()`、封板后 bind 必 Sealed 三条强断言原样保留。
+
 ### Added(contract): `EffectBuf` 批量入口 `push_batch` + 读侧 `remaining_limit`（#237 / ADR-0011 §6）
 - **新增（纯增量，公开语义不变）**：`EffectBuf::push_batch(iter)` 一次性快照剩余额度 R 后成批追加，循环内不再逐条判断预算；`EffectBuf::remaining_limit() -> Option<usize>`（`None` = 不限、`Some(0)` = 精确零额度，与 `set_effect_cap(0)` = 不限 的公共约定区分）。
 - **边界算法**：最多追加 R 条 → R 条后迭代器仍能产出一条 ⇒ 置溢出、整段拒绝、**超出项不写入**；`size_hint` / `ExactSizeIterator::len` 只作 `reserve` 提示，**不是安全证明**；不先构造无界临时 `Vec`；已溢出时批量入口直接短路；迭代器 panic 如实传播（由 runtime 既有 panic 路径清理本段 staging）。

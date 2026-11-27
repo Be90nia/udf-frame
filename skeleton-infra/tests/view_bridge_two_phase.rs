@@ -11,7 +11,7 @@
 //! 不靠 sleep 猜时序。
 
 use std::panic;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier, OnceLock, Weak};
 use std::thread;
@@ -22,8 +22,8 @@ use skeleton::view::{BindingDecl, IntentMap, PayloadTag, ViewMap};
 use skeleton::{EffectBuf, Infallible, NoFx, Reducer, Store as _};
 use skeleton_infra::runtime::SyncStore;
 use skeleton_infra::view::{
-    Coverage, Encoders, IntentError, JsonEncoder, RegionBacking, RegionEncoder, RegionWriter,
-    SeqError, VecBacking, ViewBridge,
+    Coverage, Encoders, IntentError, JsonEncoder, RegionBacking, RegionEncoder, RegionFailure,
+    RegionWriter, SeqError, VecBacking, ViewBridge,
 };
 
 /// OS 时钟护栏：回调里重入桥的公开面，旧实现（持锁）会有界失败而非挂死。
@@ -692,67 +692,72 @@ fn bind_races_first_notification_with_region_fallback() {
             .expect("static declarations are well-formed"),
         );
 
-        let bound = Arc::new(AtomicUsize::new(0));
+        // 三段式状态机（#236）：① 准备（两个**不同** binding 已登记；dispatch 与
+        // seal 不重叠）② bind × seal 并发（dispatch worker 已退出并被 join ⇒ 无在途
+        // 发布）③ sealed 后验证（增量耗尽 ⇒ 全量重编 fallback）。
+        //
+        // 原用例让 dispatch 洪流与 seal 并发并断言封板必成功——但 `PublishBusy` 的
+        // 契约原文是「另一发布者正在进行（reseed_region 与 dispatch 并发 = 宿主
+        // 违约）」，而 `seal()` 先置 `core.bound` 再发布初始区域 ⇒ 中间到达的通知
+        // 会与它抢发布，输者拿到 `PublishBusy`。合法并发只有 bind × seal（`bind`
+        // 不发布）；违约形态由 `concurrent_publisher_gets_typed_publish_busy...`
+        // 专测，不再要求封板在宿主违约下成功。
+        let bound_mask = Arc::new(AtomicU8::new(0));
+        let stop_dispatch = Arc::new(AtomicBool::new(false));
         let sealed = Arc::new(AtomicBool::new(false));
         let barrier = Arc::new(Barrier::new(3));
-        let mut workers = Vec::new();
 
-        // ① bind 循环：封板前反复登记（幂等），封板后停手。
-        {
-            let (bridge, bound, sealed, barrier) = (
+        // ① bind worker：封板前持续登记两条**不同**路径（bit0=/count、bit1=/other）。
+        // 判据是「两个不同 binding 已登记」，不是成功调用次数（幂等成功会重复计）。
+        let binder = {
+            let (bridge, bound_mask, sealed, barrier) = (
                 Arc::clone(&bridge),
-                Arc::clone(&bound),
+                Arc::clone(&bound_mask),
                 Arc::clone(&sealed),
                 Arc::clone(&barrier),
             );
-            workers.push(thread::spawn(move || {
+            thread::spawn(move || {
                 barrier.wait();
                 while !sealed.load(Ordering::SeqCst) {
-                    if bridge.bind("/count").is_ok() {
-                        bound.fetch_add(1, Ordering::SeqCst);
+                    if bound_mask.load(Ordering::SeqCst) & 1 == 0 && bridge.bind("/count").is_ok() {
+                        bound_mask.fetch_or(1, Ordering::SeqCst);
                     }
-                    if bridge.bind("/other").is_ok() {
-                        bound.fetch_add(1, Ordering::SeqCst);
+                    if bound_mask.load(Ordering::SeqCst) & 2 == 0 && bridge.bind("/other").is_ok() {
+                        bound_mask.fetch_or(2, Ordering::SeqCst);
                     }
                 }
-            }));
-        }
-        // ② dispatch 循环：封板前只计数，封板后打满 12 拍（耗尽增量 ⇒ 全量重编）。
-        {
-            let (bridge, sealed, barrier) = (
+            })
+        };
+        // ② dispatch worker：只负责封板前的通知洪流；收到停止信号后必须先从当前
+        // `send_intent` 返回并退出（封板后的 12 拍移到协调线程，避免与 seal 抢发布）。
+        let dispatcher = {
+            let (bridge, stop_dispatch, barrier) = (
                 Arc::clone(&bridge),
-                Arc::clone(&sealed),
+                Arc::clone(&stop_dispatch),
                 Arc::clone(&barrier),
             );
-            workers.push(thread::spawn(move || {
+            thread::spawn(move || {
                 barrier.wait();
-                while !sealed.load(Ordering::SeqCst) {
+                while !stop_dispatch.load(Ordering::SeqCst) {
                     let _ = bridge.send_intent(json!(1));
                 }
-                for i in 1..=12u32 {
-                    assert!(bridge.send_intent(json!(i)).unwrap());
-                }
-            }));
+            })
+        };
+        // ③ 协调线程（本线程）：等两个不同 binding 登记 → 停 dispatch → join（join
+        // 是「无在途 dispatch publication」的确定性握手，禁 sleep / 固定延时）→
+        // 封板（bind worker 仍在并发 ⇒ bind × seal 锁序覆盖保留）→ 置 sealed →
+        // 打满 12 拍验证 fallback。
+        barrier.wait();
+        while bound_mask.load(Ordering::SeqCst) != 0b11 {
+            thread::yield_now();
         }
-        // ③ seal：等至少两个绑定登记完成再封板（否则没有可发布的初始区域）。
-        {
-            let (bridge, bound, sealed, barrier) = (
-                Arc::clone(&bridge),
-                Arc::clone(&bound),
-                Arc::clone(&sealed),
-                Arc::clone(&barrier),
-            );
-            workers.push(thread::spawn(move || {
-                barrier.wait();
-                while bound.load(Ordering::SeqCst) < 2 {
-                    std::thread::yield_now();
-                }
-                bridge.seal().expect("initial region publication fits");
-                sealed.store(true, Ordering::SeqCst);
-            }));
-        }
-        for worker in workers {
-            worker.join().expect("worker panicked");
+        stop_dispatch.store(true, Ordering::SeqCst);
+        dispatcher.join().expect("dispatch worker panicked");
+        bridge.seal().expect("initial region publication fits");
+        sealed.store(true, Ordering::SeqCst);
+        binder.join().expect("bind worker panicked");
+        for i in 1..=12u32 {
+            assert!(bridge.send_intent(json!(i)).unwrap());
         }
         assert!(
             bridge.region_id() >= 2,
@@ -768,6 +773,123 @@ fn bind_races_first_notification_with_region_fallback() {
             "封板后 bind 必须直接 Sealed（锁序前提）"
         );
         let _ = bridge.take_patches();
+    });
+}
+
+// ── PublishBusy 的 fail-closed 契约（确定性并发，不靠压力测试碰巧撞上） ────────
+
+/// 发布阻塞背衬：`armed` 后进入 `with_bytes_mut` 时置 `entered` 并等到 `release`
+/// ——把「发布在途」窗口做成确定性的（`publish_plan` 已置 `publishing` 才走到这里，
+/// 故阻塞期间第二个发布者必然看到争用）。
+struct BlockingBacking {
+    inner: VecBacking,
+    armed: AtomicBool,
+    entered: AtomicBool,
+    release: AtomicBool,
+}
+
+impl RegionBacking for BlockingBacking {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+    fn with_bytes_mut(&self, write: &mut dyn FnMut(&mut [u8])) {
+        if self.armed.load(Ordering::SeqCst) {
+            self.entered.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
+        }
+        self.inner.with_bytes_mut(write);
+    }
+    fn with_bytes(&self, read: &mut dyn FnMut(&[u8])) {
+        self.inner.with_bytes(read);
+    }
+    fn store_publish_seq(&self, seq: u64) -> Result<(), SeqError> {
+        self.inner.store_publish_seq(seq)
+    }
+    fn load_publish_seq(&self) -> Result<u64, SeqError> {
+        self.inner.load_publish_seq()
+    }
+}
+
+/// 两个发布者重叠：后者必须拿到 typed `PublishBusy`（fail-closed，不死锁、不静默
+/// 成功），失败计数 +1；放行前者后其发布正常完成，桥仍可经 `reseed_region` 恢复并
+/// 继续处理合法发布。
+#[test]
+fn concurrent_publisher_gets_typed_publish_busy_and_bridge_stays_usable() {
+    bounded(|| {
+        let hook = Hook::new();
+        let backing = Arc::new(BlockingBacking {
+            inner: VecBacking::new(4096),
+            armed: AtomicBool::new(false),
+            entered: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+        });
+        let store = SyncStore::new(AppReducer, NoFx);
+        let bridge = Arc::new(
+            ViewBridge::mount(
+                store,
+                ProbeMap {
+                    hook: Arc::clone(&hook),
+                    quiet: false,
+                },
+                Intent,
+                Encoders {
+                    json: Some(Json {
+                        hook: Arc::clone(&hook),
+                    }),
+                    region: Some((
+                        Region {
+                            hook: Arc::clone(&hook),
+                        },
+                        Arc::clone(&backing) as Arc<dyn RegionBacking>,
+                    )),
+                },
+            )
+            .expect("static declarations are well-formed"),
+        );
+        bridge.bind("/count").unwrap();
+        bridge.bind("/other").unwrap();
+        bridge.seal().expect("initial region publication fits"); // 未武装：不阻塞
+
+        // ① 发布者 A：进入发布临界区后阻塞（`publishing` 已置位 ⇒ 发布在途）。
+        backing.armed.store(true, Ordering::SeqCst);
+        let publisher = {
+            let bridge = Arc::clone(&bridge);
+            thread::spawn(move || bridge.send_intent(json!(1)))
+        };
+        while !backing.entered.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+
+        // ② 发布者 B：A 未完成时再发布 ⇒ typed PublishBusy（fail-closed）。
+        let before = bridge.region_failures();
+        let busy = bridge.reseed_region();
+        assert!(
+            matches!(busy, Err(RegionFailure::PublishBusy)),
+            "并发发布者必须 fail-closed 为 PublishBusy：{busy:?}"
+        );
+        assert_eq!(bridge.region_failures(), before + 1, "失败计数按契约 +1");
+
+        // ③ 放行 A：A 正常完成；桥经显式 `reseed_region` 恢复（契约的恢复口）后
+        // 失败槽清空、后续合法发布照常。
+        backing.release.store(true, Ordering::SeqCst);
+        assert!(publisher.join().expect("publisher panicked").unwrap());
+        assert!(
+            bridge.reseed_region().is_ok(),
+            "违约并发后显式重编必须可恢复"
+        );
+        assert!(bridge.region_failure().is_none(), "成功发布清空失败槽");
+        assert!(
+            bridge.send_intent(json!(2)).unwrap(),
+            "违约并发之后桥仍处理合法发布"
+        );
+        let batch = bridge.take_patches();
+        // 补丁值 = 投影后的状态（AppReducer：count += 动作）；A 的 +1 与本次 +2 ⇒ 3。
+        assert_eq!(
+            batch.patches.last().map(|p| p.value.clone()),
+            Some(json!(3))
+        );
     });
 }
 
