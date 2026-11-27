@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Changed(runtime): per-reducer 分段效果预算改为「暂存期硬界 + 转换全有或全无」（#233 / ADR-0011）
+- **破坏性（编译期可见）**：`udf-skeleton-infra` 的 `DispatchOutcome` 新增 `BudgetRejected { rejected }` 变体（穷尽匹配的采用方需补臂；本仓 consumer-sim 不引用该枚举，故其装配面不受影响）。`segment_effect_budget_exceeded()` **已删除**——同名不同义（旧 = 超量条数，新 = 被拒转换次数），替代读侧 `segment_effect_overflow_count()`；0.1.0 未发布，按 ADR-0005 破坏性直迁先例处理。
+- **语义变更**：per-reducer 分段预算的生效点从「reduce 返回后的提交点」前移到 **reducer 入口快照**——`EffectBuf` 到界拒绝插入并置溢出标志，reducer 返回后框架**整次拒绝**该转换：不发布 next state、该 segment 效果零转发、超量 `Emit` 不入 deferred queue。不再有「状态已提交、超量 `Run` / `Cancel` 部分未转发」的分裂结局；超限 action **无部分进展**。默认值 `4096` 与「默认启用」不变。
+- **显形**：专属计数 `segment_effect_overflow_count()`（每次被拒计一次，与根预算 / 停放容量 / 解释器失败分账）+ 审计事件 `SegmentEffectOverflow`（节点数 9）+ `dispatch_with_receipt` 的 typed 结局 `BudgetRejected`；legacy `dispatch` 在该路径**不 panic**（返回值不代表 transition 已提交——契约 trait 与固有方法文档均已写明）。
+- **`EffectBuf`（契约层，零依赖不变）**：新增 `set_effect_cap(usize)`（`0` = 不限）与 `overflowed() -> bool`；`push` 签名不变、到界后不入缓冲；`clear()` 复位溢出标志（实现面专用）。布局 +2 字、每次 `push` 多一次长度比较。
+- **已知限制**：`combine!` 委托链的子件缓冲仍无界（子输出先落子缓冲，再逐条进父的有界 `out`）——转换**总条数**受界与全有或全无成立，但父层以下的内存动机未达成，跟进票处理（ADR-0011 §6）。
+- **测试**：`tests/bounded_staging.rs`（4 条：拒绝不发布 / 不转发 / 不入队、已提交段原样存活、三类结局与计数分账、legacy 不 panic）+ `tests/bounded_staging_compose.rs`（2 条：`combine!` 按整次转换计界、`TestStore` 路径）+ `EffectBuf` 两条边界单测；变异三组（去上限检查 / 去溢出标记 / 恢复提交点截断语义）逐一红。
+
 ### Docs / Test / Ci: 12 维审计补强——panic 计数恢复「恰好一次」、本地 feature 矩阵门、行号锚改符号锚、ViewBridge 迁移节（#232）
 - **测试（行为不变）**：`udf-skeleton-infra` 与 `udf-std-ext` 的 `embedded_event_contains_subscriber_panic_and_counts_it` 断言由基线下界恢复为**恰好 +1**——panic 计数新增线程局部测试窗口（仅 `cfg(all(test, feature = "log-embed"))`，进程级计数语义不变），并新增邻居隔离测试 `panics_on_neighbor_threads_stay_out_of_the_armed_window`（邻居线程各触发一次 panic 后，本线程窗内仍恰为 1）。
 - **本地门禁**：新增 `scripts/feature_matrix.py`（仅标准库）——直接读 `.github/workflows/ci.yml` 的 feature 隔离矩阵（唯一事实源），逐组合跑 check / test / doc；支持 `--list` / `--only <feature>`。本机需配 `RUSTUP_TOOLCHAIN=1.96.0`。
