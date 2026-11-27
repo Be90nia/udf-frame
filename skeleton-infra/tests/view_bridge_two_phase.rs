@@ -11,7 +11,7 @@
 //! 不靠 sleep 猜时序。
 
 use std::panic;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier, OnceLock, Weak};
 use std::thread;
