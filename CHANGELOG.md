@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Changed(runtime): per-drain 租约改为「到界让出所有权 + 不持租约等完成」（#234 / ADR-0011 §2.4）
+- **语义变更**：per-drain 工作量预算到界时不再有「经 `try_dispatch` / `ActionSender::dispatch` 夺得租约者在自己 action 完成边界前不让出」的例外——到界且队列非空即让出**所有权**；被接手时调用方**认领**入口账本（等待期间账本不进复用池，杜绝复用 `reset` 清掉等待中终局的丢唤醒）后不持租约地等终局，醒来即返回；无人接手则原线程重新竞争续排（禁搁浅）。
+- **不变**：`ActionSender::dispatch` 的 `bool` 仍只表示「被接受」；`dispatch` / `dispatch_with_receipt` 的完成边界语义、FIFO、单写者所有权、恰好一次记账、因果账本完成均不变。
+- **仍不是严格上限**：无人接手时同一线程连续排空整条队列（上限只决定它隔多久放一次手）；有竞争时接手的租约按各自预算推进。
+- **测试**：`tests/drain_handoff.rs`（3 条公开面：禁搁浅 / 静默态完成边界 / 并发恰好一次）+ 白盒用例（交接等待跨复用池 `reset`、已终局的快路径、legacy `dispatch` 在自己线程 panic、`close` 在让出窗口的接手 / 未接手两编排）；变异 4 组（去接手 / 去重新竞争 / 终局不唤醒 / 让出后不等）逐一红，另「`claim_handoff` 去掉 `waiter` 认领」⇒ 鉴别人红（PM 独立复现）。
+- **已知限制**：交接等待无超时——排空者在 reduce 内 panic 且此后无人续排时，等待者会一直等（与既有「排空者 panic ⇒ 队列搁浅」同类，见 ADR-0011 §6）。
+
 ### Changed(runtime): per-reducer 分段效果预算改为「暂存期硬界 + 转换全有或全无」（#233 / ADR-0011）
 - **破坏性（编译期可见）**：`udf-skeleton-infra` 的 `DispatchOutcome` 新增 `BudgetRejected { rejected }` 变体（穷尽匹配的采用方需补臂；本仓 consumer-sim 不引用该枚举，故其装配面不受影响）。`segment_effect_budget_exceeded()` **已删除**——同名不同义（旧 = 超量条数，新 = 被拒转换次数），替代读侧 `segment_effect_overflow_count()`；0.1.0 未发布，按 ADR-0005 破坏性直迁先例处理。
 - **语义变更**：per-reducer 分段预算的生效点从「reduce 返回后的提交点」前移到 **reducer 入口快照**——`EffectBuf` 到界拒绝插入并置溢出标志，reducer 返回后框架**整次拒绝**该转换：不发布 next state、该 segment 效果零转发、超量 `Emit` 不入 deferred queue。不再有「状态已提交、超量 `Run` / `Cancel` 部分未转发」的分裂结局；超限 action **无部分进展**。默认值 `4096` 与「默认启用」不变。
