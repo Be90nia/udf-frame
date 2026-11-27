@@ -222,17 +222,17 @@ pub enum AdmissionOutcome {
 
 蓝图 §11 项 6：ADR 0008 在**通知面**落地了「两档并存 + 同一语义契约」，同一模式在**效果执行面**沿用——不强迫一档替掉另一档，也不新增第二个入口。
 
-**现状（源码坐标：落盘于 2026-11-17 的快照值，本轮 #34/#35/#39/#40/#41/#42/#44 改动后**行号可能已漂**——符号名恒准，定位请按符号名）**：转发环在排空环内、`dispatch` 调用栈上**同步**调用解释器——`runtime.rs:1486`（`forward_effects` 调用点，位于 `drain_owned` 循环体内）→ `runtime.rs:1529`（`forward_effects`）→ `runtime.rs:1587`（`runtime.run(effect, &inner.back)`）；`Effect::Emit` 不经解释器直接回灌入队（`runtime.rs:1536`）。异步**不在核心内**：托管由 `fx::FxScope::spawn_tracked`（`fx.rs:417`）提供，解释器实现方在 `run` 里 spawn 并把 `back` 句柄 move 进任务。
+**现状（源码坐标按符号名定位——行号随重构漂移，不记行号）**：转发环在排空环内、`dispatch` 调用栈上**同步**调用解释器——`runtime.rs`（`drain_owned` 循环体内的 `forward_effects` 调用点）→ `runtime.rs`（`forward_effects`）→ `runtime.rs`（`forward_effects` 内的 `runtime.run(effect, &inner.back)`）；`Effect::Emit` 不经解释器直接回灌入队（`runtime.rs` 的 `forward_effects` 内 `Effect::Emit` 臂）。异步**不在核心内**：托管由 `fx::FxScope::spawn_tracked`（`fx.rs`）提供，解释器实现方在 `run` 里 spawn 并把 `back` 句柄 move 进任务。
 
 | 档 | 谁执行 | 适用条件 | 失败/取消可观察面 |
 |---|---|---|---|
-| **同步档**（内联） | 排空环转发段，在 `dispatch` 调用方线程内联执行 | 有界、非阻塞、不等待外部完成的工作；**禁 `await`、禁阻塞 IO**（内联耗时直接计入 dispatch 延迟，并阻塞整个状态机） | 解释器 `run` panic：`catch_unwind` 只观察不吞（审计 `EffectInterrupted`，`runtime.rs:1587-1589`）后 `resume_unwind`——**panic 原样从 `dispatch` 上浮**（`runtime.rs:1590`）。实例不报废：毒锁在下一次效果转发时 `into_inner` 恢复 + `clear_poison` + `runtime_panic_count` +1（`runtime.rs:1574-1580`）；读数口径 = **毒位被观察到时才计**（`runtime.rs:1141-1144`），首轮 panic 后不再产效果则读 0。panic 的那条效果随转发丢弃、不再重投（重投会恒 panic 死循环）；同批未转发的效果原地留缓冲，由下一任排空续转（`runtime.rs:1529-1536` 逐条 `pop_front` 摘除形）。 |
-| **托管档**（异步） | `FxScope` 生命周期集内的 tokio 任务 | IO / 长任务 / 需与核心解耦的等待 | 完成/失败/取消经 `Spawned::join` → `TaskError::{Cancelled, Panicked, TimedOut}`（`fx.rs:577-591`）与停机排空报告（`fx.rs:251-303`）分桶可见：`completed` / `cancelled` / `panicked` / `failed`（+`errors` 逐条）/ `still_running` 终局桶互斥穷尽，`timed_out` 是与终局桶正交的截止事件计数。句柄被丢也不丢载荷：panic 消息进生命周期集，`join` 与停机排空双重可见（诊断面非 exactly-once）。 |
+| **同步档**（内联） | 排空环转发段，在 `dispatch` 调用方线程内联执行 | 有界、非阻塞、不等待外部完成的工作；**禁 `await`、禁阻塞 IO**（内联耗时直接计入 dispatch 延迟，并阻塞整个状态机） | 解释器 `run` panic：`catch_unwind` 只观察不吞（审计 `EffectInterrupted`，`runtime.rs` 的 `forward_effects`）后 `resume_unwind`——**panic 原样从 `dispatch` 上浮**（同在 `forward_effects`）。实例不报废：毒锁在下一次效果转发时 `into_inner` 恢复 + `clear_poison` + `runtime_panic_count` +1（`runtime.rs` 的 `forward_effects` 取 runtime 锁处）；读数口径 = **毒位被观察到时才计**（`SyncStore::runtime_panic_count`），首轮 panic 后不再产效果则读 0。panic 的那条效果随转发丢弃、不再重投（重投会恒 panic 死循环）；同批未转发的效果原地留缓冲，由下一任排空续转（`runtime.rs` 的 `forward_effects` 逐条 `pop_front` 摘除形）。 |
+| **托管档**（异步） | `FxScope` 生命周期集内的 tokio 任务 | IO / 长任务 / 需与核心解耦的等待 | 完成/失败/取消经 `Spawned::join` → `TaskError::{Cancelled, Panicked, TimedOut}`（`fx.rs` 的 `Spawned::join` / `Spawned::join_timeout`）与停机排空报告（`fx.rs` 的 `ShutdownReport`）分桶可见：`completed` / `cancelled` / `panicked` / `failed`（+`errors` 逐条）/ `still_running` 终局桶互斥穷尽，`timed_out` 是与终局桶正交的截止事件计数。句柄被丢也不丢载荷：panic 消息进生命周期集，`join` 与停机排空双重可见（诊断面非 exactly-once）。 |
 
 **边界规则（四条，两档共用）**：
 
-1. **核心永不阻塞等待异步完成**（蓝图 §3 原句）：`run` 是同步 trait 方法（`skeleton/src/lib.rs:354-358`），排空环调用它时既不 `await` 也没有「等句柄」路径——托管档的 `run` 只 `spawn_tracked` 入集（`fx.rs:417`；闸关返回 `Err(ScopeClosed)`，`fx.rs:429-432`，fail-closed 禁静默丢弃 future）后立即返回。**`dispatch` 返回 ≠ 效果完成**：这是托管档的文档化时序，不是缺陷。
-2. **异步结果回灌必须经 `ActionSender`**（显式消息边界）：任务完成后调 `back.dispatch(action)` 把结果变成普通 action 重入队列，状态仍只由 reducer 推进。跨线程回灌不是 dispatch 调用栈的一部分（按外部流量计，`reentrant_origin` 判定见 `runtime.rs:63`、深度归零见 `runtime.rs:1395`）——**跨线程回灌环的环防护责任在解释器/宿主自身**（契约注见 `skeleton::EffectRuntime`「回灌环责任边界」）。闭门后回灌显式返回 `false`（不静默）。
+1. **核心永不阻塞等待异步完成**（蓝图 §3 原句）：`run` 是同步 trait 方法（`skeleton/src/lib.rs` 的 `EffectRuntime::run`），排空环调用它时既不 `await` 也没有「等句柄」路径——托管档的 `run` 只 `spawn_tracked` 入集（`fx.rs` 的 `FxScope::spawn_tracked`；闸关返回 `Err(ScopeClosed)`，见 `FxScope::admit_gate`，fail-closed 禁静默丢弃 future）后立即返回。**`dispatch` 返回 ≠ 效果完成**：这是托管档的文档化时序，不是缺陷。
+2. **异步结果回灌必须经 `ActionSender`**（显式消息边界）：任务完成后调 `back.dispatch(action)` 把结果变成普通 action 重入队列，状态仍只由 reducer 推进。跨线程回灌不是 dispatch 调用栈的一部分（按外部流量计，`reentrant_context` 判定见 `runtime.rs` 的 `admission_context`、深度归零见 `runtime.rs` 的 `record_depth`）——**跨线程回灌环的环防护责任在解释器/宿主自身**（契约注见 `skeleton::EffectRuntime`「回灌环责任边界」）。闭门后回灌显式返回 `false`（不静默）。
 3. **同步档内禁 `await`/禁阻塞 IO**：`run` 在排空环内、持排空权执行，阻塞它 = 阻塞整个状态机（后续 action 与回灌链全部排队）。需要等待就换托管档，而不是在同步档里「小睡一下」。
 4. **禁 join 会回调同一 store 的线程**（跨线程形态，2026-11-20 确定性复现）：`run`（或订阅回调）内 join 一个用**阻塞式** `dispatch` 回调**同一 store** 的线程 ⇒ **确定性互等死锁**——排空环被 join 卡住，而回执只由排空环兑现。规避：派生工作走**框架提供的** sender（`Store::sender()` 或回调收到的 `back`）的 `dispatch`——**回调内该 sender 必处竞争态**（排空权在排空线程）⇒ 纯准入、不等回执（其 `bool` = **被接受**而非完成）——或不 join；同线程重入仅入队不等待（不互等）。**自建** sender（`ActionSender::new`）的语义由实现方决定，**不可假定**框架提供的 sender 的任一条路径语义。**框架侧无防护**（无法检测宿主侧的跨线程 join）⇒ 义务与规避路径都在宿主侧。复现工程与场景矩阵：`verify/2026-11-20-residual-join-risk/`（6 场景：3 死锁 / 3 不死锁）。
 
@@ -240,8 +240,8 @@ pub enum AdmissionOutcome {
 
 | 语义位 | 通知面（ADR 0008，已实现） | 效果执行面（本节） |
 |---|---|---|
-| 同步档 | `subscribe` / `subscribe_local`：回调在 dispatch 线程内联执行 | 内联 `run`：在排空环转发段执行（`runtime.rs:1486` → `:1587`） |
-| 异步档 | `NotifySink::publish`：O(1) 版本投递，重活移出环（`skeleton/src/notify.rs:62`） | `FxScope::spawn_tracked`：工作移出环，结果经 `ActionSender` 回灌（`fx.rs:417`） |
+| 同步档 | `subscribe` / `subscribe_local`：回调在 dispatch 线程内联执行 | 内联 `run`：在排空环转发段执行（`runtime.rs` 的 `drain_owned` 内 `forward_effects` 调用点 → `forward_effects` 内 `runtime.run(effect, &inner.back)`） |
+| 异步档 | `NotifySink::publish`：O(1) 版本投递，重活移出环（`skeleton/src/notify.rs:62`） | `FxScope::spawn_tracked`：工作移出环，结果经 `ActionSender` 回灌（`fx.rs` 的 `FxScope::spawn_tracked`） |
 | 载荷/契约 | 单调版本号（状态化），消费侧按需拉快照 | 仍是 `Action`（纯 reducer 推进状态） |
 | 不救另一档 | 慢同步订阅者的耗时照常计入 dispatch | 同步档 `run` 的耗时照常计入 dispatch |
 | 失败可见 | 投递口 panic = 捕获 + 摘除 + 计数 | 解释器 panic 上浮 + 计数；托管任务失败进 `TaskError` / `ShutdownReport` |
@@ -418,12 +418,14 @@ store.close(); // 闭门后 dispatch no-op、计入 rejected_after_close
 | 10 | 外部准入队列容量（ingress） | `runtime`（#38） | 无界（默认） | `SyncStore::set_capacity(n)`；默认 **0 = 不限**（等待被 reduce 的 action 数；正在执行的已出队，不计入） | 拒绝：`try_dispatch` ⇒ typed `AdmissionOutcome::Full`；`ActionSender::dispatch` ⇒ `false`；`SyncStore::dispatch`（无失败面）过载 panic fail-visible——均不阻塞、不部分插入；计数 `admission_full_count()` | 显式 `set_capacity(n)`（**#95：与准入共锁线性化**——线性化点 = `inner.queue` 锁内发布；准入先得锁则按旧值完成、setter 返回后一律按新值；**缩容不回溯**既有记录，**扩容与 0 即时**生效）；`admission_full_count()` 读数 |
 
 | 11 | per-root 因果工作量预算 | `runtime`（#105/#144） | 无界（`0`，须显式置） | `set_causal_work_budget(n)` / `causal_work_budget()`；**默认 `DEFAULT_CAUSAL_WORK_BUDGET = 16384`（默认启用）**。用量 = 单根累计**已接受**后代数（单调不回落，随账本复位清零）；与 ingress / deferred / 回灌深度**四维分立**，禁并一计数 | 超界 = 拒绝预留：子动作**不入主队列、不占在途计数**，改挂续接账本**停放**（`DispatchOutcome::Deferred`）或停放区满被**拒收**（`CapacityRejected`）；计数 `causal_work_budget_exceeded()`（停放 + 拒收各计一次） | 显式 `set_causal_work_budget(n)`（**#95 同款共锁线性化**：缩容不回溯已准入后代；`0` = 不限）；`resume_deferred(limit)`（#49，无自动重试） |
-| 12 | per-reducer 分段效果预算 | `runtime`（#144） | 无界（`0`） | `set_segment_effect_budget(n)` / `segment_effect_budget()`；**默认 `DEFAULT_SEGMENT_EFFECT_BUDGET = 4096`（默认启用）**。**生效点 = reduce 正常返回的提交点**（预算快照进段，已提交段不随 setter 缩容回溯）；reducer 调用期间框架无控制点 | 超量 **Emit** ⇒ 停放 / 拒收（同 #11 的超界行为，**不占**根预算）；超量 **Run/Cancel** ⇒ 不转发，产出 action 以**提交后部分失败**结算（`Failed{phase:ForwardingEffects,state_committed:true}`；legacy `dispatch` 按既有转发失败口径 panic）；计数 `segment_effect_budget_exceeded()` | 显式 `set_segment_effect_budget(n)`（`0` = 不限）；Emit 侧 `resume_deferred(limit)` |
-| 13 | per-drain 租约工作量预算 | `runtime`（#144） | 无界（`0`） | `set_drain_work_budget(n)` / `drain_work_budget()`；**默认 `DEFAULT_DRAIN_WORK_BUDGET = 4096`（默认启用）**。计量 = 单个排空租约**连续出队处理**的记录数（到界清零） | 到界且主队列非空 ⇒ **让出**：放旗 → 解锁 → `std::thread::yield_now` → 重新竞争（窗口内外部 push / `resume_deferred` / `close` 可接手；FIFO / 单写者 / 无丢失 / 无重复不变；无人接手则自己续排）。**例外**：经 `try_dispatch` / `ActionSender::dispatch` 夺得租约者，在自己 action 的完成边界前不让出；计数 `drain_lease_yields()` | 显式 `set_drain_work_budget(n)`（`0` = 不限）；让出只降延迟、不丢记录 |
+| 12 | per-reducer 分段效果预算 | `runtime`（#144） | 无界（`0`） | `set_segment_effect_budget(n)` / `segment_effect_budget()`；**默认 `DEFAULT_SEGMENT_EFFECT_BUDGET = 4096`（默认启用，临时基线）**。**生效点 = reduce 正常返回的提交点**（预算快照进段，已提交段不随 setter 缩容回溯）；reducer 调用期间框架无控制点——**这是条数界，不是字节界 / 内存界**：reducer 运行期间的暂存不受约束，当前语义未被追认为完整资源界（契约修订见 ADR-0011 / #231） | 超量 **Emit** ⇒ 停放 / 拒收（同 #11 的超界行为，**不占**根预算）；超量 **Run/Cancel** ⇒ 不转发，产出 action 以**提交后部分失败**结算（`Failed{phase:ForwardingEffects,state_committed:true}`；legacy `dispatch` 按既有转发失败口径 panic）——这一「状态已提交而效果部分未转发」的分裂结局已被判为待改（#231）；计数 `segment_effect_budget_exceeded()` | 显式 `set_segment_effect_budget(n)`（`0` = 不限）；Emit 侧 `resume_deferred(limit)` |
+| 13 | per-drain 协作让出阈值（**不是严格上限**） | `runtime`（#144） | 无界（`0`） | `set_drain_work_budget(n)` / `drain_work_budget()`；**默认 `DEFAULT_DRAIN_WORK_BUDGET = 4096`（默认启用，临时基线）**。计量 = 单个排空租约**连续出队处理**的记录数（到界清零） | 到界且主队列非空 ⇒ **让出**：放旗 → 解锁 → `std::thread::yield_now` → 重新竞争（窗口内外部 push / `resume_deferred` / `close` 可接手；FIFO / 单写者 / 无丢失 / 无重复不变；无人接手则自己续排）。**例外（故不是严格上限）**：经 `try_dispatch` / `ActionSender::dispatch` 夺得租约者，在自己 action 的完成边界前不让出——「到界可让出租约、调用方继续等自己的账本完成」的交接契约待设计（#231）；计数 `drain_lease_yields()` | 显式 `set_drain_work_budget(n)`（`0` = 不限）；让出只降延迟、不丢记录 |
 
 **数值决定记录（2026-11-23 维护者拍板）**：本表全部默认值**保持现值（keep current）**——具体为：Run-ID `1024`、deferred `64`、审计环/待投递 `1024`、回灌深度 `64`、ingress 无界 **照旧**；scheduler 与 watchdog 的提案值（`1024` / `4096`）**不采纳，保持无界**（草案见 `reports/2026-11-23-resource-defaults-draft.md`，留痕备查）。依据：#56 Stage C 消费方验收结论「全默认开箱可用，未出现要求把默认值改小的证据」（`reports/2026-11-23-56-stage-c-consumer-validation.md`）；共同约定 2「默认=保守可用，禁为炫技设小界」。`AUDIT_PENDING_CAP` 无配置面、`FEEDBACK_DEPTH_BUDGET` 固定——均按现状记录，不新增配置面。
 
 **追加（2026-11-26，wave7；#105/#144）**：#11–#13 三项为新增预算，**默认启用**——这是约定 1「显式 opt-in 才设界」的**明文例外**（#144 Required design 5 要求默认启用、关闭须显式 opt-in）；默认值 16384 / 4096 / 4096 由实现提案 + PM 批准，**维护者可推翻**（改大 = 兼容放宽；改小 = 破坏性，走 ADR）。
+
+**维护者评审（2026-11-27，#231）**：默认启用的方向保留；per-reducer 当前语义**不被追认为完整资源界**（生效点在提交点、不约束 reducer 运行期间的暂存；超量 `Run` / `Cancel` 是「状态已提交、效果部分未转发」的分裂结局），改为「暂存期即受条数界约束 + reducer 转换全有或全无」的契约见 ADR-0011（**Proposed，实现待授权**）；per-drain 现值是**协作让出阈值**而非严格上限（经 `try_dispatch` / `ActionSender::dispatch` 夺得租约者在完成边界前不让出）；三个默认值 16384 / 4096 / 4096 是**临时兼容基线**，不是实测定稿值——定稿需 consumer-sim 代表性负载、峰值暂存内存、cap-1 / cap / cap+1 边界与持续并发生产者的证据。#11–#13 全部是**条数界**，不是字节界。
 
 **修订规则**：某默认值经 #56 Stage B 实测不合格 ⇒ 修订本表一次（改大 = 兼容放宽；改小 = 破坏性，需 ADR 记录理由与迁移路径），各面 rustdoc 随表同步，禁单点改数。
 
@@ -464,17 +466,17 @@ pub trait Notify<S> {
 
 本域各池只有一个共同点：**每个配置值各自约束一个特定群体**。「把 `max` 当总对象数 / 总内存上限」是最常见的误读（蓝图 §5 的三轴口径即为此立）。下表逐参数回答四问：①cap 覆盖哪些对象/字节；②满容量时的动作与可观察读数；③是否存在合法的超配中间态、靠什么收敛；④各读数字段的口径，以及哪些读数**不是**准入面。
 
-行号口径：全篇行号锚为 **2026-11-17 落盘时的快照值**（本轮 #34/#35/#39/#40/#41/#42/#44/#45/#46/#47/#48 改动后**未逐个更新行号**）——**符号名恒准，行号随重构漂移**；代码变动后行号可能已过时，定位请按符号名（各处坐标均附符号名或所在函数）。路径均相对 `skeleton-infra/src/`。核心形字段定义见 `skeleton/src/pool.rs:42`。`ObjectPool` 的三轴见 [§ObjectPool](#objectpool--通用对象池有状态对象reset-钩子--有界降级--分片槽位)，`MemoryPool` / `BoundedRegistry` / `ByteBudget` 见 [§memgov 四问](#资源上限四问--memgov-三件)。
+坐标口径：源码坐标**按符号名定位**（各处坐标均附符号名或所在函数）；行号随重构漂移，2026-11-27 已对 HEAD 逐条核对、陈旧行号锚全部改为符号名，仅个别仍准确的坐标保留行号。路径均相对 `skeleton-infra/src/`。核心形字段定义见 `skeleton/src/pool.rs` 的 `PoolMetrics`。`ObjectPool` 的三轴见 [§ObjectPool](#objectpool--通用对象池有状态对象reset-钩子--有界降级--分片槽位)，`MemoryPool` / `BoundedRegistry` / `ByteBudget` 见 [§memgov 四问](#资源上限四问--memgov-三件)。
 
 #### PoolBase — 账本与裁决，不做准入
 
 | 配置/入口 | ①覆盖群体 | ②满容量行为 | ③超配中间态与收敛 | ④读数口径 | 代码锚 |
 |---|---|---|---|---|---|
-| `max` | 实现方经 `note_borrow` / `note_return` 上报的「idle + 借出」合计（组合件不持有对象，群体由特化池定义） | **无满容量动作**：`PoolBase` 不裁决单笔借出是否放行，只在归还时按边界判留存 | 是：`resize` 缩容只改边界，已在借句柄不受影响 ⇒ `borrowed` 可短时高于新 `max`，随归还收敛 | `metrics().max` = 当前配置（非构造期原值）；`watermark = borrowed / max` | `pool.rs:280` |
-| `idle_cap` | **仅闲槽留存**（不约束借出） | 归还判据 `idle < idle_cap && idle + borrowed < max`；不满足 ⇒ 丢弃 + `dropped_overflow += 1` + 审计 `OverflowDropped`（归还永不阻塞、永不报错） | 是：缩容窗内 `idle` 可短时高于新 `idle_cap`，由归还裁决 / 实现方裁剪路径收敛 | `dropped_overflow` 只数**容量因**；`PoolAuditKind::{Returned, OverflowDropped}` 与它一一对应 | `pool.rs:329` |
-| `resize(max, idle_cap)` | 参数合法性（`max == 0` / `idle_cap == 0` / `idle_cap > max`） | 非法 ⇒ `Err(PoolResizeError)`，状态零变更 + 审计 `ResizeRejected`；合法 ⇒ `Resized` | — | 错误是 `Copy` 值（拒绝路径零分配，`Display` 自带两参原值） | `pool.rs:45`、`pool.rs:261` |
+| `max` | 实现方经 `note_borrow` / `note_return` 上报的「idle + 借出」合计（组合件不持有对象，群体由特化池定义） | **无满容量动作**：`PoolBase` 不裁决单笔借出是否放行，只在归还时按边界判留存 | 是：`resize` 缩容只改边界，已在借句柄不受影响 ⇒ `borrowed` 可短时高于新 `max`，随归还收敛 | `metrics().max` = 当前配置（非构造期原值）；`watermark = borrowed / max` | `pool.rs`（`PoolBase::metrics`） |
+| `idle_cap` | **仅闲槽留存**（不约束借出） | 归还判据 `idle < idle_cap && idle + borrowed < max`；不满足 ⇒ 丢弃 + `dropped_overflow += 1` + 审计 `OverflowDropped`（归还永不阻塞、永不报错） | 是：缩容窗内 `idle` 可短时高于新 `idle_cap`，由归还裁决 / 实现方裁剪路径收敛 | `dropped_overflow` 只数**容量因**；`PoolAuditKind::{Returned, OverflowDropped}` 与它一一对应 | `pool.rs`（`PoolBase::note_return`） |
+| `resize(max, idle_cap)` | 参数合法性（`max == 0` / `idle_cap == 0` / `idle_cap > max`） | 非法 ⇒ `Err(PoolResizeError)`，状态零变更 + 审计 `ResizeRejected`；合法 ⇒ `Resized` | — | 错误是 `Copy` 值（拒绝路径零分配，`Display` 自带两参原值） | `pool.rs`（`validate`、`PoolBase::resize`） |
 
-- **`note_borrow` / `metrics()` 是观测面，不是第三本准入账**（蓝图 §5）：`PoolBase` 不做 check-then-act；准入权在特化池——`MemoryPool` 在槽位锁内判 `created < max`（`memgov.rs:568`），`ObjectPool` 在片锁内判 `alive < share(max)`（`objpool.rs:1255`）。把 `metrics()` 当放行判据 = 无锁 check-then-act。
+- **`note_borrow` / `metrics()` 是观测面，不是第三本准入账**（蓝图 §5）：`PoolBase` 不做 check-then-act；准入权在特化池——`MemoryPool` 在槽位锁内判 `created < max`（`memgov.rs` 的 `MemoryPool::acquire`），`ObjectPool` 在片锁内判 `alive < share(max)`（`objpool.rs` 的 `ObjectPool::claim_growth`）。把 `metrics()` 当放行判据 = 无锁 check-then-act。
 - **归还两入口（#98）**：`note_return` = 裁决与真实槽位提交**分属两段临界区**（事件先于提交发射；适用于「槽位存储自有锁、事件重入看不到中间态」的实现方）；`note_return_with(commit)` = `pub(crate)` 协作入口，core 裁决 + 实现方槽位提交/配额回吐在**同一 `core` 临界区**内完成，事件恒描述**已提交**状态（`MemoryPool` 用它）。锁序 `core → 实现方槽位锁`；任何实现方**禁**持槽位锁再取 core；`resize` 被裁对象的析构在 `resizing` 闸**外**。
 - **池 metrics 的快照语义（#99）**：`MemoryPoolMetrics` / `ThreadPoolMetrics` 是**逐面非原子快照**（不取 `resizing`）——并发 `resize` 时各面可能来自相邻时刻；`ThreadPool` 的 actual-vs-target worker 差异属合法状态，不是混合窗口。要「同一已提交配置」请读 `resize`/审计回调内的状态（回调在全部内部锁释放后运行）。
 - **resize 审计事件的时序（#99）**：`Resized` / `ResizeRejected` 在实现方状态**全部提交且内部锁释放后**发射 ⇒ 回调可重入 `resize`/`acquire`/`metrics`；事件顺序 = 实际发射序（并发 resize 由各实现方串行闸定序），载荷不带目标值——读配置用 `metrics()`。`ThreadPool::resize` 的 epoch 在**任何用户回调之前**领取（「最后发起的目标生效」）。
@@ -483,10 +485,10 @@ pub trait Notify<S> {
 
 | 参数 | ①覆盖群体 | ②满容量行为 | ③超配中间态与收敛 | ④读数口径 | 代码锚 |
 |---|---|---|---|---|---|
-| `core` | **保活 worker 数**（驻留 park，零 CPU）；是下限，不是任务面上限 | 不触发任何拒绝；`resize` 提高 core ⇒ 补建至新值（返回即到数） | 是：扩容补建遇 worker 创建失败 ⇒ `PoolResizeError::SpawnFailed { target_core, workers }`——调参已落地而 worker 未建够（**部分生效**），已建 worker 继续服务，可重试 `resize` 补齐 | `metrics().core` = 目标保活数（非存活数） | `pool.rs:938`、`pool.rs:977` |
-| `max` | **worker 数**上限（含 core）——不是任务数、不是队列长度 | 队列满且 `workers < max` ⇒ 新建 worker 直接接管本任务（first-task 交接，队列不越限）；队列满且 `workers >= max` 或已 shutdown ⇒ 走拒绝策略 + `rejected += 1` | 是：缩容只发退出令牌（差额 worker 处理完当前任务即退）⇒ `workers` 可短时 > 新 `max`，`shape.watermark = busy / max` 因此可 > 1.0 | `workers` = 真实存活数（创建失败不留幻影）；`busy` = 执行中；`idle` = parked（**不是**遗留对象数） | `pool.rs:885`、`pool.rs:954` |
-| `queue_cap` | 中央队列槽数 | 两档互斥：`queue_len < cap` 入队 FIFO；`>= cap` 走上行的扩容或拒绝 | 否：入队与拒绝判决同锁完成，`queue_len <= queue_cap` 恒成立；`queue_cap == 0` 在 `resize` 入口即拒（直通管道 = 池语义自毁） | `queue_len` / `queue_cap` | `pool.rs:885`、`pool.rs:953` |
-| （失败分账） | — | worker 创建失败 ⇒ `RejectedTask { cause: SpawnFailed }`，任务**原样退还**调用方 | — | `spawn_failures`（环境故障）与 `rejected`（策略触发，含 CallerRuns 内联）是两本账，禁用其一反推另一 | `pool.rs:1085` |
+| `core` | **保活 worker 数**（驻留 park，零 CPU）；是下限，不是任务面上限 | 不触发任何拒绝；`resize` 提高 core ⇒ 补建至新值（返回即到数） | 是：扩容补建遇 worker 创建失败 ⇒ `PoolResizeError::SpawnFailed { target_core, workers }`——调参已落地而 worker 未建够（**部分生效**），已建 worker 继续服务，可重试 `resize` 补齐 | `metrics().core` = 目标保活数（非存活数） | `pool.rs`（`ThreadPool::resize` 及其 `PoolResizeError::SpawnFailed` 返回点） |
+| `max` | **worker 数**上限（含 core）——不是任务数、不是队列长度 | 队列满且 `workers < max` ⇒ 新建 worker 直接接管本任务（first-task 交接，队列不越限）；队列满且 `workers >= max` 或已 shutdown ⇒ 走拒绝策略 + `rejected += 1` | 是：缩容只发退出令牌（差额 worker 处理完当前任务即退）⇒ `workers` 可短时 > 新 `max`，`shape.watermark = busy / max` 因此可 > 1.0 | `workers` = 真实存活数（创建失败不留幻影）；`busy` = 执行中；`idle` = parked（**不是**遗留对象数） | `pool.rs`（`ThreadPool::submit`） |
+| `queue_cap` | 中央队列槽数 | 两档互斥：`queue_len < cap` 入队 FIFO；`>= cap` 走上行的扩容或拒绝 | 否：入队与拒绝判决同锁完成，`queue_len <= queue_cap` 恒成立；`queue_cap == 0` 在 `resize` 入口即拒（直通管道 = 池语义自毁） | `queue_len` / `queue_cap` | `pool.rs`（`ThreadPool::submit`） |
+| （失败分账） | — | worker 创建失败 ⇒ `RejectedTask { cause: SpawnFailed }`，任务**原样退还**调用方 | — | `spawn_failures`（环境故障）与 `rejected`（策略触发，含 CallerRuns 内联）是两本账，禁用其一反推另一 | `pool.rs`（`ThreadPool::rollback_spawn`） |
 
 - **三参不可互相推导**：`max` 管 worker、`queue_cap` 管队列、任务总量 = 二者之和再加在跑件；调高 `queue_cap` 不提高并行度，调高 `max` 也不保证队列不溢出。
 
@@ -617,10 +619,10 @@ where T: Send + 'static
 
 | 轴 / 参数 | ①覆盖群体 | ②满容量行为 | ③超配中间态与收敛 | ④读数口径 | 代码锚 |
 |---|---|---|---|---|---|
-| alive（`max`） | 池宇宙 = idle + **正常**借出；不含降级件 | `claim_growth` 全片配额满 ⇒ 走降级轴（不等待、不失败） | 是：`resize` 缩容**不回溯裁剪** `alive`（不夺借出）⇒ 已认领存活数可短时高于新 `max`，随归还按新配额收敛；`core.borrowed` **含降级借出** ⇒ `idle + borrowed <= max` **不成立** | `core.idle` + `core.borrowed` 是宇宙读数（后者含降级）；`core.watermark = borrowed / max` 可 > 1.0，不钳位 | `objpool.rs:1255`、`objpool.rs:1164` |
-| 留存（`idle_cap`） | 仅 idle 槽位，按片 `share(idle_cap, shards, idx)` 均分（各片之和 = 配置值） | 归还时 home 片满 ⇒ 迁入有余量的片（`alive` 随迁）；全池余量零 ⇒ 丢弃 + `core.dropped_overflow += 1` + 审计 `OverflowDropped` | 是：缩容裁剪逐片串行，窗口内 `core.idle` 可短时高于新 `idle_cap`，裁剪完成即收敛到新上界 | `core.dropped_overflow` 只数**容量因**（idle 满 / 全池余量零 / resize 裁剪），与 `reset_panicked`（钩子因）分账 | `objpool.rs:1290`、`objpool.rs:1164` |
-| 字节（`ByteBudget::total`） | **仅 idle 常驻字节**（`weight(&T)` 现值，`Vec` 类按 `capacity()`）；借出对象不计 | 入 idle 槽（归还 / `insert`）时 `try_take` 原子 check+act；余额不足 ⇒ 返回 `false`，调用方按容量因丢弃（无「认领一半」） | 否：`held <= total` 恒成立；**借出即回卷**（`give_back`）——所以 `total` 不是进程内存上限，也不是借出对象内存上限 | `metrics().idle_bytes` = 预算已认领字节（**共享预算**下 = 全局 held，不构成按池归因）；`byte_budget` = 构造期总额；未启用两者恒 0 | `objpool.rs:411`、`objpool.rs:1362` |
-| 降级（`degraded`） | 宇宙满后直构的对象：不入宇宙、不占字节预算 | 直接调工厂（`degraded` +1、`constructed` +1），归还即释放、永不进 idle | 允许「交给调用方的对象数 > `max`」——ADR 0010 的有意设计，不是记账漏洞 | `degraded` = 降级直构次数；`constructed` = 工厂调用总数（含降级）——两独立计数，禁互推 | `objpool.rs:900` |
+| alive（`max`） | 池宇宙 = idle + **正常**借出；不含降级件 | `claim_growth` 全片配额满 ⇒ 走降级轴（不等待、不失败） | 是：`resize` 缩容**不回溯裁剪** `alive`（不夺借出）⇒ 已认领存活数可短时高于新 `max`，随归还按新配额收敛；`core.borrowed` **含降级借出** ⇒ `idle + borrowed <= max` **不成立** | `core.idle` + `core.borrowed` 是宇宙读数（后者含降级）；`core.watermark = borrowed / max` 可 > 1.0，不钳位 | `objpool.rs`（`ObjectPool::claim_growth`、`ObjectPool::resize`） |
+| 留存（`idle_cap`） | 仅 idle 槽位，按片 `share(idle_cap, shards, idx)` 均分（各片之和 = 配置值） | 归还时 home 片满 ⇒ 迁入有余量的片（`alive` 随迁）；全池余量零 ⇒ 丢弃 + `core.dropped_overflow += 1` + 审计 `OverflowDropped` | 是：缩容裁剪逐片串行，窗口内 `core.idle` 可短时高于新 `idle_cap`，裁剪完成即收敛到新上界 | `core.dropped_overflow` 只数**容量因**（idle 满 / 全池余量零 / resize 裁剪），与 `reset_panicked`（钩子因）分账 | `objpool.rs`（`ObjectPool::return_to_shard`、`ObjectPool::resize`） |
+| 字节（`ByteBudget::total`） | **仅 idle 常驻字节**（`weight(&T)` 现值，`Vec` 类按 `capacity()`）；借出对象不计 | 入 idle 槽（归还 / `insert`）时 `try_take` 原子 check+act；余额不足 ⇒ 返回 `false`，调用方按容量因丢弃（无「认领一半」） | 否：`held <= total` 恒成立；**借出即回卷**（`give_back`）——所以 `total` 不是进程内存上限，也不是借出对象内存上限 | `metrics().idle_bytes` = 预算已认领字节（**共享预算**下 = 全局 held，不构成按池归因）；`byte_budget` = 构造期总额；未启用两者恒 0 | `objpool.rs`（`ByteBudget::try_take`、`ObjectPool::budget_admits`） |
+| 降级（`degraded`） | 宇宙满后直构的对象：不入宇宙、不占字节预算 | 直接调工厂（`degraded` +1、`constructed` +1），归还即释放、永不进 idle | 允许「交给调用方的对象数 > `max`」——ADR 0010 的有意设计，不是记账漏洞 | `degraded` = 降级直构次数；`constructed` = 工厂调用总数（含降级）——两独立计数，禁互推 | `objpool.rs`（`ObjectPool::pop_or_build` 的降级直构分支） |
 
 ```rust
 pub enum ResetPhase { OnReturn, OnAcquire }        // reset 钩子相位
@@ -766,16 +768,16 @@ assert_eq!(n.load(std::sync::atomic::Ordering::Relaxed), 1);
 
 ### 资源上限四问 — memgov 三件
 
-`ByteBudget` 类型住 `objpool`（根重导出 `skeleton_infra::ByteBudget`，`lib.rs:179`），与 `ObjectPool` 的字节轴同源——本节从「预算」视角钉四问，池内三轴见 [§ObjectPool](#objectpool--通用对象池有状态对象reset-钩子--有界降级--分片槽位)。
+`ByteBudget` 类型住 `objpool`（根重导出 `skeleton_infra::ByteBudget`，`lib.rs` 的 `pub use objpool::…`），与 `ObjectPool` 的字节轴同源——本节从「预算」视角钉四问，池内三轴见 [§ObjectPool](#objectpool--通用对象池有状态对象reset-钩子--有界降级--分片槽位)。
 
 | 入口 | ①覆盖群体 | ②满容量行为 | ③超配中间态与收敛 | ④读数口径 | 代码锚 |
 |---|---|---|---|---|---|
-| `BoundedRegistry::capacity` | 条目数（`len`），**不约束值体量** | `Eviction::Reject` ⇒ `Err(BoundError { capacity })` 且原内容不动；`Eviction::EvictOldest` ⇒ 先 `pop_first()`（首键）再插；已存在 key = 覆盖（`len` 不变，不触发淘汰） | 否：判定与插入同函数内完成，`len <= capacity` 恒成立；`Clone` 是深拷贝，副本容量语义逐句柄独立 | `len()` / `capacity()`；`BoundError.capacity` 回报撞上的上界 | `memgov.rs:64`、`memgov.rs:79` |
-| `MemoryPool::max` | `created` = idle 槽 + 借出在外 + **工厂创建中预留**（issue#100；**槽位锁内** check-and-act：`inner.created < inner.max`） | 闲槽空且 `created == max` ⇒ condvar park 至调用方期限，到期 `Err(PoolAcquireTimeout)`（`Duration::ZERO` = 非阻塞尝试）；有配额空位则工厂**锁外**新建（panic 经配额回滚后原样传播） | 是：`resize` 缩容只弃超限 idle（`created` 同步递减），借出句柄不受影响 ⇒ `created` 可短时 > 新 `max`，随归还跌破（丢弃路径 `created -= 1`） | `metrics().core`：`max` 当前配置 / `idle` 闲槽 / `borrowed` 在外（**不含**在途工厂预留）/ `dropped_overflow` 容量因丢弃累计 / `watermark = borrowed / max`；`MemoryPoolMetrics.idle_cap` 单列；创建中数量用 `slot_snapshot().created − idle − borrowed` 反推（`feature = "testing"`） | `memgov.rs:558`、`memgov.rs:568` |
-| `MemoryPool::idle_cap` | 闲槽上限（收回留裁决） | 归还时判 `idle < idle_cap && idle + borrowed < max`；不满足 ⇒ 对象析构 + `created` 配额回吐 + `dropped_overflow` +1 | 仅账本瞬窗：缩容在同一临界区 `truncate` idle，`PoolBase` 账本更新跟在槽位锁之后（一次 `note_idle_delta` 延迟）——是读数时序，不是容量击穿 | `MemoryPoolMetrics.idle_cap` = 当前配置（resize 可调） | `pool.rs:329`（裁决）、`memgov.rs:718`（调用点） |
-| `ByteBudget::total` | **仅 idle 常驻字节**（多池共享同一份 `Arc<ByteBudget>` 时 = 各池 idle 之和） | `try_take` 单字原子 CAS check+act（无锁）：余额不足返回 `false`，调用方按容量因丢弃；`n == 0` 恒 `true`（未启用计量面的调用点短路） | 否：`held <= total` 恒成立（总额构造期定死、不可 resize）；借出 / prune / resize 裁剪经 `give_back` 回卷，下溢 = 记账 bug ⇒ panic | `total()` 总额、`held()` 已认领、`available()` 余额；共享预算下 `ObjectPool::metrics().idle_bytes` = 全局 held，**不构成按池归因** | `objpool.rs:411`、`objpool.rs:394` |
+| `BoundedRegistry::capacity` | 条目数（`len`），**不约束值体量** | `Eviction::Reject` ⇒ `Err(BoundError { capacity })` 且原内容不动；`Eviction::EvictOldest` ⇒ 先 `pop_first()`（首键）再插；已存在 key = 覆盖（`len` 不变，不触发淘汰） | 否：判定与插入同函数内完成，`len <= capacity` 恒成立；`Clone` 是深拷贝，副本容量语义逐句柄独立 | `len()` / `capacity()`；`BoundError.capacity` 回报撞上的上界 | `memgov.rs`（`BoundedRegistry::new`、`BoundedRegistry::insert`） |
+| `MemoryPool::max` | `created` = idle 槽 + 借出在外 + **工厂创建中预留**（issue#100；**槽位锁内** check-and-act：`inner.created < inner.max`） | 闲槽空且 `created == max` ⇒ condvar park 至调用方期限，到期 `Err(PoolAcquireTimeout)`（`Duration::ZERO` = 非阻塞尝试）；有配额空位则工厂**锁外**新建（panic 经配额回滚后原样传播） | 是：`resize` 缩容只弃超限 idle（`created` 同步递减），借出句柄不受影响 ⇒ `created` 可短时 > 新 `max`，随归还跌破（丢弃路径 `created -= 1`） | `metrics().core`：`max` 当前配置 / `idle` 闲槽 / `borrowed` 在外（**不含**在途工厂预留）/ `dropped_overflow` 容量因丢弃累计 / `watermark = borrowed / max`；`MemoryPoolMetrics.idle_cap` 单列；创建中数量用 `slot_snapshot().created − idle − borrowed` 反推（`feature = "testing"`） | `memgov.rs`（`MemoryPool::acquire`，内含 `created < max` 槽位锁内判决） |
+| `MemoryPool::idle_cap` | 闲槽上限（收回留裁决） | 归还时判 `idle < idle_cap && idle + borrowed < max`；不满足 ⇒ 对象析构 + `created` 配额回吐 + `dropped_overflow` +1 | 仅账本瞬窗：缩容在同一临界区 `truncate` idle，`PoolBase` 账本更新跟在槽位锁之后（一次 `note_idle_delta` 延迟）——是读数时序，不是容量击穿 | `MemoryPoolMetrics.idle_cap` = 当前配置（resize 可调） | `pool.rs`（`PoolBase::note_return`，裁决）、`memgov.rs`（`PoolGuard::drop` 经 `note_return_with`，调用点） |
+| `ByteBudget::total` | **仅 idle 常驻字节**（多池共享同一份 `Arc<ByteBudget>` 时 = 各池 idle 之和） | `try_take` 单字原子 CAS check+act（无锁）：余额不足返回 `false`，调用方按容量因丢弃；`n == 0` 恒 `true`（未启用计量面的调用点短路） | 否：`held <= total` 恒成立（总额构造期定死、不可 resize）；借出 / prune / resize 裁剪经 `give_back` 回卷，下溢 = 记账 bug ⇒ panic | `total()` 总额、`held()` 已认领、`available()` 余额；共享预算下 `ObjectPool::metrics().idle_bytes` = 全局 held，**不构成按池归因** | `objpool.rs`（`ByteBudget::try_take`、`ByteBudget::total`） |
 
-- **观测面 ≠ 准入面**：`CountingAllocator::live_bytes` 一类读数是进程级观测（含测试框架自身分配），不能当池的准入判据；准入/裁决只有三处 check-and-act——`created < max`（槽位锁内，`memgov.rs:568`）、`idle < idle_cap && idle + borrowed < max`（槽位锁内，`pool.rs:329`）、`held + n <= total`（单字原子 CAS，`objpool.rs:411`）。`metrics()` 全是纯读数。
+- **观测面 ≠ 准入面**：`CountingAllocator::live_bytes` 一类读数是进程级观测（含测试框架自身分配），不能当池的准入判据；准入/裁决只有三处 check-and-act——`created < max`（槽位锁内，`memgov.rs` 的 `MemoryPool::acquire`）、`idle < idle_cap && idle + borrowed < max`（槽位锁内，`pool.rs` 的 `PoolBase::note_return`）、`held + n <= total`（单字原子 CAS，`objpool.rs` 的 `ByteBudget::try_take`）。`metrics()` 全是纯读数。
 
 ### 计数分配器与泄漏断言
 
@@ -2700,7 +2702,44 @@ impl ViewBridge<S, A, M, I, J, R> {
 
 **装配期与通知期 panic 的收容面（#167）**：`ViewMap::bindings()` / 编码器 `covers()` 的 panic 在装配边界换成 typed `MountError::{DeclarationsPanicked, CoveragePanicked { channel }}`——不裸 panic、Err 路径不留半装配桥（`store.subscribe` 在 catch/编译之后）；`input_changed`（哨兵）panic 在桥边界收容：计数 + 毒化 + **fail-open 投影**（判不出「未变」不吞成「未变」），`SyncStore` 订阅不被摘除；`project` panic 保留 last-known-good 并标不完整。
 
-**采用方代码零锁内与 `M::View: Send + Sync` 门槛（#140）**：`ViewBridge` 的已提交投影值以不可变 `Arc` 句柄存放——桥内互斥量（`core` / `region`）下**只搬句柄与代次**，不执行任何采用方代码。运行期一律锁外的调用点：`JsonEncoder::to_json`、`RegionEncoder::encode`、`RegionBacking::{len, with_bytes, with_bytes_mut, store/load_publish_seq}`，以及 `M::View` 的 `PartialEq`（变更细闸）、`Clone`（**桥内零调用**：句柄共享取代值拷贝）与退役值的 `Drop`；两个 `covers()` 只在 `mount`（桥尚不存在的装配期）各求值一次并缓存，运行期零调用。两阶段协议：锁内捕获 `Arc` 句柄 + 提交代次 / 逐绑定脏代次 → 锁外跑采用方代码 → 锁内校验令牌后提交。JSON 交付只清**捕获到的那一代**脏位（编码期间竞态的新脏写留着，下批仍交付）；编码器 panic ⇒ 整批原子失败（不交付半成品、不清脏、不推进交付游标），桥保持可用并经 `PatchBatch::resync` / `SnapshotError::Incomplete` 显形。**锁序**：`core` 与 `region` 从不同时持有（唯一嵌套是 `region_failure → region`）；封板后 `bind` 直接 `Sealed`——这是「`core→region` 与 `region→core` 互斥」的状态机前提，若未来允许 sealed 后 bind 或改变封板顺序，必须重审锁序。**门槛（新增，编译期 E0277）**：`M::View` 必须 `Send + Sync`（`ViewMap::View` 自身约束 `Clone + PartialEq + Send + 'static` **不变**）——原因：`Arc<V>: Send` 要求 `V: Send + Sync`，而桥跨线程共享；受影响形态为 `View` 含 `Cell` / `RefCell` / 裸指针包装等 `Send + !Sync` 类型，逃生口 = 换成可共享视图类型或不挂到桥上（容器/投影面本身仍可用），与 #157 机制胞的门槛同质。
+**采用方代码零锁内与 `M::View: Send + Sync` 门槛（#140）**：`ViewBridge` 的已提交投影值以不可变 `Arc` 句柄存放——桥内互斥量（`core` / `region`）下**只搬句柄与代次**，不执行任何采用方代码。运行期一律锁外的调用点：`JsonEncoder::to_json`、`RegionEncoder::encode`、`RegionBacking::{len, with_bytes, with_bytes_mut, store/load_publish_seq}`，以及 `M::View` 的 `PartialEq`（变更细闸）、`Clone`（**桥内零调用**：句柄共享取代值拷贝）与退役值的 `Drop`；两个 `covers()` 只在 `mount`（桥尚不存在的装配期）各求值一次并缓存，运行期零调用。两阶段协议：锁内捕获 `Arc` 句柄 + 提交代次 / 逐绑定脏代次 → 锁外跑采用方代码 → 锁内校验令牌后提交。JSON 交付只清**捕获到的那一代**脏位（编码期间竞态的新脏写留着，下批仍交付）；编码器 panic ⇒ 整批原子失败（不交付半成品、不清脏、不推进交付游标），桥保持可用并经 `PatchBatch::resync` / `SnapshotError::Incomplete` 显形。**锁序**：`core` 与 `region` 从不同时持有（唯一嵌套是 `region_failure → region`）；封板后 `bind` 直接 `Sealed`——这是「`core→region` 与 `region→core` 互斥」的状态机前提，若未来允许 sealed 后 bind 或改变封板顺序，必须重审锁序。**门槛（新增，编译期 E0277）**：`M::View` 必须 `Send + Sync`（`ViewMap::View` 自身约束 `Clone + PartialEq + Send + 'static` **不变**）——原因：`Arc<V>: Send` 要求 `V: Send + Sync`，而桥跨线程共享；受影响形态为 `View` 含 `Cell` / `RefCell` 等 `Send + !Sync` 类型（`Rc`、裸指针本来就过不了 `ViewMap::View` 的 `Send`，不算新增受限），逃生口与迁移做法见下段，与 #157 机制胞的门槛同质。
+
+**迁移：视图类型为什么必须 `Send + Sync`（#232，`ViewBridge` 采用契约的一部分）**：桥把已提交的投影值存成不可变 `Arc` 句柄，并在锁外把这些句柄交给可能来自别的线程的回调（比对、编码、退役析构）。`Arc<V>` 要能跨线程共享，就需要 `V: Send + Sync`——这是「共享不可变快照」所有权模型的直接后果，不是内部优化，也不会挪到 `ViewMap` trait 或无关消费者上。`Cell` / `RefCell` 型的视图值是 `Send + !Sync`：`ViewMap` 本身照常接受（`ViewMap::View` 的约束只到 `Send`），但**不能直接当作跨线程桥快照**，挂到 `ViewBridge` 会在装配点编译失败。做法：在桥边界把领域状态投影成**自有的、不可变的、线程安全**的快照（纯数据 enum / struct）；共享可变的领域状态请在 `project` 里**读出来再发布**，不要把非线程安全的内部件透过桥暴露出去。
+
+```rust
+use std::cell::Cell;
+use skeleton::view::{BindingDecl, PayloadTag, ViewMap};
+
+struct Model { hits: u32 }
+
+// ✗ 迁移前：视图带 Cell。直接投影照常可用，但挂不上 ViewBridge：
+//    error[E0277]: `Cell<u32>` cannot be shared between threads safely
+//    note: required by a bound in `ViewBridge`（`M::View: Send + Sync`）
+#[derive(Clone, PartialEq)]
+enum HitsCell { Hits(Cell<u32>) }
+
+struct CellMap { decls: Vec<BindingDecl> }
+impl ViewMap<Model> for CellMap {
+    type View = HitsCell;
+    fn bindings(&self) -> &[BindingDecl] { &self.decls }
+    fn project(&self, _index: usize, state: &Model) -> HitsCell {
+        HitsCell::Hits(Cell::new(state.hits))
+    }
+}
+
+// ✓ 迁移后：在桥边界投影出自有的、不可变的线程安全快照
+#[derive(Clone, PartialEq)]
+enum Hits { Hits(u32) }
+
+struct HitsMap { decls: Vec<BindingDecl> }
+impl ViewMap<Model> for HitsMap {
+    type View = Hits;
+    fn bindings(&self) -> &[BindingDecl] { &self.decls }
+    fn project(&self, _index: usize, state: &Model) -> Hits { Hits::Hits(state.hits) }
+}
+```
+
+上例三件事均已用独立工程实编验证：`CellMap` 不挂桥直接投影可编译可运行；`HitsMap` 经 `ViewBridge::mount` 装配成功；`ViewBridge::mount(store, CellMap::new(), …)` 报上面那条 E0277。
 
 **热路径分配面（#169/#174）**：区域发布走**复用批缓冲**——编码器经 `RegionWriter` 的段窗口（`with_buffer` / `begin_segment`）把每段 TLV **直接写进**桥独占的批缓冲（`Seg` 只记 `(entry, len, at)` 偏移），`execute_plan` 再把这批字节一次拷进背衬、**填充字节在目标区就地补零**；因此稳态发布是「每变更绑定 **0 次分配 / 1 次拷贝**」，只余每拍常数 2 次（索引镜像 `entries.clone()` + 段落位表，按 issue「可证明可忽略即有意保留」）。`RegionWriter::json_blob` 直接 `serde_json::to_writer` 进缓冲（不再 `to_string()` 整段临时 String），失败回退到段前不留半截 TLV。通知面把 `pending` / `changed` / `retired` / `prev` 四块容量与区域批缓冲放进**单个 scratch 槽**（`Mutex<Option<Scratch>>` + `Option::take` 移出 = 独占，**无 unsafe、不扩 `DrainExclusive` 证明**）：取用是**惰性**的——哨兵全报未变的快路径不取不放（零新增取锁、零分配）；变更拍多 2 次取锁，换掉每拍 4~6 次分配；并发通知取不到槽就临时新建（行为不变，只多分配）。归还时句柄在**锁外** `recycle`（采用方 `Drop` 不落桥内锁）。实测（本机 release，确定性事件计数，预热后）：`#169` 每拍分配 = `N+2`（N = 变更绑定数，每绑定恰 1 次 = 投影值 `Arc::new`）；`#174` 每拍 = 每绑定 1 次 + **常数 0**（全投影与哨兵过滤两种 workload 同口径；过滤档 1/16/64/256 绑定均为 1 次/拍）。A/B 配对（复用+2 取锁 vs 不复用+0 取锁，4 轮交替）：p50 改善 7%~57%（12/12 臂同向），**无历史基线二进制对照**（对照臂 = 等价改前行为的变异）。锚：`tests/view_bridge_test.rs` 的 `region_publish_has_no_per_binding_allocation` / `notify_scratch_reuse_keeps_per_action_cost_flat`；顺序/补零锚：`region_publish_order_and_padding_are_unchanged`（录制背衬 + `0xAA` 预置字节）。
 

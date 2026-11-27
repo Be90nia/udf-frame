@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Docs / Test / Ci: 12 维审计补强——panic 计数恢复「恰好一次」、本地 feature 矩阵门、行号锚改符号锚、ViewBridge 迁移节（#232）
+- **测试（行为不变）**：`udf-skeleton-infra` 与 `udf-std-ext` 的 `embedded_event_contains_subscriber_panic_and_counts_it` 断言由基线下界恢复为**恰好 +1**——panic 计数新增线程局部测试窗口（仅 `cfg(all(test, feature = "log-embed"))`，进程级计数语义不变），并新增邻居隔离测试 `panics_on_neighbor_threads_stay_out_of_the_armed_window`（邻居线程各触发一次 panic 后，本线程窗内仍恰为 1）。
+- **本地门禁**：新增 `scripts/feature_matrix.py`（仅标准库）——直接读 `.github/workflows/ci.yml` 的 feature 隔离矩阵（唯一事实源），逐组合跑 check / test / doc；支持 `--list` / `--only <feature>`。本机需配 `RUSTUP_TOOLCHAIN=1.96.0`。
+- **consumer-sim**：`src/main.rs` 在 `block_on` 之外实测 `AdmissionError::NoRuntime`（typed 拒绝、不 panic、不计入 `rejected`）；`MIGRATION.md` 补枚举扩容说明。
+- **文档**：`docs/reference.md` 的 55 处行号锚中 45 处已陈旧、5 处弱匹配，改为符号名定位（仅保留 2 处逐条核对仍准确的坐标）；§view 新增「视图类型为什么必须 `Send + Sync`」迁移节（#232，含前后对照示例，经独立工程实编验证）；§资源上限与默认值 的预算三行按 #231 评审更正口径；ADR 0008 追加「§11 后续修订」；新增 `docs/research/wave7-external-benchmarks.md`（外部对标取证）与 ADR 0011（Proposed）。
+- **破坏性变更定性（#232 维护者拍板）**：`ViewBridge` 的 `M::View: Send + Sync` 保留，属 `ViewBridge` 采用契约的一部分；门槛不进 `ViewMap` trait，非桥用法不受影响。
+
 ### Performance(view): 区域发布与通知热路径去掉每绑定分配（#169/#174）
 - **区域发布（#169）**：段字节不再为每个绑定分配临时 `Vec`——编码器经 `RegionWriter` 的段窗口（`with_buffer` / `begin_segment`）**直接写进**桥独占的可复用批缓冲（`Seg` 只记 `(entry, len, at)` 偏移），`execute_plan` 把这批字节一次拷进背衬、**填充字节在目标区就地补零**。⇒ 每变更绑定 **0 次分配 / 1 次拷贝**（原为 `to_vec()` + 二次 clone）；每拍仅余常数 2 次分配（索引镜像 `entries.clone()` + 段落位表，按 issue「可证明可忽略即有意保留」）。`RegionWriter::json_blob` 改为 `serde_json::to_writer` 直写缓冲（省一次整段 `String`），失败回退到段前不留半截 TLV。**发布顺序（payload → index → header）、固定容量/地址稳定、单批 `with_bytes_mut` 边界不变**（录制背衬 + `0xAA` 预置字节的独立读侧反证）。
 - **通知热路径（#174）**：`pending` / `changed` / `retired` / `prev` 与区域批缓冲的容量复用同一**独占 scratch 槽**（`Mutex<Option<Scratch>>` + `Option::take` 移出 = 独占，**无 unsafe、不扩 `DrainExclusive` 证明**）；取用**惰性**——哨兵全报未变的快路径零新增取锁、零分配；变更拍多 2 次取锁，换掉每拍 4~6 次分配；并发通知取不到槽则临时新建（行为不变）。归还时句柄在**锁外** `recycle`（采用方 `Drop` 不落桥内锁）。1/16/64/256 绑定、两种 workload 下每拍分配从「每绑定 1 次 + 每拍 4~6 次」降到「每绑定 1 次 + 0」。
@@ -66,6 +73,7 @@
 - **计数**：`causal_work_budget_exceeded()` / `segment_effect_budget_exceeded()` / `drain_lease_yields()`，与深度预算的 `feedback_budget_exceeded()` 分账；数值与口径见 `docs/reference.md` §资源上限与默认值。
 - **兼容**：以前能跑通、但单根扇出 > `16384` 或单 reducer 一次吐 > `4096` 条效果的程序，现在会得到停放 / 拒收 / typed 失败——逃生口 = 对应预算置 `0`。
 - **测试**：`tests/causal_budget.rs`（14 条，含**非 tokio 线程**上的让出）+ `src/runtime.rs` 白盒探针 4 条（让出窗口内接手 / 非等待型入口让出闸 / Emit 与同栈回灌两条预留原子性）。
+- **口径更正（2026-11-27，#231 维护者评审；本轮无行为改动）**：三项均为**条数界**，不是字节界 / 内存界；默认值 16384 / 4096 / 4096 是**临时兼容基线**（非实测定稿值）；per-drain 值是**协作让出阈值**而非严格上限（经 `try_dispatch` / `ActionSender::dispatch` 夺得租约者在完成边界前不让出）；per-reducer 当前语义（提交点生效、超量 `Run` / `Cancel` 为提交后部分失败）**未被追认为完整资源界**，改为「暂存期即受界 + reducer 转换全有或全无」的契约见 ADR-0011（Proposed，实现待授权）。
 
 ### Changed(view): `Derived` / `Sentinel` 采用方代码移出胞锁（两阶段代际协议）+ 线程共享门槛收紧（#157）
 - **锁边界**：`Derived::get` / `Sentinel::changed` 的 `input` / `extract` / `compute`、`In::eq`、`Out::clone` 与缓存旧值 `Drop` 全部在内部互斥量**之外**执行（临界区内只剩 `Arc` 句柄搬移与代际记账）——可重入同一个胞，panic 不毒化（原样穿出，胞照常可用）。
