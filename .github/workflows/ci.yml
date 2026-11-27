@@ -207,6 +207,7 @@ jobs:
   # "small, intentional" 约束）。
   # 工具链经 dtolnay/rust-toolchain@1.96.0 安装，裸 cargo 即 1.96.0
   # （本机 stable ICE 需 +1.96.0 前缀属本机适配，CI 无此问题）。
+  # 本地等价门（矩阵唯一事实源 = 本文）：python scripts/feature_matrix.py
   feature-isolation:
     name: feature isolation (${{ matrix.feature }})
     runs-on: ubuntu-latest
