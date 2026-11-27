@@ -1854,12 +1854,60 @@ fn view_notify(c: &mut Criterion) {
     group.finish();
 }
 
+// ---- effect_push_forms：单条 `push` vs 批量 `push_batch` 的逐条成本（issue#237）----
+//
+// 两臂在**同一二进制、同一次运行**内对照（对照的是两条代码路径，不是历史基线
+// ⇒ 无跨版本漂移）。两臂写进同一个**有限上限**的缓冲（上限远大于批量 ⇒ 只测
+// 边界判断路径，不测溢出分支），`Throughput::Elements(k)` 把读数折算成「每条」。
+// 期望：批量臂抹掉「每条一次额度判断」，逐条成本随 k 增大而明显下降；单条臂
+// 保持票① 的即时硬界（对任意旧 reducer 不可省）。
+fn effect_push_forms(c: &mut Criterion) {
+    const CAP: usize = 1 << 20;
+    let mut group = c.benchmark_group("effect_push_forms");
+    for k in [1usize, 4, 16, 64, 256, 1024, 4096] {
+        group.throughput(Throughput::Elements(k as u64));
+        let mut buf: skeleton::EffectBuf<u64, Infallible> = skeleton::EffectBuf::new();
+        group.bench_function(format!("push/k{k}"), |b| {
+            b.iter(|| {
+                buf.clear();
+                buf.set_effect_cap(CAP);
+                for _ in 0..k {
+                    buf.push(black_box(Effect::Emit(0u64)));
+                }
+                black_box(buf.len())
+            })
+        });
+        group.bench_function(format!("batch/k{k}"), |b| {
+            b.iter(|| {
+                buf.clear();
+                buf.set_effect_cap(CAP);
+                buf.push_batch(black_box((0..k).map(|_| Effect::Emit(0u64))));
+                black_box(buf.len())
+            })
+        });
+        // 对照臂：**无上限**的单条 push（其余形状完全相同）⇒ 两臂之差就是
+        // 「每次插入一次额度判断」本身的成本（若被编译器提到循环外则≈0）。
+        group.bench_function(format!("push_nocap/k{k}"), |b| {
+            b.iter(|| {
+                buf.clear();
+                buf.set_effect_cap(0); // 0 = 不限
+                for _ in 0..k {
+                    buf.push(black_box(Effect::Emit(0u64)));
+                }
+                black_box(buf.len())
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     fxscope_spawn_join,
     journal_append_line,
     effect_steady_state,
     effect_batch_forward,
+    effect_push_forms,
     dispatch_per_beat,
     notify_dispatch,
     object_pool_acquire_drop,
