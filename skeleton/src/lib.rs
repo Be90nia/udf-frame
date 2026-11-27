@@ -619,6 +619,24 @@ impl<A, Op> EffectBuf<A, Op> {
             return;
         }
         let mut iter = effects.into_iter();
+        // 选路（只影响性能，不影响语义）：小批量且容量已够时走逐条路径——批量
+        // 路径的固定开销（≈3 ns/次）在小 k 上更贵；否则走快照 / `reserve` 路径
+        // （把多次扩容压成一次）。`size_hint` 在这里**只用于选路**，谎报不影响边界。
+        const SMALL_BATCH: usize = 16;
+        let hint = iter.size_hint().0;
+        if hint < SMALL_BATCH {
+            // 容量检查只在小批量分支里做（大批量路径不为它付代价）。
+            let spare = self.effects.capacity() - self.effects.len();
+            if spare >= hint {
+                for effect in iter {
+                    self.push(effect);
+                    if self.overflowed {
+                        break;
+                    }
+                }
+                return;
+            }
+        }
         match self.remaining_limit() {
             None => self.effects.extend(iter),
             Some(remaining) => {
