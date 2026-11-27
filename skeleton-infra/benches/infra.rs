@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use skeleton::notify::{Notify as _, NotifySink};
 use skeleton::view::{BindingDecl, IntentMap, PayloadTag, ViewMap};
-use skeleton::{Effect, EffectBuf, Fragment, FragmentInto, Infallible, Reducer, Store as _};
+use skeleton::{Effect, EffectBuf, Fragment, Infallible, Reducer, Store as _};
 use skeleton_infra::fx::FxScope;
 use skeleton_infra::memgov::{CountingAllocator, MemoryPool};
 use skeleton_infra::objpool::{ByteBudget, ObjectPool};

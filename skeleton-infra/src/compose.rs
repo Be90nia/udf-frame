@@ -648,7 +648,7 @@ impl<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L, I>
     }
 }
 
-/// 构造 [`CombineInto`]（六闭包/子件具名形态；宏 [`combine_into!`] 是便利包装）。
+/// 构造 [`CombineInto`]（六闭包/子件具名形态；宏 `combine_into!` 是便利包装）。
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn combine_into<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L, I>(
     get: G,

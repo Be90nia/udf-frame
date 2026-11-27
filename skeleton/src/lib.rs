@@ -780,9 +780,23 @@ impl<A, Op> StagingLease<'_, A, Op> {
     where
         F: FnMut(Effect<CA, CO>, &mut EffectBuf<A, Op>),
     {
-        while let Some(effect) = child.pop_front() {
-            self.release_one();
-            mapper(effect, self.buf);
+        match (self.outstanding, self.original) {
+            // 有限额度：用局部计数器推进（每条 pop 只写一次父上限，避免逐条
+            // 走 `release_one` 的两次 Option 解包——k 大时这是可测的固定成本）。
+            (Some(mut outstanding), Some(original)) => {
+                while let Some(effect) = child.pop_front() {
+                    outstanding = outstanding.saturating_sub(1);
+                    self.buf.cap = Some(original.saturating_sub(outstanding));
+                    mapper(effect, self.buf);
+                }
+                self.outstanding = Some(outstanding);
+            }
+            // 不限额度：不记账。
+            _ => {
+                while let Some(effect) = child.pop_front() {
+                    mapper(effect, self.buf);
+                }
+            }
         }
         if child.overflowed() {
             self.buf.mark_overflowed();
