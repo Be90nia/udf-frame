@@ -103,7 +103,8 @@ fn back_sender<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                     // 队列为空。契约（两条路径 + bool 的唯一含义）见
                     // skeleton::ActionSender::dispatch 的 rustdoc。
                     audit_enqueued_as_lease_winner(&inner, origin, first.as_ref());
-                    // 入口账本随行：本 action 完成边界之前不让出（见 drain_owned）。
+                    // 入口账本随行：让出后不持租约地等它终局，故返回值仍是「本
+                    // action 的完成边界」（见 drain_owned）。
                     drain_owned(&inner, first, Some(&ledger));
                     true
                 }
@@ -644,6 +645,11 @@ struct StoreInner<S, A, Op> {
     /// 让出停靠闸（**仅 `cfg(test)`**）：让出窗口（已放旗、尚未重新竞争）停靠。
     #[cfg(test)]
     yield_gate: CapacitySettle,
+    /// 交接计数（**仅 `cfg(test)`**）：重新竞争失败的次数 = **真的有人接手**的次数。
+    /// 让出计数 [`SyncStore::drain_lease_yields`] 不区分「让出后自己重夺」，故交接
+    /// 证据只能用本探针（非公共 API）。
+    #[cfg(test)]
+    handoffs: AtomicU64,
     /// 预留停靠闸（**仅 `cfg(test)`**）：因果后代预留临界区**之前**（未持 queue
     /// 锁）停靠——预留原子性探针的可观测窗口。
     #[cfg(test)]
@@ -1935,6 +1941,8 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             #[cfg(test)]
             yield_gate: CapacitySettle::new(),
             #[cfg(test)]
+            handoffs: AtomicU64::new(0),
+            #[cfg(test)]
             reserve_gate: CapacitySettle::new(),
             #[cfg(test)]
             notify_sub_gate: CapacitySettle::new(),
@@ -2318,8 +2326,9 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// **同栈回灌撞 per-root 因果工作量预算**（issue#105/#144）：超出的子动作被
     /// 停放 ⇒ 返回 [`AdmissionOutcome::Accepted`]（仍归本 store，结果由根账本
     /// 承担）；停放区满被拒收 ⇒ 返回 [`AdmissionOutcome::Full`]（未留存，显式
-    /// 拒绝）。另：静默态夺得的租约在本 action 完成边界之后可能按 per-drain
-    /// 预算让出（[`Self::set_drain_work_budget`]）——不影响上述完成边界保证。
+    /// 拒绝）。另：静默态夺得的租约在本 action 完成边界**之前**也可能按 per-drain
+    /// 预算让出（[`Self::set_drain_work_budget`]，ADR-0011 §2.4）——让出后本线程
+    /// 不持租约地等自己的入口账本终局，故上述完成边界保证不变。
     pub fn try_dispatch(&self, action: A) -> AdmissionOutcome {
         if self.is_closed() {
             self.inner
@@ -2355,7 +2364,8 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             }
             Enqueue::Draining(_, ledger, first) => {
                 audit_enqueued_as_lease_winner(&self.inner, origin, first.as_ref());
-                // 非等待型入口：账本随行，本 action 完成边界之前不让出。
+                // 非等待型入口：入口账本随行并由本线程认领——到界照样让出所有权，
+                // 让出后不持租约地等它终局（返回仍是本 action 的完成边界）。
                 drain_owned(&self.inner, first, Some(&ledger));
                 AdmissionOutcome::Accepted
             }
@@ -2460,15 +2470,18 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     }
 
     /// per-drain 租约工作量预算（issue#144）：`cap` = 单个排空租约连续出队处理的
-    /// 记录数上限；`0` = 不限。到界且主队列非空即**让出**排空租约：放旗后重新
-    /// 竞争，窗口内到达的外部 push / [`Self::resume_deferred`] / [`Self::close`]
-    /// 可接手剩余队列（FIFO 不变、无丢失、无重复），无人接手则原线程续排——
-    /// 不依赖外部流量，无自死锁。单写者不变：所有权只在 `queue` 锁内转移。让出
-    /// 只用 `std::thread::yield_now`，与异步运行时无关。
+    /// 记录数上限；`0` = 不限。到界且主队列非空即**让出所有权**（ADR-0011 §2.4）：
+    /// 放旗解锁，窗口内到达的外部 push / [`Self::resume_deferred`] /
+    /// [`Self::close`] 可接手剩余队列（FIFO 不变、无丢失、无重复）；判定已被接手
+    /// 时，让出者**不持租约**地等**自己入口账本**的终局（与回执同一等待原语），
+    /// 醒来即返回；无人接手则原线程重新夺得租约续排——不依赖外部流量，无自死锁、
+    /// 无队列搁浅。单写者不变：所有权只在 `queue` 锁内转移。让出只用
+    /// `std::thread::yield_now`，与异步运行时无关。
     ///
-    /// 例外：经 [`Self::try_dispatch`] / [`skeleton::ActionSender::dispatch`] 夺得
-    /// 租约的调用方，在**自己的 action 完成边界之前不让出**（契约层的「静默态
-    /// 返回即完成边界」优先）。让出次数见 [`Self::drain_lease_yields`]。
+    /// **协作让出阈值，不是严格上限**：无人接手时同一线程连续排空整条队列，
+    /// `cap` 只决定它隔多久放一次手（否则队列搁浅）；有竞争生产者时接手的租约
+    /// 按自己的预算推进，队列可被推得比 `cap` 更远。让出次数见
+    /// [`Self::drain_lease_yields`]。
     pub fn set_drain_work_budget(&self, cap: usize) {
         self.inner.drain_work_budget.store(cap, Ordering::Relaxed);
     }
@@ -3387,6 +3400,22 @@ impl<S, A, Op> Drop for DrainGuard<'_, S, A, Op> {
     }
 }
 
+/// 入口账本的交接认领（ADR-0011 §2.4）：持有期间该账本**不可能进复用池**
+/// （`claim_release` 见 `waiter` 即拒），故交接等待可以安全地睡在它的终局上。
+/// Drop 用 [`release_ledger_by_waiter`] 收口——正常出口与 panic 展开同一条路径，
+/// 「恰好一次进池」由账本的 `released` 守卫兜底（重复归还为空操作）。
+struct EntryClaim<'a, S, A, Op> {
+    inner: &'a Arc<StoreInner<S, A, Op>>,
+    ledger: Arc<Ledger>,
+}
+
+impl<S, A, Op> Drop for EntryClaim<'_, S, A, Op> {
+    fn drop(&mut self) {
+        // 终局未发布即归还 ⇒ 不入池（活账本绝不许进池，账本随最后一个 Arc 消亡）。
+        release_ledger_by_waiter(self.inner, &self.ledger);
+    }
+}
+
 /// 排空入口（close 路径与重入兜底）：夺排空权后交 [`drain_owned`]。
 /// dispatch 的常规路径不经过此函数——其夺权已并入 push 临界区
 /// （[`enqueue`]），同窗免二次加锁。
@@ -3411,18 +3440,33 @@ fn drain<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static
 /// 「重夺排空权」分支随窗口封死而不可达，rearm 机制随之删除（不变量由孤儿
 /// 监视测试与守恒竞速持续咬住）。
 ///
-/// **让出（issue#105/#144 per-drain 工作量预算）**：每出队处理
+/// **让出（issue#105/#144 per-drain 工作量预算；ADR-0011 §2.4）**：每出队处理
 /// [`DEFAULT_DRAIN_WORK_BUDGET`] 条记录（可配，`0` = 不限）即到让出点——持
-/// `queue` 锁判队列非空则放旗、重新竞争（见 [`yield_lease`]）。`entry` = 经
-/// `try_dispatch` / `ActionSender::dispatch` 夺得租约的调用方自己的账本：它们的
-/// 契约是「静默态返回即本 action 的完成边界」，故该 action 结算且其因果子树无
-/// 在途后代之前不让出；等待型入口 / `close` / `resume_deferred` 返回后自会等各自
-/// 的账本，传 `None` 即随时可让出。
+/// `queue` 锁判队列非空则让出**所有权**（放旗 + 解锁，见 [`yield_lease`]）。
+/// `entry` = 经 `try_dispatch` / `ActionSender::dispatch` 夺得租约的调用方自己的
+/// 账本：它们的契约是「静默态返回即本 action 的完成边界」，而**等完成不需要持
+/// 租约**——他人接手时本线程转去不持租约地等该账本终局（[`Ledger::wait`，与回执
+/// 等待面同一原语），醒来即返回；无人接手则让出者重新夺得租约续排（禁搁浅）。
+/// 等待型入口 / `close` / `resume_deferred` 返回后自会等各自的账本，传 `None`
+/// 即随时可让出。
 fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
     inner: &Arc<StoreInner<S, A, Op>>,
     first: Option<ActionRecord<A>>,
     entry: Option<&Arc<Ledger>>,
 ) {
+    // 交接等待的**归属认领**（ADR-0011 §2.4）：`entry` 账本原归框架（终局即入复用池），
+    // 而复用池 `reset` 会清掉终局——交接等待要睡在那个终局上，必须在**终局可能发布
+    // 之前**把归还权翻到本线程（本调用点入口记录尚未结算，`root_done` 必为 false ⇒
+    // 终局不可能已发布）。声明**先于** `guard`：panic 展开时 `guard` 先结算（发布
+    // 终局）、本守卫后归还，与正常出口同一顺序。
+    let entry_claim = match entry {
+        Some(ledger) if ledger.claim_handoff() => Some(EntryClaim {
+            inner,
+            ledger: Arc::clone(ledger),
+        }),
+        // 已终局（或在池内）：完成边界已成立 ⇒ 不认领、不等、不代还。
+        _ => None,
+    };
     let mut guard = DrainGuard {
         inner,
         armed: true,
@@ -3433,10 +3477,6 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
     let mut first = first;
     // 本租约已出队处理的记录数（per-drain 工作量预算的计量；首条记录也计入）。
     let mut work = usize::from(first.is_some());
-    // 入口 action 的让出闸：`entry_settled` = 入口记录已结算；`entry_complete` =
-    // 其因果子树已无在途后代（此后才允许让出，见函数文档）。
-    let mut entry_settled = false;
-    let mut entry_complete = entry.is_none();
     loop {
         let mut record = match first.take() {
             Some(record) => record,
@@ -3447,19 +3487,24 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                 // 让出点（per-drain 工作量预算）：到界先清零；队列空则无需让出，
                 // 下方 pop None 即走原出口协议。
                 let budget = inner.drain_work_budget.load(Ordering::Relaxed);
-                if budget > 0 && work >= budget {
+                if budget > 0 && work >= budget && !queue.is_empty() {
                     work = 0;
-                    if let Some(ledger) = entry {
-                        entry_complete |= entry_settled && ledger.has_no_inflight();
-                    }
-                    if entry_complete && !queue.is_empty() {
-                        if !yield_lease(inner, queue) {
-                            // 他人已接手剩余队列：本线程交出租约返回。
-                            guard.handoff();
-                            return;
+                    // 到界让出**所有权**（ADR-0011 §2.4）：等入口账本完成不需要持
+                    // 租约，故不再以入口完成作为让出的前置条件。
+                    if !yield_lease(inner, queue) {
+                        // 他人已接手剩余队列：本线程不持租约（也不持任何锁）地等自己
+                        // 的入口账本终局，醒来即返回——「返回即本 action 的完成边界」
+                        // 不变。账本已被本线程认领 ⇒ 等待期间不会被复用池 reset（终局
+                        // 是本账本自己的、不会丢唤醒）；终局若已发布则等待面立即返回。
+                        guard.handoff();
+                        if let Some(claim) = &entry_claim {
+                            // try_dispatch / sender 无结果面：终局只用于「等完成」，
+                            // typed 结局走 dispatch_with_receipt。
+                            let _ = claim.ledger.wait();
                         }
-                        queue = lock(&inner.queue);
+                        return;
                     }
+                    queue = lock(&inner.queue);
                 }
                 let Some(record) = queue.pop_front() else {
                     // 出口交接（M1）：持锁放旗——push 被锁外挡，锁内空即终局空；
@@ -3594,9 +3639,6 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                 // 同步等待路径。
                 inner.segment_effect_overflow.fetch_add(1, Ordering::SeqCst);
                 audit_emit(inner, AuditEventKind::SegmentEffectOverflow);
-                if let Some(ledger) = entry {
-                    entry_settled |= record.root && Arc::ptr_eq(ledger, &record.ledger);
-                }
                 if record.root {
                     record.ledger.finish_root_rejected();
                 } else {
@@ -3682,9 +3724,6 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // 前不发布终局——因果后代屏障：根调用者的同步边界覆盖其引发的子动作）。
         // 分段预算不再在这里结算：溢出的转换在提交之前就整次被拒（ADR-0011
         // §2.2），走不到本行。
-        if let Some(ledger) = entry {
-            entry_settled |= record.root && Arc::ptr_eq(ledger, &record.ledger);
-        }
         if record.root {
             record.ledger.finish_root(None);
         } else {
@@ -3796,7 +3835,8 @@ where
 ///
 /// 单写者：所有权唯一凭证是 `draining` 在 queue 锁内的 `swap(false→true)`；放锁后
 /// 到重新夺得之间本线程不触达任何排空态（无在途记录、无 TLS 帧、无 cell 借用）。
-/// 返回 `true` = 本线程仍是排空者；`false` = 他人已接手（调用方交出租约返回）。
+/// 返回 `true` = 本线程仍是排空者；`false` = 他人已接手（调用方**不得**再触碰队列
+/// 态：交出租约后改为不持租约地等自己的入口账本，见 [`drain_owned`]）。
 fn yield_lease<S, A, Op>(
     inner: &Arc<StoreInner<S, A, Op>>,
     queue: MutexGuard<'_, VecDeque<ActionRecord<A>>>,
@@ -3816,6 +3856,11 @@ fn yield_lease<S, A, Op>(
     let re_acquired = !inner.draining.swap(true, Ordering::AcqRel);
     #[cfg(test)]
     inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+    // 交接探针：重新竞争失败 = 他人**真的**接手了剩余队列（让出计数不区分这两者）。
+    #[cfg(test)]
+    if !re_acquired {
+        inner.handoffs.fetch_add(1, Ordering::SeqCst);
+    }
     re_acquired
 }
 
@@ -5372,6 +5417,12 @@ mod tests {
     struct Fan {
         log: FanLog,
         frame_ledger: FanFrameLedger,
+        /// 测试停靠点：命中的 `Leaf(k)` 在记账后停靠——用于让「接手者」停在
+        /// **持有租约、该记录未结算**的时刻（可同时布防多处）。
+        stalls: Vec<(usize, Arc<CapacitySettle>)>,
+        /// 测试停靠点：命中的 `Leaf(k)` 在停靠放行之后 panic——交接后的失败路径
+        /// （panic 在**接手者线程**上浮，根账本记 `Failed`）。
+        panics: Vec<usize>,
     }
 
     impl Reducer for Fan {
@@ -5390,6 +5441,14 @@ mod tests {
                 .push((a, std::thread::current().id()));
             *self.frame_ledger.lock().unwrap() = DRAIN_FRAMES
                 .with(|cell| cell.borrow().last().map(|frame| Arc::clone(&frame.ledger)));
+            for (leaf, gate) in &self.stalls {
+                if a == FanAct::Leaf(*leaf) {
+                    gate.park();
+                }
+            }
+            if self.panics.iter().any(|leaf| a == FanAct::Leaf(*leaf)) {
+                panic!("udf-frame test: 因果后代 reducer 爆炸（交接后的失败路径）");
+            }
             if let FanAct::Fan(n) = a {
                 for i in 0..n {
                     out.push(Effect::Emit(FanAct::Leaf(i)));
@@ -5424,18 +5483,38 @@ mod tests {
 
     /// 装配扇出 store（per-drain 预算 = `drain_budget`），连同观测面一起交出。
     fn fan_store(drain_budget: usize, fx: FanFx) -> (FanStore, FanLog, FanFrameLedger, FanInner) {
+        fan_store_with(drain_budget, fx, Vec::new(), Vec::new())
+    }
+
+    /// [`fan_store`] + reducer 停靠点（`stalls` 命中的叶子停靠、`panics` 命中的叶子
+    /// 在停靠放行后 panic）。
+    fn fan_store_with(
+        drain_budget: usize,
+        fx: FanFx,
+        stalls: Vec<(usize, Arc<CapacitySettle>)>,
+        panics: Vec<usize>,
+    ) -> (FanStore, FanLog, FanFrameLedger, FanInner) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let frame_ledger = Arc::new(Mutex::new(None));
         let store = Arc::new(SyncStore::new(
             Fan {
                 log: Arc::clone(&log),
                 frame_ledger: Arc::clone(&frame_ledger),
+                stalls,
+                panics,
             },
             fx,
         ));
         store.set_drain_work_budget(drain_budget);
         let inner = Arc::clone(&store.inner);
         (store, log, frame_ledger, inner)
+    }
+
+    /// 账本是否在复用池里（交接等待期间的「不可复用」判据）。
+    fn pooled_contains(inner: &FanInner, ledger: &Arc<Ledger>) -> bool {
+        lock(&inner.ledger_pool)
+            .iter()
+            .any(|pooled| Arc::ptr_eq(pooled, ledger))
     }
 
     /// 有界轮询到 `ready` 成立（OS 时钟截止；超时即 panic 报红，不挂死）。
@@ -5516,22 +5595,24 @@ mod tests {
         drop(log);
         assert_eq!(*store.snapshot(), 8);
         assert_eq!(store.pending_actions(), 0);
-        assert_eq!(
-            store.drain_lease_yields(),
-            1,
-            "只有 A 到界让出；接手者是 try_dispatch 入口，自己的 action 完成前不让出"
+        assert!(
+            store.drain_lease_yields() >= 2,
+            "A 到界让出一次；接手者（try_dispatch 入口）到界也让出——等完成不持租约\
+             （旧「入口完成前不让出」例外已被本票消解，此后由谁续排取决于调度）"
         );
         assert!(!inner.draining.load(Ordering::SeqCst), "静止态排空旗已放");
         assert_eq!(inner.in_flight.load(Ordering::SeqCst), 0);
     }
 
-    /// 非等待型入口的让出闸（per-drain 预算 = 1）：`try_dispatch` 在让出窗口内
-    /// 接手后，自己的 action（排在剩余队列之后）尚未处理 ⇒ 途中的到界点**不放
-    /// 旗**，返回即其完成边界（契约层对静默态 sender / try_dispatch 的保证）。
-    /// 判别：去掉入口闸 ⇒ 接手者在自己的 action 之前再次停靠进（仍布防的）让出
-    /// 闸，5s 内不返回，红。
+    /// 非等待型入口的让出（per-drain 预算 = 1，ADR-0011 §2.4）：`try_dispatch` 在
+    /// 让出窗口内接手后，自己的 action（排在剩余队列之后）尚未处理 ⇒ 途中的到界点
+    /// **照样让出所有权**（旧契约在此处不让出——「入口完成前不让出」的例外已被本票
+    /// 消解），交出租约后不持租约地等自己的入口账本，返回仍是其完成边界。
+    ///
+    /// 判别：到界不让出（旧行为）⇒ 让出计数停在 1，`wait_until` 超时红；返回不等
+    /// 完成 ⇒ 接手者返回时快照 < 4，红。
     #[test]
-    fn non_waiting_entry_does_not_yield_before_its_own_completion() {
+    fn non_waiting_entry_yields_before_own_completion_and_still_returns_at_boundary() {
         let (store, _log, _frame_ledger, inner) = fan_store(1, FanFx::default());
         inner.yield_gate.arm();
         let a = {
@@ -5549,24 +5630,32 @@ mod tests {
             let store = Arc::clone(&store);
             std::thread::spawn(move || {
                 let outcome = store.try_dispatch(FanAct::Ping);
-                let _ = done.send(());
+                let _ = done.send(*store.snapshot());
                 outcome
             })
         };
-        finished
+        // 接手者到界：自己的 Ping 还排在队列里也让出 ⇒ 让出计数 1 → 2。
+        wait_until("接手者在自己的 action 完成前也让出", || {
+            store.drain_lease_yields() == 2
+        });
+        {
+            let queue = lock(&inner.queue);
+            assert!(!inner.draining.load(Ordering::SeqCst), "让出窗口：租约已放");
+            assert_eq!(
+                queue.len(),
+                2,
+                "Leaf1 与接手者自己的 Ping 都还在队里（接手者刚处理完 Leaf0 就到界）"
+            );
+        }
+        assert_eq!(*store.snapshot(), 2, "Fan、Leaf0 已 reduce");
+        inner.yield_gate.release();
+        let snapshot_at_return = finished
             .recv_timeout(Duration::from_secs(5))
-            .expect("接手者在自己的 action 完成前不得让出（让出闸仍布防 ⇒ 让出即停靠不返回）");
+            .expect("接手者必须在自己的 action 完成边界返回");
         assert_eq!(
-            *store.snapshot(),
-            4,
+            snapshot_at_return, 4,
             "返回即完成边界：Fan、Leaf0、Leaf1、Ping 全部已 reduce"
         );
-        assert_eq!(
-            store.drain_lease_yields(),
-            1,
-            "入口 action 完成前的到界点不计让出"
-        );
-        inner.yield_gate.release();
         a.join().expect("排空线程不得 panic");
         assert_eq!(
             taker.join().expect("接手线程不得 panic"),
@@ -5575,6 +5664,527 @@ mod tests {
         assert_eq!(store.pending_actions(), 0);
         assert!(!inner.draining.load(Ordering::SeqCst));
         assert_eq!(inner.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// 交接后**不持租约**地等入口账本（per-drain 预算 = 4，ADR-0011 §2.4）：
+    /// A（`try_dispatch(Fan(5))`）处理 4 条后到界让出并停靠在让出闸（剩余 Leaf3、
+    /// Leaf4 ⇒ 入口账本未终局）；B 接手租约并在 Leaf3 的 reduce 内停靠（持租约、该
+    /// 记录未结算）。A 恢复后夺不回租约（B 持着）⇒ 交出租约、**不持租约**地等自己的
+    /// 入口账本；B 结算完 Leaf4（A 的账本终局）后 A 才返回——完成边界与「谁在排空」
+    /// 解耦，且无人搁浅。
+    ///
+    /// 判别：让出后直接返回 ⇒ A 返回时叶子只跑 3 条（红）；终局不唤醒等待者 ⇒
+    /// A 永不返回（`recv_timeout` 红）；不让出 / 不让接手 ⇒ 让出闸不进入（红）。
+    #[test]
+    fn handoff_waits_entry_ledger_without_holding_lease() {
+        let gate = Arc::new(CapacitySettle::new());
+        let (store, log, frame_ledger, inner) = fan_store_with(
+            4,
+            FanFx::default(),
+            vec![(3, Arc::clone(&gate))],
+            Vec::new(),
+        );
+        inner.yield_gate.arm();
+        let (a_done, a_reports) = std::sync::mpsc::channel();
+        let a = {
+            let store = Arc::clone(&store);
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || {
+                let accepted = store.try_dispatch(FanAct::Fan(5));
+                // 返回即入口 action 的完成边界：本根因果子树（5 个叶子）必已全部
+                // reduce——让出后不持租约，但等待本身不放松。
+                let leaves = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(act, _)| matches!(act, FanAct::Leaf(_)))
+                    .count();
+                let _ = a_done.send((accepted, leaves));
+            })
+        };
+        // A 到界让出：Fan + Leaf0..2 已处理，剩余 2 条在队，入口账本未终局。
+        assert!(
+            inner.yield_gate.wait_entered(Duration::from_secs(5)),
+            "A 未在让出点停靠"
+        );
+        assert_eq!(store.drain_lease_yields(), 1);
+        {
+            let queue = lock(&inner.queue);
+            assert!(!inner.draining.load(Ordering::SeqCst), "让出窗口：租约已放");
+            assert_eq!(queue.len(), 2, "剩余 Leaf3、Leaf4 仍在主队列");
+        }
+        assert_eq!(*store.snapshot(), 4, "Fan、Leaf0..2 已 reduce");
+        let entry_ledger = frame_ledger
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("根账本已在 reduce 期交出");
+        assert!(
+            !entry_ledger.terminal_published(),
+            "让出发生在入口账本完成之前（本票消解的正是旧例外）"
+        );
+
+        // B 接手租约，并在 Leaf3 的 reduce 内停靠（持租约、该记录未结算）。
+        gate.arm();
+        let b = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.try_dispatch(FanAct::Ping))
+        };
+        assert!(
+            gate.wait_entered(Duration::from_secs(5)),
+            "接手者未在 Leaf3 的 reduce 内停靠"
+        );
+        assert!(inner.draining.load(Ordering::SeqCst), "接手者持着租约");
+
+        // 放行 A：B 仍持租约 ⇒ A 夺不回 ⇒ 交出租约、不持租约地等入口账本。
+        inner.yield_gate.release();
+        // 握手（无丢失唤醒的时序钉死）：先确认 A **已睡在入口账本的终局等待上**
+        // （此刻 A 不持任何锁、不持租约），再放行 B 制造终局——终局发布必须唤醒它。
+        wait_until(
+            "A 睡在入口账本的终局等待上（不持租约）",
+            || entry_ledger.blocked_waiters() == 1,
+        );
+        // 放行 B：结算 Leaf3 → Leaf4 ⇒ A 的账本终局 ⇒ A 被唤醒返回。
+        gate.release();
+
+        let (outcome, leaves) = a_reports
+            .recv_timeout(Duration::from_secs(10))
+            .expect("让出后等入口账本的线程必须被唤醒并返回");
+        assert_eq!(outcome, AdmissionOutcome::Accepted);
+        assert_eq!(leaves, 5, "返回即入口账本的完成边界：5 个叶子全部已 reduce");
+        a.join().expect("A 不得 panic");
+        assert_eq!(b.join().expect("B 不得 panic"), AdmissionOutcome::Accepted);
+
+        let log = log.lock().unwrap();
+        assert_eq!(
+            acts(&log),
+            vec![
+                FanAct::Fan(5),
+                FanAct::Leaf(0),
+                FanAct::Leaf(1),
+                FanAct::Leaf(2),
+                FanAct::Leaf(3),
+                FanAct::Leaf(4),
+                FanAct::Ping,
+            ],
+            "FIFO 不变、无丢失、无重复"
+        );
+        let a_id = log[0].1;
+        assert!(
+            log[..4].iter().all(|(_, id)| *id == a_id),
+            "Fan、Leaf0..2 由 A 在让出前 reduce"
+        );
+        assert!(
+            log[4..].iter().all(|(_, id)| *id != a_id),
+            "让出后的记录全部由接手者 reduce（A 不持租约）"
+        );
+        drop(log);
+        assert_eq!(*store.snapshot(), 7, "每条 action 恰 reduce 一次");
+        assert_eq!(store.pending_actions(), 0);
+        assert_eq!(store.drain_lease_yields(), 1, "B 只处理 3 条，未到界");
+        assert_eq!(
+            inner.handoffs.load(Ordering::SeqCst),
+            1,
+            "A 的重新竞争必须失败 = 交接真的发生过（让出计数不区分「自己重夺」）"
+        );
+        assert!(!inner.draining.load(Ordering::SeqCst));
+        assert_eq!(inner.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// 交接等待必须横跨「复用池复用」（审查 B1 / ADR-0011 §2.4）：非等待型根的账本归
+    /// 框架所有（终局发布即 `claim_release` 入池），而复用池的 `reset` 会在锁内清掉
+    /// 终局 ⇒ 等待者若在「notify 之后、重新拿锁之前」被 reset 抢先就丢唤醒（还会读到
+    /// 别的根的结局）。`claim_handoff` 在终局**可能**发布之前把归还权翻到等待者一侧
+    /// ⇒ 认领期间账本不进池 ⇒ 终局不会被复位。
+    ///
+    /// 判别（两条，均确定性）：
+    /// ① 终局已发布、等待者仍停在等待面入口时，断言账本**不在**复用池（旧实现此处
+    ///    已被 `claim_release` 收进池 ⇒ 红）；
+    /// ② 之后让新根复用/复位、再放行等待者：它必须立刻拿到自己的终局（旧实现下它睡在
+    ///    复位后的账本上，而该账本的终局只能由已被我们排空的队列产生 ⇒ 超时红）。
+    #[test]
+    fn handoff_wait_survives_pool_reuse() {
+        let stall = Arc::new(CapacitySettle::new());
+        let (store, log, frame_ledger, inner) = fan_store_with(
+            4,
+            FanFx::default(),
+            vec![(3, Arc::clone(&stall))],
+            Vec::new(),
+        );
+        inner.yield_gate.arm();
+        let (a_done, a_reports) = std::sync::mpsc::channel();
+        let a = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let outcome = store.try_dispatch(FanAct::Fan(5));
+                let _ = a_done.send((outcome, *store.snapshot()));
+            })
+        };
+        // A 到界：Fan + Leaf0..2 已处理，剩余 Leaf3、Leaf4。
+        assert!(
+            inner.yield_gate.wait_entered(Duration::from_secs(5)),
+            "A 未在让出点停靠"
+        );
+        assert_eq!(store.drain_lease_yields(), 1);
+        let entry_ledger = frame_ledger
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("根账本已在 reduce 期交出");
+        // 等待面入口停靠：让 A 停在「尚未检查终局」的时刻（复用池 reset 的确定性窗口）。
+        entry_ledger.arm_wait_gate();
+
+        // B 接手租约，并在 Leaf3 的 reduce 内停靠（持租约、该记录未结算）。
+        stall.arm();
+        let (b_done, b_reports) = std::sync::mpsc::channel();
+        let b = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let _ = b_done.send(store.try_dispatch(FanAct::Leaf(99)));
+            })
+        };
+        assert!(
+            stall.wait_entered(Duration::from_secs(5)),
+            "接手者未在 Leaf3 的 reduce 内停靠"
+        );
+        // 放行 A：B 持租约 ⇒ A 交出租约并进入等待面（停靠在入口，尚未检查终局）。
+        inner.yield_gate.release();
+        assert!(
+            entry_ledger.wait_gate_entered(Duration::from_secs(5)),
+            "A 未进入入口账本的等待面"
+        );
+
+        // 放行 B：结算 Leaf3、Leaf4 ⇒ A 的账本终局发布（A 仍停在等待面入口）。
+        stall.release();
+        assert_eq!(
+            b_reports
+                .recv_timeout(Duration::from_secs(10))
+                .expect("接手者必须返回"),
+            AdmissionOutcome::Accepted
+        );
+        assert!(
+            entry_ledger.terminal_published(),
+            "前置：A 的入口账本已终局（否则本测没走到复用窗口）"
+        );
+        assert_eq!(
+            entry_ledger.blocked_waiters(),
+            0,
+            "A 停在等待面入口：此刻不该有沉睡等待者"
+        );
+        // ① 认领期间账本不得进复用池（旧实现此处已入池 ⇒ 红）。
+        assert!(
+            !pooled_contains(&inner, &entry_ledger),
+            "交接等待期间入口账本进了复用池：reset 会清掉它的终局（丢唤醒）"
+        );
+
+        // ② 新根复用/复位：旧实现在这里把 A 等待的账本 reset 掉（终局被清）。
+        assert_eq!(
+            store.try_dispatch(FanAct::Leaf(7)),
+            AdmissionOutcome::Accepted
+        );
+        assert!(
+            !pooled_contains(&inner, &entry_ledger),
+            "复用后入口账本仍不得入池（认领未归还）"
+        );
+        entry_ledger.release_wait_gate();
+        let (a_outcome, a_snapshot) = a_reports
+            .recv_timeout(Duration::from_secs(10))
+            .expect("等待者必须拿到自己的终局（不得睡在被复用的账本上）");
+        assert_eq!(a_outcome, AdmissionOutcome::Accepted);
+        assert_eq!(a_snapshot, 8, "A 返回时 8 条 action 全部已 reduce");
+        a.join().expect("A 不得 panic");
+        b.join().expect("B 不得 panic");
+
+        assert_eq!(
+            acts(&log.lock().unwrap()),
+            vec![
+                FanAct::Fan(5),
+                FanAct::Leaf(0),
+                FanAct::Leaf(1),
+                FanAct::Leaf(2),
+                FanAct::Leaf(3),
+                FanAct::Leaf(4),
+                FanAct::Leaf(99),
+                FanAct::Leaf(7),
+            ],
+            "FIFO 不变、无丢失、无重复"
+        );
+        assert_eq!(*store.snapshot(), 8);
+        assert_eq!(store.pending_actions(), 0);
+        assert_eq!(inner.handoffs.load(Ordering::SeqCst), 1, "恰一次接手");
+        assert!(!inner.draining.load(Ordering::SeqCst));
+        assert_eq!(inner.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// 快路径（审查 B1 性质 2）：进入交接分支时入口账本**已终局** ⇒ 等待面立即返回
+    /// （不睡、也不再碰复用池）。编排：A 到界让出并停靠在让出闸；B 接手后先结算 A 的
+    /// 最后一条后代（A 的账本就此终局），再停在**自己的** action 里（仍持租约）。
+    /// 判别：让等待者睡下去即超时红（B 停着，没人能推进）。
+    #[test]
+    fn handoff_fast_path_when_entry_already_terminal() {
+        let stall = Arc::new(CapacitySettle::new());
+        let (store, log, frame_ledger, inner) = fan_store_with(
+            3,
+            FanFx::default(),
+            vec![(99, Arc::clone(&stall))],
+            Vec::new(),
+        );
+        inner.yield_gate.arm();
+        let (a_done, a_reports) = std::sync::mpsc::channel();
+        let a = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let outcome = store.try_dispatch(FanAct::Fan(3));
+                let _ = a_done.send((outcome, *store.snapshot()));
+            })
+        };
+        // A 到界：Fan、Leaf0、Leaf1（W=3），剩余 Leaf2。
+        assert!(
+            inner.yield_gate.wait_entered(Duration::from_secs(5)),
+            "A 未在让出点停靠"
+        );
+        assert_eq!(store.drain_lease_yields(), 1);
+        let entry_ledger = frame_ledger
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("根账本已在 reduce 期交出");
+
+        // B 接手：先结算 Leaf2（⇒ A 的账本终局），再停在自己的 Leaf(99) 里。
+        stall.arm();
+        let b = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.try_dispatch(FanAct::Leaf(99)))
+        };
+        assert!(
+            stall.wait_entered(Duration::from_secs(5)),
+            "接手者未停在自己的 action 里"
+        );
+        assert!(
+            entry_ledger.terminal_published(),
+            "前置：A 的入口账本已终局"
+        );
+        assert!(inner.draining.load(Ordering::SeqCst), "接手者仍持租约");
+
+        // 放行 A：交接分支的快路径 —— B 还停着，「A 返回」只能来自「不等」。
+        inner.yield_gate.release();
+        let (a_outcome, a_snapshot) = a_reports
+            .recv_timeout(Duration::from_secs(5))
+            .expect("已终局 ⇒ 等待面立即返回（接手者仍停着）");
+        assert_eq!(a_outcome, AdmissionOutcome::Accepted);
+        assert_eq!(a_snapshot, 4, "A 的因果子树（Fan + 3 叶子）已完成");
+        assert_eq!(
+            entry_ledger.blocked_waiters(),
+            0,
+            "快路径不得睡在终局等待上"
+        );
+
+        stall.release();
+        a.join().expect("A 不得 panic");
+        assert_eq!(b.join().expect("B 不得 panic"), AdmissionOutcome::Accepted);
+        assert_eq!(
+            acts(&log.lock().unwrap()),
+            vec![
+                FanAct::Fan(3),
+                FanAct::Leaf(0),
+                FanAct::Leaf(1),
+                FanAct::Leaf(2),
+                FanAct::Leaf(99),
+            ],
+            "FIFO 不变、无丢失、无重复"
+        );
+        assert_eq!(*store.snapshot(), 5);
+        assert_eq!(store.pending_actions(), 0);
+        assert_eq!(inner.handoffs.load(Ordering::SeqCst), 1);
+        assert!(!inner.draining.load(Ordering::SeqCst));
+    }
+
+    /// 交接后的失败语义（审查 S1）：根的因果后代在**接手者线程**上 panic ⇒ 根账本记
+    /// `Failed` ⇒ legacy `SyncStore::dispatch` 仍在**自己的线程**上 panic（fail-visible
+    /// 不位移到别人的线程）。票② 之前不可达：持租约者不会让出，根的子代只会在它自己
+    /// 的线程上 reduce。
+    #[test]
+    fn legacy_dispatch_panics_on_its_own_thread_after_handoff() {
+        let stall = Arc::new(CapacitySettle::new());
+        let (store, log, _frame_ledger, inner) =
+            fan_store_with(2, FanFx::default(), vec![(1, Arc::clone(&stall))], vec![1]);
+        inner.yield_gate.arm();
+        let a = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.dispatch(FanAct::Fan(3)))
+        };
+        // A 到界：Fan、Leaf0（W=2），剩余 Leaf1、Leaf2。
+        assert!(
+            inner.yield_gate.wait_entered(Duration::from_secs(5)),
+            "A 未在让出点停靠"
+        );
+        assert_eq!(store.drain_lease_yields(), 1);
+
+        // B 接手租约，在 Leaf1 的 reduce 内停靠（放行后 panic）。
+        stall.arm();
+        let b = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.try_dispatch(FanAct::Leaf(99)))
+        };
+        assert!(
+            stall.wait_entered(Duration::from_secs(5)),
+            "接手者未在 Leaf1 的 reduce 内停靠"
+        );
+        // 放行 A：B 持租约 ⇒ A 交接（entry=None ⇒ 立刻进自己的 `ledger.wait()`）。
+        inner.yield_gate.release();
+        wait_until("A 交出租约（B 仍持着）", || {
+            inner.handoffs.load(Ordering::SeqCst) == 1
+        });
+        // 放行 B：Leaf1 的 reducer panic ⇒ 展开路径把余下记录结算为失败 ⇒ A 的账本 Failed。
+        stall.release();
+
+        let b_err = b.join().expect_err("接手者线程必须带着 reducer panic 上浮");
+        let b_msg = b_err
+            .downcast_ref::<&str>()
+            .map(|m| (*m).to_string())
+            .or_else(|| b_err.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(b_msg.contains("爆炸"), "接手者应为 reducer panic：{b_msg}");
+
+        let a_err = a
+            .join()
+            .expect_err("legacy dispatch 必须在自己的线程上 panic（根账本 Failed）");
+        let a_msg = a_err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| a_err.downcast_ref::<&str>().map(|m| (*m).to_string()))
+            .unwrap_or_default();
+        assert!(
+            a_msg.contains("SyncStore dispatch 失败"),
+            "legacy dispatch 的失败必须 fail-visible：{a_msg}"
+        );
+
+        // 实例不砖：展开路径结算完毕、旗已放，后续 dispatch 正常。
+        assert!(!inner.draining.load(Ordering::SeqCst));
+        assert_eq!(store.pending_actions(), 0);
+        assert_eq!(inner.in_flight.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.try_dispatch(FanAct::Leaf(5)),
+            AdmissionOutcome::Accepted
+        );
+        // Fan、Leaf0 在让出前已提交（2），Leaf1 panicked、Leaf2/Leaf99 被展开路径结算为
+        // 失败（都不前进），随后 Leaf5 提交 ⇒ 3。
+        assert_eq!(
+            *store.snapshot(),
+            3,
+            "失败记录不前进（只有 Fan、Leaf0、Leaf5 提交）；reduce 序 = {:?}",
+            acts(&log.lock().unwrap())
+        );
+    }
+
+    /// close 落在让出窗口内（审查 B1 要求 3 的 close 交错）：两种编排都要排空到 idle。
+    /// (a) close 在 A 停靠在让出点时接手 ⇒ close 的 drain 排空整条队列（A 的入口账本
+    /// 由 closer 结算 ⇒ A 被唤醒返回）；(b) 交接完成后再 close ⇒ 队列已空、报 Drained。
+    #[test]
+    fn close_during_handoff_window_drains_to_idle() {
+        // (a) close 接手让出窗口。
+        {
+            let (store, log, _frame_ledger, inner) = fan_store(2, FanFx::default());
+            inner.yield_gate.arm();
+            let (done, reports) = std::sync::mpsc::channel();
+            let a = {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    let outcome = store.try_dispatch(FanAct::Fan(5));
+                    let _ = done.send((outcome, *store.snapshot()));
+                })
+            };
+            assert!(
+                inner.yield_gate.wait_entered(Duration::from_secs(5)),
+                "A 未在让出点停靠"
+            );
+            let closer = {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || store.close_wait_with_report(Duration::from_secs(10)))
+            };
+            inner.yield_gate.release();
+            let (outcome, snapshot) = reports
+                .recv_timeout(Duration::from_secs(10))
+                .expect("close 排空队列后 A 必须返回（要么自己重夺、要么等自己的账本）");
+            assert_eq!(outcome, AdmissionOutcome::Accepted);
+            assert_eq!(snapshot, 6, "Fan(5) + 5 个叶子全部已 reduce");
+            a.join().expect("A 不得 panic");
+            match closer.join().expect("closer 不得 panic") {
+                CloseReportOutcome::Drained(report) => {
+                    assert_eq!(report.queued_actions, 0, "让出窗口内 close 必须排空队列");
+                    assert_eq!(report.deferred_actions, 0);
+                }
+                other => panic!("close 交错后必须排空到静止：{other:?}"),
+            }
+            assert_eq!(acts(&log.lock().unwrap()).len(), 6);
+            assert!(!inner.draining.load(Ordering::SeqCst));
+            assert_eq!(inner.in_flight.load(Ordering::SeqCst), 0);
+        }
+        // (b) close **未接手**：让出窗口里接手者正持租约（停在自己的记录里）⇒ close 的
+        //     best-effort drain 立即返回；等待面在接管者排空后才报 Drained。
+        {
+            let stall = Arc::new(CapacitySettle::new());
+            let (store, log, _frame_ledger, inner) = fan_store_with(
+                4,
+                FanFx::default(),
+                vec![(3, Arc::clone(&stall))],
+                Vec::new(),
+            );
+            inner.yield_gate.arm();
+            let (done, reports) = std::sync::mpsc::channel();
+            let a = {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    let outcome = store.try_dispatch(FanAct::Fan(5));
+                    let _ = done.send((outcome, *store.snapshot()));
+                })
+            };
+            assert!(
+                inner.yield_gate.wait_entered(Duration::from_secs(5)),
+                "A 未在让出点停靠"
+            );
+            // 接手者在 Leaf3 的 reduce 内停靠（持租约、记录未结算）。
+            stall.arm();
+            let taker = {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || store.try_dispatch(FanAct::Leaf(99)))
+            };
+            assert!(
+                stall.wait_entered(Duration::from_secs(5)),
+                "接手者未在 Leaf3 的 reduce 内停靠"
+            );
+            assert!(inner.draining.load(Ordering::SeqCst), "接手者持着租约");
+            // close 此刻只能「不接手」（best-effort drain 见旗即返）。
+            store.close();
+            assert!(store.is_closed());
+            // 放行 A：A 交出租约、不持租约地等自己的账本。
+            inner.yield_gate.release();
+            wait_until("A 交出租约", || {
+                inner.handoffs.load(Ordering::SeqCst) == 1
+            });
+            // 放行接手者：排空剩余队列（含 A 的 Leaf4）⇒ A 被唤醒返回。
+            stall.release();
+            let (outcome, snapshot) = reports
+                .recv_timeout(Duration::from_secs(10))
+                .expect("close 期间 A 仍必须被唤醒返回");
+            assert_eq!(outcome, AdmissionOutcome::Accepted);
+            assert_eq!(snapshot, 7, "Fan(5) + Leaf0..4 + Leaf99 全部已 reduce");
+            a.join().expect("A 不得 panic");
+            assert_eq!(
+                taker.join().expect("接手者不得 panic"),
+                AdmissionOutcome::Accepted
+            );
+            match store.close_wait_with_report(Duration::from_secs(10)) {
+                CloseReportOutcome::Drained(report) => {
+                    assert_eq!(report.queued_actions, 0, "接管者排空后 close 必须静止");
+                    assert_eq!(report.deferred_actions, 0);
+                }
+                other => panic!("接管者排空后 close 必须报 Drained：{other:?}"),
+            }
+            assert_eq!(acts(&log.lock().unwrap()).len(), 7);
+            assert!(!inner.draining.load(Ordering::SeqCst));
+            assert_eq!(inner.in_flight.load(Ordering::SeqCst), 0);
+        }
     }
 
     /// 预留原子性探针（issue#105 第 3 条）：`reserve_gate` 停靠在预留临界区**之前**

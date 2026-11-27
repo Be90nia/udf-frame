@@ -26,6 +26,8 @@
 //! 到停放队列、可被 [`super::SyncStore::resume_deferred`] 恢复）与 `rejected`
 //! （停放队列满、续接无法留存）。两者不合并：被拒记录**不是**「已停放」。
 
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// action 处理阶段（终局分类用；[`DispatchFailure`] 的公开字段）。
@@ -125,6 +127,15 @@ struct LedgerState {
 pub(crate) struct Ledger {
     state: Mutex<LedgerState>,
     cv: Condvar,
+    /// 调试面：此刻（或即将）睡在终局等待上的线程数。两个用途：① 让「等待者已睡」
+    /// 可被确定性编排（无丢失唤醒探针的握手面）；② 让 [`Self::reset`] 在 debug 构建
+    /// 咬住「仍有沉睡等待者却被复用」——那正是丢唤醒的现场。
+    #[cfg(debug_assertions)]
+    blocked: AtomicUsize,
+    /// 测试停靠闸（**仅 `cfg(test)`**）：在进入终局等待面之前（不持锁）停靠，供
+    /// 「等待者已睡 / 尚未睡」的确定性交错（复用池 reset 抢先的清况）。
+    #[cfg(test)]
+    wait_gate: super::CapacitySettle,
 }
 
 impl Ledger {
@@ -140,6 +151,10 @@ impl Ledger {
                 ..LedgerState::default()
             }),
             cv: Condvar::new(),
+            #[cfg(debug_assertions)]
+            blocked: AtomicUsize::new(0),
+            #[cfg(test)]
+            wait_gate: super::CapacitySettle::new(),
         })
     }
 
@@ -170,13 +185,6 @@ impl Ledger {
         } else {
             st.deferred_rejected += 1;
         }
-    }
-
-    /// 本账本的因果子树是否已无在途后代（终局已发布，或 `outstanding` 为 0）。
-    /// 排空让出点用它判定「非等待型入口 action 的完成边界是否已过」。
-    pub(crate) fn has_no_inflight(&self) -> bool {
-        let st = self.lock();
-        st.terminal.is_some() || st.outstanding == 0
     }
 
     /// 后代终局（成功 / 失败 / 脱钩后另行记账）。
@@ -244,6 +252,26 @@ impl Ledger {
         self.publish(&mut st);
     }
 
+    /// 交接等待的**归属认领**（ADR-0011 §2.4 / issue#234）：非等待型根的账本归
+    /// 框架所有（终局发布即 `claim_release` 入复用池），而复用池的 [`Self::reset`]
+    /// 会在锁内清掉终局——交接等待要睡在这个终局上，若不改归属，等待者可能在
+    /// 「notify 之后、重新拿锁之前」被 reset 抢先，于是丢唤醒（甚至读到别的根的
+    /// 结局）。本方法把归还权翻到等待者一侧，**必须在终局可能发布之前调用**（调用
+    /// 点 = 入口记录尚未结算时，`root_done` 必为 false）：认领期间 `claim_release`
+    /// 恒拒 ⇒ 账本不会进池、不会被复用。归还由认领方经 [`Self::waiter_release`]
+    /// 收口（同一个 `released` 恰好一次守卫）。
+    ///
+    /// `true` = 认领成功；`false` = 账本已终局（或在池内）⇒ **交付完成边界已成立**，
+    /// 调用方**不得**再等、也不得代还（复用池可能已把它交给别的根）。
+    pub(crate) fn claim_handoff(&self) -> bool {
+        let mut st = self.lock();
+        if st.terminal.is_some() || st.released {
+            return false;
+        }
+        st.waiter = true;
+        true
+    }
+
     /// 恢复路径的等待者认领（issue#49/#57）：停放记录尚未被任何排空者处理 ⇒
     /// 终局未发布、无归还竞争 ⇒ 此刻把归属 token 翻到等待者一侧（恢复调用者在
     /// 消费终局后归还，见 [`Self::waiter_release`]）。
@@ -259,15 +287,25 @@ impl Ledger {
     /// 等待终局（外部调用者的同步等待面）。中毒锁按 `into_inner` 恢复——
     /// 账本锁内不跑用户代码，中毒只可能来自框架自身的记账 panic。
     pub(crate) fn wait(&self) -> Outcome {
+        // 测试停靠点：进入等待面**之前**（不持账本锁）——供「等待者尚未检查终局时
+        // 终局已被发布 / 账本已被复用」的确定性交错。
+        #[cfg(test)]
+        self.wait_gate.park();
         let mut st = self.lock();
         loop {
             if let Some(outcome) = st.terminal.clone() {
                 return outcome;
             }
+            // 计数在**持锁且终局未发布**时自增 ⇒ 读侧见 1 即「该等待者确实要睡，
+            // 且发布者此刻尚未发布」。
+            #[cfg(debug_assertions)]
+            self.blocked.fetch_add(1, Ordering::SeqCst);
             st = self
                 .cv
                 .wait(st)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            #[cfg(debug_assertions)]
+            self.blocked.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -325,6 +363,15 @@ impl Ledger {
             "复位仍有在途后代的账本（终局谓词未成立）"
         );
         debug_assert!(st.released, "复位未被 claim 归还的账本");
+        // 丢唤醒现场（ADR-0011 §2.4）：还有线程睡在本账本的终局上就复位 ⇒ 它醒来看
+        // 不到自己的终局（会被无关根的终局扣留）。交接认领（`claim_handoff`）保证这
+        // 不可达；本断言把该不变量在 debug/test 构建下咬住（release 零开销）。
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.blocked.load(Ordering::SeqCst),
+            0,
+            "复位仍有沉睡在终局等待上的线程：复用会清掉它的终局（丢唤醒）"
+        );
         st.outstanding = 0;
         st.work = 0;
         st.root_done = false;
@@ -390,6 +437,28 @@ impl Ledger {
     /// 测试读侧：终局是否已发布（复用池不变式断言用）。
     pub(crate) fn terminal_published(&self) -> bool {
         self.lock().terminal.is_some()
+    }
+
+    /// 调试读侧：此刻（或即将）睡在终局等待上的线程数（无丢失唤醒探针的握手面 +
+    /// 测试停靠闸的读侧）。
+    #[cfg(debug_assertions)]
+    pub(crate) fn blocked_waiters(&self) -> usize {
+        self.blocked.load(Ordering::SeqCst)
+    }
+
+    /// 测试面：在等待面入口停靠（见 [`Self::wait`] 的停靠点）。
+    pub(crate) fn arm_wait_gate(&self) {
+        self.wait_gate.arm();
+    }
+
+    /// 测试面：有界等待「等待者已进入等待面」。
+    pub(crate) fn wait_gate_entered(&self, timeout: std::time::Duration) -> bool {
+        self.wait_gate.wait_entered(timeout)
+    }
+
+    /// 测试面：放行停靠的等待者并解除布防。
+    pub(crate) fn release_wait_gate(&self) {
+        self.wait_gate.release();
     }
 
     /// 测试读侧：累计已接受后代数 / 在途后代数（预留原子性探针用）。
