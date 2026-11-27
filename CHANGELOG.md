@@ -8,7 +8,7 @@
 - **测试（行为不变）**：`udf-skeleton-infra` 与 `udf-std-ext` 的 `embedded_event_contains_subscriber_panic_and_counts_it` 断言由基线下界恢复为**恰好 +1**——panic 计数新增线程局部测试窗口（仅 `cfg(all(test, feature = "log-embed"))`，进程级计数语义不变），并新增邻居隔离测试 `panics_on_neighbor_threads_stay_out_of_the_armed_window`（邻居线程各触发一次 panic 后，本线程窗内仍恰为 1）。
 - **本地门禁**：新增 `scripts/feature_matrix.py`（仅标准库）——直接读 `.github/workflows/ci.yml` 的 feature 隔离矩阵（唯一事实源），逐组合跑 check / test / doc；支持 `--list` / `--only <feature>`。本机需配 `RUSTUP_TOOLCHAIN=1.96.0`。
 - **consumer-sim**：`src/main.rs` 在 `block_on` 之外实测 `AdmissionError::NoRuntime`（typed 拒绝、不 panic、不计入 `rejected`）；`MIGRATION.md` 补枚举扩容说明。
-- **文档**：`docs/reference.md` 的 55 处行号锚中 45 处已陈旧、5 处弱匹配，改为符号名定位（仅保留 2 处逐条核对仍准确的坐标）；§view 新增「视图类型为什么必须 `Send + Sync`」迁移节（#232，含前后对照示例，经独立工程实编验证）；§资源上限与默认值 的预算三行按 #231 评审更正口径；ADR 0008 追加「§11 后续修订」；新增 `docs/research/wave7-external-benchmarks.md`（外部对标取证）与 ADR 0011（Proposed）。
+- **文档**：`docs/reference.md` 的 55 处行号锚中 45 处已陈旧、5 处弱匹配，改为符号名定位（仅保留 2 处逐条核对仍准确的坐标）；§view 新增「视图类型为什么必须 `Send + Sync`」迁移节（#232，含前后对照示例，经独立工程实编验证）；§资源上限与默认值 的预算三行按 #231 评审更正口径；ADR 0008 追加「§11 后续修订」；新增 ADR 0011（Proposed）。外部对标取证（Vue / Svelte / React / 内核 seqlock / slotmap / la_arena）按本仓惯例留存在本地 `docs/research/wave7-external-benchmarks.md`（该目录不入库）。
 - **破坏性变更定性（#232 维护者拍板）**：`ViewBridge` 的 `M::View: Send + Sync` 保留，属 `ViewBridge` 采用契约的一部分；门槛不进 `ViewMap` trait，非桥用法不受影响。
 
 ### Performance(view): 区域发布与通知热路径去掉每绑定分配（#169/#174）
