@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Added(contract+compose): 融合写入 opt-in API（#235 二段 / ADR-0011 §2.2）
+- **契约层**：`EffectSink<E>`（`push` / `remaining` / `mark_overflowed` / `reserve_staging` / `release_staging` / 默认 `push_batch`；方法级泛型 ⇒ **不** dyn 兼容，旧 `Fragment` 仍可 dyn）、`FragmentInto`（`reduce_into<S: EffectSink<..>>`）、`impl EffectSink for EffectBuf`（根适配器，不引入额外 newtype）、`SinkLease`（RAII：Drop 归还剩余 credits，panic 展开也安全）、`Buffered<F>`（旧 `Fragment` → `FragmentInto`，保留旧效果回调时点，走有界兼容缓冲）。
+- **infra**：`MapSink`（父 sink + 静态映射闭包：不装箱、不分配、不加锁；`remaining`/`reserve_staging`/`release_staging`/`mark_overflowed` **逐层转发**）、`CombineInto`（同时实现旧 `Fragment` 与新 `FragmentInto`——旧入口下 `EffectBuf` 本身就是 sink，因此同样零中间缓冲）、`combine_into!` 宏（必须显式 `lift:` 或 `discard_effects`：融合路径不做零效果闸的隐式丢弃）。
+- **不变**：旧 `Fragment` / `combine!` 完全不动；旧 `lift_fx` 不自动迁移（纯映射约束 + 映射 panic 由根 transition 整体失败，框架不回滚其外部副作用）。
+- **预算**：全链共用一份暂存预算——子层在 `reduce_into` 停靠点看到 `Some(预算 − 祖先已写)`，用尽即 `Some(0)`（精确零，不是「不限」），溢出沿适配链传回后整段原子拒绝。
+- **测试**：`tests/compose_into.rs` 3 条（跨层预算共享 + 精确零额度 + `Buffered` 互操作）；变异两组（`MapSink` 不传回 overflow ⇒ 1 条红；不转发 `remaining` ⇒ 2 条红），还原全绿。
+
 ### Changed(contract): 组合链全链 live staging 受同一份预算（#235 一段 / ADR-0011 §2.2）
 - **内部表示变更（公共语义不变）**：`EffectBuf` 的上限表示由 `usize`（`0` = 不限）改为 `Option<usize>`（`None` = 不限、`Some(0)` = **精确零额度**）——组合链借出额度时父缓冲需要「精确零可写」这一中间态，旧表示无法与「不限」区分。`set_effect_cap(0)` 仍表示不限。
 - **新增实现面原语**：`reserve_all_remaining() -> StagingLease`（RAII：借出本段全部剩余额度，Drop 归还并恢复原上限，panic 展开也安全）、`release_unused(used)`、`release_one()`、`transfer_from(child, mapper)`（每 pop 一条先归还一个 credit 再调 mapper）、`mark_overflowed()`、`set_staging_cap(Option<usize>)`、`len()`。

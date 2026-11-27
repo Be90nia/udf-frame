@@ -87,7 +87,10 @@ pub mod logpath;
 pub mod notify;
 pub mod parse;
 pub mod pool;
+pub mod sink;
 pub mod view;
+
+pub use sink::{Buffered, EffectSink, FragmentInto, SinkLease};
 
 use std::collections::VecDeque;
 pub use std::convert::Infallible;
@@ -567,6 +570,28 @@ impl<A, Op> EffectBuf<A, Op> {
     /// 不限」不是一回事：不限额度在本方法返回 `None`，绝不返回 `Some(0)`。
     pub fn remaining_limit(&self) -> Option<usize> {
         self.cap.map(|cap| cap.saturating_sub(self.effects.len()))
+    }
+
+    /// 预留 `want` 条额度（实现面预算协作，见 [`sink::SinkLease`]）。返回**实际
+    /// 借到**的条数：有限额度下 = min(剩余, `want`)；不限额度时恒等于 `want`
+    /// （不记账）。
+    pub fn reserve_staging(&mut self, want: usize) -> usize {
+        match self.cap {
+            None => want,
+            Some(cap) => {
+                let free = cap.saturating_sub(self.effects.len());
+                let granted = free.min(want);
+                self.cap = Some(cap - granted);
+                granted
+            }
+        }
+    }
+
+    /// 归还 `n` 条额度（与 [`Self::reserve_staging`] 配对；不限额度时是空操作）。
+    pub fn release_staging(&mut self, n: usize) {
+        if let Some(cap) = self.cap {
+            self.cap = Some(cap + n);
+        }
     }
 
     /// 批量写入（opt-in；issue#237）。一次性快照剩余额度 R 后成批追加，追加

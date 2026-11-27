@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use skeleton::{Effect, EffectBuf, Fragment, Infallible};
+use skeleton::{Effect, EffectBuf, EffectSink, Fragment, FragmentInto, Infallible};
 
 // 组合命名空间面（issue#163）：`combine!` 的 `namespaces:` 臂在**编译期**断言这里的
 // 校验函数；宏在采用方 crate 展开，故路径必须经 `$crate::compose::` 公开可达。
@@ -564,4 +564,239 @@ where
         (self.set)(&mut next, child_next);
         next
     }
+}
+
+// ── 融合写入（issue#235 二段）：静态映射 sink + `CombineInto` + `combine_into!` ──
+
+/// 静态映射适配器：子层写 `Effect<CA, CO>`，这里映射成父层效果**直接写父 sink**
+/// ——不建中间缓冲、不装箱、不分配、不加锁（ADR-0011 §2.2 / #235 二段）。
+///
+/// 预算协作面（`remaining` / `reserve_staging` / `release_staging` /
+/// `mark_overflowed`）逐层转发给父 sink ⇒ 祖先的 `SinkLease` 与本层看到的额度
+/// 始终一致，全链 live staging ≤ 预算。
+pub struct MapSink<'a, S, E, PE, M> {
+    parent: &'a mut S,
+    map: M,
+    _p: PhantomData<fn(E) -> PE>,
+}
+
+impl<'a, S, E, PE, M> MapSink<'a, S, E, PE, M>
+where
+    S: EffectSink<PE>,
+    M: FnMut(E, &mut S),
+{
+    /// 以 `map` 把子层效果映射进 `parent`。
+    pub fn new(parent: &'a mut S, map: M) -> Self {
+        Self {
+            parent,
+            map,
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<S, E, PE, M> EffectSink<E> for MapSink<'_, S, E, PE, M>
+where
+    S: EffectSink<PE>,
+    M: FnMut(E, &mut S),
+{
+    fn push(&mut self, effect: E) {
+        (self.map)(effect, self.parent);
+    }
+
+    fn remaining(&self) -> Option<usize> {
+        self.parent.remaining()
+    }
+
+    fn mark_overflowed(&mut self) {
+        self.parent.mark_overflowed();
+    }
+
+    fn reserve_staging(&mut self, want: usize) -> usize {
+        self.parent.reserve_staging(want)
+    }
+
+    fn release_staging(&mut self, n: usize) {
+        self.parent.release_staging(n);
+    }
+}
+
+/// [`combine_into`] 产物：融合写入形态的组合器。
+///
+/// 与 [`Combine`] 的区别只有效果出参：子件实现 [`FragmentInto`]，其效果经
+/// [`MapSink`] 静态映射后**直接写根 sink**（无中间缓冲、无 pop/drain/re-push）。
+/// 同时实现旧 [`Fragment`]：被旧 `Reducer` 调用时，根缓冲本身就是 sink ⇒ 同样
+/// 走融合路径。
+pub struct CombineInto<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L, I> {
+    get: G,
+    set: Se,
+    wrap: W,
+    unwrap: U,
+    child: C,
+    lift: L,
+    route_miss: AtomicU64,
+    _slices: PhantomData<(PS, PA, PO, CS, CA, CO)>,
+    _lifted: PhantomData<fn() -> I>,
+}
+
+impl<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L, I>
+    CombineInto<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L, I>
+{
+    /// 路由 miss 读侧（语义同 [`Combine::route_misses`]）。
+    pub fn route_misses(&self) -> u64 {
+        self.route_miss.load(Ordering::Relaxed)
+    }
+}
+
+/// 构造 [`CombineInto`]（六闭包/子件具名形态；宏 [`combine_into!`] 是便利包装）。
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn combine_into<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L, I>(
+    get: G,
+    set: Se,
+    wrap: W,
+    unwrap: U,
+    child: C,
+    lift: L,
+) -> CombineInto<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L, I>
+where
+    G: Fn(&PS) -> &CS,
+    Se: Fn(&mut PS, CS),
+    W: Fn(CA) -> PA,
+    U: Fn(&PA) -> Option<CA>,
+    C: FragmentInto<State = CS, Action = CA, Op = CO>,
+    L: Fn(Effect<CA, CO>) -> I,
+    I: IntoIterator<Item = Effect<PA, PO>>,
+{
+    CombineInto {
+        get,
+        set,
+        wrap,
+        unwrap,
+        child,
+        lift,
+        route_miss: AtomicU64::new(0),
+        _slices: PhantomData,
+        _lifted: PhantomData,
+    }
+}
+
+impl<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L, I> FragmentInto
+    for CombineInto<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L, I>
+where
+    G: Fn(&PS) -> &CS,
+    Se: Fn(&mut PS, CS),
+    W: Fn(CA) -> PA,
+    U: Fn(&PA) -> Option<CA>,
+    C: FragmentInto<State = CS, Action = CA, Op = CO>,
+    L: Fn(Effect<CA, CO>) -> I,
+    I: IntoIterator<Item = Effect<PA, PO>>,
+    PS: Clone + Send,
+    PA: Send,
+{
+    type State = PS;
+    type Action = PA;
+    type Op = PO;
+
+    fn reduce_into<S>(&self, state: &PS, action: PA, out: &mut S) -> PS
+    where
+        S: EffectSink<Effect<PA, PO>>,
+    {
+        let Some(child_action) = (self.unwrap)(&action) else {
+            // miss 留痕（读侧 route_misses）：语义不变——状态克隆原样返回、零效果。
+            self.route_miss.fetch_add(1, Ordering::Relaxed);
+            return state.clone();
+        };
+        let mut sink = MapSink::new(out, |effect: Effect<CA, CO>, parent: &mut S| match effect {
+            // Emit 回灌是子 action 上浮（wrap 的职责），核心代 lifted；
+            // Run/Cancel 交显式 lift（0/1/多输出，无临时 Vec）。
+            Effect::Emit(a) => parent.push(Effect::Emit((self.wrap)(a))),
+            effect => {
+                for lifted in (self.lift)(effect) {
+                    parent.push(lifted);
+                }
+            }
+        });
+        let child_next = self
+            .child
+            .reduce_into((self.get)(state), child_action, &mut sink);
+        let mut next = state.clone();
+        (self.set)(&mut next, child_next);
+        next
+    }
+}
+
+impl<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L, I> Fragment
+    for CombineInto<PS, PA, PO, CS, CA, CO, G, Se, W, U, C, L, I>
+where
+    G: Fn(&PS) -> &CS,
+    Se: Fn(&mut PS, CS),
+    W: Fn(CA) -> PA,
+    U: Fn(&PA) -> Option<CA>,
+    C: FragmentInto<State = CS, Action = CA, Op = CO>,
+    L: Fn(Effect<CA, CO>) -> I,
+    I: IntoIterator<Item = Effect<PA, PO>>,
+    PS: Clone + Send,
+    PA: Send,
+{
+    type State = PS;
+    type Action = PA;
+    type Op = PO;
+
+    fn reduce(&self, state: &PS, action: PA, out: &mut EffectBuf<PA, PO>) -> PS {
+        // 旧入口：`EffectBuf` 本身就是根 sink ⇒ 直接走融合路径（零中间缓冲）。
+        FragmentInto::reduce_into(self, state, action, out)
+    }
+}
+
+/// 融合写入形态的 `combine!`（[`CombineInto`] 的宏包装）。
+///
+/// 与 [`combine!`](crate::combine!) 的差别：
+/// - 子件须实现 [`FragmentInto`]（旧 fragment 用 `Buffered::new(..)` 显式适配）；
+/// - `lift` 返回 `IntoIterator<Item = Effect<PA, PO>>`（0/1/多输出，无临时 Vec）；
+/// - **必须显式给出 `lift:` 或 `discard_effects`**——融合路径不做零效果闸的隐式
+///   丢弃（静默丢效果的形态只在显式声明处出现）。
+#[macro_export]
+macro_rules! combine_into {
+    // 变体短形态 + 显式 lift
+    ($child:expr, $state:ident . $field:ident, $pa:ident :: $variant:ident,
+        lift: $lift:expr $(,)?) => {
+        $crate::compose::combine_into(
+            |p: &$state| &p.$field,
+            |p: &mut $state, c| p.$field = c,
+            $pa::$variant,
+            |p: &$pa| match p {
+                $pa::$variant(c) => Some(c.clone()),
+                _ => None,
+            },
+            $child,
+            $lift,
+        )
+    };
+    // 变体短形态 + 显式丢弃（数据丢失决定在调用点显形）
+    ($child:expr, $state:ident . $field:ident, $pa:ident :: $variant:ident,
+        discard_effects $(,)?) => {
+        $crate::compose::combine_into(
+            |p: &$state| &p.$field,
+            |p: &mut $state, c| p.$field = c,
+            $pa::$variant,
+            |p: &$pa| match p {
+                $pa::$variant(c) => Some(c.clone()),
+                _ => None,
+            },
+            $child,
+            |_discarded| ::core::iter::empty(),
+        )
+    };
+    // 显式形态 + lift
+    ($child:expr, $state:ident . $field:ident,
+        wrap: $wrap:expr, unwrap: $unwrap:expr, lift: $lift:expr $(,)?) => {
+        $crate::compose::combine_into(
+            |p: &$state| &p.$field,
+            |p: &mut $state, c| p.$field = c,
+            $wrap,
+            $unwrap,
+            $child,
+            $lift,
+        )
+    };
 }
