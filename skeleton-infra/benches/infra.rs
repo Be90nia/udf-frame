@@ -2051,6 +2051,46 @@ impl skeleton::EffectRuntime<CompAction, Beep> for CompFx {
     }
 }
 
+/// `legacy` 臂：**旧形态**手写（无上限子缓冲 + pop/push 循环）——即 #235 一段
+/// 之前的 `Combine::reduce` 行为，用来回答「加租约后旧路径有没有变慢」。
+struct CompParentLegacy {
+    per_action: u64,
+}
+
+impl skeleton::Reducer for CompParentLegacy {
+    type State = CompState;
+    type Action = CompAction;
+    type Op = Beep;
+
+    fn initial(&self) -> CompState {
+        CompState { child: 0 }
+    }
+
+    fn reduce(
+        &self,
+        s: &CompState,
+        a: CompAction,
+        out: &mut skeleton::EffectBuf<CompAction, Beep>,
+    ) -> CompState {
+        let CompAction::Child(n) = a;
+        let mut child_out: skeleton::EffectBuf<u64, Beep> = skeleton::EffectBuf::new();
+        let child_next = skeleton::Reducer::reduce(
+            &CompChild {
+                per_action: self.per_action,
+            },
+            &s.child,
+            n,
+            &mut child_out,
+        );
+        while let Some(effect) = child_out.pop_front() {
+            if let Effect::Run { id, op } = effect {
+                out.push(Effect::Run { id, op });
+            }
+        }
+        CompState { child: child_next }
+    }
+}
+
 fn effect_compose_forms(c: &mut Criterion) {
     let mut group = c.benchmark_group("effect_compose_forms");
     for k in [1u64, 4, 16, 64, 256, 1024] {
@@ -2061,6 +2101,13 @@ fn effect_compose_forms(c: &mut Criterion) {
         }
         group.bench_function(format!("compat/k{k}"), |b| {
             b.iter(|| compat.dispatch(black_box(CompAction::Child(0))))
+        });
+        let legacy = SyncStore::new(CompParentLegacy { per_action: k }, CompFx);
+        for _ in 0..10 {
+            legacy.dispatch(CompAction::Child(0));
+        }
+        group.bench_function(format!("legacy/k{k}"), |b| {
+            b.iter(|| legacy.dispatch(black_box(CompAction::Child(0))))
         });
         let fused = SyncStore::new(CompParentFused { per_action: k }, CompFx);
         for _ in 0..10 {
