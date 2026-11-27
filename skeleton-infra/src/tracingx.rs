@@ -63,7 +63,7 @@ pub fn bridge_events_to_tracing<
     store.subscribe_events(capacity, emit)
 }
 
-/// 单事件转译：八节点八分支，`kind` 字段值即节点名（过滤/聚合的稳定键）。
+/// 单事件转译：九节点九分支，`kind` 字段值即节点名（过滤/聚合的稳定键）。
 fn emit(event: &AuditEvent) {
     let seq = event.seq;
     match event.kind {
@@ -120,6 +120,10 @@ fn emit(event: &AuditEvent) {
         }
         AuditEventKind::FeedbackBudgetExceeded => {
             let kind = "feedback_budget_exceeded";
+            tracing::event!(target: "skeleton::audit", tracing::Level::INFO, seq, kind);
+        }
+        AuditEventKind::SegmentEffectOverflow => {
+            let kind = "segment_effect_overflow";
             tracing::event!(target: "skeleton::audit", tracing::Level::INFO, seq, kind);
         }
     }

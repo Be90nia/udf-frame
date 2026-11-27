@@ -514,9 +514,21 @@ impl EffectKind {
 ///
 /// **内部为前向可读的 FIFO 环形缓冲**（`VecDeque`）：追加在尾、摘取在头，摘队首
 /// **不搬动**其余效果——多效果批量转发的元素搬移从 O(k²) 降为 O(k)（issue#43）。
-/// 公共 API、语义与容量行为逐字不变（`clear` 仍保容量）。
+/// `clear` 仍保容量。
+///
+/// **有界暂存（ADR-0011 §2.1，issue#233）**：[`Self::push`] 签名不变、仍不可
+/// 失败——条数到达本段生效上限（[`Self::set_effect_cap`]，`0` = 不限）后**拒绝
+/// 继续插入**并置溢出标志（[`Self::overflowed`]）。实现方在 reducer 返回后读该
+/// 标志，把整次转换按全有或全无处理（不发布状态、不转发任何效果）⇒ 拒绝是
+/// 「整段作废」的一部分，不是静默丢弃。溢出后继续 `push` 不增长条数、不 panic；
+/// [`Self::clear`] 复位溢出标志（复用前必清零），上限值由实现方在每次 reduce
+/// 入口重设（禁沿用上一拍）。
 pub struct EffectBuf<A, Op = Infallible> {
     effects: VecDeque<Effect<A, Op>>,
+    /// 本段生效上限（条数；`0` = 不限）。
+    cap: usize,
+    /// 到界后是否已拒绝过插入（`clear` 复位）。
+    overflowed: bool,
 }
 
 impl<A, Op> EffectBuf<A, Op> {
@@ -524,17 +536,44 @@ impl<A, Op> EffectBuf<A, Op> {
     pub fn new() -> Self {
         Self {
             effects: VecDeque::new(),
+            cap: 0,
+            overflowed: false,
         }
     }
 
     /// reducer 写入一条效果；写入顺序 = 解释器转发顺序。
+    ///
+    /// 到界（[`Self::set_effect_cap`]）后**本条不入缓冲**并置溢出标志：调用方
+    /// 据此整段作废，不得把本条当作已接受（见类型文档「有界暂存」）。
     pub fn push(&mut self, effect: Effect<A, Op>) {
+        if self.cap > 0 && self.effects.len() >= self.cap {
+            self.overflowed = true;
+            return;
+        }
         self.effects.push_back(effect);
     }
 
-    /// 清空保容量（实现面便利：容量留给下一次 reduce 复用）。
+    /// 清空保容量并复位溢出标志（实现面便利：容量留给下一次 reduce 复用）。
+    ///
+    /// **实现面专用**：框架在每次 reduce 入口自行调用（并随即重设本段上限）。
+    /// reducer 在 `reduce` 里调用它会**削弱拒绝显形**——溢出标志被复位，本条输出
+    /// 的「已溢出」事实消失，框架因此不会整次拒绝该转换（条数界本身不破：被拒的
+    /// 插入一条也没进缓冲）。不要在自己的 reducer 里调用。
     pub fn clear(&mut self) {
         self.effects.clear();
+        self.overflowed = false;
+    }
+
+    /// 本段暂存的条数上限（`0` = 不限）。实现面在每次 reduce 入口重设。
+    pub fn set_effect_cap(&mut self, cap: usize) {
+        self.cap = cap;
+    }
+
+    /// 自上次 [`Self::clear`] 以来是否有过被拒绝的插入（= 本段已溢出）。
+    ///
+    /// 实现面在 reducer 返回后读它：`true` ⇒ 整次转换被拒（全有或全无）。
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     /// 缓冲是否为空（实现面便利）。
@@ -912,6 +951,12 @@ pub trait Driver<S, A> {
 ///    没跑**——`dispatch` 的 void 返回因此**不证明完整因果完成**。参考实现把
 ///    这条信息放在加法面上（`SyncStore::dispatch_with_receipt` 的
 ///    `DispatchOutcome`），本 trait 签名不变、行为不变。
+///    **例外（资源保护拒绝）**：实现方可用资源保护策略**拒绝整次转换**（例如单次
+///    reducer 输出超过实现方配置的条数界）。此时 `dispatch` 返回时该 transition
+///    **什么都没提交**（next state 未发布、它产出的效果零转发、超限 work 无部分
+///    进展）——返回**不代表** transition 已提交，也**不代表**失败。本 trait 不
+///    规定拒绝的判定、数值与观测面：判定与数值由实现方配置，观测手段也由实现
+///    定义（计数读侧 / 审计事件 / 结果面）。
 /// 2. **快照一致性**：[`Store::snapshot`] 返回值语义 `Arc<State>`；同拍通知
 ///    共享同一 Arc（订阅者与快照持有者永见自洽状态）。
 /// 3. **订阅**：回调在 dispatch 线程同步执行；票据 Drop 即注销；`#[must_use]`
@@ -959,6 +1004,14 @@ pub trait Store {
     /// 没跑。void 签名承载不了这条信息（本 trait 不为此改签名）：实现方若提供
     /// 结果面（参考实现 = `SyncStore::dispatch_with_receipt` 的
     /// `DispatchOutcome`），要区分「完整完成」与「子树被停放」的调用方必须用它。
+    ///
+    /// **资源保护拒绝例外（返回不代表 transition 已提交）**：实现方可用资源保护
+    /// 策略**拒绝整次转换**（例如单次 reducer 输出超过实现方配置的条数界）。被拒
+    /// 时本方法返回**什么都没提交**：该 transition 的 next state 未发布、它产出的
+    /// 效果零转发、超限 work 无部分进展——本方法**不 panic**（拒绝是资源保护，
+    /// 不是失败），void 返回也不构成「已提交」的证据。判定与数值由实现定义；
+    /// 需要同步获知该结局、或从诊断面观测（计数读侧 / 审计事件 / 结果面）的
+    /// 调用方见实现方文档。
     ///
     /// **等待语义与宿主义务**：外部调用者的 `dispatch` **阻塞**至自己的完成边界
     /// （含其全部因果后代终局）。由此产生两条宿主义务：
@@ -1277,5 +1330,58 @@ mod tests {
             FlushUnsupported.to_string(),
             "journal backend has no flush/durability boundary"
         );
+    }
+
+    /// 有界暂存（ADR-0011 §2.1）：条数到本段上限后拒绝继续插入并置溢出标志——
+    /// `push` 签名不变，但暂存条数**不可能**超过上限。判别：把上限检查去掉即红
+    /// （第 4 条入缓冲、`overflowed()` 为假）。
+    #[test]
+    fn effect_buf_refuses_pushes_past_the_effect_cap() {
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        buf.set_effect_cap(3);
+        for _ in 0..3 {
+            buf.push(Effect::Emit(Tick::Tick));
+        }
+        assert!(!buf.overflowed(), "到界但未超界：尚未溢出");
+        assert_eq!(buf.effects.len(), 3);
+        buf.push(Effect::Emit(Tick::Tick));
+        assert!(buf.overflowed(), "第 4 条被拒 ⇒ 置溢出标志");
+        assert_eq!(buf.effects.len(), 3, "超界插入不得增长暂存条数");
+        // 溢出后继续 push 不增长、不 panic。
+        for _ in 0..8 {
+            buf.push(Effect::Emit(Tick::Tick));
+        }
+        assert_eq!(buf.effects.len(), 3);
+    }
+
+    /// `0` = 不限；`clear` 复位溢出标志（实现面复用缓冲前必清零）；上限可按拍重设
+    /// 且**只影响之后的插入**。判别：`clear` 不清标志（复用后立刻再判溢出）即红。
+    #[test]
+    fn effect_buf_cap_zero_is_unbounded_and_clear_resets_overflow() {
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        for _ in 0..64 {
+            buf.push(Effect::Emit(Tick::Tick));
+        }
+        assert!(!buf.overflowed(), "cap 0 = 不限");
+        assert_eq!(buf.effects.len(), 64);
+
+        buf.clear();
+        buf.set_effect_cap(2);
+        for _ in 0..5 {
+            buf.push(Effect::Emit(Tick::Tick));
+        }
+        assert!(buf.overflowed());
+        assert_eq!(buf.effects.len(), 2);
+
+        buf.clear();
+        assert!(!buf.overflowed(), "clear 必须复位溢出标志");
+        assert!(buf.is_empty());
+        // 上一拍的上限随下一拍重设变化（不得沿用到新上限之外）。
+        buf.set_effect_cap(0);
+        for _ in 0..8 {
+            buf.push(Effect::Emit(Tick::Tick));
+        }
+        assert!(!buf.overflowed());
+        assert_eq!(buf.effects.len(), 8);
     }
 }

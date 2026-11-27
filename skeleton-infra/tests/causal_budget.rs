@@ -4,80 +4,16 @@
 //! per-drain 租约工作量——各自的耗尽语义、typed outcome、计数，以及 `0 = 不限`。
 //!
 //! 编排纪律：并发用例一律确定性握手 / 有界等待（OS 时钟截止），禁 sleep 竞速。
-//! 本文件自带事件计数分配器（形态照 `tests/alloc_site.rs`：开关与计数同住
-//! thread_local，libtest 并发线程的分配不进窗），只服务「留存暂存容量有界」一条。
+//! 分段预算的「暂存条数不过上限」判据落在 `skeleton` 的 `EffectBuf` 单测（直接观测
+//! `effects.len()`）；本文件只钉运行时面的边界、结局、计数与 `0 = 不限`。
 
 use skeleton::{ActionSender, Effect, EffectBuf, EffectId, EffectRuntime, Reducer, Store as _};
-use skeleton_infra::runtime::{
-    AdmissionOutcome, DispatchFailure, DispatchOutcome, DispatchPhase, SyncStore,
-};
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-use std::hint::black_box;
+use skeleton_infra::runtime::{AdmissionOutcome, DispatchOutcome, SyncStore};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
-
-// ── 事件计数分配器（只服务 segment_budget_bounds_retained_staging_capacity）──
-
-struct EventCounting;
-
-thread_local! {
-    static WINDOW: Cell<(bool, usize)> = const { Cell::new((false, 0)) };
-}
-
-fn note_event() {
-    let _ = WINDOW.try_with(|c| {
-        let (open, n) = c.get();
-        if open {
-            c.set((true, n + 1));
-        }
-    });
-}
-
-// SAFETY: 纯转发 System，仅在窗内转发前累加事件计数；null 原样透传（alloc 契约）。
-unsafe impl GlobalAlloc for EventCounting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note_event();
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        note_event();
-        unsafe { System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        note_event();
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
-#[global_allocator]
-static COUNTING: EventCounting = EventCounting;
-
-/// op 执行期本线程的分配事件数（窗开才计）。
-fn allocs<T>(op: impl FnOnce() -> T) -> usize {
-    WINDOW.with(|c| c.set((true, 0)));
-    let out = op();
-    black_box(&out);
-    let events = WINDOW.with(|c| c.get().1);
-    WINDOW.with(|c| c.set((false, 0)));
-    events
-}
-
-/// 仪器自检：窗内分配必须可见（防「分配器没挂上 / 门没开」的假绿）。
-#[test]
-fn alloc_counter_sees_allocations_in_window() {
-    let events = allocs(|| Vec::<u8>::with_capacity(32));
-    assert_eq!(events, 1, "窗内一次分配必须计 1 事件（仪器在位）");
-}
 
 // ── 夹具 ──────────────────────────────────────────────────────────────
 
@@ -189,15 +125,6 @@ fn store() -> (SyncStore<u64, Act, u32>, Obs) {
 
 fn seen(obs: &Obs) -> Vec<Act> {
     obs.seen.lock().unwrap().clone()
-}
-
-/// panic 载荷取文本（断言失败消息用）。
-fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "<non-string panic payload>".to_string())
 }
 
 // ── per-root 因果工作量预算 ────────────────────────────────────────────
@@ -460,101 +387,100 @@ fn resumed_continuation_gets_a_fresh_budget() {
 
 // ── per-reducer 分段效果预算 ───────────────────────────────────────────
 
-/// 单个 reducer 一次吐 8 条 ⇒ 预算内前缀（3）照常回灌，超量后缀（5）停放且**不占**
-/// 根预算（根预算 3 未被超量触发）；主队列继续处理其他工作。判别：提交 / 转发
-/// 不切分超量后缀即红（8 条全部回灌）。
+/// 单个 reducer 一次吐 8 条、上限 3 ⇒ **整次转换被拒**（ADR-0011 §2.2 全有或全无）：
+/// 无子代被回灌、状态不发布、超量 Emit 不入停放队列、根预算不被动用。判别：把
+/// 上限检查去掉（8 条全部回灌 ⇒ `Deferred`）或退回「提交点截断」（前缀照跑、
+/// outcome `Deferred{5}`）即红。
 #[test]
-fn segment_budget_truncates_one_reducer_output() {
+fn segment_budget_rejects_whole_transition_over_cap() {
     let (store, obs) = store();
     store.set_segment_effect_budget(3);
     store.set_causal_work_budget(3);
     let receipt = store.dispatch_with_receipt(Act::Fan(8)).expect("准入");
-    assert_eq!(receipt.wait(), DispatchOutcome::Deferred { retained: 5 });
     assert_eq!(
-        seen(&obs),
-        vec![Act::Fan(8), Act::Leaf(0), Act::Leaf(1), Act::Leaf(2)]
+        receipt.wait(),
+        DispatchOutcome::BudgetRejected { rejected: 1 }
     );
-    assert_eq!(store.segment_effect_budget_exceeded(), 5);
+    assert_eq!(seen(&obs), vec![Act::Fan(8)], "整段作废：子代一条都没跑");
+    assert_eq!(*store.snapshot(), 0, "被拒转换的 next state 未发布");
+    assert_eq!(store.segment_effect_overflow_count(), 1);
+    assert_eq!(store.segment_effect_overflow_count(), 1);
     assert_eq!(
         store.causal_work_budget_exceeded(),
         0,
-        "分段超量走分段账，不消耗根预算"
+        "拒绝在入库前：不消耗根预算、不进停放路径"
     );
+    assert_eq!(store.deferred_actions(), 0, "超量 Emit 不入停放队列");
+    assert_eq!(store.pending_actions(), 0);
     assert_eq!(store.segment_effect_budget(), 3);
 
-    // 主队列继续处理其他工作。
+    // 主队列继续处理其他工作；实例不报废。
     assert_eq!(store.try_dispatch(Act::Ping), AdmissionOutcome::Accepted);
     assert_eq!(seen(&obs).last(), Some(&Act::Ping));
-    assert_eq!(*store.snapshot(), 5);
+    assert_eq!(*store.snapshot(), 1);
 }
 
-/// 分段预算的 Run/Cancel 超量无法停放 ⇒ 不转发，产出 action 以**提交后部分失败**
-/// 结算（`Failed{ForwardingEffects, state_committed: true}`）；解释器恰收到预算内
-/// 前缀；legacy dispatch 按既有转发失败口径 panic。判别：静默转发或静默丢弃
-/// （报 Completed）即红。
+/// 边界三档：cap-1 与 cap 都被接受，cap+1 被整次拒绝（状态与效果零进展）。
+/// 判别：上限判定写成 `>` 而非 `>=`（cap+1 也过）或根本不判定（三档全过）即红。
 #[test]
-fn segment_budget_rejects_excess_run_effects_visibly() {
+fn segment_budget_boundary_cap_minus_one_cap_cap_plus_one() {
+    let (store, obs) = store();
+    store.set_segment_effect_budget(4);
+
+    let under = store.dispatch_with_receipt(Act::Fan(3)).expect("准入");
+    assert_eq!(under.wait(), DispatchOutcome::Completed, "cap-1：接受");
+    assert_eq!(seen(&obs).len(), 4, "根 + 3 子代都跑了");
+
+    let at = store.dispatch_with_receipt(Act::Fan(4)).expect("准入");
+    assert_eq!(at.wait(), DispatchOutcome::Completed, "cap：恰满仍接受");
+    assert_eq!(seen(&obs).len(), 9, "根 + 4 子代");
+    assert_eq!(store.segment_effect_overflow_count(), 0);
+
+    let before = *store.snapshot();
+    let over = store.dispatch_with_receipt(Act::Fan(5)).expect("准入");
+    assert_eq!(over.wait(), DispatchOutcome::BudgetRejected { rejected: 1 });
+    assert_eq!(*store.snapshot(), before, "cap+1：状态零进展");
+    assert_eq!(seen(&obs).len(), 10, "cap+1 的子代一条都没跑");
+    assert_eq!(store.segment_effect_overflow_count(), 1);
+    assert_eq!(store.deferred_actions(), 0);
+}
+
+/// 溢出 ⇒ 该 segment 的任何效果都不转发（包括预算内的前缀——旧「提交点截断」
+/// 语义下前缀会照常转发）；legacy `dispatch` 在同一路径上**不 panic**（ADR-0011
+/// §2.5），只增加专属计数。判别：转发前缀、或 legacy 抛 panic 即红。
+#[test]
+fn segment_budget_rejection_forwards_nothing_and_legacy_does_not_panic() {
     let (store, obs) = store();
     store.set_segment_effect_budget(3);
     let receipt = store.dispatch_with_receipt(Act::Runs(5)).expect("准入");
     assert_eq!(
         receipt.wait(),
-        DispatchOutcome::Failed(DispatchFailure {
-            seq: 0,
-            phase: DispatchPhase::ForwardingEffects,
-            state_committed: true,
-            cause: "segment effect budget exceeded: Run/Cancel effects not forwarded",
-        })
+        DispatchOutcome::BudgetRejected { rejected: 1 }
     );
-    assert_eq!(
-        *obs.runs.lock().unwrap(),
-        vec![0, 1, 2],
-        "预算内前缀照常转发，超量不转发"
+    assert!(
+        obs.runs.lock().unwrap().is_empty(),
+        "整段作废：预算内前缀也不得转发"
     );
-    assert_eq!(*store.snapshot(), 1, "状态已提交（提交后部分失败）");
-    assert_eq!(
-        store.segment_effect_budget_exceeded(),
-        2,
-        "归因计数：仅凭 outcome 分不清预算因 / 端口因"
-    );
+    assert_eq!(*store.snapshot(), 0, "状态未提交");
+    assert_eq!(store.segment_effect_overflow_count(), 1);
     assert_eq!(store.pending_actions(), 0);
 
-    let boom = catch_unwind(AssertUnwindSafe(|| store.dispatch(Act::Runs(5))));
-    let message = panic_text(boom.expect_err("legacy dispatch 在失败路径 panic"));
-    assert!(
-        message.contains("segment effect budget exceeded"),
-        "panic 文案带成因：{message}"
+    let legacy = catch_unwind(AssertUnwindSafe(|| store.dispatch(Act::Runs(5))));
+    assert!(legacy.is_ok(), "预算拒绝不升级为 panic（资源保护拒绝）");
+    assert_eq!(
+        store.segment_effect_overflow_count(),
+        2,
+        "legacy 也计入专属计数"
     );
+    assert!(
+        obs.runs.lock().unwrap().is_empty(),
+        "两次超限转换一条效果都没转发"
+    );
+    assert_eq!(*store.snapshot(), 0, "两次都没发布状态");
+
     // 实例不报废：后续 action 照常。
     assert_eq!(store.try_dispatch(Act::Ping), AdmissionOutcome::Accepted);
-    // 两次 Runs 的状态都已提交（提交后部分失败 ≠ 状态未前进），再加 Ping。
-    assert_eq!(*store.snapshot(), 3);
-    assert_eq!(*obs.runs.lock().unwrap(), vec![0, 1, 2, 0, 1, 2]);
-}
-
-/// 分段预算约束「被接受并转发」的条数与**留存容量**：超量段的缓冲不换回
-/// `staged`，其后的 reducer 输出必须重新分配暂存缓冲。判别：仍把超量缓冲换回
-/// staged 即零分配 ⇒ 红（稳态 dispatch 本身零分配，窗内事件只可能来自暂存缓冲）。
-#[test]
-fn segment_budget_bounds_retained_staging_capacity() {
-    let (store, _obs) = store();
-    store.set_segment_effect_budget(4);
-    let receipt = store.dispatch_with_receipt(Act::Fan(8)).expect("准入");
-    assert_eq!(
-        receipt.wait(),
-        DispatchOutcome::Deferred { retained: 4 },
-        "前置：本段超量"
-    );
-    drop(receipt);
-
-    let events = allocs(|| {
-        let receipt = store.dispatch_with_receipt(Act::Fan(2)).expect("准入");
-        receipt.wait()
-    });
-    assert_eq!(
-        events, 1,
-        "预算内输出重新分配暂存缓冲：超量段（8 条）的缓冲未被留存"
-    );
+    assert_eq!(*store.snapshot(), 1);
 }
 
 // ── per-drain 租约工作量预算 ───────────────────────────────────────────
@@ -677,5 +603,5 @@ fn external_traffic_progresses_across_yields() {
         store.drain_lease_yields()
     );
     assert_eq!(store.causal_work_budget_exceeded(), 0);
-    assert_eq!(store.segment_effect_budget_exceeded(), 0);
+    assert_eq!(store.segment_effect_overflow_count(), 0);
 }

@@ -261,12 +261,9 @@ struct PendingSegment<A, Op> {
     /// 段内下一条待转发效果的 0-based 位置（含回灌变体占位）。转发逐条推进，
     /// panic 时随段留存 ⇒ 续转的后缀从断点继续编号（与逐条包装版同值）。
     next_index: u64,
-    /// 分段效果预算快照（issue#144）：本段 `effect_index < effect_cap` 的效果是
-    /// **已接受前缀**，其余是超量后缀（Emit ⇒ 停放/拒收；Run/Cancel ⇒ 提交后部分
-    /// 失败）。`0` = 不限。提交点读当前配置并固化——已提交段不随 setter 缩容回溯。
-    effect_cap: usize,
     /// 段内待转发效果。缓冲本体在 `staged` ↔ 段之间 `mem::swap` 循环
     /// （提交点移交、摘壳点回收）⇒ 稳态零新增分配（分配锚见 `tests/memgov.rs`）。
+    /// 段缓冲**不受**暂存上限约束（上限在提交前已裁决：溢出段根本不入队）。
     buf: EffectBuf<A, Op>,
 }
 
@@ -279,27 +276,39 @@ impl<A, Op> EffectBufs<A, Op> {
         }
     }
 
-    /// 提交点：暂存区**整段并入**已提交待转发队列（j9q：`mem::swap` O(1) 三
+    /// 暂存区整段并入已提交待转发队列（j9q：`mem::swap` O(1) 三
     /// 指针整体移交，替代逐条包装——旧版每条一次 move，成本 O(n·sizeof(Op))，
     /// 512B/4096B 载荷实测约 +50%；来源元数据固化在段级，逐条版的
     /// `(origin_action_seq, effect_index)` 语义零变化——审计事件/失败回执/
     /// 探针全部同值）。swap 后 `staged` 留空壳（容量 0），摘壳点把满缓冲换回
     /// （稳态零新增分配，分配锚见 `tests/memgov.rs`）。
-    /// 分段效果预算（issue#144）在此快照进段（`effect_cap`，`0` = 不限）：超量
-    /// 后缀在转发游标处切分，提交点仍是 O(1) 整段移交。
-    fn commit(&mut self, origin_action_seq: u64, effect_cap: usize) {
+    /// 分段效果预算（ADR-0011 §2.2）在**提交之前**裁决：溢出段不走到这里——
+    /// 只有未溢出的暂存输出才会入队，段缓冲因此无需携带上限（换到段侧时清 0，
+    /// 关闭路径的后缀回填不受限）。
+    fn commit(&mut self, origin_action_seq: u64) {
         if self.staged.is_empty() {
             return;
         }
         let mut seg = PendingSegment {
             origin_action_seq,
             next_index: 0,
-            effect_cap,
             buf: EffectBuf::new(),
         };
         std::mem::swap(&mut seg.buf, &mut self.staged);
+        seg.buf.set_effect_cap(0);
         self.pending.push_back(seg);
     }
+}
+
+/// 一次 reducer 调用的三结局（ADR-0011 §2.2 全有或全无）。
+enum Reduced<S> {
+    /// reducer 正常返回且暂存未溢出：暂存输出已提交到待转发队列。
+    Committed(S),
+    /// 暂存超过本拍上限 ⇒ **整次转换被拒**：状态不发布、效果零转发、超量 Emit
+    /// 不入 deferred 队列（拒绝本身在提交之前裁决，故不会留下半段）。
+    BudgetRejected,
+    /// reducer panic：暂存输出整段丢弃，载荷照常上浮。
+    Panicked(Box<dyn std::any::Any + Send>),
 }
 
 struct ExclusiveCells<S, A, Op> {
@@ -618,12 +627,15 @@ struct StoreInner<S, A, Op> {
     /// 因果工作量预算拒绝计数（读侧 [`SyncStore::causal_work_budget_exceeded`]）：
     /// 未获预留的子动作数（已停放 + 被拒收），与深度预算的 `feedback_exceeded` 分账。
     causal_work_exceeded: AtomicU64,
-    /// per-reducer 分段效果预算（issue#144）：单次 `reduce` 可被接受的效果条数；
-    /// `0` = 不限。提交点把当前值快照进段（`PendingSegment::effect_cap`），已提交段
-    /// 不随 setter 缩容回溯。
+    /// per-reducer 分段效果预算（ADR-0011 §2.1）：单次 `reduce` 可被接受的效果
+    /// 条数；`0` = 不限。reducer 入口快照进本轮 `EffectBuf` 的生效上限 ⇒ 暂存期
+    /// 即受界，超界即整次转换被拒（不再有「提交后截断」的中间态）。
     segment_effect_budget: AtomicUsize,
-    /// 分段预算超量计数（读侧 [`SyncStore::segment_effect_budget_exceeded`]）。
-    segment_effect_exceeded: AtomicU64,
+    /// 被拒转换计数（读侧 [`SyncStore::segment_effect_overflow_count`]）：单次
+    /// `reduce` 暂存超界 ⇒ 整次转换被拒，**每次被拒计一次**（与超量条数无关）。
+    /// 与 `causal_work_exceeded`（根预算）、`deferred_capacity_rejected`（停放
+    /// 容量）、解释器失败计数分账。
+    segment_effect_overflow: AtomicU64,
     /// per-drain 租约工作量预算（issue#144）：单个排空租约连续出队处理的记录数
     /// 上限；`0` = 不限。
     drain_work_budget: AtomicUsize,
@@ -877,8 +889,11 @@ struct StoreInner<S, A, Op> {
 /// （[`Self::set_causal_work_budget`]）、per-reducer 分段效果
 /// （[`Self::set_segment_effect_budget`]）、per-drain 租约
 /// （[`Self::set_drain_work_budget`]）。**以前能跑通的程序若单根扇出或单次
-/// reducer 输出超过默认值，现在会得到停放 / 拒收 / typed 失败**（legacy
-/// [`Self::dispatch`] 在失败路径按既有口径 panic）——逃生口 = 把对应预算置 `0`。
+/// reducer 输出超过默认值，现在会得到停放 / 拒收 / typed 拒绝**——逃生口 = 把
+/// 对应预算置 `0`。**per-reducer 分段预算是暂存期硬界**（ADR-0011 §2.2）：超界
+/// 的转换整次被拒（[`DispatchOutcome::BudgetRejected`]），legacy
+/// [`Self::dispatch`] 在它上面**不 panic**（只从计数 / 审计事件显形）；而
+/// 解释器失败仍是 fail-visible 的 panic（`DispatchOutcome::Failed`）。
 /// 各自的计入口径、耗尽语义与计数见这三个 setter 的文档；数值见
 /// `docs/reference.md` §资源上限与默认值。
 pub struct SyncStore<S, A, Op = Infallible> {
@@ -935,10 +950,11 @@ const DEFAULT_DRAIN_WORK_BUDGET: usize = 4096;
 ///
 /// [`Self::Completed`] 与 [`Self::Deferred`] 的区分正是 legacy void
 /// [`skeleton::Store::dispatch`] 无法表达的那条信息：某个因果后代撞上回灌深度
-/// 预算（[`SyncStore::feedback_budget_exceeded`]）或 per-root 因果工作量预算 /
-/// 分段效果预算（[`SyncStore::causal_work_budget_exceeded`] /
-/// [`SyncStore::segment_effect_budget_exceeded`]）时，**状态与已转发效果都已
-/// 生效，但被停放的子树没跑**——那是「未完成」，不是成功完成。
+/// 预算（[`SyncStore::feedback_budget_exceeded`]）或 per-root 因果工作量预算
+/// （[`SyncStore::causal_work_budget_exceeded`]）时，**状态与已转发效果都已
+/// 生效，但被停放的子树没跑**——那是「未完成」，不是成功完成。三层**互不
+/// 折算**的非成功面另有 [`Self::CapacityRejected`]（停放容量）与
+/// [`Self::BudgetRejected`]（分段预算的整次转换拒绝）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchOutcome {
     /// 根 action 与全部因果后代终局成功（完整因果完成）。
@@ -954,11 +970,18 @@ pub enum DispatchOutcome {
     /// 停放却被容量拒收；专用计数见 [`SyncStore::deferred_capacity_rejected`]。
     CapacityRejected { retained: u64, rejected: u64 },
     /// 根或某个因果后代失败（legacy [`skeleton::Store::dispatch`] 在同一路径上
-    /// panic；结果面以值返回同一份失败摘要）。含分段效果预算切掉的 Run/Cancel
-    /// 超量：提交后部分失败（`phase = ForwardingEffects`、`state_committed = true`）
-    /// ——仅凭本 outcome 分不清「预算因」还是「解释器端口因」，归因靠
-    /// [`SyncStore::segment_effect_budget_exceeded`] 计数。
+    /// panic；结果面以值返回同一份失败摘要）。
     Failed(DispatchFailure),
+    /// 根或某个因果后代的 reducer 转换**因暂存超界被整次拒绝**（ADR-0011
+    /// §2.2）：该 action 的 next state 未发布、它产出的效果零转发、超量 Emit
+    /// 不入 deferred 队列。`rejected` = 本因果树里被拒的转换数。
+    ///
+    /// 与 [`Self::Failed`] 分开表达：这是**资源保护拒绝**（超限 action 无部分
+    /// 进展，逃生口 = 调大预算或置 `0`），不是解释器/框架失败；legacy
+    /// [`skeleton::Store::dispatch`] 在它上面**不 panic**——显形靠计数
+    /// [`SyncStore::segment_effect_overflow_count`] 与审计事件
+    /// [`crate::audit::AuditEventKind::SegmentEffectOverflow`]。
+    BudgetRejected { rejected: u64 },
 }
 
 /// 根 action 的回执句柄（issue#57）：结果面的可等待观测点。
@@ -1011,6 +1034,12 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Dr
 }
 
 /// [`SyncStore::resume_deferred`] 的结构化结果（issue#49：无隐藏自动重试）。
+///
+/// **拒绝不计入本结构**：恢复的记录若因暂存超界被**整次拒绝**（ADR-0011 §2.2），
+/// 它无部分进展、不重新停放，既不进 `deferred_again` 也不进 `capacity_rejected`
+/// ——只计入 [`SyncStore::segment_effect_overflow_count`] 并发
+/// `SegmentEffectOverflow` 审计事件（拒绝是全局资源保护账，不随一次恢复调用的
+/// 批次走，刻意不留批次计数位）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DeferredResume {
     /// 本次送进主队列的记录数（`limit` 上界内）。
@@ -1029,6 +1058,7 @@ fn public_outcome(outcome: Outcome) -> DispatchOutcome {
     match outcome {
         Outcome::Completed => DispatchOutcome::Completed,
         Outcome::Failed(failure) => DispatchOutcome::Failed(failure),
+        Outcome::BudgetRejected { rejected } => DispatchOutcome::BudgetRejected { rejected },
         Outcome::Deferred { retained, rejected } if rejected > 0 => {
             DispatchOutcome::CapacityRejected { retained, rejected }
         }
@@ -1385,6 +1415,15 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
     /// 但被停放的子树没跑）。要拿到那个终局请用结果面
     /// [`Self::dispatch_with_receipt`]（本方法签名不变、行为不变）。
     ///
+    /// **例外三（分段预算拒绝，BudgetRejected）**：本 action 或某个因果后代的
+    /// reducer 转换因暂存超界被**整次拒绝**（[`Self::set_segment_effect_budget`]，
+    /// ADR-0011 §2.2）时——**不 panic**、不发布该转换的 next state、不转发它产出
+    /// 的任何效果（超量 `Emit` 不入停放队列）。⇒ **本方法的返回不代表 reducer
+    /// transition 一定成功提交**；拒绝可从诊断面观察：计数
+    /// [`Self::segment_effect_overflow_count`] + 审计事件
+    /// [`crate::audit::AuditEventKind::SegmentEffectOverflow`]。要同步拿到该结局
+    /// 请用 [`Self::dispatch_with_receipt`]（[`DispatchOutcome::BudgetRejected`]）。
+    ///
     /// 闭门后恒 no-op 并计入 [`Self::rejected_after_close`]，签名不变（取舍
     /// 对照 [`ActionSender::dispatch`] 的显式 `false`——见类型文档「闭门后的
     /// 入口对照」表）。容量满（配了 [`Self::set_capacity`]）按过载显式失败
@@ -1410,6 +1449,11 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> St
                     // ——差别只在 [`Self::dispatch_with_receipt`] 的结果面。
                     DispatchOutcome::Completed | DispatchOutcome::Deferred { .. } => {}
                     DispatchOutcome::CapacityRejected { .. } => {}
+                    // 预算拒绝是资源保护拒绝，**不**升级为 panic（ADR-0011 §2.5）：
+                    // 状态未发布、该 segment 效果零转发，显形走
+                    // [`Self::segment_effect_overflow_count`] 与审计事件
+                    // `SegmentEffectOverflow`。签名不变 ⇒ 只能从诊断面观察。
+                    DispatchOutcome::BudgetRejected { .. } => {}
                     // fail-visible：已接受但失败的 action 禁伪装成成功。
                     DispatchOutcome::Failed(failure) => panic!(
                         "udf-frame: SyncStore dispatch 失败——seq={} phase={:?} state_committed={} cause={}",
@@ -1885,7 +1929,7 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
             causal_work_budget: AtomicUsize::new(DEFAULT_CAUSAL_WORK_BUDGET),
             causal_work_exceeded: AtomicU64::new(0),
             segment_effect_budget: AtomicUsize::new(DEFAULT_SEGMENT_EFFECT_BUDGET),
-            segment_effect_exceeded: AtomicU64::new(0),
+            segment_effect_overflow: AtomicU64::new(0),
             drain_work_budget: AtomicUsize::new(DEFAULT_DRAIN_WORK_BUDGET),
             drain_lease_yields: AtomicU64::new(0),
             #[cfg(test)]
@@ -2142,6 +2186,12 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     ///   完整因果完成，恢复走 [`Self::resume_deferred`]；
     /// - `CapacityRejected { retained, rejected }`：停放队列满，`rejected` 条续接
     ///   无法留存（专用计数 [`Self::deferred_capacity_rejected`]）；
+    /// - `BudgetRejected { rejected }`：根或某个因果后代的 reducer 转换因暂存超界被
+    ///   **整次拒绝**（ADR-0011 §2.2）——**资源保护拒绝、无部分进展、不是失败**：
+    ///   该 transition 的 next state 未发布、其效果零转发、超量 `Emit` 不入停放队列；
+    ///   `rejected` = 本因果树里被拒的转换数，归因计数见
+    ///   [`Self::segment_effect_overflow_count`]（legacy [`Store::dispatch`] 在同处
+    ///   **不 panic**，只从该计数与审计事件显形）；
     /// - `Failed(..)`：根或某个因果后代失败（legacy 路径同处 panic）。
     ///
     /// `Err(..)` = **未准入**（[`AdmissionOutcome::Closed`] / `Full`）：action 未
@@ -2377,20 +2427,19 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         self.inner.causal_work_exceeded.load(Ordering::SeqCst)
     }
 
-    /// per-reducer 分段效果预算（issue#144）：`cap` = 单次 `reduce` 调用可被接受
-    /// 的效果条数上限（Emit / Run / Cancel 合计）；`0` = 不限。预算内的前缀照常
-    /// 提交转发；**超量后缀从不成为已接受效果**：Emit ⇒ 停放 / 容量拒收（同
-    /// [`Self::set_causal_work_budget`] 的超界行为，不另占根预算），Run / Cancel
-    /// 无法停放 ⇒ 不转发，产出它的 action 以**提交后部分失败**结算
-    /// （[`DispatchOutcome::Failed`]，`state_committed = true`；legacy
-    /// [`Self::dispatch`] 按既有转发失败口径 panic）。两者都计入
-    /// [`Self::segment_effect_budget_exceeded`]——**仅凭 outcome 分不清预算因还是
-    /// 解释器端口因，归因靠该计数**。**默认启用**。
+    /// per-reducer 分段效果预算（ADR-0011 §2.1 / §2.2）：`cap` = 单次 `reduce`
+    /// 调用可被接受的效果条数上限（Emit / Run / Cancel 合计）；`0` = 不限。
     ///
-    /// 生效点 = 提交点：预算在 reducer 正常返回的提交点快照进段，已提交的段不随
-    /// 本方法缩容回溯；reducer **调用期间**框架无控制点（`EffectBuf::push` 无失败
-    /// 面），故本预算约束的是「被接受并转发」的条数与留存容量，不是 reducer 自身
-    /// 在调用期内的瞬时分配。
+    /// **暂存期即受界**：reducer 入口把本值快照成本轮 `EffectBuf` 的生效上限，
+    /// 超界的插入被拒并置溢出标志 ⇒ reducer 返回后**整次转换被拒**——状态不发布、
+    /// 该 segment 的效果零转发、超量 Emit 不入 deferred 队列，回执以
+    /// [`DispatchOutcome::BudgetRejected`] 收口并计入
+    /// [`Self::segment_effect_overflow_count`]。**超限 action 没有部分进展**；
+    /// 逃生口 = 调大预算或置 `0`（不限）。**默认启用**。
+    ///
+    /// 生效点 = 下一次 reducer 入口（已提交的段不随缩容回溯——它们在自己暂存期
+    /// 就裁决完了）。`EffectBuf::push` 仍不可失败：被拒的插入是「整段作废」的
+    /// 一部分，不构成静默丢弃（框架在发布之前就显形）。
     pub fn set_segment_effect_budget(&self, cap: usize) {
         self.inner
             .segment_effect_budget
@@ -2402,10 +2451,12 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
         self.inner.segment_effect_budget.load(Ordering::Relaxed)
     }
 
-    /// 分段效果预算超量计数（fail-visible 读侧）：被分段预算切掉的效果累计数
-    /// （Emit 停放 + Emit 拒收 + Run/Cancel 未转发各计一次）。
-    pub fn segment_effect_budget_exceeded(&self) -> u64 {
-        self.inner.segment_effect_exceeded.load(Ordering::SeqCst)
+    /// 被拒转换计数（fail-visible 读侧）：暂存超界、**整次转换被拒**的 reducer
+    /// 调用累计数（每次被拒计一次，与超量条数无关）。与 per-root 因果预算
+    /// （[`Self::causal_work_budget_exceeded`]）、停放容量
+    /// （[`Self::deferred_capacity_rejected`]）及解释器失败计数分账。
+    pub fn segment_effect_overflow_count(&self) -> u64 {
+        self.inner.segment_effect_overflow.load(Ordering::SeqCst)
     }
 
     /// per-drain 租约工作量预算（issue#144）：`cap` = 单个排空租约连续出队处理的
@@ -2488,7 +2539,10 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
     /// - 恢复出的工作拿**自己的**（分离的）续接回执：本方法等到每条记录的终局
     ///   才返回，据此给出 [`DeferredResume`] 的计数；
     /// - **无隐藏重试**：恢复后再次撞预算就再次停放（计入 `deferred_again`），
-    ///   停放队列满则拿显式非成功容量终局（计入 `capacity_rejected` + 专用计数）。
+    ///   停放队列满则拿显式非成功容量终局（计入 `capacity_rejected` + 专用计数）；
+    ///   恢复记录的 reducer 转换若因暂存超界被**整次拒绝**（ADR-0011 §2.2），该
+    ///   记录**无部分进展**、不重新停放——它计入
+    ///   [`Self::segment_effect_overflow_count`] 并有对应的审计事件。
     ///
     /// # 串行化
     ///
@@ -2560,6 +2614,9 @@ impl<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static> Sy
                         resume.deferred_again += 1;
                     }
                 }
+                // 恢复的记录其转换也被整次拒绝（ADR-0011 §2.2）：无部分进展、不回
+                // 停放（计数与审计事件已由排空环记录，见 `resume_deferred` 文档）。
+                Outcome::BudgetRejected { .. } => {}
                 // 与 legacy dispatch 同一 fail-visible 口径（已接受但失败禁伪装成
                 // 成功）。同线程排空时 panic 已经过排空环上浮到这里，此臂只见
                 // 「他线程排空」的路径。
@@ -3490,24 +3547,31 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // SAFETY: 持排空权（DrainGuard armed 区间）；重入 dispatch 只入队即返，
         // 到不了此处——独占访问成立，见 DrainExclusive 安全纪要
         let reduced = inner.effect_buf.with_mut(|bufs| {
-            // 暂存区入口清零：每次 reducer 调用独享（跨调用不串味）。
+            // 暂存区入口清零：每次 reducer 调用独享（跨调用不串味）；本拍的
+            // 分段预算上限在此**快照**（ADR-0011 §2.1——不沿用上一拍的值）。
             bufs.staged.clear();
+            bufs.staged
+                .set_effect_cap(inner.segment_effect_budget.load(Ordering::Relaxed));
             match catch_unwind(AssertUnwindSafe(|| {
                 inner
                     .reducer
                     .reduce(&current, record.action, &mut bufs.staged)
             })) {
                 Ok(next) => {
+                    // 全有或全无（ADR-0011 §2.2）：溢出 ⇒ 整次转换被拒。暂存输出
+                    // 整段丢弃（不提交 ⇒ 不转发、超量 Emit 不入 deferred 队列），
+                    // 状态也不发布。
+                    if bufs.staged.overflowed() {
+                        bufs.staged.clear();
+                        return Reduced::BudgetRejected;
+                    }
                     // 提交点（issue#44）：reducer 正常返回 ⇒ 本次调用的暂存输出
                     // 整段并入已提交待转发队列（按 action 序）。提交点落在状态
                     // 发布之前——旧快照析构 panic（状态已发布）时，已提交效果
                     // 不得随之丢失。**来源在此固化**（issue#48）：产出这些效果
                     // 的 action = 当前被 reduce 的 `record` ⇒ 其入队序号。
-                    bufs.commit(
-                        record.seq,
-                        inner.segment_effect_budget.load(Ordering::Relaxed),
-                    );
-                    Ok(next)
+                    bufs.commit(record.seq);
+                    Reduced::Committed(next)
                 }
                 Err(payload) => {
                     // 失败调用：本次暂存输出整段丢弃（未提交的迁移零外部副作用）
@@ -3515,13 +3579,33 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
                     bufs.staged.clear();
                     inner.reducer_panics.fetch_add(1, Ordering::SeqCst);
                     audit_emit(inner, AuditEventKind::ReducerInterrupted);
-                    Err(payload)
+                    Reduced::Panicked(payload)
                 }
             }
         });
         let next_val = match reduced {
-            Ok(next) => next,
-            Err(payload) => std::panic::resume_unwind(payload),
+            Reduced::Committed(next) => next,
+            Reduced::Panicked(payload) => std::panic::resume_unwind(payload),
+            Reduced::BudgetRejected => {
+                // 拒绝分支：不发布状态、不转发该 segment 任何效果、不入停放队列；
+                // 此前已提交的段原样留存（没进转发环 ⇒ `pending` 未动）。
+                // 显形（ADR-0011 §2.5）：专属计数 + 有界非阻塞审计事件。此处
+                // **不持任何内部锁**（独占区间已随缓冲归还结束）、不跑用户回调的
+                // 同步等待路径。
+                inner.segment_effect_overflow.fetch_add(1, Ordering::SeqCst);
+                audit_emit(inner, AuditEventKind::SegmentEffectOverflow);
+                if let Some(ledger) = entry {
+                    entry_settled |= record.root && Arc::ptr_eq(ledger, &record.ledger);
+                }
+                if record.root {
+                    record.ledger.finish_root_rejected();
+                } else {
+                    record.ledger.descendant_done_rejected();
+                }
+                guard.current = None;
+                release_ledger(inner, &record.ledger);
+                continue;
+            }
         };
         audit_emit(inner, AuditEventKind::Reduced);
         // CoW 前置：reduce 后立即放手 current——不放
@@ -3574,8 +3658,7 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         // action）的入队序号——与 pending 效果各自的来源序号（可能更早）区分
         // （issue#48）。
         guard.phase = DispatchPhase::ForwardingEffects;
-        // `unforwarded` = 分段预算切掉的 Run/Cancel 条数（结算时折成提交后部分失败）。
-        let unforwarded = inner.effect_buf.with_mut(|bufs| {
+        inner.effect_buf.with_mut(|bufs| {
             forward_effects(inner, bufs, feedback_depth, &record.ledger, record.seq)
         });
         guard.phase = DispatchPhase::EffectsForwarded;
@@ -3597,20 +3680,15 @@ fn drain_owned<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + '
         }
         // 结算本记录：自身阶段完成 → 账本终局判定（根账本在全部因果后代终局
         // 前不发布终局——因果后代屏障：根调用者的同步边界覆盖其引发的子动作）。
-        // 分段预算切掉的 Run/Cancel 超量 = 提交后部分失败（显式、不报 Completed）。
-        let failure = (unforwarded > 0).then_some(DispatchFailure {
-            seq: record.seq,
-            phase: DispatchPhase::ForwardingEffects,
-            state_committed: true,
-            cause: "segment effect budget exceeded: Run/Cancel effects not forwarded",
-        });
+        // 分段预算不再在这里结算：溢出的转换在提交之前就整次被拒（ADR-0011
+        // §2.2），走不到本行。
         if let Some(ledger) = entry {
             entry_settled |= record.root && Arc::ptr_eq(ledger, &record.ledger);
         }
         if record.root {
-            record.ledger.finish_root(failure);
+            record.ledger.finish_root(None);
         } else {
-            record.ledger.descendant_done(failure);
+            record.ledger.descendant_done(None);
         }
         guard.current = None;
         // 每个可能使账本终局的转移后都尝试归还：非等待型根的**最后一个后代**
@@ -3792,20 +3870,16 @@ fn place_snapshot<S, A, Op>(inner: &Arc<StoreInner<S, A, Op>>, next_val: S) -> O
 /// 新增分配）；panic 路径不经过摘壳臂 ⇒ 不影响该不变量（毒化半砖后的一次性
 /// 分配不在稳态口径内）。
 ///
-/// **分段效果预算（issue#144）**：段自带提交点快照 `effect_cap`；`effect_index ≥
-/// effect_cap` 的效果是**超量后缀、从不成为已接受效果**——Emit 停放/拒收（同未获
-/// 预留子动作），Run/Cancel 不转发并计入返回值（调用方结算为提交后部分失败）。
-/// 判定落在本就逐条推进的段内游标上：提交点的 O(1) 整段移交与稳态零分配不变。
+/// **分段效果预算（ADR-0011 §2.2）**：预算在**提交之前**裁决——溢出的转换整次
+/// 被拒、其段从不入队，故转发环不切分任何前缀/后缀（旧「提交点截断」语义已
+/// 删除：它会产生「状态已提交、超量 Run/Cancel 静默不转发」的分裂结局）。
 fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send + 'static>(
     inner: &Arc<StoreInner<S, A, Op>>,
     bufs: &mut EffectBufs<A, Op>,
     feedback_depth: u64,
     parent: &Arc<Ledger>,
     dispatch_action_seq: u64,
-) -> u64 {
-    // 分段效果预算（issue#144）：`unforwarded` 数被预算切掉的 Run/Cancel 条数
-    // （调用方折成提交后部分失败）；Emit 超量走停放/拒收，不计入。
-    let mut unforwarded = 0u64;
+) {
     // 单步转发决策：把「段内弹出一条」与「段空摘壳」从借用区带出——
     // `bufs.pending` 与 `bufs.staged` 的 &mut 互斥 ⇒ 决策与执行分段借用。
     enum Step<A, Op> {
@@ -3813,11 +3887,9 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
             effect: Effect<A, Op>,
             origin_action_seq: u64,
             effect_index: u64,
-            excess: bool,
         },
-        /// 段空摘壳；`recycle` = 段内效果数未超分段预算（超量段的缓冲不回收：
-        /// 留存容量回到 ≤ 预算量级，issue#144）。
-        Retire { recycle: bool },
+        /// 段空摘壳（缓冲换回 `staged`）。
+        Retire,
     }
     loop {
         let step = {
@@ -3825,7 +3897,6 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                 Some(seg) => seg,
                 None => break,
             };
-            let cap = seg.effect_cap;
             match seg.buf.pop_front() {
                 Some(effect) => {
                     let effect_index = seg.next_index;
@@ -3834,30 +3905,23 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                         effect,
                         origin_action_seq: seg.origin_action_seq,
                         effect_index,
-                        // 分段预算：预算内 = 已接受前缀；其余 = 超量后缀。
-                        excess: cap > 0 && effect_index >= cap as u64,
                     }
                 }
-                None => Step::Retire {
-                    recycle: !(cap > 0 && seg.next_index > cap as u64),
-                },
+                None => Step::Retire,
             }
         };
-        let (origin_action_seq, effect_index, excess, effect) = match step {
-            Step::Retire { recycle } => {
+        let (origin_action_seq, effect_index, effect) = match step {
+            Step::Retire => {
                 // 段空摘壳：满缓冲换回 staged（稳态零新增分配），空壳出队 drop。
                 let mut seg = bufs.pending.pop_front().expect("front_mut 判空后队首必存");
-                if recycle {
-                    std::mem::swap(&mut seg.buf, &mut bufs.staged);
-                }
+                std::mem::swap(&mut seg.buf, &mut bufs.staged);
                 continue;
             }
             Step::Forward {
                 effect,
                 origin_action_seq,
                 effect_index,
-                excess,
-            } => (origin_action_seq, effect_index, excess, effect),
+            } => (origin_action_seq, effect_index, effect),
         };
         match effect {
             Effect::Emit(a) => {
@@ -3870,27 +3934,11 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                 let mut queue = lock(&inner.queue);
                 // 序号在 queue 临界区内分配（issue#158），紧邻后代记账与 push ⇒
                 // 序号序 = **队列插入线性化序**：外部准入（[`enqueue`]）与回灌同一
-                // 分配序，回执/审计消费方可按 `seq` 重排出队（= 执行）序。分段超量
-                // 的记录不入主队列，但取号同在此处 ⇒「凡回灌取号皆持 queue 锁」无
-                // 例外（`next_seq` 不是新争用点：本临界区本就在自增它，且已含
-                // `push_back` 的指针写）。
+                // 分配序，回执/审计消费方可按 `seq` 重排出队（= 执行）序。未获
+                // 因果预算预留的记录不入主队列，但取号同在此处 ⇒「凡回灌取号皆持
+                // queue 锁」无例外（`next_seq` 不是新争用点：本临界区本就在自增
+                // 它，且已含 `push_back` 的指针写）。
                 let seq = inner.next_seq.fetch_add(1, Ordering::SeqCst);
-                // 分段超量的 Emit 从不接受（不占根预算）：直接停放 / 拒收。
-                if excess {
-                    drop(queue);
-                    park_unadmitted(
-                        inner,
-                        ActionRecord {
-                            seq,
-                            action: a,
-                            origin: ActionOrigin::Resumed { prior_depth: depth },
-                            ledger: Arc::clone(parent),
-                            root: false,
-                        },
-                    );
-                    inner.segment_effect_exceeded.fetch_add(1, Ordering::SeqCst);
-                    continue;
-                }
                 // 回灌入队 = 因果后代：**预算预留** + 未终局后代计数（同一账本临界
                 // 区）与入队同在 queue 临界区（锁序 queue → ledger；issue#105/#144）
                 // ——父账本在后代可见前不可能发布终局，未获预留的子动作不可见、
@@ -3927,13 +3975,6 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
                 );
             }
             effect => {
-                // 分段超量的 Run/Cancel 无法停放（停放区只装 action）⇒ 不转发，
-                // 计数并由调用方折成提交后部分失败（不静默、不报 Completed）。
-                if excess {
-                    inner.segment_effect_exceeded.fetch_add(1, Ordering::SeqCst);
-                    unforwarded += 1;
-                    continue;
-                }
                 // 效果身份（kind + 逻辑 id）：**单一映射点** `EffectKind::of`
                 // （skeleton crate 内穷尽匹配 Effect 词表 ⇒ 词表演进时编译期
                 // 强制同步）。非 Emit ⇒ 恒 `Some`（`of` 仅对 Emit 返回 `None`，
@@ -4002,8 +4043,6 @@ fn forward_effects<S: Clone + Send + Sync + 'static, A: Send + 'static, Op: Send
             }
         }
     }
-
-    unforwarded
 }
 
 /// 通知段：本地订阅先行、跨线程订阅随后（确定性），返回当拍**是否真有订阅

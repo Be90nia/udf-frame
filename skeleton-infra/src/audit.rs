@@ -34,8 +34,9 @@ fn lock_audit<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// per-action `seq` 递增确定——时间线断言用语义不变量（深度链/节点计数），
 /// 勿钉逐字全局顺序。`Notified`
 /// 仅当拍确有**状态快照订阅者**收到快照时记录（事件订阅不开此闸）。病理终点
-/// 两类：`ReducerInterrupted`（reduce 中断，
-/// 后继无 Reduced）与 `FeedbackBudgetExceeded`（回灌环预算止步）。`seq` 单调；
+/// 三类：`ReducerInterrupted`（reduce 中断，
+/// 后继无 Reduced）、`FeedbackBudgetExceeded`（回灌环预算止步）与
+/// `SegmentEffectOverflow`（暂存超界 ⇒ 整次转换被拒，后继无 Reduced）。`seq` 单调；
 /// 订阅窗内**连续**，空洞 = 有界环溢出丢最旧的显式证据（禁静默重写历史的对账键）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditEvent {
@@ -45,8 +46,8 @@ pub struct AuditEvent {
     pub kind: AuditEventKind,
 }
 
-/// 生命周期节点枚举（八节点：入队/reduce 完成/reduce 中断/效果转发/效果中断/
-/// 通知/拒绝/回灌超限）。
+/// 生命周期节点枚举（九节点：入队/reduce 完成/reduce 中断/效果转发/效果中断/
+/// 通知/拒绝/回灌超限/暂存超界拒绝）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditEventKind {
     /// action 入队（dispatch / [`skeleton::ActionSender::dispatch`] / Emit 回灌三路同闸）。
@@ -141,6 +142,12 @@ pub enum AuditEventKind {
     /// [`crate::runtime::SyncStore::feedback_budget_exceeded`]（计数与事件同一
     /// 触发点各计一次——环结构重建走事件流，快速巡检走计数）。
     FeedbackBudgetExceeded,
+    /// reducer 转换因暂存超界被**整次拒绝**（ADR-0011 §2.2）：状态未发布、该
+    /// segment 的效果零转发、超量 Emit 不入停放队列（后继无 `Reduced`——本事件
+    /// 就是该 action 生命周期在时间线上的终点）。轮询式对照读侧：
+    /// [`crate::runtime::SyncStore::segment_effect_overflow_count`]（计数与事件
+    /// 同一触发点各记一次）。
+    SegmentEffectOverflow,
 }
 
 /// 审计回调闭包（crate 内别名收口 type_complexity，零公共面增量）。

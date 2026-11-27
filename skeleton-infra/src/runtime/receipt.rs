@@ -7,7 +7,8 @@
 //! 终局谓词：`root_done && outstanding == 0`。
 //! - 后代计数在 queue 锁内与入队原子增减（锁序 queue → ledger），
 //!   根账本不可能在后代被接受之前发布终局（无「已接受但未计数」的缝）。
-//! - 终局结果一经发布即不可变（`Completed` / `Failed` / `Deferred` 三者互斥）。
+//! - 终局结果一经发布即不可变（`Completed` / `Failed` / `BudgetRejected` /
+//!   `Deferred` 四者互斥；预算拒绝不是失败——ADR-0011 §2.2）。
 //!
 //! **复用生命周期（issue#84）**：`Arc` 克隆可在飞行中保留到**全部因果后代
 //! 结算**；账本进复用池只在**终局发布**且**指定 owner 让渡**之后开始——
@@ -61,13 +62,21 @@ pub struct DispatchFailure {
     pub cause: &'static str,
 }
 
-/// 账本终局结果（三者互斥，发布后不可变）。
+/// 账本终局结果（互斥，发布后不可变）。
 #[derive(Clone, Debug)]
 pub(crate) enum Outcome {
     /// 自身各阶段完成且全部因果后代终局成功。
     Completed,
     /// 自身或某个因果后代失败。
     Failed(DispatchFailure),
+    /// 自身或某个因果后代的 reducer 转换因暂存超界被整次拒绝（ADR-0011 §2.2）：
+    /// `rejected` = 本因果树里被拒的转换数。**不是**失败——资源保护拒绝，无部分
+    /// 进展，legacy `dispatch` 不 panic。
+    ///
+    /// **终局优先级 `Failed > BudgetRejected > Deferred`**：混合因果树里既有失败
+    /// 又有被拒转换时，根回执只报 `Failed`（被拒转换不改变「已失败」这一事实）；
+    /// 只有没有失败时，被拒才压过停放（被拒 = 「没跑」，停放 = 「留下来待恢复」）。
+    BudgetRejected { rejected: u64 },
     /// 因果后代被回灌预算脱钩续接——本次等待边界以「未完成」收口。
     ///
     /// `retained` = 已留存到停放队列（可被恢复）的记录数；`rejected` = 停放
@@ -99,6 +108,9 @@ struct LedgerState {
     /// 脱钩但**停放队列满、续接无法留存**的记录数（issue#57：独立非成功计数，
     /// 不并入 `deferred`——被拒记录不是「已停放」）。
     deferred_rejected: u64,
+    /// reducer 转换因暂存超界被整次拒绝的次数（ADR-0011 §2.2；终局取
+    /// `BudgetRejected`）。**不并入** `first_failure`：预算拒绝不是失败。
+    budget_rejected: u64,
     /// 是否已被归还到复用池（首次归还者胜——防同一账本被归还两次）。
     released: bool,
     /// 归属 token（issue#84）：本账本属于**等待型根**（`true`）= 外部等待者
@@ -194,6 +206,23 @@ impl Ledger {
         self.publish(&mut st);
     }
 
+    /// 根 action 自身的 reducer 转换因暂存超界被整次拒绝（ADR-0011 §2.2）：
+    /// 记一次预算拒绝，终局取 [`Outcome::BudgetRejected`]（不是失败）。
+    pub(crate) fn finish_root_rejected(&self) {
+        let mut st = self.lock();
+        st.root_done = true;
+        st.budget_rejected += 1;
+        self.publish(&mut st);
+    }
+
+    /// 因果后代的转换被整次拒绝：减未终局计数并记一次预算拒绝。
+    pub(crate) fn descendant_done_rejected(&self) {
+        let mut st = self.lock();
+        release_descendant_slot(&mut st);
+        st.budget_rejected += 1;
+        self.publish(&mut st);
+    }
+
     /// 因果后代被回灌预算脱钩（迁往续接账本）：本账本记「未完成」并减计数。
     ///
     /// `is_root` = 被脱钩者是否本账本的根（外部根恒 false——外部流量深度恒 0
@@ -251,7 +280,14 @@ impl Ledger {
             return;
         }
         let outcome = if let Some(f) = st.first_failure {
+            // 优先级 **Failed > BudgetRejected > Deferred**：混合因果树里被拒转换
+            // 不改变「已失败」这一事实（同一条根回执只报最重的那个终局）。
             Outcome::Failed(f)
+        } else if st.budget_rejected > 0 {
+            // 预算拒绝优先于 Deferred：被拒转换是「没跑」，不是「被停放」。
+            Outcome::BudgetRejected {
+                rejected: st.budget_rejected,
+            }
         } else if st.deferred > 0 || st.deferred_rejected > 0 {
             Outcome::Deferred {
                 retained: st.deferred,
@@ -297,6 +333,7 @@ impl Ledger {
         st.failure_count = 0;
         st.deferred = 0;
         st.deferred_rejected = 0;
+        st.budget_rejected = 0;
         st.released = false;
         st.waiter = waiter;
     }
