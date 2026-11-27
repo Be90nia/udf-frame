@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use skeleton::notify::{Notify as _, NotifySink};
 use skeleton::view::{BindingDecl, IntentMap, PayloadTag, ViewMap};
-use skeleton::{Effect, EffectBuf, Infallible, Reducer, Store as _};
+use skeleton::{Effect, EffectBuf, Fragment, FragmentInto, Infallible, Reducer, Store as _};
 use skeleton_infra::fx::FxScope;
 use skeleton_infra::memgov::{CountingAllocator, MemoryPool};
 use skeleton_infra::objpool::{ByteBudget, ObjectPool};
@@ -1901,6 +1901,178 @@ fn effect_push_forms(c: &mut Criterion) {
     group.finish();
 }
 
+// ---- effect_compose_forms：旧有界兼容 combine! vs 融合 CombineInto（#235 §四）----
+//
+// 同一 fixture（子件每拍产 k 条 Run、父层 1:1 上提），只换组合机制：
+// `compat` = `combine!`（子件缓冲 + pop/drain/push，走有界兼容路径）；
+// `fused`  = `combine_into!`（`MapSink` 直写根 sink，无中间缓冲）。
+// 两臂同二进制、同一次运行 ⇒ 差值就是「中间缓冲/分配/搬运」被消除的结构性收益。
+#[derive(Clone, Debug, PartialEq)]
+struct CompState {
+    child: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CompAction {
+    Child(u64),
+}
+
+/// 旧写法子件（`Fragment`）：产 k 条 `Run`。
+struct CompChild {
+    per_action: u64,
+}
+
+impl skeleton::Reducer for CompChild {
+    type State = u64;
+    type Action = u64;
+    type Op = Beep;
+
+    fn initial(&self) -> u64 {
+        0
+    }
+
+    fn reduce(&self, s: &u64, _a: u64, out: &mut skeleton::EffectBuf<u64, Beep>) -> u64 {
+        for i in 0..self.per_action {
+            out.push(Effect::Run {
+                id: skeleton::EffectId::new(i + 1),
+                op: Beep::One,
+            });
+        }
+        *s + 1
+    }
+}
+
+/// 融合写法子件（`FragmentInto`）：效果**直写 sink**。
+struct CompChildInto {
+    per_action: u64,
+}
+
+impl skeleton::FragmentInto for CompChildInto {
+    type State = u64;
+    type Action = u64;
+    type Op = Beep;
+
+    fn reduce_into<S>(&self, s: &u64, _a: u64, out: &mut S) -> u64
+    where
+        S: skeleton::EffectSink<Effect<u64, Beep>>,
+    {
+        for i in 0..self.per_action {
+            out.push(Effect::Run {
+                id: skeleton::EffectId::new(i + 1),
+                op: Beep::One,
+            });
+        }
+        *s + 1
+    }
+}
+
+struct CompParentCompat {
+    per_action: u64,
+}
+
+impl skeleton::Reducer for CompParentCompat {
+    type State = CompState;
+    type Action = CompAction;
+    type Op = Beep;
+
+    fn initial(&self) -> CompState {
+        CompState { child: 0 }
+    }
+
+    fn reduce(
+        &self,
+        s: &CompState,
+        a: CompAction,
+        out: &mut skeleton::EffectBuf<CompAction, Beep>,
+    ) -> CompState {
+        skeleton_infra::combine!(
+            CompChild {
+                per_action: self.per_action,
+            },
+            CompState.child,
+            CompAction::Child,
+            lift: |effect: Effect<u64, Beep>,
+                   out: &mut skeleton::EffectBuf<CompAction, Beep>| {
+                if let Effect::Run { id, op } = effect {
+                    out.push(Effect::Run { id, op });
+                }
+            }
+        )
+        .reduce(s, a, out)
+    }
+}
+
+struct CompParentFused {
+    per_action: u64,
+}
+
+impl skeleton::Reducer for CompParentFused {
+    type State = CompState;
+    type Action = CompAction;
+    type Op = Beep;
+
+    fn initial(&self) -> CompState {
+        CompState { child: 0 }
+    }
+
+    fn reduce(
+        &self,
+        s: &CompState,
+        a: CompAction,
+        out: &mut skeleton::EffectBuf<CompAction, Beep>,
+    ) -> CompState {
+        skeleton_infra::combine_into!(
+            CompChildInto {
+                per_action: self.per_action,
+            },
+            CompState.child,
+            CompAction::Child,
+            lift: |effect: Effect<u64, Beep>| {
+                // 夹具只产 Run；用 `once` 保持零分配（与 combine! 的逐条 push 同形）。
+                ::core::iter::once(match effect {
+                    Effect::Run { id, op } => Effect::Run { id, op },
+                    _ => unreachable!("fixture 只产 Run"),
+                })
+            }
+        )
+        .reduce(s, a, out)
+    }
+}
+
+/// 组合臂解释器：只吞效果（夹具的 `Run` 无副作用）。
+struct CompFx;
+
+impl skeleton::EffectRuntime<CompAction, Beep> for CompFx {
+    fn run(
+        &mut self,
+        _effect: Effect<CompAction, Beep>,
+        _back: &skeleton::ActionSender<CompAction>,
+    ) {
+    }
+}
+
+fn effect_compose_forms(c: &mut Criterion) {
+    let mut group = c.benchmark_group("effect_compose_forms");
+    for k in [1u64, 4, 16, 64, 256, 1024] {
+        group.throughput(Throughput::Elements(k));
+        let compat = SyncStore::new(CompParentCompat { per_action: k }, CompFx);
+        for _ in 0..10 {
+            compat.dispatch(CompAction::Child(0));
+        }
+        group.bench_function(format!("compat/k{k}"), |b| {
+            b.iter(|| compat.dispatch(black_box(CompAction::Child(0))))
+        });
+        let fused = SyncStore::new(CompParentFused { per_action: k }, CompFx);
+        for _ in 0..10 {
+            fused.dispatch(CompAction::Child(0));
+        }
+        group.bench_function(format!("fused/k{k}"), |b| {
+            b.iter(|| fused.dispatch(black_box(CompAction::Child(0))))
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     fxscope_spawn_join,
@@ -1908,6 +2080,7 @@ criterion_group!(
     effect_steady_state,
     effect_batch_forward,
     effect_push_forms,
+    effect_compose_forms,
     dispatch_per_beat,
     notify_dispatch,
     object_pool_acquire_drop,

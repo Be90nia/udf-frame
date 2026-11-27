@@ -138,6 +138,8 @@
 
 **融合写入（opt-in，2026-11-27 #235 二段）**：给可融合的 reducer/fragment 一条**无中间缓冲**的写入路径。契约层新增 `EffectSink<E>`（`push` / `remaining` / `mark_overflowed` / `reserve_staging` / `release_staging` / 默认 `push_batch`；**方法级泛型 ⇒ 不承诺 `dyn` 兼容**）与 `FragmentInto`（`reduce_into<S: EffectSink<..>>`），`impl EffectSink for EffectBuf` 承担根适配器（**不新增 `EffectBufSink` newtype**——语义等价、少一个类型）；`SinkLease` 是 RAII 额度租约（Drop 归还剩余 credits）；`Buffered<F>` 把旧 `Fragment` 适配进新树并**保留旧效果回调时点**（走 §二 的有界兼容缓冲）。infra 侧新增 `MapSink`（持父 sink + 静态映射闭包：不装箱、不分配、不加锁；预算协作面**逐层转发**）、`CombineInto`（同时实现旧 `Fragment` 与新 `FragmentInto`——旧入口下 `EffectBuf` 本身就是 sink，因此同样零中间缓冲）与 `combine_into!` 宏。旧 `Fragment` / `combine!` **完全不动**；融合路径**不自动迁移**旧 `lift_fx`（纯映射约束：不做 IO、不写共享态、不依赖「回调在子 reduce 之后」；映射 panic 仍让根 transition 整体失败，框架不回滚其外部副作用）。`combine_into!` 必须显式给 `lift:` 或 `discard_effects`——融合路径不做零效果闸的隐式丢弃。验收：`tests/compose_into.rs` 三条（全链共用一份预算且停靠点观测到 `Some(预算−祖先已写)`、预算用尽 = 精确零额度且整段原子拒绝、旧 `Fragment` 经 `Buffered` 可进融合树）；变异两组（`MapSink` 不传回 overflow / 不转发 `remaining`）各自红。
 
+**融合写入的实测（2026-11-27，同二进制内对照 `benches/infra.rs::effect_compose_forms`）**：同一 fixture（子件每拍产 k 条 `Run`、父层 1:1 上提），只换组合机制：`compat` = `combine!`（子件缓冲 + pop/drain/push）、`fused` = `combine_into!`（`MapSink` 直写根 sink）。逐拍墙钟：k1 373.6→296.0 ns（**−20.8%**）、k4 439.1→333.1（**−24.1%**）、k16 837.9→526.2（**−37.2%**）、k64 2111→1534（**−27.3%**）、k256 6008→4555（**−24.2%**）、k1024 22120→20488（**−7.4%**）。⇒ **结构性收益成立**（消除中间缓冲/分配/搬运），与批量入口的「无收益」形成对照；k1024 相对收益变小是因为该规模下转发环本身主导。
+
 **已知限制（票② 实现轮发现，2026-11-27）**：交接等待用 condvar 等入口账本终局、**无超时**。若排空者在 reduce 内 panic 且此后无人继续排空，等待者会一直等——与既有的「排空者 panic ⇒ 队列搁浅」同类（等待型根的 `wait()` 一直如此），本票只是让 `try_dispatch` / `ActionSender::dispatch` 的调用方也进入该路径。
 
 ---

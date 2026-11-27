@@ -10,6 +10,7 @@
 - **不变**：旧 `Fragment` / `combine!` 完全不动；旧 `lift_fx` 不自动迁移（纯映射约束 + 映射 panic 由根 transition 整体失败，框架不回滚其外部副作用）。
 - **预算**：全链共用一份暂存预算——子层在 `reduce_into` 停靠点看到 `Some(预算 − 祖先已写)`，用尽即 `Some(0)`（精确零，不是「不限」），溢出沿适配链传回后整段原子拒绝。
 - **测试**：`tests/compose_into.rs` 3 条（跨层预算共享 + 精确零额度 + `Buffered` 互操作）；变异两组（`MapSink` 不传回 overflow ⇒ 1 条红；不转发 `remaining` ⇒ 2 条红），还原全绿。
+- **实测（同二进制对照 `effect_compose_forms`）**：同一 fixture 下 `combine_into!` 比 `combine!` 快 **−20.8%~−37.2%**（k1 −20.8% / k4 −24.1% / k16 −37.2% / k64 −27.3% / k256 −24.2% / k1024 −7.4%）⇒ 结构性收益（消除中间缓冲/分配/搬运）成立，与批量入口的「无收益」形成对照。
 
 ### Changed(contract): 组合链全链 live staging 受同一份预算（#235 一段 / ADR-0011 §2.2）
 - **内部表示变更（公共语义不变）**：`EffectBuf` 的上限表示由 `usize`（`0` = 不限）改为 `Option<usize>`（`None` = 不限、`Some(0)` = **精确零额度**）——组合链借出额度时父缓冲需要「精确零可写」这一中间态，旧表示无法与「不限」区分。`set_effect_cap(0)` 仍表示不限。
