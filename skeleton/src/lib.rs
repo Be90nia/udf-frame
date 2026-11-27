@@ -523,6 +523,11 @@ impl EffectKind {
 /// 「整段作废」的一部分，不是静默丢弃。溢出后继续 `push` 不增长条数、不 panic；
 /// [`Self::clear`] 复位溢出标志（复用前必清零），上限值由实现方在每次 reduce
 /// 入口重设（禁沿用上一拍）。
+///
+/// **批量入口（opt-in，issue#237）**：[`Self::push_batch`] 一次性快照剩余额度
+/// 后成批追加，循环内不再逐条判断预算——收益只属于显式采用该 API 的写入方，
+/// 旧 [`Self::push`] 的即时硬界不变（单条 push 无法在没有可信批量信息时省掉
+/// 边界判断）。`size_hint` 只作预留提示，不是安全证明。
 pub struct EffectBuf<A, Op = Infallible> {
     effects: VecDeque<Effect<A, Op>>,
     /// 本段生效上限（条数；`0` = 不限）。
@@ -551,6 +556,62 @@ impl<A, Op> EffectBuf<A, Op> {
             return;
         }
         self.effects.push_back(effect);
+    }
+
+    /// 本段剩余额度（实现面读侧，供批量入口与组合链预算协作）。
+    ///
+    /// `None` = **不限**；`Some(n)` = 还可再接纳 n 条（`Some(0)` = **精确零
+    /// 额度**）。注意 `Some(0)` 与公共约定「[`Self::set_effect_cap`] 的 `0` =
+    /// 不限」不是一回事：不限额度在本方法返回 `None`，绝不返回 `Some(0)`。
+    pub fn remaining_limit(&self) -> Option<usize> {
+        if self.cap == 0 {
+            None
+        } else {
+            Some(self.cap.saturating_sub(self.effects.len()))
+        }
+    }
+
+    /// 批量写入（opt-in；issue#237）。一次性快照剩余额度 R 后成批追加，追加
+    /// 循环内**不再逐条重复预算判断**——批量路径的收益来自这里，旧 [`Self::push`]
+    /// 的即时硬界**不变**（对任意旧 reducer 的单条 push，写入前仍必须判断额度；
+    /// 把检查挪到 reduce 返回后、每 N 次检查一次、或让 `VecDeque` 自行扩容后
+    /// 再裁决，都会破坏 ADR-0011 的暂存期硬界）。
+    ///
+    /// 语义（ADR-0011 §6「批量入口」）：
+    /// - **不信任** `size_hint` / `ExactSizeIterator::len`：只作 `reserve` 提示，
+    ///   实际消费严格受 R 限制；R 条后再探测一次，迭代器仍能产出一条 ⇒ 置
+    ///   [`Self::overflowed`]，**超出项不写入**（条数界绝不破）。
+    /// - 不限额度时直接 `extend`（无边界判断）。
+    /// - 已溢出时直接短路：本段已注定整段拒绝，继续写入只是无谓工作。
+    /// - 迭代器 panic 如实传播——本段 staging 由实现方既有的 reducer panic 路径
+    ///   整体清理，本方法不 `catch_unwind`。
+    ///
+    /// 条数界不是字节界：`reserve` 只影响容量，分配器可以给得更多，不能据此
+    /// 声称字节级硬上限。
+    pub fn push_batch<I>(&mut self, effects: I)
+    where
+        I: IntoIterator<Item = Effect<A, Op>>,
+    {
+        if self.overflowed {
+            return;
+        }
+        let mut iter = effects.into_iter();
+        match self.remaining_limit() {
+            None => self.effects.extend(iter),
+            Some(remaining) => {
+                let hint = iter.size_hint().0.min(remaining);
+                self.effects.reserve(hint);
+                for _ in 0..remaining {
+                    match iter.next() {
+                        Some(effect) => self.effects.push_back(effect),
+                        None => return,
+                    }
+                }
+                if iter.next().is_some() {
+                    self.overflowed = true;
+                }
+            }
+        }
     }
 
     /// 清空保容量并复位溢出标志（实现面便利：容量留给下一次 reduce 复用）。
@@ -1383,5 +1444,159 @@ mod tests {
         }
         assert!(!buf.overflowed());
         assert_eq!(buf.effects.len(), 8);
+    }
+
+    /// 批量入口（issue#237）：一次性快照剩余额度后成批追加，循环内不再逐条
+    /// 判断预算。少产出正常结束、恰好到界不溢出、超一条 ⇒ 置溢出且**只写入
+    /// 快照额度条**（超出项不入暂存）。判别：把 `for _ in 0..remaining` 的
+    /// 上界改成 `remaining + 1` 即红。
+    #[test]
+    fn effect_buf_push_batch_writes_at_most_the_remaining_quota() {
+        // 少产出（2 < 5）：正常结束、不溢出。
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        buf.set_effect_cap(5);
+        buf.push_batch((0..2).map(|_| Effect::Emit(Tick::Tick)));
+        assert_eq!(buf.effects.len(), 2);
+        assert!(!buf.overflowed(), "少产出不是溢出");
+
+        // 恰好到界：边界额外探测一次取不到 ⇒ 不置位。
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        buf.set_effect_cap(3);
+        buf.push_batch((0..3).map(|_| Effect::Emit(Tick::Tick)));
+        assert_eq!(buf.effects.len(), 3);
+        assert!(!buf.overflowed(), "恰好到界但未超界：不溢出");
+
+        // 超一条：置溢出，且只写入 3 条（超出项不写入）。
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        buf.set_effect_cap(3);
+        buf.push_batch((0..4).map(|_| Effect::Emit(Tick::Tick)));
+        assert!(buf.overflowed(), "额度用尽后仍能产出一条 ⇒ 溢出");
+        assert_eq!(buf.effects.len(), 3, "超出项不得写入暂存");
+    }
+
+    /// 剩余额度读侧：`None` = 不限、`Some(n)` = 还可接纳 n 条、`Some(0)` =
+    /// **精确零额度**——不得与公共约定「`set_effect_cap(0)` = 不限」混淆。
+    #[test]
+    fn effect_buf_remaining_limit_distinguishes_unlimited_from_zero() {
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        assert_eq!(buf.remaining_limit(), None, "不限额度必须是 None");
+        buf.set_effect_cap(2);
+        assert_eq!(buf.remaining_limit(), Some(2));
+        buf.push(Effect::Emit(Tick::Tick));
+        assert_eq!(buf.remaining_limit(), Some(1));
+        buf.push(Effect::Emit(Tick::Tick));
+        assert_eq!(buf.remaining_limit(), Some(0), "额度用尽 = 精确零额度");
+        // 精确零额度下批量入口一条也不写，且仍能判出溢出。
+        buf.push_batch((0..1).map(|_| Effect::Emit(Tick::Tick)));
+        assert!(buf.overflowed());
+        assert_eq!(buf.effects.len(), 2);
+    }
+
+    /// 精确零额度：空迭代器正常结束不溢出；非空迭代器一条也写不进 ⇒ 溢出。
+    #[test]
+    fn effect_buf_push_batch_with_zero_remaining_writes_nothing() {
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        buf.set_effect_cap(1);
+        buf.push(Effect::Emit(Tick::Tick));
+        assert_eq!(buf.remaining_limit(), Some(0));
+        buf.push_batch(core::iter::empty::<Effect<Tick, Infallible>>());
+        assert!(!buf.overflowed(), "空批次不是溢出");
+        buf.push_batch(core::iter::once(Effect::Emit(Tick::Tick)));
+        assert!(buf.overflowed(), "零额度下仍有产出 ⇒ 溢出");
+        assert_eq!(buf.effects.len(), 1);
+    }
+
+    /// 不限额度：全部写入、不溢出（批量入口走 `extend`，无边界判断）。
+    #[test]
+    fn effect_buf_push_batch_unlimited_writes_everything() {
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        buf.push_batch((0..1000).map(|_| Effect::Emit(Tick::Tick)));
+        assert_eq!(buf.effects.len(), 1000);
+        assert!(!buf.overflowed());
+    }
+
+    /// `size_hint` 只作 `reserve` 提示、**不是**安全证明：谎报过多不能据此判
+    /// 溢出；谎报过少不得突破上限。
+    #[test]
+    fn effect_buf_push_batch_does_not_trust_size_hint() {
+        struct Lying {
+            inner: std::vec::IntoIter<Effect<Tick, Infallible>>,
+            hint: (usize, Option<usize>),
+        }
+        impl Iterator for Lying {
+            type Item = Effect<Tick, Infallible>;
+            fn next(&mut self) -> Option<Self::Item> {
+                self.inner.next()
+            }
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                self.hint
+            }
+        }
+
+        // 谎报下界 1000 而实际只产 2 条：不溢出、写 2 条。
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        buf.set_effect_cap(5);
+        buf.push_batch(Lying {
+            inner: (0..2)
+                .map(|_| Effect::Emit(Tick::Tick))
+                .collect::<Vec<_>>()
+                .into_iter(),
+            hint: (1000, Some(1000)),
+        });
+        assert_eq!(buf.effects.len(), 2);
+        assert!(!buf.overflowed(), "size_hint 过报不能当溢出证明");
+
+        // 谎报下界 0 而实际产 8 条：仍严格受上限约束并判溢出。
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        buf.set_effect_cap(3);
+        buf.push_batch(Lying {
+            inner: (0..8)
+                .map(|_| Effect::Emit(Tick::Tick))
+                .collect::<Vec<_>>()
+                .into_iter(),
+            hint: (0, None),
+        });
+        assert_eq!(buf.effects.len(), 3, "size_hint 少报不得突破上限");
+        assert!(buf.overflowed());
+    }
+
+    /// 已溢出时批量入口直接短路：本段已注定整段拒绝，继续写入只是无谓工作。
+    #[test]
+    fn effect_buf_push_batch_short_circuits_after_overflow() {
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        buf.set_effect_cap(2);
+        buf.push_batch((0..5).map(|_| Effect::Emit(Tick::Tick)));
+        assert!(buf.overflowed());
+        assert_eq!(buf.effects.len(), 2);
+        buf.push_batch((0..5).map(|_| Effect::Emit(Tick::Tick)));
+        assert_eq!(buf.effects.len(), 2, "溢出后批量入口不得再写入");
+    }
+
+    /// 迭代器 panic 如实传播（不 catch）；已接受的前缀留在缓冲里，由实现方
+    /// 既有的 reducer panic 路径整体清理本段 staging。
+    #[test]
+    fn effect_buf_push_batch_propagates_iterator_panic() {
+        let mut buf: EffectBuf<Tick, Infallible> = EffectBuf::new();
+        buf.set_effect_cap(8);
+        let mut produced = 0;
+        let iter = core::iter::from_fn(|| {
+            produced += 1;
+            if produced == 3 {
+                panic!("iterator blew up");
+            }
+            Some(Effect::Emit(Tick::Tick))
+        });
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            buf.push_batch(iter);
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(
+            caught.is_err(),
+            "迭代器 panic 必须如实传播（禁 catch_unwind）"
+        );
+        assert_eq!(buf.effects.len(), 2, "panic 前已接受的前缀留在缓冲");
+        assert!(!buf.overflowed(), "panic 不是溢出");
     }
 }

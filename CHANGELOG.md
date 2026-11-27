@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Added(contract): `EffectBuf` 批量入口 `push_batch` + 读侧 `remaining_limit`（#237 / ADR-0011 §6）
+- **新增（纯增量，公开语义不变）**：`EffectBuf::push_batch(iter)` 一次性快照剩余额度 R 后成批追加，循环内不再逐条判断预算；`EffectBuf::remaining_limit() -> Option<usize>`（`None` = 不限、`Some(0)` = 精确零额度，与 `set_effect_cap(0)` = 不限 的公共约定区分）。
+- **边界算法**：最多追加 R 条 → R 条后迭代器仍能产出一条 ⇒ 置溢出、整段拒绝、**超出项不写入**；`size_hint` / `ExactSizeIterator::len` 只作 `reserve` 提示，**不是安全证明**；不先构造无界临时 `Vec`；已溢出时批量入口直接短路；迭代器 panic 如实传播（由 runtime 既有 panic 路径清理本段 staging）。
+- **不动的边界**：旧 `push` 的**即时硬界不变**（对任意旧 reducer 的单条 push，写入前仍必须判断额度——把检查挪到 reduce 返回后 / 每 N 次 / 扩容后裁决都会破坏暂存期硬界）；根 staged 仍是唯一提交缓冲；不新增锁 / 原子计数 / `dyn` sink / MPSC；条数界 ≠ 字节界（`reserve` 只影响容量）。
+- **收益只属于显式采用方**：旧 reducer 继续调 `push` 不会自动获得批量收益；`push_batch` 的收益与「消除中间缓冲」的结构性收益（#235 组合链融合）一起实测后再决定是否更换底层容器。
+- **测试**：8 条 `EffectBuf` 单测（少产出 / 恰好到界 / 超一条 / 剩余额度读侧 / 精确零额度 / 不限 / `size_hint` 过报与少报 / 溢出后短路 / 迭代器 panic 传播）；变异：把快照上界改成 `remaining + 1` ⇒ 越界用例必红。
+
 ### Changed(runtime): per-drain 租约改为「到界让出所有权 + 不持租约等完成」（#234 / ADR-0011 §2.4）
 - **语义变更**：per-drain 工作量预算到界时不再有「经 `try_dispatch` / `ActionSender::dispatch` 夺得租约者在自己 action 完成边界前不让出」的例外——到界且队列非空即让出**所有权**；被接手时调用方**认领**入口账本（等待期间账本不进复用池，杜绝复用 `reset` 清掉等待中终局的丢唤醒）后不持租约地等终局，醒来即返回；无人接手则原线程重新竞争续排（禁搁浅）。
 - **不变**：`ActionSender::dispatch` 的 `bool` 仍只表示「被接受」；`dispatch` / `dispatch_with_receipt` 的完成边界语义、FIFO、单写者所有权、恰好一次记账、因果账本完成均不变。
