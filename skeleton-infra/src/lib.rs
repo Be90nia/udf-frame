@@ -78,6 +78,41 @@ fn emit_embedded_event(emit: impl FnOnce()) {
             std::sync::atomic::Ordering::Relaxed,
             |count| Some(count.saturating_add(1)),
         );
+        #[cfg(all(test, feature = "log-embed"))]
+        embedded_event_panic_window::note_counted_panic();
+    }
+}
+
+/// 测试窗口（仅单元测试构建）：**本线程**自武装起被计数的 subscriber panic 次数。
+/// 进程级计数 `embedded_event_panic_count` 会被同二进制并行邻居测试的 panic
+/// 抬高，钉不出「恰好 +1」；开关与计数同住线程局部（const 初始化、无惰性分配），
+/// 邻居线程的 panic 天然不进窗。进程级计数本身不因本窗口改变语义。
+#[cfg(all(test, feature = "log-embed"))]
+mod embedded_event_panic_window {
+    use std::cell::Cell;
+
+    thread_local! {
+        static WINDOW: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// 在调用线程上武装窗口（窗内计数从 0 起）。
+    pub(crate) fn arm() {
+        WINDOW.with(|window| window.set(Some(0)));
+    }
+
+    /// 收窗并取走窗内计数；本线程未武装则为 `None`。
+    pub(crate) fn take() -> Option<u64> {
+        WINDOW.with(|window| window.replace(None))
+    }
+
+    /// 计数钩子：进程级计数 +1 之后调用；仅本线程窗口已武装时累加。
+    pub(crate) fn note_counted_panic() {
+        // 线程析构期 TLS 已销毁 ⇒ 放弃记账（窗口随之不可读），不得 panic。
+        let _ = WINDOW.try_with(|window| {
+            if let Some(count) = window.get() {
+                window.set(Some(count.saturating_add(1)));
+            }
+        });
     }
 }
 
@@ -267,16 +302,56 @@ mod embedded_event_panic_tests {
 
     #[test]
     fn embedded_event_contains_subscriber_panic_and_counts_it() {
+        // 精确「恰好 +1」只对线程局部窗口成立：进程级计数是 crate 级全局，同二进制
+        // 并行邻居测试的 panic 也会抬高它，故对进程级只钉「严格增加」这一可判定方向。
+        embedded_event_panic_window::arm();
         let before = embedded_event_panic_count();
         tracing::subscriber::with_default(PanicSubscriber, || {
             embed_event!(debug, target: "skeleton::telemetry_test", marker = 1);
         });
-        // 基线增量而非「恰好 +1」：计数是 crate 级全局，同二进制另一条
-        // panic-subscriber 测试并发跑时会多计（bd udf-frame-ep5）⇒ 只钉可判定的
-        // 方向：panic 被观测到且不穿出发射调用。
+        assert_eq!(
+            embedded_event_panic_window::take(),
+            Some(1),
+            "本线程窗口内 subscriber panic 恰计一次"
+        );
         assert!(
             embedded_event_panic_count() > before,
-            "subscriber panic is counted without escaping the emitting call"
+            "进程级计数同样记到这次 panic，且 panic 不穿出发射调用"
+        );
+    }
+
+    /// 邻居隔离（确定性握手，禁 sleep）：窗口武装后，N 个邻居线程各触发一次会抬高
+    /// 进程级计数的 subscriber panic，全部 join 落定后本线程再触发恰一次——窗内
+    /// 计数必须恰为 1（邻居的 panic 不进本线程窗口），进程级计数至少增加 N。
+    #[test]
+    fn panics_on_neighbor_threads_stay_out_of_the_armed_window() {
+        const NEIGHBORS: u64 = 4;
+
+        embedded_event_panic_window::arm();
+        let global_before = embedded_event_panic_count();
+        std::thread::scope(|scope| {
+            for _ in 0..NEIGHBORS {
+                scope.spawn(|| {
+                    tracing::subscriber::with_default(PanicSubscriber, || {
+                        embed_event!(debug, target: "skeleton::telemetry_test", marker = 1);
+                    });
+                });
+            }
+        });
+        let after_neighbors = embedded_event_panic_count();
+
+        tracing::subscriber::with_default(PanicSubscriber, || {
+            embed_event!(debug, target: "skeleton::telemetry_test", marker = 1);
+        });
+
+        assert!(
+            after_neighbors - global_before >= NEIGHBORS,
+            "邻居的 panic 必须真被引发并抬高进程级计数"
+        );
+        assert_eq!(
+            embedded_event_panic_window::take(),
+            Some(1),
+            "窗内只计本线程那一次：邻居线程的 panic 不得进窗"
         );
     }
 }
